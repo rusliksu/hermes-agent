@@ -237,12 +237,147 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import (
+    get_due_jobs,
+    get_job,
+    mark_job_run,
+    pause_job,
+    save_job_output,
+    advance_next_run,
+    claim_dispatch,
+    update_job,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_PROVIDER_FAILURE_MARKERS = {
+    "rate_limit": (
+        "usage limit",
+        "rate limit",
+        "429",
+        "too many requests",
+        "quota",
+        "insufficient_quota",
+    ),
+    "auth": (
+        "authentication",
+        "unauthorized",
+        "invalidated",
+        "invalid api key",
+        "api key",
+        "credential",
+        "401",
+        "403",
+    ),
+    "billing": (
+        "payment required",
+        "billing",
+        "402",
+    ),
+}
+
+
+def _is_cron_circuit_breaker_enabled() -> bool:
+    value = os.getenv("HERMES_CRON_CIRCUIT_BREAKER_ENABLED", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _cron_circuit_breaker_threshold() -> int:
+    raw = os.getenv("HERMES_CRON_CIRCUIT_BREAKER_THRESHOLD", "3").strip()
+    try:
+        threshold = int(raw)
+    except ValueError:
+        return 3
+    return max(1, threshold)
+
+
+def _classify_provider_failure(error: Optional[str]) -> Optional[str]:
+    text = (error or "").strip().lower()
+    if not text:
+        return None
+    for category, markers in _PROVIDER_FAILURE_MARKERS.items():
+        if any(marker in text for marker in markers):
+            return category
+    return None
+
+
+def _clear_provider_failure_streak(job_id: str, current_job: dict) -> None:
+    if not (
+        current_job.get("provider_failure_streak")
+        or current_job.get("last_provider_failure_category")
+        or current_job.get("last_provider_failure_at")
+    ):
+        return
+    update_job(
+        job_id,
+        {
+            "provider_failure_streak": 0,
+            "last_provider_failure_category": None,
+            "last_provider_failure_at": None,
+        },
+    )
+
+
+def _apply_cron_circuit_breaker(job: dict, success: bool, error: Optional[str]) -> bool:
+    """Track consecutive provider failures and auto-pause noisy cron jobs."""
+
+    if not _is_cron_circuit_breaker_enabled():
+        return False
+
+    job_id = job.get("id")
+    if not job_id:
+        return False
+
+    current_job = get_job(job_id) or job
+    if success:
+        _clear_provider_failure_streak(job_id, current_job)
+        return False
+
+    category = _classify_provider_failure(error)
+    if not category:
+        _clear_provider_failure_streak(job_id, current_job)
+        return False
+
+    try:
+        previous_streak = int(current_job.get("provider_failure_streak") or 0)
+    except (TypeError, ValueError):
+        previous_streak = 0
+
+    streak = previous_streak + 1
+    threshold = _cron_circuit_breaker_threshold()
+    update_job(
+        job_id,
+        {
+            "provider_failure_streak": streak,
+            "last_provider_failure_category": category,
+            "last_provider_failure_at": _hermes_now().isoformat(),
+        },
+    )
+
+    if streak < threshold:
+        logger.warning(
+            "Cron job '%s' provider failure streak %d/%d (%s)",
+            job.get("name", job_id),
+            streak,
+            threshold,
+            category,
+        )
+        return False
+
+    reason = (
+        f"auto-paused after {streak} consecutive provider {category} failures; "
+        "check credentials/quota before resuming"
+    )
+    pause_job(job_id, reason=reason)
+    logger.error(
+        "Cron job '%s' auto-paused by provider failure circuit breaker: %s",
+        job.get("name", job_id),
+        reason,
+    )
+    return True
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -3371,11 +3506,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        _apply_cron_circuit_breaker(job, success, error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
+        _apply_cron_circuit_breaker(job, False, str(e))
         return False
 
 

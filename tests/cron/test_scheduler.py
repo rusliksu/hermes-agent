@@ -9,8 +9,69 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _apply_cron_circuit_breaker, _classify_provider_failure
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestProviderFailureCircuitBreaker:
+    def test_classifies_provider_failures(self):
+        assert _classify_provider_failure("RuntimeError: usage limit reached") == "rate_limit"
+        assert _classify_provider_failure("HTTP 429 Too Many Requests") == "rate_limit"
+        assert _classify_provider_failure("credential invalidated for provider") == "auth"
+        assert _classify_provider_failure("402 Payment Required") == "billing"
+        assert _classify_provider_failure("script exited with status 1") is None
+
+    def test_auto_pauses_after_provider_failure_threshold(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_CIRCUIT_BREAKER_THRESHOLD", "3")
+        job = {
+            "id": "quota-job",
+            "name": "quota monitor",
+        }
+        persisted = dict(job, provider_failure_streak=2)
+
+        with patch("cron.scheduler.get_job", return_value=persisted), \
+             patch("cron.scheduler.update_job") as update_mock, \
+             patch("cron.scheduler.pause_job") as pause_mock:
+            paused = _apply_cron_circuit_breaker(
+                job,
+                False,
+                "RuntimeError: usage limit reached",
+            )
+
+        assert paused is True
+        update_mock.assert_called_once()
+        assert update_mock.call_args[0][0] == "quota-job"
+        assert update_mock.call_args[0][1]["provider_failure_streak"] == 3
+        assert update_mock.call_args[0][1]["last_provider_failure_category"] == "rate_limit"
+        pause_mock.assert_called_once()
+        assert pause_mock.call_args[0][0] == "quota-job"
+        assert "auto-paused after 3 consecutive provider rate_limit failures" in pause_mock.call_args.kwargs["reason"]
+
+    def test_resets_provider_failure_streak_on_success(self):
+        job = {
+            "id": "recovered-job",
+            "name": "recovered monitor",
+            "provider_failure_streak": 2,
+            "last_provider_failure_category": "auth",
+            "last_provider_failure_at": "2026-06-27T00:00:00+00:00",
+        }
+
+        with patch("cron.scheduler.get_job", return_value=job), \
+             patch("cron.scheduler.update_job") as update_mock, \
+             patch("cron.scheduler.pause_job") as pause_mock:
+            paused = _apply_cron_circuit_breaker(job, True, None)
+
+        assert paused is False
+        update_mock.assert_called_once_with(
+            "recovered-job",
+            {
+                "provider_failure_streak": 0,
+                "last_provider_failure_category": None,
+                "last_provider_failure_at": None,
+            },
+        )
+        pause_mock.assert_not_called()
 
 
 class TestPerJobToolsetMcpMerge:
