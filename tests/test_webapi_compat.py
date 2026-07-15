@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,28 @@ class FakeSessionDB:
         if session_id in self.sessions:
             self.sessions[session_id]["message_count"] += 1
 
+    def get_messages_as_conversation(self, session_id: str) -> list[dict[str, Any]]:
+        return [
+            {"role": message["role"], "content": message.get("content")}
+            for message in self.messages
+            if message["session_id"] == session_id
+        ]
+
+
+def _decode_sse_events(body: str) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
+    for frame in body.strip().split("\n\n"):
+        event_name = ""
+        data = ""
+        for line in frame.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = line.removeprefix("data: ")
+        if event_name and data:
+            events.append((event_name, json.loads(data)))
+    return events
+
 
 @pytest.mark.asyncio
 async def test_health_and_config_nested_resolution(monkeypatch, tmp_path):
@@ -163,20 +186,49 @@ async def test_config_patch_writes_nested_model_config(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sessions_route_construction_and_chat_mock_boundary(monkeypatch, tmp_path):
+async def test_sessions_route_construction_and_chat_runs_agent(monkeypatch, tmp_path):
     app, _home = _app(
         monkeypatch,
         tmp_path,
         {"model": {"default": "dummy-model", "provider": "dummy-provider"}},
     )
     from webapi.deps import get_session_db_dependency
+    import webapi.routes.chat as chat_route
 
     fake_db = FakeSessionDB()
+    create_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+    threadpool_calls: list[dict[str, Any]] = []
 
     async def fake_session_db_dependency() -> FakeSessionDB:
         return fake_db
 
+    class FakeAgent:
+        def run_conversation(self, user_message, **kwargs):
+            run_calls.append({"user_message": user_message, **kwargs})
+            return {
+                "final_response": "real mocked answer",
+                "completed": True,
+                "partial": False,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "real mocked answer"},
+                ],
+            }
+
+    def fake_create_agent(**kwargs):
+        create_calls.append(kwargs)
+        return FakeAgent()
+
+    async def fake_run_in_threadpool(func, *args, **kwargs):
+        threadpool_calls.append({"func": func, "args": args, "kwargs": kwargs})
+        return func(*args, **kwargs)
+
     app.dependency_overrides[get_session_db_dependency] = fake_session_db_dependency
+    monkeypatch.setattr(chat_route, "create_agent", fake_create_agent)
+    monkeypatch.setattr(chat_route, "run_in_threadpool", fake_run_in_threadpool)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -191,14 +243,159 @@ async def test_sessions_route_construction_and_chat_mock_boundary(monkeypatch, t
         assert listed["total"] == 1
         assert listed["items"][0]["id"] == "sess_test"
 
-        chat = await client.post("/api/sessions/sess_test/chat", json={"message": "hello"})
+        fake_db.append_message("sess_test", role="user", content="old question")
+        fake_db.append_message("sess_test", role="assistant", content="old answer")
+        chat = await client.post(
+            "/api/sessions/sess_test/chat",
+            json={
+                "message": "hello",
+                "persist_user_message": "clean hello",
+                "model": "request-model",
+                "enabled_toolsets": ["memory"],
+                "skip_memory": True,
+            },
+        )
     assert chat.status_code == 200
     payload = chat.json()
     assert payload["session_id"] == "sess_test"
-    assert payload["api_calls"] == 0
-    assert payload["completed"] is False
-    assert payload["interrupted"] is True
-    assert "compatibility shim" in payload["final_response"]
+    assert payload["api_calls"] == 2
+    assert payload["completed"] is True
+    assert payload["interrupted"] is False
+    assert payload["final_response"] == "real mocked answer"
+    assert len(create_calls) == 1
+    assert create_calls[0]["session_id"] == "sess_test"
+    assert create_calls[0]["session_db"] is fake_db
+    assert create_calls[0]["model"] == "request-model"
+    assert create_calls[0]["enabled_toolsets"] == ["memory"]
+    assert create_calls[0]["skip_memory"] is True
+    assert len(threadpool_calls) == 1
+    assert threadpool_calls[0]["func"] is chat_route._run_chat
+    assert threadpool_calls[0]["kwargs"]["session_id"] == "sess_test"
+    assert len(run_calls) == 1
+    assert run_calls[0]["user_message"] == "hello"
+    assert run_calls[0]["conversation_history"] == [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert run_calls[0]["persist_user_message"] == "clean hello"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_runs_agent_and_emits_callbacks_result_done(monkeypatch, tmp_path):
+    app, _home = _app(
+        monkeypatch,
+        tmp_path,
+        {"model": {"default": "dummy-model", "provider": "dummy-provider"}},
+    )
+    from webapi.deps import get_session_db_dependency
+    import webapi.routes.chat as chat_route
+
+    fake_db = FakeSessionDB()
+    fake_db.create_session("sess_stream", source="web", model="dummy-model")
+    fake_db.append_message("sess_stream", role="user", content="old question")
+    fake_db.append_message("sess_stream", role="assistant", content="old answer")
+    create_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+
+    async def fake_session_db_dependency() -> FakeSessionDB:
+        return fake_db
+
+    class FakeAgent:
+        def __init__(self, callbacks: dict[str, Any]) -> None:
+            self.callbacks = callbacks
+
+        def run_conversation(self, user_message, **kwargs):
+            run_calls.append({"user_message": user_message, **kwargs})
+            self.callbacks["stream_callback"]("partial ")
+            self.callbacks["tool_progress_callback"](
+                "tool.started",
+                "terminal",
+                "terminal: echo hi",
+                {"command": "echo hi"},
+            )
+            self.callbacks["tool_progress_callback"](
+                "tool.completed",
+                "terminal",
+                None,
+                None,
+                duration=0.25,
+                is_error=False,
+                result="{\"path\":\"/tmp/out.txt\"}",
+            )
+            self.callbacks["thinking_callback"]("thinking")
+            self.callbacks["reasoning_callback"]("reasoning")
+            return {
+                "final_response": "streamed answer",
+                "completed": True,
+                "partial": False,
+                "interrupted": False,
+                "api_calls": 3,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": "terminal", "arguments": "{\"command\":\"echo hi\"}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "{\"path\":\"/tmp/out.txt\"}"},
+                    {"role": "assistant", "content": "streamed answer"},
+                ],
+            }
+
+    def fake_create_agent(**kwargs):
+        create_calls.append(kwargs)
+        return FakeAgent(kwargs)
+
+    app.dependency_overrides[get_session_db_dependency] = fake_session_db_dependency
+    monkeypatch.setattr(chat_route, "create_agent", fake_create_agent)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/sessions/sess_stream/chat/stream",
+            json={"message": "stream hello", "persist_user_message": "clean stream hello"},
+        )
+
+    assert response.status_code == 200
+    events = _decode_sse_events(response.text)
+    event_names = [name for name, _data in events]
+    assert event_names[:3] == ["session.created", "run.started", "message.started"]
+    assert "assistant.delta" in event_names
+    assert "tool.started" in event_names
+    assert "thinking.delta" in event_names
+    assert "reasoning.delta" in event_names
+    assert "artifact.created" in event_names
+    assert "assistant.completed" in event_names
+    assert "run.completed" in event_names
+    assert event_names[-1] == "done"
+    assert event_names.count("tool.completed") == 1
+    assert event_names.index("tool.started") < event_names.index("tool.completed")
+    assert event_names.index("tool.completed") < event_names.index("artifact.created")
+    tool_completed = [data for name, data in events if name == "tool.completed"][0]
+    assistant_completed = [data for name, data in events if name == "assistant.completed"][-1]
+    run_completed = [data for name, data in events if name == "run.completed"][-1]
+    assert tool_completed["tool_name"] == "terminal"
+    assert tool_completed["result_preview"] == "{\"path\":\"/tmp/out.txt\"}"
+    assert any(data["path"] == "/tmp/out.txt" for name, data in events if name == "artifact.created")
+    assert assistant_completed["content"] == "streamed answer"
+    assert run_completed["api_calls"] == 3
+    assert len(create_calls) == 1
+    assert callable(create_calls[0]["stream_callback"])
+    assert callable(create_calls[0]["tool_progress_callback"])
+    assert callable(create_calls[0]["thinking_callback"])
+    assert callable(create_calls[0]["reasoning_callback"])
+    assert callable(create_calls[0]["step_callback"])
+    assert len(run_calls) == 1
+    assert run_calls[0]["user_message"] == "stream hello"
+    assert run_calls[0]["conversation_history"] == [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    assert run_calls[0]["persist_user_message"] == "clean stream hello"
+    assert "stream_callback" not in run_calls[0]
 
 
 def test_legacy_webui_routes_are_registered(monkeypatch, tmp_path):

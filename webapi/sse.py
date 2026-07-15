@@ -1,3 +1,4 @@
+import asyncio
 import json
 import queue
 from dataclasses import dataclass
@@ -50,6 +51,17 @@ class SSEStream:
     def __iter__(self) -> Iterator[bytes]:
         while True:
             item = self._queue.get()
+            if item is None:
+                break
+            yield item
+
+    async def __aiter__(self):
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
             if item is None:
                 break
             yield item

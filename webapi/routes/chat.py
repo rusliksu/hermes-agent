@@ -1,12 +1,15 @@
 import json
+import threading
 import uuid
+from collections import Counter
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from hermes_state import SessionDB
-from webapi.deps import get_session_db_dependency, get_session_or_404, get_runtime_model
+from webapi.deps import create_agent, get_session_db_dependency, get_session_or_404, get_runtime_model
 from webapi.models.chat import ChatRequest, ChatResponse
 from webapi.sse import SSEEmitter, SSEStream
 
@@ -93,7 +96,13 @@ def _result_preview(content: Any, limit: int = 400) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-def _emit_post_run_events(emitter: SSEEmitter, stream: SSEStream, result: dict[str, Any], assistant_message_id: str) -> None:
+def _emit_post_run_events(
+    emitter: SSEEmitter,
+    stream: SSEStream,
+    result: dict[str, Any],
+    assistant_message_id: str,
+    emitted_tool_lifecycle: Counter[str] | None = None,
+) -> None:
     messages = result.get("messages") or []
     tools = _tool_map(messages)
 
@@ -112,7 +121,10 @@ def _emit_post_run_events(emitter: SSEEmitter, stream: SSEStream, result: dict[s
         content = message.get("content") or ""
         lower = content.lower() if isinstance(content, str) else ""
         failed = "error" in lower or "failed" in lower
-        stream.put(emitter.event("tool.failed" if failed else "tool.completed", **payload))
+        if emitted_tool_lifecycle and emitted_tool_lifecycle[tool_name] > 0:
+            emitted_tool_lifecycle[tool_name] -= 1
+        else:
+            stream.put(emitter.event("tool.failed" if failed else "tool.completed", **payload))
 
         if not failed and tool_name == "memory":
             try:
@@ -192,39 +204,23 @@ def _run_chat(
     session_db: SessionDB,
 ) -> dict[str, Any]:
     get_session_or_404(session_id, session_db)
-    _user_content, persist_text = _build_user_content(payload)
-    if persist_text:
-        session_db.append_message(
-            session_id=session_id,
-            role="user",
-            content=persist_text,
-        )
-    final_response = (
-        "Hermes webapi compatibility shim: chat execution is disabled in this "
-        "server-side compatibility route to avoid external LLM calls."
-    )
-    session_db.append_message(
+    history = session_db.get_messages_as_conversation(session_id)
+    user_content, persist_text = _build_user_content(payload)
+    agent = create_agent(
         session_id=session_id,
-        role="assistant",
-        content=final_response,
-        finish_reason="mock_boundary",
+        session_db=session_db,
+        model=payload.model,
+        ephemeral_system_prompt=payload.system_message,
+        enabled_toolsets=payload.enabled_toolsets,
+        disabled_toolsets=payload.disabled_toolsets,
+        skip_context_files=payload.skip_context_files,
+        skip_memory=payload.skip_memory,
     )
-    return {
-        "final_response": final_response,
-        "completed": False,
-        "partial": True,
-        "interrupted": True,
-        "api_calls": 0,
-        "messages": [
-            {"role": "user", "content": persist_text},
-            {
-                "role": "assistant",
-                "content": final_response,
-                "finish_reason": "mock_boundary",
-            },
-        ],
-        "response_previewed": False,
-    }
+    return agent.run_conversation(
+        user_content,
+        conversation_history=history,
+        persist_user_message=persist_text,
+    )
 
 
 @router.post("/{session_id}/chat", response_model=ChatResponse)
@@ -233,7 +229,7 @@ async def chat(
     payload: ChatRequest,
     session_db: Annotated[SessionDB, Depends(get_session_db_dependency)],
 ) -> ChatResponse:
-    result = _run_chat(session_id=session_id, payload=payload, session_db=session_db)
+    result = await run_in_threadpool(_run_chat, session_id=session_id, payload=payload, session_db=session_db)
     if result.get("error") and not result.get("final_response"):
         raise HTTPException(status_code=500, detail=result["error"])
     return ChatResponse(
@@ -289,55 +285,128 @@ async def chat_stream(
         )
     )
 
-    try:
-        if persist_text:
-            session_db.append_message(
+    def worker() -> None:
+        try:
+            history = session_db.get_messages_as_conversation(session_id)
+            emitted_tool_lifecycle: Counter[str] = Counter()
+
+            def stream_callback(delta: str | None) -> None:
+                if delta:
+                    stream.put(
+                        emitter.event(
+                            "assistant.delta",
+                            message_id=assistant_message_id,
+                            delta=delta,
+                        )
+                    )
+
+            def tool_progress_callback(*args: Any, **kwargs: Any) -> None:
+                event_type = str(args[0]) if args else str(kwargs.get("event_type") or "")
+                tool_name = args[1] if len(args) > 1 else kwargs.get("name") or kwargs.get("tool_name")
+                preview = args[2] if len(args) > 2 else kwargs.get("preview")
+                tool_args = args[3] if len(args) > 3 else kwargs.get("args")
+
+                if event_type == "_thinking":
+                    preview = args[1] if len(args) > 1 else preview
+                    stream.put(
+                        emitter.event(
+                            "tool.progress",
+                            message_id=assistant_message_id,
+                            delta=preview,
+                        )
+                    )
+                    return
+                if event_type == "reasoning.available":
+                    stream.put(
+                        emitter.event(
+                            "reasoning.delta",
+                            message_id=assistant_message_id,
+                            delta=preview or "",
+                        )
+                    )
+                    return
+                if event_type == "tool.completed":
+                    emitted_tool_lifecycle[str(tool_name or "unknown")] += 1
+                    stream.put(
+                        emitter.event(
+                            "tool.completed",
+                            tool_name=tool_name or "unknown",
+                            args=tool_args,
+                            result_preview=_result_preview(kwargs.get("result") or ""),
+                            duration=kwargs.get("duration"),
+                            is_error=kwargs.get("is_error", False),
+                        )
+                    )
+                    return
+                if event_type == "tool.failed":
+                    emitted_tool_lifecycle[str(tool_name or "unknown")] += 1
+                    event_name = "tool.failed"
+                else:
+                    event_name = "tool.started" if event_type == "tool.started" else "tool.pending"
+                stream.put(
+                    emitter.event(
+                        event_name,
+                        tool_name=tool_name or event_type or "unknown",
+                        preview=preview,
+                        args=tool_args,
+                    )
+                )
+
+            def thinking_callback(text: str) -> None:
+                stream.put(
+                    emitter.event(
+                        "thinking.delta",
+                        message_id=assistant_message_id,
+                        delta=text,
+                    )
+                )
+
+            def reasoning_callback(text: str) -> None:
+                stream.put(
+                    emitter.event(
+                        "reasoning.delta",
+                        message_id=assistant_message_id,
+                        delta=text,
+                    )
+                )
+
+            def step_callback(iteration: int, prev_tools: list[Any]) -> None:
+                stream.put(
+                    emitter.event(
+                        "run.step",
+                        iteration=iteration,
+                        tool_count=len(prev_tools or []),
+                    )
+                )
+
+            agent = create_agent(
                 session_id=session_id,
-                role="user",
-                content=persist_text,
+                session_db=session_db,
+                model=payload.model,
+                ephemeral_system_prompt=payload.system_message,
+                enabled_toolsets=payload.enabled_toolsets,
+                disabled_toolsets=payload.disabled_toolsets,
+                skip_context_files=payload.skip_context_files,
+                skip_memory=payload.skip_memory,
+                stream_callback=stream_callback,
+                tool_progress_callback=tool_progress_callback,
+                thinking_callback=thinking_callback,
+                reasoning_callback=reasoning_callback,
+                step_callback=step_callback,
             )
-        final_response = (
-            "Hermes webapi compatibility shim: chat execution is disabled in this "
-            "server-side compatibility route to avoid external LLM calls."
-        )
-        session_db.append_message(
-            session_id=session_id,
-            role="assistant",
-            content=final_response,
-            finish_reason="mock_boundary",
-        )
-        stream.put(
-            emitter.event(
-                "assistant.delta",
-                message_id=assistant_message_id,
-                delta=final_response,
+            result = agent.run_conversation(
+                user_content,
+                conversation_history=history,
+                persist_user_message=persist_text,
             )
-        )
-        _emit_post_run_events(
-            emitter,
-            stream,
-            {
-                "messages": [
-                    {"role": "user", "content": persist_text},
-                    {
-                        "role": "assistant",
-                        "content": final_response,
-                        "finish_reason": "mock_boundary",
-                    },
-                ],
-                "final_response": final_response,
-                "completed": False,
-                "partial": True,
-                "interrupted": True,
-                "api_calls": 0,
-            },
-            assistant_message_id,
-        )
-    except Exception as exc:
-        stream.put(emitter.event("error", message=str(exc)))
-    finally:
-        stream.put(emitter.event("done"))
-        stream.close()
+            _emit_post_run_events(emitter, stream, result, assistant_message_id, emitted_tool_lifecycle)
+        except Exception as exc:
+            stream.put(emitter.event("error", message=str(exc)))
+        finally:
+            stream.put(emitter.event("done"))
+            stream.close()
+
+    threading.Thread(target=worker, daemon=True).start()
     return StreamingResponse(
         stream,
         media_type="text/event-stream",

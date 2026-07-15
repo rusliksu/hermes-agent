@@ -141,6 +141,7 @@ def create_agent(
         thinking_callback=thinking_callback,
         reasoning_callback=reasoning_callback,
         step_callback=step_callback,
+        stream_delta_callback=stream_callback,
     )
 
 
