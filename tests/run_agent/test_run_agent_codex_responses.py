@@ -1403,6 +1403,38 @@ def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     assert result["service_tier"] == "priority"
 
 
+def test_handle_max_iterations_preflights_responses_lite_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.api_mode = "codex_responses"
+    agent.model = "gpt-5.6-luna"
+    agent.reasoning_config = {"effort": "medium", "summary": "auto"}
+    captured = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.codex_model_uses_responses_lite",
+        lambda model: model == "gpt-5.6-luna",
+    )
+
+    def fake_run_codex_stream(kwargs):
+        captured.update(kwargs)
+        return _codex_message_response("Summary")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_run_codex_stream)
+
+    result = agent._handle_max_iterations(
+        [{"role": "user", "content": "do work"}],
+        api_call_count=8,
+    )
+
+    assert result == "Summary"
+    assert captured["reasoning"] == {
+        "effort": "medium",
+        "summary": "auto",
+        "context": "all_turns",
+    }
+    assert captured["parallel_tool_calls"] is False
+
+
 def test_preflight_codex_api_kwargs_preserves_positive_timeout(monkeypatch):
     """Positive numeric timeouts survive preflight so the SDK honors them."""
     agent = _build_agent(monkeypatch)
