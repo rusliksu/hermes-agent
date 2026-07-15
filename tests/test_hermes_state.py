@@ -3482,6 +3482,22 @@ class TestListSessionsRich:
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
 
+    def test_hides_empty_telegram_placeholders_only(self, db):
+        db.create_session("tg-real", "telegram")
+        db.append_message("tg-real", "user", "Real Telegram session")
+        db.create_session("tg-placeholder", "telegram")
+        db.create_session("cli-empty", "cli")
+        db.create_session("cron-empty", "cron")
+
+        all_ids = [s["id"] for s in db.list_sessions_rich()]
+        assert "tg-real" in all_ids
+        assert "cli-empty" in all_ids
+        assert "cron-empty" in all_ids
+        assert "tg-placeholder" not in all_ids
+
+        telegram_ids = [s["id"] for s in db.list_sessions_rich(source="telegram")]
+        assert telegram_ids == ["tg-real"]
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")

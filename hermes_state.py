@@ -3050,6 +3050,19 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        # Hide empty Telegram placeholders created during session rotation from
+        # both All and Telegram views. Keep empty CLI/cron/admin rows visible.
+        where_clauses.append(
+            """NOT (
+                s.source = 'telegram'
+                AND COALESCE(s.message_count, 0) = 0
+                AND s.title IS NULL
+                AND s.model IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM messages mp WHERE mp.session_id = s.id
+                )
+            )"""
+        )
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
