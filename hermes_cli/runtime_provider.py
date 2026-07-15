@@ -408,10 +408,26 @@ def _resolve_runtime_from_pool_entry(
     effective_model = (target_model or model_cfg.get("default") or "")
     base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+    default_headers = None
     api_mode = "chat_completions"
     if provider == "openai-codex":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_CODEX_BASE_URL
+        try:
+            default_headers = auth_mod.codex_default_headers(
+                auth_mod._extract_codex_account_id(
+                    {
+                        "account_id": getattr(entry, "account_id", None),
+                        "chatgpt_account_id": getattr(entry, "chatgpt_account_id", None),
+                        "chatgpt_account": getattr(entry, "chatgpt_account", None),
+                        "chatgpt_account_id_v2": getattr(entry, "chatgpt_account_id_v2", None),
+                        "access_token": getattr(entry, "access_token", None),
+                    }
+                ),
+                model=effective_model,
+            )
+        except Exception:
+            default_headers = None
     elif provider == "xai-oauth":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_XAI_OAUTH_BASE_URL
@@ -521,7 +537,7 @@ def _resolve_runtime_from_pool_entry(
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -530,6 +546,9 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    if default_headers:
+        result["default_headers"] = default_headers
+    return result
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -1358,6 +1377,7 @@ def _resolve_explicit_runtime(
     model_cfg: Dict[str, Any],
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
@@ -1395,10 +1415,13 @@ def _resolve_explicit_runtime(
         base_url = explicit_base_url or DEFAULT_CODEX_BASE_URL
         api_key = explicit_api_key
         last_refresh = None
+        model_id = str(target_model or model_cfg.get("default") or "").strip()
+        default_headers = auth_mod.codex_default_headers(model=model_id)
         if not api_key:
-            creds = resolve_codex_runtime_credentials()
+            creds = resolve_codex_runtime_credentials(model=model_id)
             api_key = creds.get("api_key", "")
             last_refresh = creds.get("last_refresh")
+            default_headers = dict(creds.get("default_headers") or {})
             if not explicit_base_url:
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
         return {
@@ -1409,6 +1432,7 @@ def _resolve_explicit_runtime(
             "source": "explicit",
             "last_refresh": last_refresh,
             "requested_provider": requested_provider,
+            "default_headers": default_headers,
         }
 
     if provider == "nous":
@@ -1765,7 +1789,8 @@ def resolve_runtime_provider(
 
     if provider == "openai-codex":
         try:
-            creds = resolve_codex_runtime_credentials()
+            model_id = str(target_model or model_cfg.get("default") or "").strip()
+            creds = resolve_codex_runtime_credentials(model=model_id)
             return {
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
@@ -1774,6 +1799,7 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "hermes-auth-store"),
                 "last_refresh": creds.get("last_refresh"),
                 "requested_provider": requested_provider,
+                "default_headers": dict(creds.get("default_headers") or {}),
             }
         except AuthError:
             if requested_provider != "auto":

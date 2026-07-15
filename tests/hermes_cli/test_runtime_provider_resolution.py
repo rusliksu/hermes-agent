@@ -26,6 +26,7 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
         access_token = "pool-token"
         source = "manual"
         base_url = "https://chatgpt.com/backend-api/codex"
+        account_id = "acct_pool_123"
 
     class _Pool:
         def has_credentials(self):
@@ -35,6 +36,11 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
             return _Entry()
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"default": "gpt-5.6-luna"})
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.codex_model_uses_responses_lite",
+        lambda model: model == "gpt-5.6-luna",
+    )
     monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
 
     resolved = rp.resolve_runtime_provider(requested="openai-codex")
@@ -43,6 +49,8 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["api_key"] == "pool-token"
     assert resolved["credential_pool"] is not None
     assert resolved["source"] == "manual"
+    assert resolved["default_headers"]["ChatGPT-Account-Id"] == "acct_pool_123"
+    assert resolved["default_headers"]["x-openai-internal-codex-responses-lite"] == "true"
 
 
 def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
@@ -92,7 +100,7 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda **_: {
             "provider": "anthropic",
             "base_url": "https://proxy.example.com/anthropic",
         },
@@ -180,7 +188,7 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {
+        lambda **_: {
             "provider": "anthropic",
             "base_url": "https://config.example.com/anthropic",
         },
@@ -215,7 +223,7 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     monkeypatch.setattr(
         rp,
         "resolve_codex_runtime_credentials",
-        lambda: {
+        lambda **_: {
             "provider": "openai-codex",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": "codex-token",
@@ -240,7 +248,7 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     monkeypatch.setattr(
         rp,
         "resolve_codex_runtime_credentials",
-        lambda: {
+        lambda **_: {
             "provider": "openai-codex",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": "codex-token",

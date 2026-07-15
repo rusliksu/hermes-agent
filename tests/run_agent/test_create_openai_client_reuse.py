@@ -19,6 +19,7 @@ network, so it runs in CI on every PR.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from hermes_cli.codex_models import CODEX_RESPONSES_LITE_HEADER
 from run_agent import AIAgent
 
 
@@ -224,3 +225,41 @@ def test_force_close_tcp_sockets_descends_httpcore_1_connection_wrapper():
     # #29507: close() must NOT be called from this helper — the owning
     # httpx worker thread releases the FD, not us.
     assert sock.close_calls == 0
+
+
+def test_codex_client_removes_inherited_responses_lite_header_for_non_lite_model(tmp_path, monkeypatch):
+    agent = _make_agent()
+    constructed: list = []
+    fake_openai = _make_fake_openai_factory(constructed)
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "models_cache.json").write_text(
+        '{"client_version":"0.144.0","models":['
+        '{"slug":"gpt-5.6-luna","use_responses_lite":true},'
+        '{"slug":"gpt-5.5","use_responses_lite":false}]}'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    agent.provider = "openai-codex"
+    agent.model = "gpt-5.5"
+    agent._client_kwargs = {
+        "api_key": "***",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "default_headers": {
+            "originator": "codex_cli_rs",
+            "ChatGPT-Account-Id": "acct_request_789",
+            CODEX_RESPONSES_LITE_HEADER: "true",
+        },
+    }
+
+    with patch("run_agent.OpenAI", fake_openai):
+        client = agent._create_openai_client(
+            agent._client_kwargs,
+            reason="seed",
+            shared=True,
+        )
+
+    headers = client._kwargs["default_headers"]
+    assert headers["ChatGPT-Account-Id"] == "acct_request_789"
+    assert CODEX_RESPONSES_LITE_HEADER not in headers

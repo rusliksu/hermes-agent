@@ -1371,6 +1371,28 @@ def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch
     assert result["max_output_tokens"] == 4096
 
 
+def test_preflight_codex_api_kwargs_applies_responses_lite_contract(monkeypatch):
+    kwargs = _codex_request_kwargs()
+    kwargs["model"] = "gpt-5.6-luna"
+    kwargs["reasoning"] = {"effort": "medium", "summary": "auto"}
+    kwargs["parallel_tool_calls"] = True
+
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.codex_model_uses_responses_lite",
+        lambda model: model == "gpt-5.6-luna",
+    )
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert result["reasoning"] == {
+        "effort": "medium",
+        "summary": "auto",
+        "context": "all_turns",
+    }
+    assert result["parallel_tool_calls"] is False
+
+
 def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     agent = _build_agent(monkeypatch)
     kwargs = _codex_request_kwargs()

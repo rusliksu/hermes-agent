@@ -1,7 +1,12 @@
 import json
 from unittest.mock import patch
 
-from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
+from hermes_cli.codex_models import (
+    DEFAULT_CODEX_MODELS,
+    codex_cached_client_version,
+    codex_model_uses_responses_lite,
+    get_codex_model_ids,
+)
 
 
 def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch):
@@ -55,6 +60,39 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
     assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
     assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
+
+
+def test_codex_cached_client_version_and_responses_lite_flags(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "client_version": "0.144.0",
+                "models": [
+                    {"slug": "gpt-5.6-luna", "use_responses_lite": True},
+                    {"slug": "gpt-5.5", "use_responses_lite": False},
+                ],
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert codex_cached_client_version() == "0.144.0"
+    assert codex_model_uses_responses_lite("openai-codex/gpt-5.6-luna") is True
+    assert codex_model_uses_responses_lite("gpt-5.5") is False
+    assert codex_model_uses_responses_lite("missing") is False
+
+
+def test_codex_cached_client_version_rejects_malformed_values(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "models_cache.json").write_text(
+        json.dumps({"client_version": "0.144.0 invalid", "models": []})
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert codex_cached_client_version() is None
 
 
 def test_get_codex_model_ids_adds_forward_compat_models_from_templates(monkeypatch):

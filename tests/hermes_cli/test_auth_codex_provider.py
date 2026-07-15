@@ -12,6 +12,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
+    codex_default_headers,
     _read_codex_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
@@ -20,6 +21,7 @@ from hermes_cli.auth import (
     resolve_codex_runtime_credentials,
     resolve_provider,
 )
+from hermes_cli.codex_models import CODEX_RESPONSES_LITE_HEADER
 
 
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
@@ -50,6 +52,11 @@ def _jwt_with_exp(exp_epoch: int) -> str:
     return f"h.{encoded}.s"
 
 
+def _jwt_with_claims(claims: dict) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).rstrip(b"=").decode("utf-8")
+    return f"h.{encoded}.s"
+
+
 def test_read_codex_tokens_success(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
@@ -58,6 +65,62 @@ def test_read_codex_tokens_success(tmp_path, monkeypatch):
     data = _read_codex_tokens()
     assert data["tokens"]["access_token"] == "access"
     assert data["tokens"]["refresh_token"] == "refresh"
+
+
+def test_codex_default_headers_include_account_version_and_lite(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "client_version": "0.144.0",
+                "models": [{"slug": "gpt-5.6-luna", "use_responses_lite": True}],
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    headers = codex_default_headers("acct_test_123", model="gpt-5.6-luna")
+
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["ChatGPT-Account-Id"] == "acct_test_123"
+    assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
+    assert headers[CODEX_RESPONSES_LITE_HEADER] == "true"
+
+
+def test_resolve_codex_runtime_credentials_includes_account_header_from_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    auth_file = _setup_hermes_auth(hermes_home)
+    payload = json.loads(auth_file.read_text())
+    payload["providers"]["openai-codex"]["account_id"] = "acct_store_123"
+    auth_file.write_text(json.dumps(payload))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-empty"))
+
+    resolved = resolve_codex_runtime_credentials(model="gpt-5.5")
+
+    assert resolved["account_id"] == "acct_store_123"
+    assert resolved["default_headers"] == {
+        "originator": "codex_cli_rs",
+        "ChatGPT-Account-Id": "acct_store_123",
+    }
+
+
+def test_save_codex_tokens_persists_account_metadata(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    token = _jwt_with_claims(
+        {"https://api.openai.com/auth": {"chatgpt_account_id": "acct_claim_123"}}
+    )
+
+    _save_codex_tokens(
+        {"access_token": token, "refresh_token": "refresh"},
+        metadata={"access_token": token},
+    )
+
+    resolved = resolve_codex_runtime_credentials(model="gpt-5.5")
+    assert resolved["account_id"] == "acct_claim_123"
+    assert resolved["default_headers"]["ChatGPT-Account-Id"] == "acct_claim_123"
 
 
 def test_read_codex_tokens_missing(tmp_path, monkeypatch):
@@ -993,7 +1056,7 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, **_kwargs):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh

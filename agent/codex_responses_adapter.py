@@ -886,9 +886,25 @@ def _preflight_codex_api_kwargs(
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
 
-    # Pass through reasoning config
+    try:
+        from hermes_cli.codex_models import codex_model_uses_responses_lite
+    except Exception:
+        codex_model_uses_responses_lite = None
+    uses_responses_lite = False
+    if codex_model_uses_responses_lite is not None:
+        try:
+            uses_responses_lite = codex_model_uses_responses_lite(model)
+        except Exception:
+            uses_responses_lite = False
+
+    # Pass through reasoning config. Responses Lite is a per-model Codex
+    # catalog capability and requires the reasoning context contract on every
+    # request body.
     reasoning = api_kwargs.get("reasoning")
     if isinstance(reasoning, dict):
+        if uses_responses_lite:
+            reasoning = dict(reasoning)
+            reasoning["context"] = "all_turns"
         normalized["reasoning"] = reasoning
     include = api_kwargs.get("include")
     if isinstance(include, list):
@@ -912,11 +928,17 @@ def _preflight_codex_api_kwargs(
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
 
-    # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
-    for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
+    # Pass through tool_choice and prompt_cache_key.
+    for passthrough_key in ("tool_choice", "prompt_cache_key"):
         val = api_kwargs.get(passthrough_key)
         if val is not None:
             normalized[passthrough_key] = val
+    if uses_responses_lite:
+        normalized["parallel_tool_calls"] = False
+    else:
+        parallel_tool_calls = api_kwargs.get("parallel_tool_calls")
+        if parallel_tool_calls is not None:
+            normalized["parallel_tool_calls"] = parallel_tool_calls
 
     extra_headers = api_kwargs.get("extra_headers")
     if extra_headers is not None:

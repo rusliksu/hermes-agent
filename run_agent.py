@@ -461,6 +461,7 @@ class AIAgent:
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
+        default_headers: Dict[str, str] = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -536,6 +537,7 @@ class AIAgent:
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
+            default_headers=default_headers,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
             platform=platform,
@@ -3956,6 +3958,15 @@ class AIAgent:
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
+        if self.provider == "openai-codex":
+            from hermes_cli.auth import codex_default_headers
+            from hermes_cli.codex_models import CODEX_RESPONSES_LITE_HEADER
+
+            headers = dict(client_kwargs.get("default_headers") or {})
+            headers.pop(CODEX_RESPONSES_LITE_HEADER, None)
+            for key, value in codex_default_headers(model=self.model).items():
+                headers.setdefault(key, value)
+            client_kwargs["default_headers"] = headers
         from agent.agent_runtime_helpers import create_openai_client
         return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
 
@@ -4166,6 +4177,7 @@ class AIAgent:
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
                 singleton_now = resolve_codex_runtime_credentials(
+                    model=self.model,
                     refresh_if_expiring=False,
                 )
             else:
@@ -4193,7 +4205,7 @@ class AIAgent:
             if self.provider == "openai-codex":
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
-                creds = resolve_codex_runtime_credentials(force_refresh=force)
+                creds = resolve_codex_runtime_credentials(model=self.model, force_refresh=force)
             else:
                 from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
@@ -4213,6 +4225,9 @@ class AIAgent:
         self.base_url = base_url.strip().rstrip("/")
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
+        default_headers = creds.get("default_headers")
+        if isinstance(default_headers, dict) and default_headers:
+            self._client_kwargs["default_headers"] = dict(default_headers)
 
         if not self._replace_primary_openai_client(reason=f"{self.provider}_credential_refresh"):
             return False
@@ -4400,6 +4415,10 @@ class AIAgent:
             self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
+        elif self.provider == "openai-codex":
+            from hermes_cli.auth import codex_default_headers
+
+            self._client_kwargs["default_headers"] = codex_default_headers(model=self.model)
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
@@ -4498,7 +4517,21 @@ class AIAgent:
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
-        self._apply_client_headers_for_base_url(self.base_url)
+        if self.provider == "openai-codex":
+            from hermes_cli.auth import _extract_codex_account_id, codex_default_headers
+
+            account_id = _extract_codex_account_id(
+                {
+                    "account_id": getattr(entry, "account_id", None),
+                    "chatgpt_account_id": getattr(entry, "chatgpt_account_id", None),
+                    "chatgpt_account": getattr(entry, "chatgpt_account", None),
+                    "chatgpt_account_id_v2": getattr(entry, "chatgpt_account_id_v2", None),
+                    "access_token": getattr(entry, "access_token", None),
+                }
+            )
+            self._client_kwargs["default_headers"] = codex_default_headers(account_id, model=self.model)
+        else:
+            self._apply_client_headers_for_base_url(self.base_url)
         self._replace_primary_openai_client(reason="credential_rotation")
 
     def _recover_with_credential_pool(

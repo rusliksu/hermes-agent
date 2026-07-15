@@ -107,6 +107,13 @@ except Exception:  # pragma: no cover - version import should always succeed
     _HERMES_CLI_VERSION = "unknown"
 CODEX_OAUTH_USER_AGENT = f"hermes-cli/{_HERMES_CLI_VERSION}"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_ACCOUNT_ID_KEYS = (
+    "account_id",
+    "chatgpt_account_id",
+    "chatgpt_account",
+    "chatgpt_account_id_v2",
+)
+CODEX_ORIGINATOR_HEADER_VALUE = "codex_cli_rs"
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -2177,6 +2184,55 @@ def _codex_access_token_is_expiring(access_token: Any, skew_seconds: int) -> boo
     return float(exp) <= (time.time() + max(0, int(skew_seconds)))
 
 
+def _extract_codex_account_id(*payloads: Any) -> Optional[str]:
+    """Return ChatGPT account/workspace id metadata without exposing tokens."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        token = payload.get("access_token")
+        if isinstance(token, str) and token.strip():
+            from_claims = _extract_codex_account_id(_decode_jwt_claims(token))
+            if from_claims:
+                return from_claims
+        for key in CODEX_ACCOUNT_ID_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                nested = value.get("id")
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+        for value in payload.values():
+            if isinstance(value, dict):
+                nested = _extract_codex_account_id(value)
+                if nested:
+                    return nested
+    return None
+
+
+def codex_default_headers(account_id: Any = None, model: Any = None) -> Dict[str, str]:
+    """Headers required by ChatGPT-backed Codex runtime requests."""
+    headers = {"originator": CODEX_ORIGINATOR_HEADER_VALUE}
+    resolved = _extract_codex_account_id({"account_id": account_id})
+    if resolved:
+        headers["ChatGPT-Account-Id"] = resolved
+    try:
+        from hermes_cli.codex_models import (
+            CODEX_RESPONSES_LITE_HEADER,
+            codex_cached_client_version,
+            codex_model_uses_responses_lite,
+        )
+
+        client_version = codex_cached_client_version()
+        if client_version:
+            headers["User-Agent"] = f"{CODEX_ORIGINATOR_HEADER_VALUE}/{client_version}"
+        if codex_model_uses_responses_lite(model):
+            headers[CODEX_RESPONSES_LITE_HEADER] = "true"
+    except Exception:
+        pass
+    return headers
+
+
 def _qwen_cli_auth_path() -> Path:
     return Path.home() / ".qwen" / "oauth_creds.json"
 
@@ -3239,6 +3295,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+        "account_id": _extract_codex_account_id(state, tokens),
     }
 
 
@@ -3335,6 +3392,9 @@ def _sync_codex_pool_entries(
             entry["refresh_token"] = refresh_token
         if last_refresh:
             entry["last_refresh"] = last_refresh
+        account_id = _extract_codex_account_id(tokens, entry)
+        if account_id:
+            entry["account_id"] = account_id
         entry["last_status"] = None
         entry["last_status_at"] = None
         entry["last_error_code"] = None
@@ -3343,7 +3403,13 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3361,6 +3427,9 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        account_id = _extract_codex_account_id(metadata, state, tokens)
+        if account_id:
+            state["account_id"] = account_id
         _save_provider_state(auth_store, "openai-codex", state)
         _sync_codex_pool_entries(
             auth_store,
@@ -3383,7 +3452,7 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
     ):
         return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
+    _save_codex_tokens(imported, metadata=imported)
     return dict(imported)
 
 
@@ -3594,13 +3663,18 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
                 "Codex CLI tokens at %s are expired — skipping import.", auth_path,
             )
             return None
-        return dict(tokens)
+        imported = dict(tokens)
+        account_id = _extract_codex_account_id(payload, tokens)
+        if account_id:
+            imported["account_id"] = account_id
+        return imported
     except Exception:
         return None
 
 
 def resolve_codex_runtime_credentials(
     *,
+    model: Optional[str] = None,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -3648,6 +3722,7 @@ def resolve_codex_runtime_credentials(
                 "source": "credential_pool",
                 "last_refresh": None,
                 "auth_mode": "chatgpt",
+                "default_headers": codex_default_headers(model=model),
             }
         pool_rate_limit = _codex_pool_rate_limit_status()
         if pool_rate_limit:
@@ -3704,6 +3779,8 @@ def resolve_codex_runtime_credentials(
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
+    account_id = _extract_codex_account_id(data, tokens)
+    default_headers = codex_default_headers(account_id, model=model)
 
     return {
         "provider": "openai-codex",
@@ -3712,6 +3789,8 @@ def resolve_codex_runtime_credentials(
         "source": "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
+        "account_id": account_id,
+        "default_headers": default_headers,
     }
 
 
@@ -6903,7 +6982,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_tokens(cli_tokens, metadata=cli_tokens)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -6921,7 +7000,7 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"), metadata=creds)
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")

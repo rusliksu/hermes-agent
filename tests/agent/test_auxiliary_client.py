@@ -44,6 +44,41 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{header}.{payload}.sig"
 
 
+def test_raw_codex_client_includes_pool_account_and_responses_lite_headers(monkeypatch):
+    class _Entry:
+        provider = "openai-codex"
+        access_token = "pooled-codex-token"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        account_id = "acct_pool_456"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr("agent.auxiliary_client.load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.codex_model_uses_responses_lite",
+        lambda model: model == "gpt-5.6-luna",
+    )
+
+    with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        client, model = resolve_provider_client(
+            "openai-codex",
+            model="gpt-5.6-luna",
+            raw_codex=True,
+        )
+
+    assert client is mock_openai.return_value
+    assert model == "gpt-5.6-luna"
+    headers = mock_openai.call_args.kwargs["default_headers"]
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["ChatGPT-Account-Id"] == "acct_pool_456"
+    assert headers["x-openai-internal-codex-responses-lite"] == "true"
+
+
 class _FakeAnthropicStream:
     def __init__(self, final_message):
         self._final_message = final_message

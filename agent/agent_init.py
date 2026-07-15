@@ -305,6 +305,7 @@ def init_agent(
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
+    default_headers: Dict[str, str] = None,
     request_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
@@ -908,13 +909,22 @@ def init_agent(
                 }
             else:
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
+            if isinstance(default_headers, dict) and default_headers:
+                client_kwargs["default_headers"] = dict(default_headers)
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
             if agent.provider == "copilot-acp":
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
-            if base_url_host_matches(effective_base, "openrouter.ai"):
+            if agent.provider == "openai-codex":
+                from hermes_cli.auth import codex_default_headers
+
+                headers = dict(client_kwargs.get("default_headers") or {})
+                for key, value in codex_default_headers(model=agent.model).items():
+                    headers.setdefault(key, value)
+                client_kwargs["default_headers"] = headers
+            elif base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
                 client_kwargs["default_headers"] = build_or_headers()
             elif base_url_host_matches(effective_base, "integrate.api.nvidia.com"):

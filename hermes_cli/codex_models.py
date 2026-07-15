@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import os
 
 logger = logging.getLogger(__name__)
+
+CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_CODEX_CLIENT_VERSION_RE = re.compile(
+    r"^\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z][0-9A-Za-z._-]*)?$"
+)
 
 DEFAULT_CODEX_MODELS: List[str] = [
     "gpt-5.5",
@@ -137,13 +143,20 @@ def _read_default_model(codex_home: Path) -> Optional[str]:
     return None
 
 
-def _read_cache_models(codex_home: Path) -> List[str]:
+def _read_models_cache_payload(codex_home: Path) -> Optional[Dict[str, Any]]:
     cache_path = codex_home / "models_cache.json"
     if not cache_path.exists():
-        return []
+        return None
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _read_cache_models(codex_home: Path) -> List[str]:
+    raw = _read_models_cache_payload(codex_home)
+    if raw is None:
         return []
 
     entries = raw.get("models") if isinstance(raw, dict) else None
@@ -172,6 +185,59 @@ def _read_cache_models(codex_home: Path) -> List[str]:
         if slug not in deduped:
             deduped.append(slug)
     return deduped
+
+
+def _normalize_codex_model_slug(model_id: Optional[str]) -> str:
+    if not isinstance(model_id, str):
+        return ""
+    slug = model_id.strip()
+    if "/" in slug:
+        slug = slug.split("/", 1)[1].strip()
+    return slug
+
+
+def codex_cached_client_version(codex_home: Optional[Path] = None) -> Optional[str]:
+    """Return a conservative Codex CLI client_version from models_cache.json."""
+    if codex_home is None:
+        codex_home_str = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+        codex_home = Path(codex_home_str).expanduser()
+
+    raw = _read_models_cache_payload(codex_home)
+    if raw is None:
+        return None
+    version = raw.get("client_version")
+    if not isinstance(version, str):
+        return None
+    version = version.strip()
+    if not version or not _CODEX_CLIENT_VERSION_RE.fullmatch(version):
+        return None
+    return version
+
+
+def codex_model_uses_responses_lite(
+    model_id: Optional[str],
+    codex_home: Optional[Path] = None,
+) -> bool:
+    """Return the local Codex catalog use_responses_lite flag for a model."""
+    slug = _normalize_codex_model_slug(model_id)
+    if not slug:
+        return False
+    if codex_home is None:
+        codex_home_str = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+        codex_home = Path(codex_home_str).expanduser()
+
+    raw = _read_models_cache_payload(codex_home)
+    if raw is None:
+        return False
+    entries = raw.get("models")
+    if not isinstance(entries, list):
+        return False
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        if _normalize_codex_model_slug(item.get("slug")) == slug:
+            return item.get("use_responses_lite") is True
+    return False
 
 
 def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:

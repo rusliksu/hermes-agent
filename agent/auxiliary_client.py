@@ -802,6 +802,66 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
     return str(url or "").strip().rstrip("/")
 
 
+def _pool_runtime_default_headers(entry: Any, model: Optional[str] = None) -> Dict[str, str]:
+    if entry is None:
+        return {}
+    try:
+        from hermes_cli.auth import _extract_codex_account_id, codex_default_headers
+    except Exception:
+        return {}
+    account_id = _extract_codex_account_id(
+        {
+            "account_id": getattr(entry, "account_id", None),
+            "chatgpt_account_id": getattr(entry, "chatgpt_account_id", None),
+            "chatgpt_account": getattr(entry, "chatgpt_account", None),
+            "chatgpt_account_id_v2": getattr(entry, "chatgpt_account_id_v2", None),
+            "access_token": getattr(entry, "access_token", None),
+        }
+    )
+    return codex_default_headers(account_id, model=model)
+
+
+def _resolve_codex_client_kwargs(model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    pool_present, entry = _select_pool_entry("openai-codex")
+    if pool_present:
+        codex_token = _pool_runtime_api_key(entry)
+        if codex_token:
+            return {
+                "api_key": codex_token,
+                "base_url": _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL,
+                "default_headers": _pool_runtime_default_headers(entry, model=model),
+            }
+
+    try:
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+
+        creds = resolve_codex_runtime_credentials(model=model)
+    except Exception:
+        codex_token = _read_codex_access_token()
+        if not codex_token:
+            return None
+        try:
+            from hermes_cli.auth import codex_default_headers
+
+            default_headers = codex_default_headers(model=model)
+        except Exception:
+            default_headers = {}
+        return {
+            "api_key": codex_token,
+            "base_url": _CODEX_AUX_BASE_URL,
+            "default_headers": default_headers,
+        }
+
+    codex_token = str(creds.get("api_key") or "").strip()
+    if not codex_token:
+        return None
+    return {
+        "api_key": codex_token,
+        "base_url": str(creds.get("base_url") or _CODEX_AUX_BASE_URL).strip().rstrip("/") or _CODEX_AUX_BASE_URL,
+        "default_headers": dict(creds.get("default_headers") or {}),
+    }
+
+
 # Hostnames (lowercase, exact) that the auxiliary Anthropic path is allowed to
 # be pointed at via config.yaml model.base_url. Anything else falls back to the
 # Anthropic default — operators routing main-session traffic through a
@@ -2448,27 +2508,11 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        codex_token = _pool_runtime_api_key(entry)
-        if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
-        else:
-            codex_token = _read_codex_access_token()
-            if not codex_token:
-                return None, None
-            base_url = _CODEX_AUX_BASE_URL
-    else:
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            return None, None
-        base_url = _CODEX_AUX_BASE_URL
+    client_kwargs = _resolve_codex_client_kwargs(model)
+    if not client_kwargs:
+        return None, None
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
-    real_client = _create_openai_client(
-        api_key=codex_token,
-        base_url=base_url,
-        default_headers=_codex_cloudflare_headers(codex_token),
-    )
+    real_client = _create_openai_client(**client_kwargs)
     return CodexAuxiliaryClient(real_client, model), model
 
 
@@ -4565,17 +4609,13 @@ def resolve_provider_client(
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
-            codex_token = _read_codex_access_token()
-            if not codex_token:
+            final_model = _normalize_resolved_model(model, provider)
+            client_kwargs = _resolve_codex_client_kwargs(final_model)
+            if not client_kwargs:
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")
                 return None, None
-            final_model = _normalize_resolved_model(model, provider)
-            raw_client = _create_openai_client(
-                api_key=codex_token,
-                base_url=_CODEX_AUX_BASE_URL,
-                default_headers=_codex_cloudflare_headers(codex_token),
-            )
+            raw_client = _create_openai_client(**client_kwargs)
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
         client, default = _build_codex_client(model)
