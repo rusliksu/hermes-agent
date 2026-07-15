@@ -1772,6 +1772,10 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.user_overrides import (
+    UserOverride,
+    resolve_gateway_user_override as _resolve_gateway_user_override,
+)
 
 
 from gateway.whatsapp_identity import (
@@ -3741,12 +3745,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        gateway_user_override: Optional[UserOverride] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        DM-scoped ``gateway.user_overrides`` → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider
+        resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -3833,6 +3839,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # did not specify an explicit model.
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
+
+        if gateway_user_override is None:
+            gateway_user_override = _resolve_gateway_user_override(
+                user_config,
+                source,
+                current_model=model,
+                current_runtime=runtime_kwargs,
+                log=logger,
+            )
+        if gateway_user_override and gateway_user_override.model:
+            model = gateway_user_override.model
+            if gateway_user_override.runtime is not None:
+                runtime_kwargs = gateway_user_override.runtime.to_agent_kwargs()
 
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
@@ -4812,6 +4831,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides."""
         resolved_session_key = session_key
@@ -4824,6 +4844,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        gateway_user_override = _resolve_gateway_user_override(
+            user_config if user_config is not None else _load_gateway_config(),
+            source,
+            log=logger,
+        )
+        if gateway_user_override and gateway_user_override.reasoning_config is not None:
+            return gateway_user_override.reasoning_config
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -13074,7 +13101,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source,
+                user_config=user_config,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -17711,6 +17741,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                user_config=user_config,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
