@@ -1374,7 +1374,7 @@ class TelegramAdapter(BasePlatformAdapter):
     )
     _RICH_TASK_LIST_RE = re.compile(r"(?m)^[ \t]*-[ \t]+\[[ xX]\][ \t]+\S")
     _RICH_DETAILS_TAG_RE = re.compile(
-        r"(?im)^[ \t]*</?(?:details|summary)\b[^>]*>"
+        r"</?(?:details|summary)\b[^>]*>", re.IGNORECASE
     )
     _RICH_SAFE_DETAILS_RE = re.compile(
         r"(?ims)^[ \t]*<details\b[^>]*>\s*"
@@ -1470,7 +1470,13 @@ class TelegramAdapter(BasePlatformAdapter):
         for segment in self._iter_rich_unprotected_segments(content):
             safe_spans: list[tuple[int, int]] = []
             for match in self._RICH_SAFE_DETAILS_RE.finditer(segment):
-                if match.group("summary").strip():
+                summary = match.group("summary")
+                body = match.group("body")
+                if (
+                    summary.strip()
+                    and not self._RICH_DETAILS_TAG_RE.search(summary)
+                    and not self._RICH_DETAILS_TAG_RE.search(body)
+                ):
                     found = True
                     safe_spans.append(match.span())
 
