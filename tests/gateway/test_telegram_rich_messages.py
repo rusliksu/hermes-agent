@@ -282,6 +282,46 @@ async def test_rich_messages_opt_out_uses_rich_for_safe_details():
 
 
 @pytest.mark.asyncio
+async def test_safe_details_opt_out_preserves_multiline_preformatted_neighbor():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    pre_block = "<pre>- [ ] literal\nsecond line\nthird line</pre>"
+    content = (
+        "Copy block:\n"
+        f"{pre_block}\n"
+        "<details><summary>Notes</summary>\nRendered details.\n</details>"
+    )
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert pre_block in markdown
+    assert "<details>" in markdown
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_safe_structured_bypass_ignores_protected_details_math_crash_shape():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    protected_details_math = (
+        "<pre><details><summary>Literal proof</summary>\n"
+        "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n"
+        "</details></pre>"
+    )
+    content = f"{protected_details_math}\n- [ ] Render the real task"
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert protected_details_math in markdown
+    assert "- [ ] Render the real task" in markdown
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content",
     [
@@ -1167,6 +1207,29 @@ async def test_finalize_edit_opt_out_uses_legacy():
     assert result.success is True
     adapter._bot.do_api_request.assert_not_called()
     adapter._bot.edit_message_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_opt_out_uses_rich_for_safe_details_with_expect_edits():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.edit_message(
+        "12345",
+        "555",
+        SAFE_DETAILS_CONTENT,
+        finalize=True,
+        metadata={"expect_edits": True},
+    )
+
+    assert result.success is True
+    assert result.message_id == "555"
+    api_kwargs = _rich_edit_kwargs(adapter)
+    assert api_kwargs["message_id"] == 555
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert markdown.startswith("Short answer first.")
+    assert "<details>" in markdown
+    assert "<summary>Подробнее</summary>" in markdown
+    adapter._bot.edit_message_text.assert_not_called()
 
 
 @pytest.mark.asyncio

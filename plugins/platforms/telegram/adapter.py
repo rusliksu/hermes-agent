@@ -383,7 +383,7 @@ _RICH_PREFORMATTED_REGION_RE = re.compile(
 )
 
 
-def _rich_normalize_linebreaks(text: str) -> str:
+def _rich_normalize_linebreaks(text: str, unprotected_spans=None) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
 
     Standard Markdown treats a lone ``\\n`` as whitespace (soft break), so
@@ -392,25 +392,49 @@ def _rich_normalize_linebreaks(text: str) -> str:
     paragraph.  Adding two trailing spaces before each single newline
     forces a hard line break (``<br>``) in the rendered output.
 
-    Paragraph breaks (``\\n\\n``), fenced code blocks, and GFM pipe-table
-    blocks are left untouched: tables render natively in the rich path and a
-    hard break injected into a row separator would corrupt the table.
+    Paragraph breaks (``\\n\\n``), fenced code blocks, GFM pipe-table blocks,
+    and HTML ``<pre>`` blocks are left untouched: tables render natively in
+    the rich path and a hard break injected into a row separator would corrupt
+    the table.
     """
     if not text or '\n' not in text:
         return text
+
+    def _normalize(segment: str) -> str:
+        return re.sub(r'(?<!\n)\n(?!\n)', '  \n', segment)
+
+    if unprotected_spans is not None:
+        out: list[str] = []
+        pos = 0
+        for start, end, segment in unprotected_spans:
+            if pos < start:
+                out.append(text[pos:start])
+            out.append(_normalize(segment))
+            pos = end
+        out.append(text[pos:])
+        return ''.join(out)
 
     out: list[str] = []
     # Split off protected regions (fenced code OR table blocks) and only inject
     # hard breaks in the prose between them. Boundary newlines are handled by
     # the original single-\n regex, which sees each prose run as a whole string.
     pos = 0
-    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
+    protected_matches = sorted(
+        [
+            *list(_RICH_PROTECTED_REGION_RE.finditer(text)),
+            *list(_RICH_PREFORMATTED_REGION_RE.finditer(text)),
+        ],
+        key=lambda match: match.start(),
+    )
+    for m in protected_matches:
+        if m.start() < pos:
+            continue
         prose = text[pos:m.start()]
-        out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
+        out.append(_normalize(prose))
         out.append(m.group(0))  # protected region kept verbatim
         pos = m.end()
     tail = text[pos:]
-    out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', tail))
+    out.append(_normalize(tail))
     return ''.join(out)
 
 
@@ -1358,7 +1382,7 @@ class TelegramAdapter(BasePlatformAdapter):
         r"(?P<body>.*?)</details>[ \t]*(?=\n|$)"
     )
 
-    def _iter_rich_unprotected_segments(self, content: str):
+    def _iter_rich_unprotected_segments(self, content: str, *, with_spans: bool = False):
         """Yield content outside fenced/table/preformatted protected regions."""
         matches = sorted(
             [
@@ -1372,10 +1396,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if match.start() < pos:
                 continue
             if pos < match.start():
-                yield content[pos:match.start()]
+                segment = content[pos:match.start()]
+                yield (pos, match.start(), segment) if with_spans else segment
             pos = match.end()
         if pos < len(content):
-            yield content[pos:]
+            segment = content[pos:]
+            yield (pos, len(content), segment) if with_spans else segment
 
     def _has_telegram_desktop_details_math_crash_shape(self, content: str) -> bool:
         """Return True for rich-message details+math content that crashes TDesktop.
@@ -1388,9 +1414,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return False
-        for details_block in self._RICH_DETAILS_RE.findall(content):
-            if self._RICH_MATH_IN_DETAILS_RE.search(details_block):
-                return True
+        for segment in self._iter_rich_unprotected_segments(content):
+            for details_block in self._RICH_DETAILS_RE.findall(segment):
+                if self._RICH_MATH_IN_DETAILS_RE.search(details_block):
+                    return True
         return False
 
     def _has_telegram_desktop_cjk_rich_garble_shape(self, content: str) -> bool:
@@ -1470,13 +1497,11 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def _has_display_math_outside_protected_regions(self, content: str) -> bool:
-        """True for paired ``$$...$$`` outside fenced/table protected regions."""
+        """True for paired ``$$...$$`` outside protected regions."""
         if not content or "$$" not in content:
             return False
 
-        pos = 0
-        for match in _RICH_PROTECTED_REGION_RE.finditer(content):
-            segment = content[pos:match.start()]
+        for segment in self._iter_rich_unprotected_segments(content):
             start = segment.find("$$")
             while start != -1:
                 end = segment.find("$$", start + 2)
@@ -1485,17 +1510,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 if segment[start + 2:end].strip():
                     return True
                 start = segment.find("$$", end + 2)
-            pos = match.end()
-
-        segment = content[pos:]
-        start = segment.find("$$")
-        while start != -1:
-            end = segment.find("$$", start + 2)
-            if end == -1:
-                return False
-            if segment[start + 2:end].strip():
-                return True
-            start = segment.find("$$", end + 2)
         return False
 
     def _content_is_pipe_table_primary(self, content: str) -> bool:
@@ -1618,7 +1632,12 @@ class TelegramAdapter(BasePlatformAdapter):
         multi-line content (slash-command lists, etc.) renders correctly
         in the rich-message path.  See ``_rich_normalize_linebreaks``.
         """
-        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
+        payload: Dict[str, Any] = {
+            "markdown": _rich_normalize_linebreaks(
+                content,
+                self._iter_rich_unprotected_segments(content, with_spans=True),
+            )
+        }
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
