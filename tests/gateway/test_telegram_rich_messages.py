@@ -34,6 +34,11 @@ TABLE_ONLY_CONTENT = (
     "| Dodgers | 40 | 30 | 2.0 |"
 )
 DISPLAY_MATH_CONTENT = "Here is the rendered formula:\n\n$$\nE = mc^2\n$$"
+TASK_LIST_CONTENT = "- [ ] Write tests\n- [x] Keep metadata"
+SAFE_DETAILS_CONTENT = (
+    "Short answer first.\n\n"
+    "<details><summary>Подробнее</summary>\nLonger explanation.\n</details>"
+)
 DANGEROUS_DETAILS_MATH = (
     "<details><summary>Complex proof</summary>\n\n"
     "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\n"
@@ -231,6 +236,125 @@ async def test_rich_messages_opt_out_still_uses_rich_for_display_math():
 
 
 @pytest.mark.asyncio
+async def test_rich_messages_opt_out_uses_rich_for_task_list():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", TASK_LIST_CONTENT)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert "- [ ] Write tests" in markdown
+    assert "- [x] Keep metadata" in markdown
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_list_opt_out_preserves_reply_and_thread_metadata():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send(
+        "-100123",
+        TASK_LIST_CONTENT,
+        reply_to="999",
+        metadata={"thread_id": "5"},
+    )
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["message_thread_id"] == 5
+    assert api_kwargs["reply_parameters"] == {"message_id": 999}
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_uses_rich_for_safe_details():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", SAFE_DETAILS_CONTENT)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert "<details>" in markdown
+    assert "<summary>Подробнее</summary>" in markdown
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Copy this:\n\n```\n- [ ] not a rendered task\n```",
+        "Copy this:\n\n```\n<details><summary>Подробнее</summary>x</details>\n```",
+        "<pre>- [x] not a rendered task</pre>",
+        "<pre><details><summary>Подробнее</summary>x</details></pre>",
+    ],
+)
+async def test_rich_messages_opt_out_fenced_or_preformatted_structured_uses_legacy(
+    content,
+):
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<details><summary>Подробнее</summary>\nMissing close",
+        "<details><summary></summary>\nEmpty summary.\n</details>",
+        "Literal docs mention <details> and - [ ] in a sentence.",
+    ],
+)
+async def test_rich_messages_opt_out_malformed_details_and_false_substrings_legacy(
+    content,
+):
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_details_with_math_crash_shape_uses_legacy():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", DANGEROUS_DETAILS_MATH)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_ordinary_bullets_use_legacy_send_path():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", "- ordinary bullet\n- another bullet")
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rich_messages_opt_out_plain_markdown_uses_legacy_send_path():
     adapter = _make_adapter(extra={"rich_messages": False})
 
@@ -335,8 +459,8 @@ async def test_rich_messages_can_be_opted_in():
 
 @pytest.mark.asyncio
 async def test_rich_messages_can_be_opted_out():
-    """Setting platforms.telegram.extra.rich_messages: false keeps every reply
-    on the legacy MarkdownV2 path even for rich-eligible content."""
+    """Setting platforms.telegram.extra.rich_messages: false keeps mixed rich
+    replies on the legacy path unless a narrow safe bypass applies."""
     config = PlatformConfig(
         enabled=True, token="fake-token", extra={"rich_messages": False}
     )

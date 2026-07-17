@@ -377,6 +377,10 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
     re.MULTILINE,
 )
+_RICH_PREFORMATTED_REGION_RE = re.compile(
+    r"<pre\b[^>]*>[\s\S]*?</pre>",
+    re.IGNORECASE,
+)
 
 
 def _rich_normalize_linebreaks(text: str) -> str:
@@ -1344,6 +1348,34 @@ class TelegramAdapter(BasePlatformAdapter):
         "\U00020000-\U000323af"  # CJK extensions and compatibility supplement
         "]"
     )
+    _RICH_TASK_LIST_RE = re.compile(r"(?m)^[ \t]*-[ \t]+\[[ xX]\][ \t]+\S")
+    _RICH_DETAILS_TAG_RE = re.compile(
+        r"(?im)^[ \t]*</?(?:details|summary)\b[^>]*>"
+    )
+    _RICH_SAFE_DETAILS_RE = re.compile(
+        r"(?ims)^[ \t]*<details\b[^>]*>\s*"
+        r"<summary\b[^>]*>(?P<summary>.*?)</summary>"
+        r"(?P<body>.*?)</details>[ \t]*(?=\n|$)"
+    )
+
+    def _iter_rich_unprotected_segments(self, content: str):
+        """Yield content outside fenced/table/preformatted protected regions."""
+        matches = sorted(
+            [
+                *list(_RICH_PROTECTED_REGION_RE.finditer(content)),
+                *list(_RICH_PREFORMATTED_REGION_RE.finditer(content)),
+            ],
+            key=lambda match: match.start(),
+        )
+        pos = 0
+        for match in matches:
+            if match.start() < pos:
+                continue
+            if pos < match.start():
+                yield content[pos:match.start()]
+            pos = match.end()
+        if pos < len(content):
+            yield content[pos:]
 
     def _has_telegram_desktop_details_math_crash_shape(self, content: str) -> bool:
         """Return True for rich-message details+math content that crashes TDesktop.
@@ -1385,13 +1417,57 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
-        if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
+        if self._has_task_list_outside_protected_regions(content):
             return True
-        if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+        if self._has_safe_details_outside_protected_regions(content):
             return True
         if self._has_display_math_outside_protected_regions(content):
             return True
         return False
+
+    def _has_task_list_outside_protected_regions(self, content: str) -> bool:
+        """True for real ``- [ ]``/``- [x]`` items outside protected regions."""
+        if not content or "[" not in content:
+            return False
+        return any(
+            self._RICH_TASK_LIST_RE.search(segment)
+            for segment in self._iter_rich_unprotected_segments(content)
+        )
+
+    def _has_safe_details_outside_protected_regions(self, content: str) -> bool:
+        """True for paired details blocks with a non-empty summary."""
+        if not content or "<details" not in content.lower():
+            return False
+
+        found = False
+        for segment in self._iter_rich_unprotected_segments(content):
+            safe_spans: list[tuple[int, int]] = []
+            for match in self._RICH_SAFE_DETAILS_RE.finditer(segment):
+                if match.group("summary").strip():
+                    found = True
+                    safe_spans.append(match.span())
+
+            for tag in self._RICH_DETAILS_TAG_RE.finditer(segment):
+                if not any(start <= tag.start() < end for start, end in safe_spans):
+                    return False
+
+        return found
+
+    def _has_details_tag_outside_protected_regions(self, content: str) -> bool:
+        """True when details/summary tags appear outside protected regions."""
+        if not content or "<" not in content:
+            return False
+        return any(
+            self._RICH_DETAILS_TAG_RE.search(segment)
+            for segment in self._iter_rich_unprotected_segments(content)
+        )
+
+    def _has_malformed_details_outside_protected_regions(self, content: str) -> bool:
+        """True for details/summary tags that are not a safe paired block."""
+        return (
+            self._has_details_tag_outside_protected_regions(content)
+            and not self._has_safe_details_outside_protected_regions(content)
+        )
 
     def _has_display_math_outside_protected_regions(self, content: str) -> bool:
         """True for paired ``$$...$$`` outside fenced/table protected regions."""
@@ -1436,19 +1512,33 @@ class TelegramAdapter(BasePlatformAdapter):
             _TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()
         ):
             return False
-        if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
+        if self._has_task_list_outside_protected_regions(content):
             return False
-        if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+        if self._has_details_tag_outside_protected_regions(content):
             return False
         if self._has_display_math_outside_protected_regions(content):
             return False
         return True
+
+    def _content_is_safe_structured_rich_primary(self, content: str) -> bool:
+        """True for safe task-list/details payloads eligible for opt-out bypass."""
+        if not content:
+            return False
+        if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
+            return False
+        if self._has_display_math_outside_protected_regions(content):
+            return False
+        return (
+            self._has_task_list_outside_protected_regions(content)
+            or self._has_safe_details_outside_protected_regions(content)
+        )
 
     def _rich_delivery_enabled(self, content: str) -> bool:
         """Whether rich delivery is allowed for this payload."""
         return bool(
             getattr(self, "_rich_messages_enabled", True)
             or self._content_is_pipe_table_primary(content)
+            or self._content_is_safe_structured_rich_primary(content)
             or self._has_display_math_outside_protected_regions(content)
         )
 
@@ -1467,6 +1557,7 @@ class TelegramAdapter(BasePlatformAdapter):
             and content
             and content.strip()
             and self._needs_rich_rendering(content)
+            and not self._has_malformed_details_outside_protected_regions(content)
             and not self._has_telegram_desktop_details_math_crash_shape(content)
             and not self._has_telegram_desktop_cjk_rich_garble_shape(content)
             and self._content_fits_rich_limits(content)
