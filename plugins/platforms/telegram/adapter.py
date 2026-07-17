@@ -1389,8 +1389,37 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return True
-        if "$$" in content:
+        if self._has_display_math_outside_protected_regions(content):
             return True
+        return False
+
+    def _has_display_math_outside_protected_regions(self, content: str) -> bool:
+        """True for paired ``$$...$$`` outside fenced/table protected regions."""
+        if not content or "$$" not in content:
+            return False
+
+        pos = 0
+        for match in _RICH_PROTECTED_REGION_RE.finditer(content):
+            segment = content[pos:match.start()]
+            start = segment.find("$$")
+            while start != -1:
+                end = segment.find("$$", start + 2)
+                if end == -1:
+                    break
+                if segment[start + 2:end].strip():
+                    return True
+                start = segment.find("$$", end + 2)
+            pos = match.end()
+
+        segment = content[pos:]
+        start = segment.find("$$")
+        while start != -1:
+            end = segment.find("$$", start + 2)
+            if end == -1:
+                return False
+            if segment[start + 2:end].strip():
+                return True
+            start = segment.find("$$", end + 2)
         return False
 
     def _content_is_pipe_table_primary(self, content: str) -> bool:
@@ -1400,7 +1429,8 @@ class TelegramAdapter(BasePlatformAdapter):
         ``rich_messages`` opt-in is off — MarkdownV2 has no table syntax and
         the legacy path rewrites them into bullet lists, which reads like a
         regression when users enable Telegram Topics and expect native tables.
-        Task lists, ``<details>``, and block math still require the full opt-in.
+        Task lists, ``<details>``, and non-table display math are not considered
+        table-primary.
         """
         if not content or not any(
             _TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()
@@ -1410,7 +1440,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return False
-        if "$$" in content:
+        if self._has_display_math_outside_protected_regions(content):
             return False
         return True
 
@@ -1419,6 +1449,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(
             getattr(self, "_rich_messages_enabled", True)
             or self._content_is_pipe_table_primary(content)
+            or self._has_display_math_outside_protected_regions(content)
         )
 
     def _rich_eligible(self, content: str) -> bool:

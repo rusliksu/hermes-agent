@@ -33,6 +33,7 @@ TABLE_ONLY_CONTENT = (
     "| Red Sox | 36 | 34 | 6.0 |\n"
     "| Dodgers | 40 | 30 | 2.0 |"
 )
+DISPLAY_MATH_CONTENT = "Here is the rendered formula:\n\n$$\nE = mc^2\n$$"
 DANGEROUS_DETAILS_MATH = (
     "<details><summary>Complex proof</summary>\n\n"
     "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\n"
@@ -214,6 +215,77 @@ async def test_rich_messages_opt_out_accepts_string_false():
     assert bot is not None
     bot.do_api_request.assert_not_called()
     bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_still_uses_rich_for_display_math():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", DISPLAY_MATH_CONTENT)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert "$$" in api_kwargs["rich_message"]["markdown"]
+    assert "E = mc^2" in api_kwargs["rich_message"]["markdown"]
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_plain_markdown_uses_legacy_send_path():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", "Hello **there**\n\nJust a normal reply.")
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_fenced_math_uses_legacy_send_path():
+    adapter = _make_adapter(extra={"rich_messages": False})
+    content = "Copy this:\n\n```latex\n$$\nE = mc^2\n$$\n```"
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_unclosed_display_math_uses_legacy_send_path():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", "Here is a broken block:\n\n$$\nE = mc^2")
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_math_rich_opt_out_preserves_reply_and_thread_metadata():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send(
+        "-100123",
+        DISPLAY_MATH_CONTENT,
+        reply_to="999",
+        metadata={"thread_id": "5"},
+    )
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["message_thread_id"] == 5
+    assert api_kwargs["reply_parameters"] == {"message_id": 999}
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
