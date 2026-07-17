@@ -355,6 +355,11 @@ async def test_rich_messages_opt_out_fenced_or_preformatted_structured_uses_lega
             "<details><summary>Подробнее</summary>\nBody.\n</details> "
             "trailing </details>"
         ),
+        (
+            "<details><summary>Outer</summary>\n"
+            "<details><summary>Inner</summary>Nested.</details>\n"
+            "</details>"
+        ),
         "Literal docs mention <details> and - [ ] in a sentence.",
     ],
 )
