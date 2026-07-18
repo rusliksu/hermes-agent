@@ -1,6 +1,7 @@
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useState,
   useCallback,
   useRef,
@@ -71,6 +72,17 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  DEFAULT_SESSION_SOURCE,
+  DEFAULT_SESSIONS_VIEW,
+  SESSION_ROW_TITLE_CLASS,
+  SESSION_SOURCE_BADGE_TEXT_CLASS,
+  buildSessionSourceOptions,
+  resetSessionSourceListState,
+  sessionSourceLabel,
+  sessionSourceQuery,
+  type SessionsView,
+} from "@/lib/session-history-filter";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -438,8 +450,13 @@ function SessionRow({
 
   const actionButtons = (
     <>
-      <Badge tone="outline" className="text-xs">
-        {session.source ?? "local"}
+      <Badge
+        tone="outline"
+        className="text-xs normal-case tracking-normal"
+      >
+        <span className={SESSION_SOURCE_BADGE_TEXT_CLASS}>
+          {sessionSourceLabel(session.source ?? "local")}
+        </span>
       </Badge>
 
       {resumeInChatEnabled && (
@@ -597,7 +614,7 @@ function SessionRow({
                   </div>
                 ) : (
                   <span
-                    className={`font-mondwest normal-case min-w-0 flex-1 truncate text-sm ${hasTitle ? "font-medium" : "text-muted-foreground italic"}`}
+                    className={`${SESSION_ROW_TITLE_CLASS} ${hasTitle ? "font-medium" : "text-muted-foreground italic"}`}
                   >
                     {hasTitle
                       ? session.title
@@ -670,8 +687,6 @@ function SessionRow({
   );
 }
 
-type SessionsView = "list" | "overview";
-
 const PAGE_SIZE = 20;
 
 function SessionsPagination({
@@ -738,7 +753,8 @@ export default function SessionsPage() {
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
-  const [view, setView] = useState<SessionsView>("overview");
+  const [view, setView] = useState<SessionsView>(DEFAULT_SESSIONS_VIEW);
+  const [sourceFilter, setSourceFilter] = useState(DEFAULT_SESSION_SOURCE);
   // Count of empty (no-message, ended, non-archived) sessions across the
   // entire DB, populated by /api/sessions/empty/count. Used to:
   //   • hide the "Delete empty" button when there's nothing to clean up
@@ -817,23 +833,28 @@ export default function SessionsPage() {
     };
   }, [setEnd]);
 
-  const loadSessions = useCallback((p: number, silent = false) => {
-    // ``silent`` skips the loading spinner so background refreshes
-    // (triggered when the overview poll detects a new session from
-    // another process) don't flicker the whole page or drop the user's
-    // scroll position.
-    if (!silent) setLoading(true);
-    api
-      .getSessions(PAGE_SIZE, p * PAGE_SIZE)
-      .then((resp) => {
-        setSessions(resp.sessions);
-        setTotal(resp.total);
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!silent) setLoading(false);
-      });
-  }, []);
+  const loadSessions = useCallback(
+    (p: number, silent = false) => {
+      // ``silent`` skips the loading spinner so background refreshes
+      // (triggered when the overview poll detects a new session from
+      // another process) don't flicker the whole page or drop the user's
+      // scroll position.
+      if (!silent) setLoading(true);
+      api
+        .getSessions(PAGE_SIZE, p * PAGE_SIZE, {
+          source: sessionSourceQuery(sourceFilter),
+        })
+        .then((resp) => {
+          setSessions(resp.sessions);
+          setTotal(resp.total);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!silent) setLoading(false);
+        });
+    },
+    [sourceFilter],
+  );
 
   const loadStats = useCallback(() => {
     api
@@ -966,6 +987,14 @@ export default function SessionsPage() {
     },
     [clearSelection],
   );
+  const changeSource = useCallback((nextSource: string) => {
+    const reset = resetSessionSourceListState();
+    setSourceFilter(nextSource);
+    setPage(reset.page);
+    setSelectedIds(reset.selectedIds);
+    lastClickedIndexRef.current = reset.lastClickedIndex;
+    setExpandedId(reset.expandedId);
+  }, []);
 
   // Debounced FTS search
   useEffect(() => {
@@ -1014,6 +1043,7 @@ export default function SessionsPage() {
           // ticks down without waiting for the next page navigation.
           refreshEmptyCount();
           showToast(t.sessions.sessionDeleted, "success");
+          loadSessions(page, true);
           loadStats();
         } catch {
           showToast(t.sessions.failedToDelete, "error");
@@ -1022,6 +1052,8 @@ export default function SessionsPage() {
       },
       [
         expandedId,
+        loadSessions,
+        page,
         refreshEmptyCount,
         showToast,
         loadStats,
@@ -1218,7 +1250,10 @@ export default function SessionsPage() {
     }
     setPruning(true);
     try {
-      const resp = await api.pruneSessions(days);
+      const resp = await api.pruneSessions(
+        days,
+        sessionSourceQuery(sourceFilter),
+      );
       showToast(
         `Pruned ${resp.removed} session${resp.removed === 1 ? "" : "s"}`,
         "success",
@@ -1232,7 +1267,7 @@ export default function SessionsPage() {
     } finally {
       setPruning(false);
     }
-  }, [pruneDays, showToast, loadSessions, loadStats]);
+  }, [pruneDays, showToast, loadSessions, loadStats, sourceFilter]);
 
   const pendingSession = sessionDelete.pendingId
     ? sessions.find((s) => s.id === sessionDelete.pendingId)
@@ -1264,6 +1299,10 @@ export default function SessionsPage() {
     platformEntries.length > 0 || recentSessions.length > 0;
   const showList = view === "list" || isSearching || !showOverviewTab;
   const showPagination = showList && !searchResults && total > PAGE_SIZE;
+  const sourceOptions = useMemo(
+    () => buildSessionSourceOptions(stats?.by_source),
+    [stats],
+  );
 
   const alerts: { message: string; detail?: string }[] = [];
   if (status) {
@@ -1543,6 +1582,24 @@ export default function SessionsPage() {
             )}
 
             {showList && (
+              <label className="flex h-8 shrink-0 items-center gap-1.5 border border-border bg-background px-2 text-muted-foreground">
+                <Database className="h-3.5 w-3.5" />
+                <select
+                  aria-label="Session source"
+                  value={sourceFilter}
+                  onChange={(event) => changeSource(event.target.value)}
+                  className="h-full max-w-[9rem] bg-transparent font-sans text-xs normal-case tracking-normal text-foreground outline-none sm:max-w-[12rem]"
+                >
+                  {sourceOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+
+            {showList && (
               <div className="relative min-w-0 w-full sm:w-auto sm:min-w-[12rem] sm:max-w-md sm:flex-1">
                 {searching ? (
                   <Spinner className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[0.875rem] text-primary" />
@@ -1773,10 +1830,12 @@ export default function SessionsPage() {
 
                     <Badge
                       tone="outline"
-                      className="shrink-0 self-start text-xs sm:self-center"
+                      className="shrink-0 self-start text-xs normal-case tracking-normal sm:self-center"
                     >
                       <Database className="mr-1 h-3 w-3" />
-                      {s.source ?? "local"}
+                      <span className={SESSION_SOURCE_BADGE_TEXT_CLASS}>
+                        {sessionSourceLabel(s.source ?? "local")}
+                      </span>
                     </Badge>
                   </div>
                 ))}

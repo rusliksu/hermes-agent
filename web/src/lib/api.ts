@@ -304,6 +304,14 @@ function appendProfileParam(url: string, profile?: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
 }
 
+type SessionsOrder = "created" | "recent";
+
+export interface GetSessionsOptions {
+  order?: SessionsOrder;
+  profile?: string;
+  source?: string | null;
+}
+
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
@@ -342,15 +350,27 @@ export const api = {
   getSessions: (
     limit = 20,
     offset = 0,
-    profile = getManagementProfile(),
-    order: "created" | "recent" = "created",
-  ) =>
-    fetchJSON<PaginatedSessions>(
+    profileOrOptions: string | GetSessionsOptions = getManagementProfile(),
+    order: SessionsOrder = "created",
+  ) => {
+    const options =
+      typeof profileOrOptions === "string"
+        ? { order, profile: profileOrOptions }
+        : profileOrOptions;
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      order: options.order ?? order,
+    });
+    const source = options.source?.trim();
+    if (source && source !== "all") params.set("source", source);
+    return fetchJSON<PaginatedSessions>(
       appendProfileParam(
-        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}`,
-        profile,
+        `/api/sessions?${params.toString()}`,
+        options.profile ?? getManagementProfile(),
       ),
-    ),
+    );
+  },
   getSessionMessages: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionMessagesResponse>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
