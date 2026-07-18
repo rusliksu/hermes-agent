@@ -73,6 +73,22 @@ describe("api.getSessions", () => {
   });
 });
 
+describe("api.pruneSessions", () => {
+  it("keeps prune payload independent from the History source filter", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = stubFetchJson({ ok: true, removed: 2 });
+
+    await api.pruneSessions(90);
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/prune",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(JSON.parse(String(init.body))).toEqual({ older_than_days: 90 });
+  });
+});
+
 describe("api.getModelOptions", () => {
   it("requests a live model refresh when asked", async () => {
     vi.stubGlobal("window", {});

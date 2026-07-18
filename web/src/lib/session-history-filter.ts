@@ -22,6 +22,22 @@ export interface SessionSourceListReset {
   expandedId: null;
 }
 
+export interface LatestSessionListRequestGuard {
+  next: () => number;
+  isLatest: (requestId: number) => boolean;
+}
+
+export function createLatestSessionListRequestGuard(): LatestSessionListRequestGuard {
+  let latestRequestId = 0;
+  return {
+    next: () => {
+      latestRequestId += 1;
+      return latestRequestId;
+    },
+    isLatest: (requestId) => requestId === latestRequestId,
+  };
+}
+
 export function sessionSourceQuery(source: string): string | undefined {
   const trimmed = source.trim();
   return trimmed && trimmed.toLowerCase() !== ALL_SESSION_SOURCES

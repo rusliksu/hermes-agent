@@ -81,6 +81,12 @@ Search behavior MUST сохранять текущую backend semantics и от
 - **THEN** delete, export, resume, rename и row expand actions остаются доступны на тех же условиях
 - **AND** payloads этих действий не получают новых обязательных session data fields
 
+#### Scenario: Prune remains independent from History source filter
+- **WHEN** пользователь запускает prune при выбранном конкретном source-фильтре History
+- **THEN** prune request не передает выбранный source
+- **AND** prune удаляет тот же набор сессий, что до добавления History source filter
+- **AND** последующий reload History может использовать текущий выбранный source для отображения списка
+
 ### Requirement: Delivery requires explicit live gate
 После реализации и локальной проверки live build/install/restart `hermes-dashboard.service` MUST выполняться только после отдельного явного разрешения пользователя.
 

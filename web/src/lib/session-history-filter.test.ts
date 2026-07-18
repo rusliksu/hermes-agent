@@ -6,6 +6,7 @@ import {
   SESSION_ROW_TITLE_CLASS,
   SESSION_SOURCE_BADGE_TEXT_CLASS,
   buildSessionSourceOptions,
+  createLatestSessionListRequestGuard,
   resetSessionSourceListState,
   sessionSourceQuery,
 } from "./session-history-filter";
@@ -56,5 +57,45 @@ describe("session history filter helpers", () => {
     expect(SESSION_SOURCE_BADGE_TEXT_CLASS).toContain("normal-case");
     expect(SESSION_SOURCE_BADGE_TEXT_CLASS).toContain("tracking-normal");
     expect(SESSION_SOURCE_BADGE_TEXT_CLASS).not.toContain("font-compressed");
+  });
+
+  it("prevents stale list requests from overwriting list state", () => {
+    const guard = createLatestSessionListRequestGuard();
+    const state = { sessions: ["new"], total: 1, loading: true };
+    const oldPageRequest = guard.next();
+    const newSourceRequest = guard.next();
+
+    if (guard.isLatest(oldPageRequest)) {
+      state.sessions = ["old"];
+      state.total = 99;
+    }
+    if (guard.isLatest(oldPageRequest)) {
+      state.loading = false;
+    }
+
+    expect(state).toEqual({ sessions: ["new"], total: 1, loading: true });
+
+    if (guard.isLatest(newSourceRequest)) {
+      state.sessions = ["new-source"];
+      state.total = 2;
+    }
+
+    const silentReloadRequest = guard.next();
+
+    if (guard.isLatest(newSourceRequest)) {
+      state.sessions = ["late-new-source"];
+      state.total = 3;
+    }
+    if (guard.isLatest(newSourceRequest)) {
+      state.loading = false;
+    }
+
+    expect(state).toEqual({ sessions: ["new-source"], total: 2, loading: true });
+
+    if (guard.isLatest(silentReloadRequest)) {
+      state.loading = false;
+    }
+
+    expect(state).toEqual({ sessions: ["new-source"], total: 2, loading: false });
   });
 });
