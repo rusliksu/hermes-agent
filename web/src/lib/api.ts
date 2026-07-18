@@ -434,11 +434,15 @@ export const api = {
     fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
-  pruneSessions: (older_than_days: number, profile = getManagementProfile()) =>
+  pruneSessions: (
+    older_than_days: number,
+    source?: string,
+    profile = getManagementProfile(),
+  ) =>
     fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, profile: profile || undefined }),
+      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
     }),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
