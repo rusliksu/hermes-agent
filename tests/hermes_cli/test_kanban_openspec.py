@@ -136,12 +136,18 @@ def test_parser_rejects_duplicate_task_ids():
         parse_openspec_tasks_md("- [ ] 1.1 A\n- [x] 1.1 B\n")
 
 
-def test_first_import_creates_todo_tasks_with_keys_and_source_path(temp_board, tmp_path):
-    source = _source(tmp_path, "- [ ] 1.1 First task\n- [x] 1.2 Done in plan\n")
+def test_first_import_round_trips_russian_text_with_technical_terms(temp_board, tmp_path):
+    source_text = (
+        "- [ ] 1.1 Обновить MCP/API раздел в README\n"
+        "- [x] 1.2 Проверить UTF-8 импорт для README\n"
+    )
+    source = _source(tmp_path, source_text)
 
     with kb.connect() as conn:
         result = import_openspec_tasks_md(conn, source, repo="repo")
         rows = conn.execute("SELECT * FROM tasks ORDER BY external_key").fetchall()
+        listed = sorted(kb.list_tasks(conn), key=lambda task: task.external_key or "")
+        read_back = kb.get_task(conn, listed[0].id)
 
     assert result["created"] == 2
     assert result["updated"] == 0
@@ -153,6 +159,17 @@ def test_first_import_creates_todo_tasks_with_keys_and_source_path(temp_board, t
     ]
     assert [row["source_path"] for row in rows] == [str(source), str(source)]
     assert [row["status"] for row in rows] == ["todo", "todo"]
+    assert [task.title for task in listed] == [
+        "Обновить MCP/API раздел в README",
+        "Проверить UTF-8 импорт для README",
+    ]
+    assert read_back is not None
+    assert read_back.title == "Обновить MCP/API раздел в README"
+    assert read_back.body == (
+        "OpenSpec задача 1.1\n\nОбновить MCP/API раздел в README"
+    )
+    assert read_back.external_key == "repo::add-widget::1.1"
+    assert read_back.source_path == str(source)
 
 
 def test_identical_second_import_creates_no_duplicates(temp_board, tmp_path):
@@ -189,7 +206,7 @@ def test_changed_source_title_and_body_update_only_source_owned_fields(temp_boar
 
     assert result["updated"] == 1
     assert changed["title"] == "New title"
-    assert changed["body"] == "OpenSpec task 1.1\n\nNew title"
+    assert changed["body"] == "OpenSpec задача 1.1\n\nNew title"
     assert changed["status"] == "running"
     assert changed["assignee"] == "alice"
     assert changed["priority"] == 50

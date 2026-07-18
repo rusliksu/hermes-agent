@@ -193,7 +193,7 @@ def _source_identity_parts(path: Path) -> tuple[str, str]:
 
 
 def _task_body(task: OpenSpecTask) -> str:
-    return f"OpenSpec task {task.task_id}\n\n{task.title}"
+    return f"OpenSpec задача {task.task_id}\n\n{task.title}"
 
 
 def _insert_imported_task(

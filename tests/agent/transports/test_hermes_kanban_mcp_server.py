@@ -144,6 +144,36 @@ def test_allow_write_exposes_only_dedicated_kanban_tools():
     assert "kanban_import_openspec_tasks" in names
 
 
+def test_language_policy_instruction_and_openspec_description_are_russian():
+    from agent.transports import hermes_kanban_mcp_server as m
+
+    assert "на русском языке" in m.SERVER_INSTRUCTIONS
+    assert "Technical identifiers" in m.SERVER_INSTRUCTIONS
+    assert "Формальная проверка Кириллицы" in m.SERVER_INSTRUCTIONS
+    assert "не требуются" in m.SERVER_INSTRUCTIONS
+    assert "Импортирует минимальные checkbox-задачи" in (
+        m.kanban_import_openspec_tasks.__doc__ or ""
+    )
+    assert "- [ ] 1.1 Название" in (m.kanban_import_openspec_tasks.__doc__ or "")
+
+
+def test_status_label_is_additive_and_preserves_internal_status_values():
+    from agent.transports import hermes_kanban_mcp_server as m
+
+    assert m.STATUS_LABELS_RU == {
+        "triage": "Триаж",
+        "todo": "К выполнению",
+        "scheduled": "Запланировано",
+        "ready": "Готово к работе",
+        "running": "В работе",
+        "blocked": "Заблокировано",
+        "review": "На проверке",
+        "done": "Готово",
+        "archived": "В архиве",
+    }
+    assert m._status_label("future-status") == "future-status"
+
+
 def test_mcp_serve_kanban_cli_dispatch_passes_allow_write(monkeypatch):
     from agent.transports import hermes_kanban_mcp_server as server
     from hermes_cli.mcp_config import mcp_command
@@ -201,6 +231,8 @@ def test_cli_stdio_read_only_smoke_no_db_mutation(tmp_path, monkeypatch):
         assert listed["ok"] is True
         assert listed["count"] == 1
         assert listed["tasks"][0]["title"] == "alpha"
+        assert listed["tasks"][0]["status"] == "ready"
+        assert listed["tasks"][0]["status_label"] == "Готово к работе"
 
     asyncio.run(run_smoke())
 
@@ -402,6 +434,8 @@ def test_read_only_status_and_list_do_not_init_or_create_sidecars(isolated_board
     assert listed["ok"] is True
     assert listed["count"] == 1
     assert listed["tasks"][0]["title"] == "alpha"
+    assert listed["tasks"][0]["status"] == "ready"
+    assert listed["tasks"][0]["status_label"] == "Готово к работе"
     assert "body" not in listed["tasks"][0]
     assert "result" not in listed["tasks"][0]
     assert "workspace_path" not in listed["tasks"][0]
@@ -443,6 +477,7 @@ def test_enqueue_claim_heartbeat_complete_happy_path(isolated_board):
     )
     assert completed["ok"] is True
     assert completed["task"]["status"] == "done"
+    assert completed["task"]["status_label"] == "Готово"
     assert "body" not in completed["task"]
 
     with kb.connect() as conn:

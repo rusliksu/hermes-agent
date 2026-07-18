@@ -52,6 +52,35 @@ MAX_LIST_LIMIT = 200
 MAX_LEASE_SECONDS = 24 * 60 * 60
 CLAIM_CANDIDATE_LIMIT = 20
 
+STATUS_LABELS_RU = {
+    "triage": "Триаж",
+    "todo": "К выполнению",
+    "scheduled": "Запланировано",
+    "ready": "Готово к работе",
+    "running": "В работе",
+    "blocked": "Заблокировано",
+    "review": "На проверке",
+    "done": "Готово",
+    "archived": "В архиве",
+}
+
+SERVER_INSTRUCTIONS = (
+    "Узкий MCP-адаптер Hermes Kanban. По умолчанию доступны только "
+    "read-only статус доски и список метаданных задач; write-инструменты "
+    "регистрируются только при запуске с --allow-write. Все human-facing "
+    "Kanban title/body/comment/block reason/result/acceptance criteria, "
+    "а также все human-readable OpenSpec artifacts/tasks нужно писать "
+    "на русском языке. Technical identifiers, API names, code, file paths, "
+    "tool names, library names, README и internal status codes могут "
+    "оставаться на английском внутри русского текста. Формальная проверка "
+    "Кириллицы, regex-валидация или отклонение смешанного технического "
+    "текста не требуются."
+)
+
+
+def _status_label(status: str) -> str:
+    return STATUS_LABELS_RU.get(status, status)
+
 
 def _ok(**fields: Any) -> dict[str, Any]:
     return {"ok": True, **fields}
@@ -174,6 +203,7 @@ def _task_payload(task: Any, *, include_body: bool) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "status_label": _status_label(task.status),
         "priority": task.priority,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -188,6 +218,12 @@ def _task_payload(task: Any, *, include_body: bool) -> dict[str, Any]:
     }
     if include_body:
         data["body"] = task.body
+    return data
+
+
+def _task_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["status_label"] = _status_label(str(data.get("status") or ""))
     return data
 
 
@@ -313,7 +349,7 @@ def kanban_list_tasks(
             visible = rows[: int(parsed_limit)]
             return _ok(
                 board=slug,
-                tasks=[dict(row) for row in visible],
+                tasks=[_task_row_payload(row) for row in visible],
                 count=len(visible),
                 limit=int(parsed_limit),
                 truncated=len(rows) > int(parsed_limit),
@@ -774,11 +810,12 @@ def kanban_import_openspec_tasks(
     repo: Optional[str] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Import minimal OpenSpec tasks.md checkboxes into Kanban.
+    """Импортирует минимальные checkbox-задачи OpenSpec tasks.md в Kanban.
 
-    Supports only ``- [ ] 1.1 Title`` and ``- [x] 1.2 Title`` task lines
-    under ``openspec/changes/<change-slug>/tasks.md``. The source file is read
-    but never modified; existing Kanban tasks update only source-owned fields.
+    Поддерживает только строки задач ``- [ ] 1.1 Название`` и
+    ``- [x] 1.2 Название`` в ``openspec/changes/<change-slug>/tasks.md``.
+    Исходный файл читается, но не изменяется; существующие Kanban-задачи
+    обновляют только поля, принадлежащие источнику.
     """
     source_text, error = _bounded_text(
         source_path,
@@ -848,11 +885,7 @@ def _build_server(*, allow_write: bool = False) -> Any:
 
     mcp = FastMCP(
         "hermes-kanban",
-        instructions=(
-            "Narrow Hermes Kanban task adapter. Default mode exposes only "
-            "read-only board status and task metadata listing. Write tools "
-            "are registered only when the server starts with --allow-write."
-        ),
+        instructions=SERVER_INSTRUCTIONS,
     )
     for name, handler in _tool_handlers(allow_write).items():
         mcp.add_tool(handler, name=name, description=(handler.__doc__ or name).strip())
