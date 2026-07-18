@@ -114,6 +114,7 @@ def test_default_tool_exposure_is_read_only():
     names = set(m._tool_names_for_mode())
     assert names == {"kanban_board_status", "kanban_list_tasks"}
     assert not (names & set(m.WRITE_TOOLS))
+    assert "kanban_import_openspec_tasks" not in names
 
 
 def test_allow_write_exposes_only_dedicated_kanban_tools():
@@ -126,6 +127,7 @@ def test_allow_write_exposes_only_dedicated_kanban_tools():
     assert "terminal" not in names
     assert "read_file" not in names
     assert "hermes_tools" not in names
+    assert "kanban_import_openspec_tasks" in names
 
 
 def test_mcp_serve_kanban_cli_dispatch_passes_allow_write(monkeypatch):

@@ -856,6 +856,8 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    external_key: Optional[str] = None
+    source_path: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -942,6 +944,8 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            external_key=row["external_key"] if "external_key" in keys else None,
+            source_path=row["source_path"] if "source_path" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1111,6 +1115,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Stable identity for tasks imported from an external source. NULL for
+    -- ordinary Kanban tasks; uniqueness is enforced only for non-NULL values.
+    external_key         TEXT,
+    -- Source document path for externally-imported tasks. Informational only.
+    source_path          TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1863,6 +1872,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "external_key" not in cols:
+        _add_column_if_missing(conn, "tasks", "external_key", "external_key TEXT")
+    if "source_path" not in cols:
+        _add_column_if_missing(conn, "tasks", "source_path", "source_path TEXT")
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -1996,6 +2009,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_key_unique "
+        "ON tasks(external_key) WHERE external_key IS NOT NULL"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"

@@ -40,6 +40,7 @@ WRITE_TOOLS: tuple[str, ...] = (
     "kanban_block",
     "kanban_add_dependency",
     "kanban_reclaim",
+    "kanban_import_openspec_tasks",
 )
 
 MAX_TITLE_CHARS = 300
@@ -768,6 +769,50 @@ def kanban_reclaim(
         return _err("kanban_error", str(exc))
 
 
+def kanban_import_openspec_tasks(
+    source_path: str,
+    repo: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Import minimal OpenSpec tasks.md checkboxes into Kanban.
+
+    Supports only ``- [ ] 1.1 Title`` and ``- [x] 1.2 Title`` task lines
+    under ``openspec/changes/<change-slug>/tasks.md``. The source file is read
+    but never modified; existing Kanban tasks update only source-owned fields.
+    """
+    source_text, error = _bounded_text(
+        source_path,
+        name="source_path",
+        max_chars=4096,
+        required=True,
+    )
+    if error:
+        return error
+    repo_text, error = _bounded_text(repo, name="repo", max_chars=256)
+    if error:
+        return error
+    try:
+        kb, conn = _write_conn(board)
+        try:
+            from hermes_cli.kanban_openspec import import_openspec_tasks_md
+
+            result = import_openspec_tasks_md(
+                conn,
+                source_text or "",
+                repo=(repo_text.strip() if repo_text else None),
+            )
+            return _ok(board=(board or kb.get_current_board()), **result)
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return _err("invalid_argument", str(exc))
+    except sqlite3.IntegrityError as exc:
+        return _err("sqlite_error", str(exc))
+    except Exception as exc:
+        logger.exception("kanban_import_openspec_tasks failed")
+        return _err("kanban_error", str(exc))
+
+
 def _tool_handlers(allow_write: bool = False) -> dict[str, Callable[..., dict[str, Any]]]:
     handlers: dict[str, Callable[..., dict[str, Any]]] = {
         "kanban_board_status": kanban_board_status,
@@ -783,6 +828,7 @@ def _tool_handlers(allow_write: bool = False) -> dict[str, Callable[..., dict[st
                 "kanban_block": kanban_block,
                 "kanban_add_dependency": kanban_add_dependency,
                 "kanban_reclaim": kanban_reclaim,
+                "kanban_import_openspec_tasks": kanban_import_openspec_tasks,
             }
         )
     return handlers
