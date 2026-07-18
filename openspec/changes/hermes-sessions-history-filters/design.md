@@ -68,13 +68,20 @@
 - [Risk] Existing search UX может выглядеть как "мало результатов", потому что это пересечение с текущей выбранной source/page. -> Mitigation: явно покрыть и описать это в spec/tasks, не обещать full backend search expansion.
 - [Risk] Toolbar может переполниться на mobile после добавления фильтра. -> Mitigation: использовать компактный segmented/select-like control с wrap/flex behavior рядом с search и проверить mobile viewport.
 - [Risk] `api.getSessions` signature change может сломать существующие вызовы. -> Mitigation: сохранить backward-compatible defaults и добавить URL/params tests.
+- [Risk] Прямой install только candidate `hermes_cli`/`web_dist` не закрепляет UI в live service, потому что `hermes dashboard` при каждом старте запускает build из текущего live source и перезаписывает `web_dist`. -> Mitigation: delivery выполняется через отдельный clean deploy-checkout candidate commit и атомарное переключение symlink `/home/openclaw/.hermes/hermes-agent`, а не через частичную замену built artifacts.
 
 ## Migration Plan
 
 - Implementation stays in task worktree and affects only source files/tests after this planning change.
 - Local validation runs before any delivery gate.
-- Live build/install/restart of `hermes-dashboard.service` is a separate manual gate after implementation and local checks.
+- Live cutover of `hermes-dashboard.service` is a separate manual gate after implementation and local checks.
+- Перед live cutover подготовить отдельный clean deploy-checkout на candidate commit и убедиться, что в нем нет uncommitted/untracked изменений, влияющих на delivery.
+- Перед переключением сохранить текущий target symlink `/home/openclaw/.hermes/hermes-agent` как rollback target.
+- Cutover выполняется атомарным переключением symlink `/home/openclaw/.hermes/hermes-agent` на candidate checkout, затем restart только user unit `hermes-dashboard.service`.
+- После restart дождаться startup build, который выполняет сам `hermes dashboard`, и только затем проверять `127.0.0.1:9119` HTTP, загруженные assets и `journalctl --user -u hermes-dashboard.service`.
+- Если HTTP/assets/journal проверка неуспешна, вернуть symlink на сохраненный rollback target и restart только user unit `hermes-dashboard.service`.
 - Rollback for implementation is reverting the frontend commit/worktree; no database or config migration is involved.
+- Rollback for live cutover is symlink restore to the saved target plus restart of `hermes-dashboard.service`; database/config rollback is not involved.
 
 ## Open Questions
 

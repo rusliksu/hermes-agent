@@ -33,5 +33,8 @@
 
 ## 5. Delivery Gate
 
-- [ ] 5.1 После реализации и локальных проверок показать diff/status и запросить отдельное явное разрешение на live build/install/restart `hermes-dashboard.service`.
-- [ ] 5.2 До получения отдельного разрешения не выполнять live build, install, restart, deploy, push или merge.
+- [ ] 5.1 После реализации и локальных проверок показать diff/status и запросить отдельное явное разрешение на live symlink cutover/restart `hermes-dashboard.service`.
+- [ ] 5.2 До получения отдельного разрешения не выполнять live symlink switch, build, install, restart, deploy, push или merge.
+- [ ] 5.3 До cutover подготовить отдельный clean deploy-checkout на candidate commit и сохранить текущий target `/home/openclaw/.hermes/hermes-agent` для rollback.
+- [ ] 5.4 Во время cutover атомарно переключить `/home/openclaw/.hermes/hermes-agent` на candidate checkout, restart только user unit `hermes-dashboard.service`, дождаться startup build и проверить HTTP/assets/journal.
+- [ ] 5.5 При неуспешной HTTP/assets/journal проверке вернуть symlink на сохраненный rollback target и restart только user unit `hermes-dashboard.service`.
