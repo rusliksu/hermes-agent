@@ -33,8 +33,21 @@
 
 ## 5. Delivery Gate
 
-- [ ] 5.1 После реализации и локальных проверок показать diff/status и запросить отдельное явное разрешение на live symlink cutover/restart `hermes-dashboard.service`.
-- [ ] 5.2 До получения отдельного разрешения не выполнять live symlink switch, build, install, restart, deploy, push или merge.
-- [ ] 5.3 До cutover подготовить отдельный clean deploy-checkout на candidate commit и сохранить текущий target `/home/openclaw/.hermes/hermes-agent` для rollback.
-- [ ] 5.4 Во время cutover атомарно переключить `/home/openclaw/.hermes/hermes-agent` на candidate checkout, restart только user unit `hermes-dashboard.service`, дождаться startup build и проверить HTTP/assets/journal.
-- [ ] 5.5 При неуспешной HTTP/assets/journal проверке вернуть symlink на сохраненный rollback target и restart только user unit `hermes-dashboard.service`.
+- [x] 5.1 После реализации и локальных проверок показать diff/status и запросить отдельное явное разрешение на live symlink cutover/restart `hermes-dashboard.service`.
+- [x] 5.2 До получения отдельного разрешения не выполнять live symlink switch, build, install, restart, deploy, push или merge.
+- [x] 5.3 До cutover подготовить отдельный clean deploy-checkout на candidate commit и сохранить текущий target `/home/openclaw/.hermes/hermes-agent` для rollback.
+- [x] 5.4 Во время cutover атомарно переключить `/home/openclaw/.hermes/hermes-agent` на candidate checkout, restart только user unit `hermes-dashboard.service`, дождаться startup build и проверить HTTP/assets/journal.
+- [x] 5.5 При неуспешной HTTP/assets/journal проверке вернуть symlink на сохраненный rollback target и restart только user unit `hermes-dashboard.service`.
+
+### Доказательства delivery
+
+- Пользователь отдельно одобрил symlink cutover.
+- Deployment evidence VPS run: `20260718T200148Z-hermes-sessions-cutover-final`.
+- Evidence dir: `/home/openclaw/staging/hermes-dashboard-cutover-backups/20260718T220843+0200-hermes-dashboard-post-verify`.
+- Candidate deploy-checkout: `/home/openclaw/staging/hermes-deploy-8f389825-20260718` на commit `8f38982570a0b7bf635148a0bee63e92a208e6cc`, с собственными `venv` и `node_modules`.
+- Live symlink `/home/openclaw/.hermes/hermes-agent` переключен на candidate checkout; rollback target сохранен как `/home/openclaw/staging/hermes-deploy-cdfe5227-20260715`.
+- `hermes-dashboard.service` active/running; HTTP `/` и `/sessions` вернули `200`.
+- Served assets совпали с candidate checkout; forbidden terms в journal: `0`; lock released; git tracked clean.
+- Browser smoke: History выбран по умолчанию; `source=telegram` показал page `1/4`; переключение на `source=cron` показало page `1/96` и только Cron rows; затем фильтр возвращен на Telegram.
+- Cron badge и row titles использовали IBM Plex Sans, `font-stretch: 100%`, `letter-spacing: normal`, `text-transform: none`; browser console errors: `0`.
+- HTTP/assets/journal проверка успешна, поэтому rollback не потребовался.
