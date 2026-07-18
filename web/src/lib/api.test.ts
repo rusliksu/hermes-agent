@@ -99,6 +99,19 @@ describe("api.pruneSessions", () => {
     );
     expect(JSON.parse(String(init.body))).toEqual({ older_than_days: 90 });
   });
+
+  it("keeps the optional source argument backward compatible", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = stubFetchJson({ ok: true, removed: 2 });
+
+    await api.pruneSessions(30, "telegram");
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      older_than_days: 30,
+      source: "telegram",
+    });
+  });
 });
 
 describe("api.getModelOptions", () => {
