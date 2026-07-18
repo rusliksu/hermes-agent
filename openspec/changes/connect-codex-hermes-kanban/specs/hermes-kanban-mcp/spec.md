@@ -69,11 +69,15 @@ Hermes Kanban MCP server SHALL инструктировать агентов п�
 - **THEN** инструкции server разрешают такой текст
 - **AND** regex-валидация кириллицы не требуется
 
-### Requirement: Операции с live-средой вне области до явного разрешения
+### Requirement: Live rollout выполняется только после явного разрешения
 
-Этот change SHALL NOT считать деплой, изменения live DB, настройку profile configuration, изменения systemd, restart или работу с secrets выполненной реализацией.
+Hermes Kanban MCP live rollout SHALL выполняться только после явного разрешения пользователя и SHALL фиксировать проверяемый backup, standalone runtime, локальную MCP-регистрацию, отсутствие gateway restart и видимый результат первой задачи без раскрытия secrets.
 
-#### Scenario: Только валидация репозитория
-- **WHEN** этот change валидируется в task-owned worktree
-- **THEN** tests могут использовать временные базы данных внутри test temp paths
-- **AND** live `/home/openclaw/.hermes`, live `kanban.db`, systemd, profile configs, deploy/restart и secrets остаются нетронутыми
+#### Scenario: Выполненный live rollout отражает разрешение и проверяемые факты
+- **WHEN** пользователь явно разрешил live MCP configuration и первую DB запись
+- **THEN** перед первой записью существует backup `/home/openclaw/.hermes/backups/kanban-before-live-mcp-20260718T165906Z.db` с SHA256 `232cec5154c3eef82260a0ec8f06265b60fa51061f49aac2facd0e6d095fdb06` и `integrity ok`
+- **AND** standalone runtime развернут в `/home/openclaw/.hermes/mcp/hermes-kanban` с wrapper `run.sh`, `manifest.txt`, source commit `6f8738dc308f909bf1735883344f2fcc12f3cbcd` и `mcp` `1.26.0`
+- **AND** local Codex global MCP зарегистрирован как `hermes-kanban` через credential-free SSH stdio command к `run.sh`
+- **AND** gateway остается без restart: `ActiveState=active`, `SubState=running`, `NRestarts=0`, PID unchanged `4081225`
+- **AND** первый live task `t_2e3f153c` с русским названием видим в dashboard на Default board как 1 task in Done, internal status `done`, status label `Готово`
+- **AND** OpenSpec artifacts не содержат tokens, credentials или secrets

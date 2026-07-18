@@ -4,7 +4,8 @@ Hermes уже имеет локальную SQLite Kanban-доску и CLI-ко
 
 Ограничения change:
 - работа только в task-owned worktree;
-- live `/home/openclaw/.hermes`, live `kanban.db`, systemd, profile configs, deploy/restart и secrets не трогаются;
+- текущая синхронизация OpenSpec не меняет production code/tests/live/config, systemd, profile configs, deploy/restart или secrets;
+- live rollout уже выполнен оркестратором после явного разрешения пользователя на live MCP configuration и первую DB запись;
 - отдельные пользователи не обязаны использовать OpenSpec;
 - импорт OpenSpec нужен как удобство для доски Руслана, но не как общий обязательный рабочий процесс.
 
@@ -16,10 +17,12 @@ Hermes уже имеет локальную SQLite Kanban-доску и CLI-ко
 - Разрешить операции записи только через `--allow-write`.
 - Поддержать параметр `board` для отдельных досок.
 - Сделать пользовательские формулировки русскоязычными без regex-запрета технического английского.
+- Зафиксировать фактический live rollout: standalone runtime, credential-free SSH stdio registration, backup, первый live task и отсутствие gateway restart.
 
 **Нецели:**
-- Не деплоить и не подключать live MCP server.
-- Не изменять live DB, systemd units, profile configs или secrets.
+- Не выполнять дополнительные live-изменения при синхронизации OpenSpec artifacts.
+- Не изменять production code/tests/live/config, systemd units, profile configs или secrets.
+- Не выполнять commit, push, restart, deploy или destructive rollback.
 - Не делать OpenSpec обязательным для всех пользователей.
 - Не расширять production transport без необходимости.
 
@@ -45,18 +48,36 @@ Hermes уже имеет локальную SQLite Kanban-доску и CLI-ко
    - Выбор: импортировать только строки вида `- [ ] 1.1 Название`, делать upsert по stable `external_key`, не удалять исчезнувшие строки и не менять рабочее состояние claim/run.
    - Альтернатива: полноценный Markdown/OpenSpec parser. Отклонено как лишнее для текущей интеграции.
 
+6. Live Codex MCP entry использует credential-free SSH stdio к standalone runtime.
+   - Выбор: local Codex global MCP зарегистрирован как `hermes-kanban` и запускает wrapper `/home/openclaw/.hermes/mcp/hermes-kanban/run.sh` без передачи credentials в OpenSpec artifacts.
+   - Альтернатива: хранить credentials или runtime command details в change artifacts. Отклонено, потому что OpenSpec должен фиксировать контракт и проверенные факты без секретов.
+
+7. Standalone runtime отделен от gateway process.
+   - Выбор: runtime размещен в `/home/openclaw/.hermes/mcp/hermes-kanban`, содержит `run.sh`, `manifest.txt`, source commit `6f8738dc308f909bf1735883344f2fcc12f3cbcd` и `mcp` `1.26.0`.
+   - Альтернатива: подключать adapter через gateway restart/deploy. Отклонено для rollout, потому что проверенный MCP stdio path не требовал gateway restart.
+
 ## Риски и компромиссы
 
-- Инструменты чтения показывают только безопасные метаданные и не возвращают поля body/result/path, поэтому для глубокого анализа агенту нужна отдельная write-capable или CLI-сессия.
-- `board` slug зависит от существующей нормализации `kanban_db`, поэтому некорректный slug возвращается как validation error.
-- Импорт OpenSpec намеренно узкий: сложные Markdown-структуры игнорируются, но базовый checklist workflow остается предсказуемым.
-- Live-конфигурация еще не выполнена: интеграция проверена локально, но не подключена к реальной общей доске до отдельного user gate.
+- Ограниченные read tools не возвращают поля body/result/path -> для глубокого анализа нужна отдельная write-capable или CLI-сессия.
+- Невалидный `board` slug может создать путаницу у агента -> server возвращает validation error и не создает доску при read-only validation.
+- Узкий OpenSpec importer игнорирует сложные Markdown-структуры -> checklist workflow остается предсказуемым, а сложные случаи решаются вручную.
+- Live runtime теперь существует вне repo worktree -> rollback разделен на локальное снятие Codex MCP-регистрации и ручной destructive runtime rollback.
+- Повторный gateway restart мог бы изменить live-состояние без необходимости -> rollout зафиксирован как no-restart: `ActiveState=active`, `SubState=running`, `NRestarts=0`, PID unchanged `4081225`.
 
-## План перехода
+## План перехода и отката
 
-1. В task-owned worktree держать код и OpenSpec artifacts.
-2. Проверить targeted tests и strict validation.
-3. После отдельного разрешения пользователя отдельно настроить live MCP entry/configuration для общей доски Руслана.
-4. После отдельного разрешения пользователя отдельно выполнить live smoke без изменения secrets и без незапрошенного restart/deploy.
+Выполненный rollout:
 
-Откат для текущего repo change: revert commit в branch. Live rollback не описывается, потому что live deployment не выполняется в этом change.
+1. Получено явное разрешение пользователя на live MCP configuration и первую DB запись.
+2. Перед записью создан backup `/home/openclaw/.hermes/backups/kanban-before-live-mcp-20260718T165906Z.db`; SHA256 `232cec5154c3eef82260a0ec8f06265b60fa51061f49aac2facd0e6d095fdb06`; integrity ok.
+3. Развернут standalone runtime `/home/openclaw/.hermes/mcp/hermes-kanban` с wrapper `run.sh`, `manifest.txt`, source commit `6f8738dc308f909bf1735883344f2fcc12f3cbcd`, `mcp` `1.26.0`.
+4. Local Codex global MCP зарегистрирован как `hermes-kanban` через credential-free SSH stdio command к `run.sh`.
+5. Gateway не рестартовал: `ActiveState=active`, `SubState=running`, `NRestarts=0`, PID unchanged `4081225`.
+6. Smoke прошел полный MCP flow: `initialize`, `tools/list` с 10 tools, `enqueue`, `claim`, `heartbeat`, `complete`.
+7. Первая live-задача `t_2e3f153c` с названием `Проверить совместную работу Codex и Hermes через общую Kanban-доску` завершена; internal status `done`, status label `Готово`; dashboard показывает Default board с 1 task in Done.
+
+Откат:
+
+1. Локальный rollback Codex MCP-регистрации: `codex mcp remove hermes-kanban`.
+2. Ручной destructive rollback runtime допускается только отдельным явным действием: удалить `/home/openclaw/.hermes/mcp/hermes-kanban` и при необходимости восстановить live DB из backup. В рамках этой синхронизации не выполнять.
+3. Repo rollback для OpenSpec/code history остается обычным revert в branch; commit/push в этой задаче не выполняются.
