@@ -311,13 +311,21 @@ def test_cli_stdio_coalesced_initialized_and_tools_list_returns(tmp_path, monkey
                 "kanban_list_tasks",
             ]
         finally:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                proc.stdin.close()
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    await proc.stdin.wait_closed()
             if proc.returncode is None:
-                proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                    if proc.returncode is None:
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=2)
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                            await proc.wait()
 
     asyncio.run(run_smoke())
 
