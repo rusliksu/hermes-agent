@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
+import contextlib
+import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+LIVE_KANBAN_DB = Path("/home/openclaw/.hermes/kanban.db")
+MCP_TIMEOUT = 10
 
 
 @pytest.fixture
@@ -39,6 +50,64 @@ def _quiet_sidecars(db: Path) -> None:
             sidecar.unlink()
 
 
+def _tool_result_payload(result) -> dict:
+    assert result.content, "MCP tool returned no content"
+    return json.loads(result.content[0].text)
+
+
+def _init_temp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    home = tmp_path / "hermes-home"
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    assert db.resolve() != LIVE_KANBAN_DB.resolve()
+    return home, db
+
+
+def _stdio_env(tmp_path: Path, home: Path, db: Path) -> dict[str, str]:
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(PROJECT_ROOT),
+        "HERMES_HOME": str(home),
+        "HERMES_KANBAN_DB": str(db),
+        "HOME": str(fake_home),
+        "TZ": "UTC",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+@contextlib.asynccontextmanager
+async def _open_cli_kanban_session(tmp_path: Path, home: Path, db: Path, *args: str):
+    pytest.importorskip("mcp")
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "hermes_cli.main", "mcp", "serve-kanban", *args],
+        cwd=PROJECT_ROOT,
+        env=_stdio_env(tmp_path, home, db),
+    )
+    errlog_path = tmp_path / "mcp-stderr.log"
+    with errlog_path.open("w", encoding="utf-8") as errlog:
+        async with stdio_client(params, errlog=errlog) as (read, write):
+            async with ClientSession(read, write) as session:
+                await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT)
+                yield session
+
+
 def test_default_tool_exposure_is_read_only():
     from agent.transports import hermes_kanban_mcp_server as m
 
@@ -57,6 +126,158 @@ def test_allow_write_exposes_only_dedicated_kanban_tools():
     assert "terminal" not in names
     assert "read_file" not in names
     assert "hermes_tools" not in names
+
+
+def test_mcp_serve_kanban_cli_dispatch_passes_allow_write(monkeypatch):
+    from agent.transports import hermes_kanban_mcp_server as server
+    from hermes_cli.mcp_config import mcp_command
+    from hermes_cli.subcommands.mcp import build_mcp_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_mcp_parser(subparsers, cmd_mcp=mcp_command)
+
+    calls: list[list[str]] = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(server, "main", fake_main)
+
+    args = parser.parse_args(["mcp", "serve-kanban"])
+    args.func(args)
+    args = parser.parse_args(["mcp", "serve-kanban", "--allow-write"])
+    args.func(args)
+
+    assert calls == [[], ["--allow-write"]]
+
+
+def test_cli_stdio_read_only_smoke_no_db_mutation(tmp_path, monkeypatch):
+    home, db = _init_temp_db(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="alpha", assignee="alice")
+
+    _quiet_sidecars(db)
+    before_mtime = db.stat().st_mtime_ns
+
+    async def run_smoke():
+        async with _open_cli_kanban_session(tmp_path, home, db) as session:
+            tools = await asyncio.wait_for(session.list_tools(), timeout=MCP_TIMEOUT)
+            names = [tool.name for tool in tools.tools]
+            assert names == ["kanban_board_status", "kanban_list_tasks"]
+
+            status_result = await asyncio.wait_for(
+                session.call_tool("kanban_board_status", {}),
+                timeout=MCP_TIMEOUT,
+            )
+            listed_result = await asyncio.wait_for(
+                session.call_tool("kanban_list_tasks", {}),
+                timeout=MCP_TIMEOUT,
+            )
+
+        status = _tool_result_payload(status_result)
+        listed = _tool_result_payload(listed_result)
+        assert status["ok"] is True
+        assert status["counts_by_status"]["ready"] == 1
+        assert listed["ok"] is True
+        assert listed["count"] == 1
+        assert listed["tasks"][0]["title"] == "alpha"
+
+    asyncio.run(run_smoke())
+
+    assert db.resolve() != LIVE_KANBAN_DB.resolve()
+    assert db.stat().st_mtime_ns == before_mtime
+    for suffix in ("-wal", "-shm", ".init.lock"):
+        assert not Path(str(db) + suffix).exists()
+
+
+def test_cli_stdio_write_mode_happy_path(tmp_path, monkeypatch):
+    home, db = _init_temp_db(tmp_path, monkeypatch)
+    from agent.transports import hermes_kanban_mcp_server as m
+    from hermes_cli import kanban_db as kb
+
+    async def run_smoke():
+        async with _open_cli_kanban_session(
+            tmp_path,
+            home,
+            db,
+            "--allow-write",
+        ) as session:
+            tools = await asyncio.wait_for(session.list_tools(), timeout=MCP_TIMEOUT)
+            assert {tool.name for tool in tools.tools} == set(m.READ_TOOLS) | set(
+                m.WRITE_TOOLS
+            )
+
+            enqueued = _tool_result_payload(
+                await asyncio.wait_for(
+                    session.call_tool(
+                        "kanban_enqueue",
+                        {
+                            "title": "Do the work",
+                            "body": "Detailed task body",
+                            "assignee": "alice",
+                            "priority": 7,
+                        },
+                    ),
+                    timeout=MCP_TIMEOUT,
+                )
+            )
+            task_id = enqueued["task"]["id"]
+
+            claimed = _tool_result_payload(
+                await asyncio.wait_for(
+                    session.call_tool(
+                        "kanban_claim_next",
+                        {"assignee": "alice", "lease_seconds": 60},
+                    ),
+                    timeout=MCP_TIMEOUT,
+                )
+            )
+            assert claimed["claimed"] is True
+            assert claimed["task"]["id"] == task_id
+            token = claimed["claim_token"]
+
+            heartbeat = _tool_result_payload(
+                await asyncio.wait_for(
+                    session.call_tool(
+                        "kanban_heartbeat",
+                        {"task_id": task_id, "claim_token": token},
+                    ),
+                    timeout=MCP_TIMEOUT,
+                )
+            )
+            assert heartbeat["ok"] is True
+
+            completed = _tool_result_payload(
+                await asyncio.wait_for(
+                    session.call_tool(
+                        "kanban_complete",
+                        {
+                            "task_id": task_id,
+                            "claim_token": token,
+                            "summary": "Implemented and tested",
+                            "result": "done",
+                            "metadata": {"tests": ["mcp-stdio"]},
+                        },
+                    ),
+                    timeout=MCP_TIMEOUT,
+                )
+            )
+            assert completed["ok"] is True
+            return task_id
+
+    task_id = asyncio.run(run_smoke())
+
+    assert db.resolve() != LIVE_KANBAN_DB.resolve()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        run = kb.latest_run(conn, task_id)
+        assert run.summary == "Implemented and tested"
+        assert run.metadata == {"tests": ["mcp-stdio"]}
 
 
 def test_read_only_status_and_list_do_not_init_or_create_sidecars(isolated_board, monkeypatch):

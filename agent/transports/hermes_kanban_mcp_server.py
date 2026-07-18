@@ -13,6 +13,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -817,6 +818,88 @@ def _build_server(*, allow_write: bool = False) -> Any:
     return mcp
 
 
+@contextlib.asynccontextmanager
+async def _stdio_transport():
+    """Compatibility stdio transport for the installed MCP SDK.
+
+    The SDK version used by Hermes exposes ``FastMCP.run_stdio_async()``, but
+    its stdin wrapper can stall on subprocess pipes in this environment.  Keep
+    FastMCP's server/session handling and replace only the line-oriented stdio
+    read/write loops.
+    """
+    try:
+        import anyio
+        from mcp import types
+        from mcp.shared.message import SessionMessage
+    except ImportError as exc:  # pragma: no cover - checked before run
+        raise ImportError(
+            f"hermes-kanban MCP server requires the 'mcp' package: {exc}"
+        ) from exc
+
+    read_writer, read_stream = anyio.create_memory_object_stream(0)
+    write_stream, write_reader = anyio.create_memory_object_stream(0)
+
+    async def stdin_reader() -> None:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stdin_fd = sys.stdin.fileno()
+
+        def on_stdin_ready() -> None:
+            line = sys.stdin.readline()
+            if line == "":
+                with contextlib.suppress(Exception):
+                    loop.remove_reader(stdin_fd)
+                queue.put_nowait(None)
+                return
+            queue.put_nowait(line)
+
+        loop.add_reader(stdin_fd, on_stdin_ready)
+        try:
+            async with read_writer:
+                while True:
+                    line = await queue.get()
+                    if line is None:
+                        break
+                    try:
+                        message = types.JSONRPCMessage.model_validate_json(line)
+                    except Exception as exc:  # pragma: no cover - malformed client input
+                        await read_writer.send(exc)
+                        continue
+                    await read_writer.send(SessionMessage(message))
+        except anyio.ClosedResourceError:  # pragma: no cover
+            await anyio.lowlevel.checkpoint()
+        finally:
+            with contextlib.suppress(Exception):
+                loop.remove_reader(stdin_fd)
+
+    async def stdout_writer() -> None:
+        try:
+            async with write_reader:
+                async for session_message in write_reader:
+                    data = session_message.message.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                    sys.stdout.write(data + "\n")
+                    sys.stdout.flush()
+        except anyio.ClosedResourceError:  # pragma: no cover
+            await anyio.lowlevel.checkpoint()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stdin_reader)
+        tg.start_soon(stdout_writer)
+        yield read_stream, write_stream
+
+
+async def _run_stdio(server: Any) -> None:
+    async with _stdio_transport() as (read_stream, write_stream):
+        await server._mcp_server.run(
+            read_stream,
+            write_stream,
+            server._mcp_server.create_initialization_options(),
+        )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     allow_write = "--allow-write" in argv
@@ -837,7 +920,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     try:
-        server.run()
+        import anyio
+
+        anyio.run(_run_stdio, server)
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
