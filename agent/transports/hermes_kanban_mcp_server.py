@@ -887,36 +887,74 @@ async def _stdio_transport():
 
     async def stdin_reader() -> None:
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue()
         stdin_fd = sys.stdin.fileno()
+        was_blocking = os.get_blocking(stdin_fd)
+        os.set_blocking(stdin_fd, False)
+        reader_removed = False
 
-        def on_stdin_ready() -> None:
-            line = sys.stdin.readline()
-            if line == "":
+        def remove_stdin_reader() -> None:
+            nonlocal reader_removed
+            if not reader_removed:
+                reader_removed = True
                 with contextlib.suppress(Exception):
                     loop.remove_reader(stdin_fd)
+
+        def on_stdin_ready() -> None:
+            try:
+                chunk = os.read(stdin_fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                remove_stdin_reader()
+                queue.put_nowait(exc)
+                return
+            if not chunk:
+                remove_stdin_reader()
                 queue.put_nowait(None)
                 return
-            queue.put_nowait(line)
+            queue.put_nowait(chunk)
 
-        loop.add_reader(stdin_fd, on_stdin_ready)
         try:
+            loop.add_reader(stdin_fd, on_stdin_ready)
             async with read_writer:
+                buffer = bytearray()
                 while True:
-                    line = await queue.get()
-                    if line is None:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        if buffer:
+                            try:
+                                message = types.JSONRPCMessage.model_validate_json(
+                                    bytes(buffer)
+                                )
+                            except Exception as exc:  # pragma: no cover - malformed client input
+                                await read_writer.send(exc)
+                            else:
+                                await read_writer.send(SessionMessage(message))
                         break
-                    try:
-                        message = types.JSONRPCMessage.model_validate_json(line)
-                    except Exception as exc:  # pragma: no cover - malformed client input
-                        await read_writer.send(exc)
-                        continue
-                    await read_writer.send(SessionMessage(message))
+                    if isinstance(chunk, Exception):
+                        await read_writer.send(chunk)
+                        break
+                    buffer.extend(chunk)
+                    while True:
+                        try:
+                            newline_index = buffer.index(b"\n")
+                        except ValueError:
+                            break
+                        line = bytes(buffer[:newline_index])
+                        del buffer[: newline_index + 1]
+                        try:
+                            message = types.JSONRPCMessage.model_validate_json(line)
+                        except Exception as exc:  # pragma: no cover - malformed client input
+                            await read_writer.send(exc)
+                            continue
+                        await read_writer.send(SessionMessage(message))
         except anyio.ClosedResourceError:  # pragma: no cover
             await anyio.lowlevel.checkpoint()
         finally:
-            with contextlib.suppress(Exception):
-                loop.remove_reader(stdin_fd)
+            remove_stdin_reader()
+            with contextlib.suppress(OSError):
+                os.set_blocking(stdin_fd, was_blocking)
 
     async def stdout_writer() -> None:
         try:

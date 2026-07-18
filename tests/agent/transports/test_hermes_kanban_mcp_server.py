@@ -108,6 +108,20 @@ async def _open_cli_kanban_session(tmp_path: Path, home: Path, db: Path, *args: 
                 yield session
 
 
+async def _read_jsonrpc_message(proc: asyncio.subprocess.Process, *, msg_id: int) -> dict:
+    assert proc.stdout is not None
+    while True:
+        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=2)
+        assert raw, f"server exited before response id={msg_id}; rc={proc.returncode}"
+        message = json.loads(raw)
+        if message.get("id") == msg_id:
+            return message
+
+
+def _jsonrpc_line(message: dict) -> bytes:
+    return (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 def test_default_tool_exposure_is_read_only():
     from agent.transports import hermes_kanban_mcp_server as m
 
@@ -194,6 +208,86 @@ def test_cli_stdio_read_only_smoke_no_db_mutation(tmp_path, monkeypatch):
     assert db.stat().st_mtime_ns == before_mtime
     for suffix in ("-wal", "-shm", ".init.lock"):
         assert not Path(str(db) + suffix).exists()
+
+
+def test_cli_stdio_coalesced_initialized_and_tools_list_returns(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    home, db = _init_temp_db(tmp_path, monkeypatch)
+
+    async def run_smoke():
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "mcp",
+            "serve-kanban",
+            cwd=PROJECT_ROOT,
+            env=_stdio_env(tmp_path, home, db),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(
+                _jsonrpc_line(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "pytest", "version": "0"},
+                        },
+                    }
+                )
+            )
+            await proc.stdin.drain()
+            initialized = await _read_jsonrpc_message(proc, msg_id=1)
+            assert "result" in initialized
+
+            coalesced = b"".join(
+                [
+                    _jsonrpc_line(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/initialized",
+                            "params": {},
+                        }
+                    ),
+                    _jsonrpc_line(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/list",
+                            "params": {},
+                        }
+                    ),
+                ]
+            )
+            proc.stdin.write(coalesced)
+            await proc.stdin.drain()
+
+            tools_list = await asyncio.wait_for(
+                _read_jsonrpc_message(proc, msg_id=2),
+                timeout=2,
+            )
+            assert "result" in tools_list
+            assert [tool["name"] for tool in tools_list["result"]["tools"]] == [
+                "kanban_board_status",
+                "kanban_list_tasks",
+            ]
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+
+    asyncio.run(run_smoke())
 
 
 def test_cli_stdio_write_mode_happy_path(tmp_path, monkeypatch):
