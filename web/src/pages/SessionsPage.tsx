@@ -78,6 +78,7 @@ import {
   SESSION_ROW_TITLE_CLASS,
   SESSION_SOURCE_BADGE_TEXT_CLASS,
   buildSessionSourceOptions,
+  createLatestSessionListRequestGuard,
   resetSessionSourceListState,
   sessionSourceLabel,
   sessionSourceQuery,
@@ -789,6 +790,7 @@ export default function SessionsPage() {
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const listRequestGuardRef = useRef(createLatestSessionListRequestGuard());
 
   const refreshEmptyCount = useCallback(() => {
     api
@@ -839,18 +841,21 @@ export default function SessionsPage() {
       // (triggered when the overview poll detects a new session from
       // another process) don't flicker the whole page or drop the user's
       // scroll position.
+      const requestId = listRequestGuardRef.current.next();
       if (!silent) setLoading(true);
       api
         .getSessions(PAGE_SIZE, p * PAGE_SIZE, {
           source: sessionSourceQuery(sourceFilter),
         })
         .then((resp) => {
+          if (!listRequestGuardRef.current.isLatest(requestId)) return;
           setSessions(resp.sessions);
           setTotal(resp.total);
         })
         .catch(() => {})
         .finally(() => {
-          if (!silent) setLoading(false);
+          if (!listRequestGuardRef.current.isLatest(requestId)) return;
+          setLoading(false);
         });
     },
     [sourceFilter],
@@ -1250,10 +1255,7 @@ export default function SessionsPage() {
     }
     setPruning(true);
     try {
-      const resp = await api.pruneSessions(
-        days,
-        sessionSourceQuery(sourceFilter),
-      );
+      const resp = await api.pruneSessions(days);
       showToast(
         `Pruned ${resp.removed} session${resp.removed === 1 ? "" : "s"}`,
         "success",
@@ -1267,7 +1269,7 @@ export default function SessionsPage() {
     } finally {
       setPruning(false);
     }
-  }, [pruneDays, showToast, loadSessions, loadStats, sourceFilter]);
+  }, [pruneDays, showToast, loadSessions, loadStats]);
 
   const pendingSession = sessionDelete.pendingId
     ? sessions.find((s) => s.id === sessionDelete.pendingId)

@@ -432,15 +432,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessions, profile: profile || undefined }),
     }),
-  pruneSessions: (
-    older_than_days: number,
-    source?: string,
-    profile = getManagementProfile(),
-  ) =>
+  pruneSessions: (older_than_days: number, profile = getManagementProfile()) =>
     fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
+      body: JSON.stringify({ older_than_days, profile: profile || undefined }),
     }),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
