@@ -11855,9 +11855,12 @@ class PairingRevoke(BaseModel):
 
 
 def _pairing_store():
+    from gateway.config import load_gateway_config
     from gateway.pairing import PairingStore
 
-    return PairingStore()
+    return PairingStore(
+        single_principal_policy=load_gateway_config().single_principal
+    )
 
 
 @app.get("/api/pairing")
@@ -11871,13 +11874,21 @@ async def list_pairing():
 
 @app.post("/api/pairing/approve")
 async def approve_pairing(body: PairingApprove):
+    from gateway.single_principal import SinglePrincipalPolicyError
+
     store = _pairing_store()
     platform = (body.platform or "").lower().strip()
     code = (body.code or "").upper().strip()
     if not platform or not code:
         raise HTTPException(status_code=400, detail="platform and code are required")
 
-    result = store.approve_code(platform, code)
+    try:
+        result = store.approve_code(platform, code)
+    except SinglePrincipalPolicyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Pairing approval denied by single-principal policy.",
+        )
     if result:
         return {"ok": True, "user": result}
     if store._is_locked_out(platform):

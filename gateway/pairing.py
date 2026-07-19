@@ -34,6 +34,7 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier,
 )
 from hermes_constants import get_hermes_dir, get_hermes_home
+from gateway.single_principal import SinglePrincipalPolicyError
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
@@ -248,7 +249,13 @@ class PairingStore:
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
 
-    def __init__(self, profile: Optional[str] = None):
+    def __init__(
+        self,
+        profile: Optional[str] = None,
+        *,
+        single_principal_policy=None,
+        read_only: bool = False,
+    ):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
         if profile:
@@ -256,8 +263,9 @@ class PairingStore:
             self._dir = get_hermes_home() / "profiles" / profile / "pairing"
         else:
             self._dir = PAIRING_DIR
-        self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
+        if not read_only:
+            self._dir.mkdir(parents=True, exist_ok=True)
+        if not profile and not read_only:
             # Heal installs whose global pairing data ended up split across
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).
@@ -266,6 +274,8 @@ class PairingStore:
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
         self._profile = profile  # for diagnostics / log lines
+        self._single_principal_policy = single_principal_policy
+        self._read_only = read_only
 
     @property
     def profile(self) -> Optional[str]:
@@ -286,6 +296,8 @@ class PairingStore:
             try:
                 return json.loads(path.read_text(encoding="utf-8"))
             except PermissionError as e:
+                if self._read_only:
+                    raise
                 # Surface this loudly: a 0600 file owned by a different user
                 # (classic Docker symptom: `docker exec` runs as root and writes
                 # the file, then the gateway process — running as `hermes` after
@@ -310,11 +322,22 @@ class PairingStore:
                 )
                 return {}
             except (json.JSONDecodeError, OSError):
+                if self._read_only:
+                    raise
                 return {}
         return {}
 
     def _save_json(self, path: Path, data: dict) -> None:
+        if self._read_only:
+            raise RuntimeError("pairing store is read-only")
         _secure_write(path, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _assert_identity_allowed(self, platform: str, user_id: str) -> None:
+        policy = self._single_principal_policy
+        if policy is not None and not policy.pairing_identity_allowed(platform, user_id):
+            raise SinglePrincipalPolicyError(
+                "pairing approval denied by single-principal policy"
+            )
 
     def _normalize_user_id(self, platform: str, user_id: str) -> str:
         """Normalize platform-specific user IDs before persisting them."""
@@ -363,6 +386,7 @@ class PairingStore:
 
     def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
         """Add a user to the approved list. Must be called under self._lock."""
+        self._assert_identity_allowed(platform, user_id)
         approved = self._load_json(self._approved_path(platform))
         normalized_user_id = self._normalize_user_id(platform, user_id)
         duplicate_ids = [
@@ -426,6 +450,10 @@ class PairingStore:
         The code is NOT stored in plaintext.  Only a salted SHA-256 hash is
         persisted so that reading the pending file does not reveal codes.
         """
+        try:
+            self._assert_identity_allowed(platform, user_id)
+        except SinglePrincipalPolicyError:
+            return None
         with self._lock:
             self._cleanup_expired(platform)
             normalized_user_id = self._normalize_user_id(platform, user_id)
@@ -523,6 +551,8 @@ class PairingStore:
             if matched_key is None:
                 self._record_failed_attempt(platform)
                 return None
+
+            self._assert_identity_allowed(platform, matched_entry["user_id"])
 
             del pending[matched_key]
             self._save_json(self._pending_path(platform), pending)
@@ -653,7 +683,9 @@ class PairingStore:
     def _all_platforms(self, suffix: str) -> list:
         """List all platforms that have data files of a given suffix."""
         platforms = []
-        for f in PAIRING_DIR.iterdir():
+        if not self._dir.exists():
+            return platforms
+        for f in self._dir.iterdir():
             if f.name.endswith(f"-{suffix}.json"):
                 platform = f.name.replace(f"-{suffix}.json", "")
                 if not platform.startswith("_"):

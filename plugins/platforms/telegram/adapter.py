@@ -866,6 +866,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
+        single_principal_enabled = bool(
+            getattr(
+                getattr(runner, "_single_principal_policy", None),
+                "enabled",
+                False,
+            )
+        )
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
@@ -886,6 +893,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return bool(auth_fn(source))
             except Exception:
+                if single_principal_enabled:
+                    return False
                 logger.debug(
                     "[Telegram] Falling back to env-only callback auth for user %s",
                     normalized_user_id,
@@ -985,6 +994,27 @@ class TelegramAdapter(BasePlatformAdapter):
         allowlist still pass through so the normal pairing flow can run.
         """
         source = self._source_from_message_for_auth(message)
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        single_principal_enabled = bool(
+            getattr(
+                getattr(runner, "_single_principal_policy", None),
+                "enabled",
+                False,
+            )
+        )
+        if single_principal_enabled:
+            if not callable(auth_fn):
+                return False
+            try:
+                return bool(auth_fn(source))
+            except Exception:
+                logger.warning(
+                    "[Telegram] Single-principal intake authorization failed",
+                    exc_info=True,
+                )
+                return False
+
         user_id = source.user_id
         # No identity at all → genuine group service message (pin, delete,
         # new_chat_members, etc.). Defer to the cold path. Channel posts
@@ -1019,8 +1049,6 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             # Only make an early decision via the runner when an allowlist
             # actually exists; otherwise unknown DMs must reach the pairing

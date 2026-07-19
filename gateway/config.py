@@ -18,6 +18,7 @@ from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from gateway.single_principal import SinglePrincipalPolicy
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -771,6 +772,9 @@ class GatewayConfig:
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
+    # Optional fail-closed owner boundary for personal gateways.
+    single_principal: SinglePrincipalPolicy = field(default_factory=SinglePrincipalPolicy)
+
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
@@ -890,6 +894,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
+            "single_principal": self.single_principal.to_dict(),
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -1012,6 +1017,9 @@ class GatewayConfig:
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
+            single_principal=SinglePrincipalPolicy.from_dict(
+                data.get("single_principal")
+            ),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
@@ -1140,6 +1148,8 @@ def load_gateway_config() -> GatewayConfig:
 
             gateway_section = yaml_cfg.get("gateway")
             if isinstance(gateway_section, dict):
+                if "single_principal" in gateway_section:
+                    gw_data["single_principal"] = gateway_section["single_principal"]
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]

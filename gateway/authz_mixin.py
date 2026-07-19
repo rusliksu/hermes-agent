@@ -288,6 +288,22 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
+        single_principal = getattr(self, "_single_principal_policy", None)
+        if single_principal is not None and single_principal.enabled:
+            upstream_authenticated = (
+                source.delivered_via_upstream_relay is True
+                or self._adapter_authorization_is_upstream(
+                    source.platform,
+                    profile=source.profile,
+                )
+            )
+            return bool(
+                single_principal.authorize(
+                    source,
+                    upstream_authenticated=upstream_authenticated,
+                )
+            )
+
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
