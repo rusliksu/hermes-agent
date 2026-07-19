@@ -308,6 +308,7 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+    restricted_shared_scope: bool = False
     
     # Session metadata
     session_key: str = ""
@@ -323,6 +324,7 @@ class SessionContext:
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
             "shared_multi_user_session": self.shared_multi_user_session,
+            "restricted_shared_scope": self.restricted_shared_scope,
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -513,6 +515,16 @@ def build_session_context_prompt(
         if redact_pii:
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")
+
+    if context.restricted_shared_scope:
+        lines.append("")
+        lines.append(
+            "**Shared-scope boundary:** This session can reply in the current "
+            "Telegram scope and use only its scoped memory. Other platforms, "
+            "home channels, local files, scheduled delivery, and private "
+            "destinations are unavailable."
+        )
+        return "\n".join(lines)
 
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
@@ -1404,9 +1416,17 @@ class SessionStore:
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        group_sessions_per_user = getattr(
+            self.config, "group_sessions_per_user", True
+        )
+        policy = getattr(self.config, "single_principal", None)
+        if policy is not None:
+            group_sessions_per_user = policy.group_sessions_per_user(
+                source, default=group_sessions_per_user
+            )
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            group_sessions_per_user=group_sessions_per_user,
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
@@ -2779,15 +2799,26 @@ def build_session_context(
         if home:
             home_channels[platform] = home
     
+    group_sessions_per_user = getattr(config, "group_sessions_per_user", True)
+    policy = getattr(config, "single_principal", None)
+    if policy is not None:
+        group_sessions_per_user = policy.group_sessions_per_user(
+            source, default=group_sessions_per_user
+        )
+
+    restricted_shared_scope = bool(
+        policy is not None and policy.shared_scope(source) is not None
+    )
     context = SessionContext(
         source=source,
         connected_platforms=connected,
         home_channels=home_channels,
         shared_multi_user_session=is_shared_multi_user_session(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            group_sessions_per_user=group_sessions_per_user,
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         ),
+        restricted_shared_scope=restricted_shared_scope,
     )
     
     if session_entry:

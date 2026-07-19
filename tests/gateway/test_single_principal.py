@@ -33,13 +33,14 @@ def _source(
     user_id=OWNER,
     *,
     platform=Platform.TELEGRAM,
+    chat_id="10001",
     chat_type="dm",
     thread_id=None,
     relay=False,
 ):
     return SessionSource(
         platform=platform,
-        chat_id="10001",
+        chat_id=chat_id,
         chat_type=chat_type,
         user_id=user_id,
         thread_id=thread_id,
@@ -87,6 +88,216 @@ def test_policy_parser_and_redacted_validation():
     assert "-123" not in rendered
 
 
+def test_shared_policy_authorizes_exact_group_and_hashes_scope_identity():
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    root = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+    )
+    topic = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+
+    assert policy.authorize(root) is True
+    assert policy.authorize(topic) is True
+    assert policy.authorize(
+        _source(OUTSIDER, chat_id="-20002", chat_type="group")
+    ) is False
+    assert policy.authorize(
+        _source(OUTSIDER, chat_id="-10001", chat_type="channel")
+    ) is False
+    bot_source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    bot_source.is_bot = True
+    assert policy.authorize(bot_source) is False
+
+    root_scope = policy.shared_scope(root)
+    topic_scope = policy.shared_scope(topic)
+    assert root_scope is not None
+    assert topic_scope is not None
+    assert root_scope.memory_namespace != topic_scope.memory_namespace
+    assert "-10001" not in root_scope.memory_namespace
+    assert "31" not in topic_scope.memory_namespace
+
+
+def test_shared_policy_session_keys_are_per_chat_and_topic_not_sender(tmp_path):
+    from gateway.session import (
+        SessionStore,
+        build_session_context,
+        build_session_context_prompt,
+    )
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    config = GatewayConfig(single_principal=policy)
+    store = SessionStore(sessions_dir=tmp_path, config=config)
+
+    alice_root = _source(OWNER, chat_id="-10001", chat_type="group")
+    bob_root = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    alice_topic = _source(
+        OWNER, chat_id="-10001", chat_type="group", thread_id="31"
+    )
+    bob_topic = _source(
+        OUTSIDER, chat_id="-10001", chat_type="group", thread_id="31"
+    )
+    other_topic = _source(
+        OUTSIDER, chat_id="-10001", chat_type="group", thread_id="32"
+    )
+
+    assert store._generate_session_key(alice_root) == store._generate_session_key(
+        bob_root
+    )
+    assert store._generate_session_key(alice_topic) == store._generate_session_key(
+        bob_topic
+    )
+    assert store._generate_session_key(alice_root) != store._generate_session_key(
+        alice_topic
+    )
+    assert store._generate_session_key(alice_topic) != store._generate_session_key(
+        other_topic
+    )
+
+    context = build_session_context(alice_topic, config)
+    prompt = build_session_context_prompt(context)
+    assert context.restricted_shared_scope is True
+    assert "Shared-scope boundary" in prompt
+    assert "Connected Platforms" not in prompt
+    assert "Home Channels" not in prompt
+    assert "Delivery options" not in prompt
+
+
+def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
+    tmp_path, monkeypatch
+):
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    scope = policy.shared_scope(source)
+    assert scope is not None
+
+    runner = _runner(policy)
+    runner.config = GatewayConfig(single_principal=policy)
+    assert runner._check_slash_access(source, "help") is None
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        source, "restart"
+    )
+
+    import gateway.run as run_module
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    agent = SimpleNamespace(valid_tool_names={"memory"})
+    runner._bind_shared_memory(agent, scope, {})
+
+    assert agent._memory_enabled is True
+    assert agent._user_profile_enabled is False
+    assert agent._memory_manager is None
+    assert agent._skip_mcp_refresh is True
+    assert agent._memory_store.allow_user_profile is False
+    assert agent._memory_store.memory_dir.is_relative_to(
+        tmp_path / "memories" / "shared" / "telegram"
+    )
+
+    from model_tools import get_tool_definitions
+
+    tool_names = {
+        definition["function"]["name"]
+        for definition in get_tool_definitions(
+            enabled_toolsets=["memory"], disabled_toolsets=["kanban"]
+        )
+    }
+    assert tool_names == {"memory"}
+
+    with pytest.raises(RuntimeError, match="shared capability profile"):
+        runner._bind_shared_memory(
+            SimpleNamespace(valid_tool_names={"memory", "terminal"}),
+            scope,
+            {},
+        )
+
+
+def test_shared_memory_canary_matrix_survives_reload_without_cross_scope_leakage(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+    from tools.memory_tool import MemoryStore
+
+    policy = _policy(telegram_shared_chat_ids=["-10001", "-20002"])
+    runner = _runner(policy)
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+
+    sources = {
+        "group-root": _source(OWNER, chat_id="-10001", chat_type="group"),
+        "general": _source(
+            OWNER, chat_id="-10001", chat_type="group", thread_id="1"
+        ),
+        "topic-a": _source(
+            OUTSIDER, chat_id="-10001", chat_type="group", thread_id="31"
+        ),
+        "topic-b": _source(
+            OUTSIDER, chat_id="-10001", chat_type="group", thread_id="32"
+        ),
+        "other-group": _source(
+            OUTSIDER, chat_id="-20002", chat_type="group", thread_id="31"
+        ),
+    }
+    stores = {}
+    for label, source in sources.items():
+        scope = policy.shared_scope(source)
+        assert scope is not None
+        agent = SimpleNamespace(valid_tool_names={"memory"})
+        runner._bind_shared_memory(agent, scope, {})
+        assert agent._memory_store.add("memory", f"canary-{label}")["success"]
+        stores[label] = agent._memory_store
+
+    personal = MemoryStore(memory_dir=tmp_path / "memories")
+    personal.load_from_disk()
+    assert personal.add("memory", "canary-personal")["success"]
+
+    reloaded = {
+        label: MemoryStore(
+            memory_dir=store.memory_dir,
+            allow_user_profile=False,
+        )
+        for label, store in stores.items()
+    }
+    reloaded["personal"] = MemoryStore(memory_dir=tmp_path / "memories")
+    for store in reloaded.values():
+        store.load_from_disk()
+
+    for label, store in reloaded.items():
+        assert store.memory_entries == [f"canary-{label}"]
+
+    from agent.system_prompt import invalidate_system_prompt
+
+    topic_agent = SimpleNamespace(
+        _cached_system_prompt="stale",
+        _memory_store=reloaded["topic-a"],
+    )
+    invalidate_system_prompt(topic_agent)
+    assert topic_agent._cached_system_prompt is None
+    assert "canary-topic-a" in (
+        topic_agent._memory_store.format_for_system_prompt("memory") or ""
+    )
+
+
+@pytest.mark.parametrize(
+    "shared_ids,category",
+    [
+        (["*"], "wildcard_shared_scope"),
+        (["not-a-chat"], "malformed_shared_scope"),
+    ],
+)
+def test_shared_policy_validation_is_redacted(shared_ids, category):
+    policy = _policy(telegram_shared_chat_ids=shared_ids)
+    report = validate_single_principal_policy(policy, environ={})
+    rendered = json.dumps(report.as_dict())
+    assert report.verdict == "fail"
+    assert dict(report.conflicts)[category] == 1
+    for value in shared_ids:
+        assert value not in rendered
+
+
 @pytest.mark.parametrize(
     "raw,category",
     [
@@ -94,6 +305,14 @@ def test_policy_parser_and_redacted_validation():
         ({"enabled": True, "telegram_owner_id": "*"}, "wildcard_owner"),
         ({"enabled": "invalid", "telegram_owner_id": OWNER}, "malformed_policy"),
         ({"enabled_typo": True, "telegram_owner_id": OWNER}, "malformed_policy"),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_shared_chat_ids": "-10001",
+            },
+            "malformed_policy",
+        ),
     ],
 )
 def test_invalid_policy_fails_without_identity(raw, category):
