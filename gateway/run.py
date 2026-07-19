@@ -2980,6 +2980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self._single_principal_policy = self.config.single_principal
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -3280,8 +3281,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``authz_mixin._is_user_authorized`` to route checks to the right
         # whitelist (one per profile in multiplex mode).
         from gateway.pairing import PairingStore
-        self.pairing_store = PairingStore()
+        self.pairing_store = PairingStore(
+            single_principal_policy=self._single_principal_policy
+        )
         self.pairing_stores: Dict[str, "PairingStore"] = {}
+        if (
+            self._single_principal_policy.enabled
+            or self._single_principal_policy.config_error_count
+        ):
+            from gateway.single_principal import require_valid_single_principal_policy
+
+            require_valid_single_principal_policy(
+                self._single_principal_policy,
+                gateway_config=self.config,
+                pairing_store=self.pairing_store,
+                require_enabled=True,
+            )
         
         # Event hook system
         from gateway.hooks import HookRegistry
@@ -9275,6 +9290,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+
+        # Personal gateways reject non-owner ingress before plugins, sessions,
+        # memory, model, or tools can observe the event.
+        if (
+            not is_internal
+            and getattr(
+                getattr(self, "_single_principal_policy", None), "enabled", False
+            )
+            and not self._is_user_authorized(source)
+        ):
+            logger.warning(
+                "Single-principal ingress denied: platform=%s chat_type=%s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_type or "unknown",
+            )
+            return None
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events

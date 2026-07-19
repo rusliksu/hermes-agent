@@ -10,9 +10,12 @@ Usage:
 
 def pairing_command(args):
     """Handle hermes pairing subcommands."""
+    from gateway.config import load_gateway_config
     from gateway.pairing import PairingStore
 
-    store = PairingStore()
+    store = PairingStore(
+        single_principal_policy=load_gateway_config().single_principal
+    )
     action = getattr(args, "pairing_action", None)
 
     if action == "list":
@@ -63,10 +66,16 @@ def _cmd_list(store):
 
 def _cmd_approve(store, platform: str, code: str):
     """Approve a pairing code."""
+    from gateway.single_principal import SinglePrincipalPolicyError
+
     platform = platform.lower().strip()
     code = code.upper().strip()
 
-    result = store.approve_code(platform, code)
+    try:
+        result = store.approve_code(platform, code)
+    except SinglePrincipalPolicyError:
+        print("\n  Pairing approval denied by single-principal policy.\n")
+        return
     if result:
         uid = result["user_id"]
         name = result.get("user_name") or ""
