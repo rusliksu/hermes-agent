@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -178,10 +179,14 @@ def _attach_single_principal(adapter, shared_chat_ids):
     class Runner:
         _single_principal_policy = policy
 
+        def __init__(self):
+            self.handle_calls = 0
+
         def _is_user_authorized(self, source):
             return bool(policy.authorize(source))
 
         async def handle(self, _event):
+            self.handle_calls += 1
             return None
 
     runner = Runner()
@@ -267,21 +272,161 @@ def test_single_principal_general_forum_topic_keeps_stable_thread_identity():
     assert event.source.thread_id == "1"
 
 
-def test_single_principal_shared_scope_disables_observation_and_callbacks():
+def test_single_principal_shared_scope_enables_text_observation_but_disables_callbacks():
     adapter = _make_adapter(
-        require_mention=True,
+        require_mention=False,
         observe_unmentioned_group_messages=True,
-        group_allowed_chats=["-100"],
     )
     _attach_single_principal(adapter, ["-100"])
     message = _group_message("ambient", chat_id=-100)
 
-    assert adapter._should_observe_unmentioned_group_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is True
     assert adapter._is_callback_user_authorized(
         "111",
         chat_id="-100",
         chat_type="group",
     ) is False
+
+    disabled = _make_adapter(require_mention=True)
+    _attach_single_principal(disabled, ["-100"])
+    assert disabled._should_observe_unmentioned_group_message(message) is False
+
+
+def test_single_principal_passive_observation_denies_unknown_bot_anonymous_and_media():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+    )
+    _attach_single_principal(adapter, ["-100"])
+
+    assert adapter._should_observe_unmentioned_group_message(
+        _group_message("ambient", chat_id=-200)
+    ) is False
+    assert adapter._should_observe_unmentioned_group_message(
+        _group_message("ambient", chat_id=-100, from_user_is_bot=True)
+    ) is False
+
+    anonymous = _group_message("ambient", chat_id=-100)
+    anonymous.from_user = None
+    assert adapter._should_observe_unmentioned_group_message(anonymous) is False
+
+    media = _group_message(None, chat_id=-100, caption="photo caption")
+    media.photo = [SimpleNamespace()]
+    assert adapter._should_observe_unmentioned_group_message(media) is False
+
+
+def test_single_principal_passive_text_is_observed_without_dispatch_or_legacy_grants():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            observe_unmentioned_group_messages=True,
+        )
+        runner = _attach_single_principal(adapter, ["-100"])
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        message = _group_message("side chatter", chat_id=-100)
+        update = SimpleNamespace(update_id=1005, message=message, effective_message=None)
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert runner.handle_calls == 0
+        assert len(store.messages) == 1
+        _, observed, _ = store.messages[0]
+        assert observed["content"] == "[Alice Example]\nside chatter"
+        assert observed["observed"] is True
+        assert store.sources[0].user_id is None
+        assert store.sources[0].chat_id == "-100"
+
+    asyncio.run(_run())
+
+
+def test_single_principal_trigger_keeps_sender_for_auth_and_uses_redacted_attribution():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+    )
+    runner = _attach_single_principal(adapter, ["-100"])
+    text = "@hermes_bot what happened?"
+    message = _group_message(
+        text,
+        chat_id=-100,
+        from_user_id=222,
+        from_user_name="Bob Example",
+        entities=[_mention_entity(text)],
+    )
+    event = adapter._build_message_event(message, MessageType.TEXT)
+    event.text = adapter._clean_bot_trigger_text(event.text)
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+
+    assert runner._is_user_authorized(attributed.source) is True
+    assert attributed.source.user_id == "222"
+    assert attributed.text == "[Bob Example]\nwhat happened?"
+    assert "222" not in attributed.channel_prompt
+    assert "user_id=" not in attributed.channel_prompt
+
+
+def test_single_principal_passive_sources_keep_group_and_topic_isolation():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+    )
+    _attach_single_principal(adapter, ["-100", "-200"])
+    store = _ScopedFakeSessionStore()
+    adapter._session_store = store
+
+    messages = [
+        _group_message("general", chat_id=-100, thread_id=None, is_forum=True),
+        _group_message("topic seven", chat_id=-100, thread_id=7, is_forum=True),
+        _group_message("topic eight", chat_id=-100, thread_id=8, is_forum=True),
+        _group_message("other group", chat_id=-200, thread_id=7, is_forum=True),
+    ]
+    for message in messages:
+        adapter._observe_unmentioned_group_message(message, MessageType.TEXT)
+
+    assert [source.thread_id for source in store.sources] == ["1", "7", "8", "7"]
+    session_ids = [session_id for session_id, _, _ in store.messages]
+    assert len(session_ids) == len(set(session_ids)) == 4
+
+
+def test_single_principal_passive_context_survives_session_store_restart(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+    from gateway.config import GatewayConfig
+    from gateway.run import _build_gateway_agent_history
+    from gateway.session import SessionStore
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+    )
+    runner = _attach_single_principal(adapter, ["-100"])
+    config = GatewayConfig(single_principal=runner._single_principal_policy)
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir=sessions_dir, config=config)
+    adapter._session_store = store
+    message = _group_message("persisted chatter", chat_id=-100, thread_id=7)
+
+    adapter._observe_unmentioned_group_message(message, MessageType.TEXT)
+    source = adapter._telegram_group_observe_shared_source(
+        adapter._build_message_event(message, MessageType.TEXT).source
+    )
+    original_entry = store.get_or_create_session(source)
+    store._db.close()
+
+    restarted = SessionStore(sessions_dir=sessions_dir, config=config)
+    recovered_entry = restarted.get_or_create_session(source)
+    history = restarted.load_transcript(recovered_entry.session_id)
+    _, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Telegram group context",
+    )
+
+    assert recovered_entry.session_id == original_entry.session_id
+    assert observed_context == "[Alice Example]\npersisted chatter"
+    restarted._db.close()
 
 
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():
@@ -359,10 +504,11 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
         _wrap_current_message_with_observed_context,
     )
 
+    timestamp = datetime.now(timezone.utc).isoformat()
     history = [
         {"role": "session_meta", "content": "tool defs"},
-        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
-        {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True},
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True, "timestamp": timestamp},
+        {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True, "timestamp": timestamp},
         {"role": "assistant", "content": "previous explicit reply"},
     ]
 
@@ -391,7 +537,12 @@ def test_observed_group_context_does_not_hide_current_user_turn_behind_history_o
     )
 
     history = [
-        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+        {
+            "role": "user",
+            "content": "[Alice|111]\nAcha que dá fazer estoque?",
+            "observed": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
     ]
     agent_history, observed_context = _build_gateway_agent_history(
         history,
@@ -439,6 +590,26 @@ def test_observed_group_context_replays_normally_without_telegram_prompt():
 
     assert observed_context is None
     assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+
+
+def test_observed_group_context_is_bounded_by_age_count_and_chars():
+    from gateway.run import _bounded_observed_group_context
+
+    now = datetime.now(timezone.utc)
+    fresh = now.isoformat()
+    stale = (now - timedelta(hours=7)).isoformat()
+
+    count_rows = [(f"message-{index:02d}", fresh) for index in range(60)]
+    count_context = _bounded_observed_group_context(count_rows, now=now.timestamp())
+    assert count_context is not None
+    assert count_context.splitlines() == [f"message-{index:02d}" for index in range(10, 60)]
+
+    char_rows = [(label * 7000, fresh) for label in ("a", "b", "c", "d")]
+    char_context = _bounded_observed_group_context(char_rows, now=now.timestamp())
+    assert char_context == f"{'c' * 7000}\n{'d' * 7000}"
+
+    age_rows = [("stale", stale), ("missing", None), ("fresh", fresh)]
+    assert _bounded_observed_group_context(age_rows, now=now.timestamp()) == "fresh"
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():
@@ -555,6 +726,16 @@ class _FakeSessionStore:
 
     def append_to_transcript(self, session_id, message, skip_db=False):
         self.messages.append((session_id, message, skip_db))
+
+
+class _ScopedFakeSessionStore(_FakeSessionStore):
+    def get_or_create_session(self, source):
+        from gateway.session import build_session_key
+
+        self.sources.append(source)
+        return SimpleNamespace(
+            session_id=build_session_key(source, group_sessions_per_user=False)
+        )
 
 
 def test_group_messages_can_require_direct_trigger_via_config():

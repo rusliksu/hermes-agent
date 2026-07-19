@@ -871,6 +871,9 @@ def _build_replay_entry(
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
 _OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
+_OBSERVED_GROUP_CONTEXT_MAX_MESSAGES = 50
+_OBSERVED_GROUP_CONTEXT_MAX_CHARS = 20_000
+_OBSERVED_GROUP_CONTEXT_MAX_AGE_SECONDS = 6 * 60 * 60
 
 
 def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
@@ -885,6 +888,31 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     """
 
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+
+
+def _bounded_observed_group_context(
+    rows: List[tuple[str, Any]], *, now: Optional[float] = None
+) -> Optional[str]:
+    """Return the newest timestamped observed rows within prompt limits."""
+    from gateway.message_timestamps import coerce_message_timestamp
+
+    current = time.time() if now is None else now
+    recent: List[str] = []
+    for content, timestamp in rows:
+        epoch = coerce_message_timestamp(timestamp)
+        if epoch is None or current - epoch > _OBSERVED_GROUP_CONTEXT_MAX_AGE_SECONDS:
+            continue
+        recent.append(content)
+
+    selected: List[str] = []
+    total_chars = 0
+    for content in reversed(recent[-_OBSERVED_GROUP_CONTEXT_MAX_MESSAGES:]):
+        added_chars = len(content) + (1 if selected else 0)
+        if total_chars + added_chars > _OBSERVED_GROUP_CONTEXT_MAX_CHARS:
+            break
+        selected.append(content)
+        total_chars += added_chars
+    return "\n".join(reversed(selected)).strip() or None
 
 
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
@@ -933,7 +961,7 @@ def _build_gateway_agent_history(
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
-    observed_group_context: List[str] = []
+    observed_group_context: List[tuple[str, Any]] = []
     separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
 
     for msg in history or []:
@@ -954,7 +982,7 @@ def _build_gateway_agent_history(
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
-            observed_group_context.append(str(content).strip())
+            observed_group_context.append((str(content).strip(), msg.get("timestamp")))
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -1008,7 +1036,7 @@ def _build_gateway_agent_history(
         agent_history, now=time.time()
     )
 
-    observed_context = "\n".join(observed_group_context).strip() or None
+    observed_context = _bounded_observed_group_context(observed_group_context)
     return agent_history, observed_context
 
 
