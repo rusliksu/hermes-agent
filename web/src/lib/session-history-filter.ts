@@ -27,6 +27,19 @@ export interface LatestSessionListRequestGuard {
   isLatest: (requestId: number) => boolean;
 }
 
+export type SessionOwnerKind = "named" | "masked_id" | "unknown";
+
+export interface SessionOwnerFields {
+  source?: string | null;
+  owner_label?: string | null;
+  owner_kind?: SessionOwnerKind | null;
+}
+
+export interface TelegramOwnerChip {
+  label: string;
+  kind: SessionOwnerKind;
+}
+
 export function createLatestSessionListRequestGuard(): LatestSessionListRequestGuard {
   let latestRequestId = 0;
   return {
@@ -36,6 +49,19 @@ export function createLatestSessionListRequestGuard(): LatestSessionListRequestG
     },
     isLatest: (requestId) => requestId === latestRequestId,
   };
+}
+
+export function telegramOwnerChip(
+  session: SessionOwnerFields,
+): TelegramOwnerChip | null {
+  if ((session.source ?? "").trim().toLowerCase() !== "telegram") return null;
+  const kind = session.owner_kind;
+  if (kind === "unknown") {
+    return { label: "Владелец неизвестен", kind };
+  }
+  if (kind !== "named" && kind !== "masked_id") return null;
+  const label = (session.owner_label ?? "").trim();
+  return label ? { label, kind } : null;
 }
 
 export function sessionSourceQuery(source: string): string | undefined {

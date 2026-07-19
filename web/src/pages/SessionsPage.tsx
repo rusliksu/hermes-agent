@@ -82,6 +82,7 @@ import {
   resetSessionSourceListState,
   sessionSourceLabel,
   sessionSourceQuery,
+  telegramOwnerChip,
   type SessionsView,
 } from "@/lib/session-history-filter";
 
@@ -433,6 +434,7 @@ function SessionRow({
     : null) ?? { icon: Globe, color: "text-muted-foreground" };
   const SourceIcon = sourceInfo.icon;
   const hasTitle = session.title && session.title !== "Untitled";
+  const ownerChip = telegramOwnerChip(session);
 
   const submitRename = async () => {
     const value = renameValue.trim();
@@ -459,6 +461,17 @@ function SessionRow({
           {sessionSourceLabel(session.source ?? "local")}
         </span>
       </Badge>
+
+      {ownerChip && (
+        <Badge
+          tone="secondary"
+          className="max-w-[12rem] text-xs normal-case tracking-normal"
+        >
+          <span className="min-w-0 truncate font-sans">
+            {ownerChip.label}
+          </span>
+        </Badge>
+      )}
 
       {resumeInChatEnabled && (
         <Button

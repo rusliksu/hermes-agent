@@ -1241,6 +1241,179 @@ class TestWebServerEndpoints:
         assert row["system_prompt"].startswith("# SOUL.md")
         assert "temperature" in (row["model_config"] or "")
 
+    def _create_gateway_row(
+        self,
+        session_id: str,
+        *,
+        source: str = "telegram",
+        chat_type: str = "dm",
+        user_id: str | None = None,
+        display_name: str | None = None,
+        origin: dict | None = None,
+        started_at: float | None = None,
+        parent_session_id: str | None = None,
+    ) -> None:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id=session_id,
+                source=source,
+                user_id=user_id,
+                chat_type=chat_type,
+                parent_session_id=parent_session_id,
+            )
+            db.record_gateway_session_peer(
+                session_id,
+                source=source,
+                user_id=user_id,
+                session_key=f"agent:main:{source}:{chat_type}:chat-{session_id}:{user_id or 'u'}",
+                chat_id=f"chat-{session_id}",
+                chat_type=chat_type,
+                display_name=display_name,
+                origin_json=json.dumps(origin) if origin is not None else None,
+            )
+            if started_at is not None:
+                db._conn.execute(
+                    "UPDATE sessions SET started_at=? WHERE id=?",
+                    (started_at, session_id),
+                )
+                db._conn.commit()
+        finally:
+            db.close()
+
+    def _session_row(self, session_id: str, query: str = "") -> dict:
+        resp = self.client.get(f"/api/sessions{query}")
+        assert resp.status_code == 200
+        return next(s for s in resp.json()["sessions"] if s["id"] == session_id)
+
+    def test_get_sessions_telegram_group_uses_sender_name_not_group_name(self):
+        self._create_gateway_row(
+            "tg-group",
+            chat_type="group",
+            user_id="test-user-1",
+            display_name="Project Group",
+            origin={
+                "platform": "telegram",
+                "chat_type": "group",
+                "chat_name": "Project Group",
+                "user_id": "test-user-1",
+                "user_name": "Sender One",
+            },
+        )
+
+        row = self._session_row("tg-group")
+        assert row["owner_kind"] == "named"
+        assert row["owner_label"] == "Sender One"
+        assert row["owner_label"] != "Project Group"
+
+    def test_get_sessions_telegram_private_dm_falls_back_to_display_name(self):
+        self._create_gateway_row(
+            "tg-dm-display",
+            chat_type="dm",
+            user_id="test-user-2",
+            display_name="Private Person",
+            origin={"platform": "telegram", "chat_type": "dm", "user_id": "test-user-2"},
+        )
+
+        row = self._session_row("tg-dm-display")
+        assert row["owner_kind"] == "named"
+        assert row["owner_label"] == "Private Person"
+
+    def test_get_sessions_telegram_masks_id_when_name_missing(self):
+        self._create_gateway_row(
+            "tg-mask",
+            chat_type="group",
+            user_id="123456789",
+            display_name="Group Name",
+            origin={"platform": "telegram", "chat_type": "group", "user_id": "123456789"},
+        )
+
+        row = self._session_row("tg-mask")
+        assert row["owner_kind"] == "masked_id"
+        assert row["owner_label"].startswith("ID #")
+        assert "123456789" not in row["owner_label"]
+
+    def test_get_sessions_telegram_unknown_owner(self):
+        self._create_gateway_row(
+            "tg-unknown",
+            chat_type="group",
+            display_name="Group Name",
+            origin={"platform": "telegram", "chat_type": "group", "chat_name": "Group Name"},
+        )
+
+        row = self._session_row("tg-unknown")
+        assert row["owner_kind"] == "unknown"
+        assert row["owner_label"] == "Владелец неизвестен"
+
+    def test_get_sessions_non_telegram_omits_owner_fields(self):
+        self._create_gateway_row(
+            "cli-row",
+            source="cli",
+            chat_type="dm",
+            user_id="cli-user",
+            display_name="CLI User",
+            origin={"platform": "cli", "chat_type": "dm", "user_name": "CLI User"},
+        )
+
+        row = self._session_row("cli-row")
+        assert "owner_kind" not in row
+        assert "owner_label" not in row
+
+    def test_get_sessions_owner_fields_respect_source_filter_and_pagination(self):
+        self._create_gateway_row("cli-newer", source="cli", started_at=300)
+        self._create_gateway_row(
+            "tg-newer",
+            user_id="tg-newer-user",
+            origin={"platform": "telegram", "chat_type": "dm", "user_name": "Newer"},
+            started_at=200,
+        )
+        self._create_gateway_row(
+            "tg-older",
+            user_id="tg-older-user",
+            origin={"platform": "telegram", "chat_type": "dm", "user_name": "Older"},
+            started_at=100,
+        )
+
+        resp = self.client.get("/api/sessions?source=telegram&limit=1&offset=1")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 2
+        assert [s["id"] for s in body["sessions"]] == ["tg-older"]
+        assert body["sessions"][0]["owner_label"] == "Older"
+
+    def test_get_sessions_compression_projection_uses_tip_owner(self):
+        self._create_gateway_row(
+            "tg-root",
+            user_id="root-user",
+            origin={"platform": "telegram", "chat_type": "dm", "user_name": "Root Owner"},
+            started_at=100,
+        )
+        self._create_gateway_row(
+            "tg-tip",
+            user_id="tip-user",
+            origin={"platform": "telegram", "chat_type": "dm", "user_name": "Tip Owner"},
+            started_at=200,
+            parent_session_id="tg-root",
+        )
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db._conn.execute(
+                "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
+                (150, "tg-root"),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        row = self._session_row("tg-tip", "?source=telegram&limit=20")
+        assert row["_lineage_root_id"] == "tg-root"
+        assert row["owner_kind"] == "named"
+        assert row["owner_label"] == "Tip Owner"
+
     def test_profiles_sessions_strips_heavy_fields_by_default(self):
         """The cross-profile aggregate applies the same list projection."""
         self._create_session_with_heavy_fields("lean-profiles-row")

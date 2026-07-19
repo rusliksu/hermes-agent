@@ -3959,6 +3959,8 @@ class SessionDB:
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                    "source", "user_id", "session_key", "chat_id", "chat_type",
+                    "thread_id", "display_name", "origin_json",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]

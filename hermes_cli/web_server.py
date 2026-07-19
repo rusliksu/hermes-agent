@@ -4027,6 +4027,73 @@ async def get_action_status(name: str, lines: int = 200):
 # them; ``GET /api/sessions/{id}`` detail reads stay complete. List callers
 # that genuinely need the full rows can pass ``?full=1``.
 _SESSION_LIST_HEAVY_FIELDS = ("system_prompt", "model_config")
+_TELEGRAM_DM_CHAT_TYPES = {"", "dm", "direct", "private"}
+_OWNER_KIND_NAMED = "named"
+_OWNER_KIND_MASKED = "masked_id"
+_OWNER_KIND_UNKNOWN = "unknown"
+
+
+def _clean_owner_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _telegram_owner_mask(user_id: str) -> str:
+    digest = hashlib.sha256(f"telegram-owner:{user_id}".encode("utf-8")).hexdigest()
+    return f"ID #{digest[:10]}"
+
+
+def _telegram_origin_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("origin_json")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _telegram_owner_fields(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    if str(row.get("source") or "").strip().lower() != "telegram":
+        return None
+
+    origin = _telegram_origin_dict(row)
+    user_name = _clean_owner_value(origin.get("user_name"))
+    if user_name:
+        return {"owner_label": user_name, "owner_kind": _OWNER_KIND_NAMED}
+
+    chat_type = _clean_owner_value(origin.get("chat_type")) or _clean_owner_value(
+        row.get("chat_type")
+    )
+    if (chat_type or "").lower() in _TELEGRAM_DM_CHAT_TYPES:
+        display_name = _clean_owner_value(row.get("display_name"))
+        if display_name:
+            return {"owner_label": display_name, "owner_kind": _OWNER_KIND_NAMED}
+
+    user_id = _clean_owner_value(origin.get("user_id")) or _clean_owner_value(
+        row.get("user_id")
+    )
+    if user_id:
+        return {
+            "owner_label": _telegram_owner_mask(user_id),
+            "owner_kind": _OWNER_KIND_MASKED,
+        }
+
+    return {
+        "owner_label": "Владелец неизвестен",
+        "owner_kind": _OWNER_KIND_UNKNOWN,
+    }
+
+
+def _add_session_owner_fields(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for session in sessions:
+        fields = _telegram_owner_fields(session)
+        if fields:
+            session.update(fields)
+    return sessions
 
 
 def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4113,6 +4180,7 @@ def get_sessions(
                 exclude_children=True,
             )
             now = time.time()
+            _add_session_owner_fields(sessions)
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
@@ -10086,6 +10154,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        _add_session_owner_fields([session])
         if profile:
             session["profile"] = _cron_profile_home(profile)[0]
         return session

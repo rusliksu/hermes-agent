@@ -1845,6 +1845,8 @@ export interface StatusResponse {
 export interface SessionInfo {
   id: string;
   source: string | null;
+  owner_label?: string | null;
+  owner_kind?: "named" | "masked_id" | "unknown" | null;
   model: string | null;
   title: string | null;
   started_at: number;

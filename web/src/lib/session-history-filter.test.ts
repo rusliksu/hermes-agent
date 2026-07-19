@@ -9,6 +9,7 @@ import {
   createLatestSessionListRequestGuard,
   resetSessionSourceListState,
   sessionSourceQuery,
+  telegramOwnerChip,
 } from "./session-history-filter";
 
 describe("session history filter helpers", () => {
@@ -97,5 +98,41 @@ describe("session history filter helpers", () => {
     }
 
     expect(state).toEqual({ sessions: ["new-source"], total: 2, loading: false });
+  });
+
+  it("builds Telegram owner chips for named, masked, and unknown owners", () => {
+    expect(
+      telegramOwnerChip({
+        source: "telegram",
+        owner_kind: "named",
+        owner_label: "Sender One",
+      }),
+    ).toEqual({ kind: "named", label: "Sender One" });
+
+    expect(
+      telegramOwnerChip({
+        source: "telegram",
+        owner_kind: "masked_id",
+        owner_label: "ID #abcdef1234",
+      }),
+    ).toEqual({ kind: "masked_id", label: "ID #abcdef1234" });
+
+    expect(
+      telegramOwnerChip({
+        source: "telegram",
+        owner_kind: "unknown",
+        owner_label: "ignored",
+      }),
+    ).toEqual({ kind: "unknown", label: "Владелец неизвестен" });
+  });
+
+  it("does not build an owner chip for non-Telegram sessions", () => {
+    expect(
+      telegramOwnerChip({
+        source: "cli",
+        owner_kind: "named",
+        owner_label: "CLI User",
+      }),
+    ).toBeNull();
   });
 });
