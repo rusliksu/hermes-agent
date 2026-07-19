@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-18
+goal: Сделать /sessions удобным для Telegram-first истории без изменения backend
+  search и без live-деплоя до отдельного разрешения
