@@ -242,6 +242,7 @@ def test_validator_fails_closed_when_pairing_store_is_unreadable():
 def test_cli_preflight_output_is_redacted(monkeypatch, capsys):
     import gateway.config as config_module
     import gateway.pairing as pairing_module
+    import hermes_cli.config as cli_config_module
     from gateway.single_principal import main
 
     for key in (
@@ -257,6 +258,11 @@ def test_cli_preflight_output_is_redacted(monkeypatch, capsys):
 
     config = GatewayConfig(single_principal=_policy())
     monkeypatch.setattr(config_module, "load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        cli_config_module,
+        "load_env",
+        lambda: {"GATEWAY_ALLOW_ALL_USERS": "true", "UNRELATED_TOKEN": "secret"},
+    )
 
     class ReadOnlyPairing:
         def __init__(self, *, read_only=False):
@@ -268,9 +274,28 @@ def test_cli_preflight_output_is_redacted(monkeypatch, capsys):
     monkeypatch.setattr(pairing_module, "PairingStore", ReadOnlyPairing)
     assert main(["--json", "--require-enabled"]) == 2
     output = capsys.readouterr().out
+    assert "allow_all" in output
     assert "non_owner_pairing" in output
     assert OWNER not in output
     assert OUTSIDER not in output
+    assert "secret" not in output
+
+
+def test_persisted_grant_audit_fails_closed_when_env_is_unreadable(monkeypatch):
+    import hermes_cli.config as cli_config_module
+    from gateway.single_principal import _runtime_grant_environment
+
+    monkeypatch.setattr(
+        cli_config_module,
+        "load_env",
+        MagicMock(side_effect=PermissionError("private path")),
+    )
+    report = validate_single_principal_policy(
+        _policy(), environ=_runtime_grant_environment()
+    )
+    rendered = json.dumps(report.as_dict())
+    assert dict(report.conflicts) == {"grant_store_unreadable": 1}
+    assert "private path" not in rendered
 
 
 def test_gateway_startup_accepts_valid_policy(monkeypatch, tmp_path):
