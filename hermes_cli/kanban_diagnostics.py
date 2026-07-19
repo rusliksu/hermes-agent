@@ -160,6 +160,15 @@ def _parse_payload(ev) -> dict:
     return {}
 
 
+def _registered_external_lane(task: Any) -> bool:
+    return bool(
+        str(_task_field(task, "external_key") or "").strip()
+        and str(_task_field(task, "source_path") or "").strip()
+        and str(_task_field(task, "assignee") or "").strip()
+        and str(_task_field(task, "created_by") or "").strip() == "external-sync"
+    )
+
+
 def _event_kind(ev) -> str:
     return _task_field(ev, "kind", "") or ""
 
@@ -921,13 +930,15 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         # already the right signal. A separate diagnostic here would
         # double-flag the same condition.
         return []
+    if _registered_external_lane(task):
+        return []
 
     # Find the most recent event that put this task into ready.
     # ``created`` covers tasks born ready; ``promoted`` covers parent-
     # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
     # ``unblocked`` covers human-driven resumes.
     READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
+        "created", "promoted", "reclaimed", "unblocked", "external_synced",
     }
     last_ready_ts = 0
     for ev in events:
