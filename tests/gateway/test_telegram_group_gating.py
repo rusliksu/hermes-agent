@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
+from gateway.single_principal import SinglePrincipalPolicy
 
 
 def _make_adapter(
@@ -99,6 +100,8 @@ def _group_message(
     entities=None,
     caption=None,
     caption_entities=None,
+    is_forum=None,
+    from_user_is_bot=False,
 ):
     reply_to_message = None
     if reply_to_bot:
@@ -111,8 +114,18 @@ def _group_message(
         caption_entities=caption_entities or [],
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
-        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
+        chat=SimpleNamespace(
+            id=chat_id,
+            type="group",
+            title="Test Group",
+            is_forum=thread_id is not None if is_forum is None else is_forum,
+        ),
+        from_user=SimpleNamespace(
+            id=from_user_id,
+            full_name=from_user_name,
+            first_name=from_user_name.split()[0],
+            is_bot=from_user_is_bot,
+        ),
         reply_to_message=reply_to_message,
         date=None,
     )
@@ -153,10 +166,122 @@ def _bot_command_entity(text, command):
     return SimpleNamespace(type="bot_command", offset=offset, length=len(command))
 
 
+def _attach_single_principal(adapter, shared_chat_ids):
+    policy = SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": "9999",
+            "telegram_shared_chat_ids": shared_chat_ids,
+        }
+    )
+
+    class Runner:
+        _single_principal_policy = policy
+
+        def _is_user_authorized(self, source):
+            return bool(policy.authorize(source))
+
+        async def handle(self, _event):
+            return None
+
+    runner = Runner()
+    adapter._message_handler = runner.handle
+    # _make_adapter installs a permissive instance stub for legacy trigger
+    # tests; shared-scope tests need the real class-level callback boundary.
+    del adapter._is_callback_user_authorized
+    return runner
+
+
 def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 
     assert adapter._should_process_message(_group_message("hello everyone")) is True
+
+
+def test_single_principal_shared_group_requires_exact_trigger_and_exact_chat():
+    adapter = _make_adapter(
+        require_mention=False,
+        free_response_chats=["-100"],
+        mention_patterns=[r"^gurra\b"],
+    )
+    _attach_single_principal(adapter, ["-100"])
+
+    mention_text = "hi @hermes_bot"
+    command_text = "/status@hermes_bot"
+    assert adapter._should_process_message(_group_message("ambient", chat_id=-100)) is False
+    assert adapter._should_process_message(_group_message("gurra help", chat_id=-100)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            mention_text,
+            chat_id=-100,
+            entities=[_mention_entity(mention_text)],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message("reply", chat_id=-100, reply_to_bot=True)
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            command_text,
+            chat_id=-100,
+            entities=[_bot_command_entity(command_text, command_text)],
+        ),
+        is_command=True,
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            mention_text,
+            chat_id=-200,
+            entities=[_mention_entity(mention_text)],
+        )
+    ) is False
+    assert adapter._is_user_authorized_from_message(
+        _group_message(
+            mention_text,
+            chat_id=-100,
+            entities=[_mention_entity(mention_text)],
+            from_user_is_bot=True,
+        )
+    ) is False
+    anonymous = _group_message(mention_text, chat_id=-100)
+    anonymous.from_user = None
+    anonymous.sender_chat = SimpleNamespace(id=-100, title="Test Group")
+    assert adapter._is_user_authorized_from_message(anonymous) is False
+
+
+def test_single_principal_general_forum_topic_keeps_stable_thread_identity():
+    adapter = _make_adapter(require_mention=True)
+    _attach_single_principal(adapter, ["-100"])
+    text = "@hermes_bot remember this"
+    message = _group_message(
+        text,
+        chat_id=-100,
+        entities=[_mention_entity(text)],
+        thread_id=None,
+        is_forum=True,
+    )
+
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert adapter._should_process_message(message) is True
+    event = adapter._build_message_event(message, MessageType.TEXT)
+    assert event.source.thread_id == "1"
+
+
+def test_single_principal_shared_scope_disables_observation_and_callbacks():
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+        group_allowed_chats=["-100"],
+    )
+    _attach_single_principal(adapter, ["-100"])
+    message = _group_message("ambient", chat_id=-100)
+
+    assert adapter._should_observe_unmentioned_group_message(message) is False
+    assert adapter._is_callback_user_authorized(
+        "111",
+        chat_id="-100",
+        chat_type="group",
+    ) is False
 
 
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():

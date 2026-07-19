@@ -127,11 +127,20 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        memory_dir: Optional[Path] = None,
+        allow_user_profile: bool = True,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.memory_dir = Path(memory_dir) if memory_dir is not None else get_memory_dir()
+        self.allow_user_profile = allow_user_profile
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -182,11 +191,13 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
+        mem_dir = self.memory_dir
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.user_entries = (
+            self._read_file(mem_dir / "USER.md") if self.allow_user_profile else []
+        )
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -277,9 +288,8 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
+    def _path_for(self, target: str) -> Path:
+        mem_dir = self.memory_dir
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
@@ -308,7 +318,7 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
@@ -985,6 +995,11 @@ def memory_tool(
 
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target == "user" and not getattr(store, "allow_user_profile", True):
+        return tool_error(
+            "User-profile memory is not available in this shared scope.",
+            success=False,
+        )
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1047,6 +1062,11 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     """
     action = payload.get("action")
     target = payload.get("target", "memory")
+    if target == "user" and not getattr(store, "allow_user_profile", True):
+        return {
+            "success": False,
+            "error": "User-profile memory is not available in this shared scope.",
+        }
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
@@ -1146,7 +1166,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
 
 

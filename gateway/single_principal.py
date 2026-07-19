@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -44,11 +46,20 @@ def _config_bool(value: Any, *, default: bool = False) -> tuple[bool, bool]:
 
 
 @dataclass(frozen=True)
+class SharedTelegramScope:
+    """Opaque server-bound identity for one shared Telegram memory scope."""
+
+    memory_namespace: str
+    is_topic: bool
+
+
+@dataclass(frozen=True)
 class SinglePrincipalPolicy:
     """Compiled policy for one logical owner and explicit ingress mappings."""
 
     enabled: bool = False
     telegram_owner_id: Optional[str] = None
+    telegram_shared_chat_ids: tuple[str, ...] = field(default_factory=tuple, repr=False)
     allow_owner_bound_relay: bool = False
     config_error_count: int = field(default=0, repr=False)
 
@@ -62,6 +73,7 @@ class SinglePrincipalPolicy:
         known_keys = {
             "enabled",
             "telegram_owner_id",
+            "telegram_shared_chat_ids",
             "allow_owner_bound_relay",
         }
         shape_errors = len(set(raw) - known_keys)
@@ -75,21 +87,69 @@ class SinglePrincipalPolicy:
             not isinstance(owner_raw, (bool, dict, list, tuple, set))
         )
         owner = str(owner_raw).strip() if owner_ok and owner_raw is not None else None
+
+        shared_raw = raw.get("telegram_shared_chat_ids")
+        shared_ok = shared_raw is None or isinstance(
+            shared_raw, (list, tuple, set, frozenset)
+        )
+        shared_values: list[str] = []
+        if shared_ok and shared_raw is not None:
+            for value in shared_raw:
+                if isinstance(value, (bool, dict, list, tuple, set, frozenset)):
+                    shared_ok = False
+                    continue
+                normalized = str(value).strip()
+                if normalized and normalized not in shared_values:
+                    shared_values.append(normalized)
         return cls(
             enabled=enabled,
             telegram_owner_id=owner or None,
+            telegram_shared_chat_ids=tuple(shared_values),
             allow_owner_bound_relay=relay,
             config_error_count=(
-                shape_errors + sum((not enabled_ok, not relay_ok, not owner_ok))
+                shape_errors
+                + sum((not enabled_ok, not relay_ok, not owner_ok, not shared_ok))
             ),
         )
+
+    def shared_scope(self, source: Any) -> Optional[SharedTelegramScope]:
+        """Resolve an allowlisted shared Telegram group/topic, otherwise deny."""
+        if not self.enabled:
+            return None
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        chat_id = getattr(source, "chat_id", None)
+        user_id = getattr(source, "user_id", None)
+        if (
+            platform != "telegram"
+            or chat_type not in {"group", "forum"}
+            or chat_id is None
+            or user_id is None
+            or bool(getattr(source, "is_bot", False))
+            or str(chat_id) not in self.telegram_shared_chat_ids
+        ):
+            return None
+
+        thread_id = getattr(source, "thread_id", None)
+        canonical = "\0".join(
+            ("telegram", str(chat_id), str(thread_id) if thread_id else "root")
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return SharedTelegramScope(
+            memory_namespace=f"telegram/{digest}",
+            is_topic=bool(thread_id),
+        )
+
+    def group_sessions_per_user(self, source: Any, *, default: bool) -> bool:
+        """Force allowlisted shared scopes onto one session per chat/topic."""
+        return False if self.shared_scope(source) is not None else default
 
     def authorize(self, source: Any, *, upstream_authenticated: bool = False) -> Optional[bool]:
         """Return an authoritative decision, or ``None`` when mode is disabled."""
         if not self.enabled:
             return None
         if getattr(source, "chat_type", None) != "dm":
-            return False
+            return self.shared_scope(source) is not None
         if upstream_authenticated:
             return self.allow_owner_bound_relay
         platform = getattr(getattr(source, "platform", None), "value", None)
@@ -112,6 +172,8 @@ class SinglePrincipalPolicy:
         }
         if self.telegram_owner_id:
             result["telegram_owner_id"] = self.telegram_owner_id
+        if self.telegram_shared_chat_ids:
+            result["telegram_shared_chat_ids"] = list(self.telegram_shared_chat_ids)
         return result
 
 
@@ -180,6 +242,17 @@ def validate_single_principal_policy(
         add("missing_owner_mapping")
     if policy.telegram_owner_id == "*":
         add("wildcard_owner")
+    add(
+        "wildcard_shared_scope",
+        sum(value == "*" for value in policy.telegram_shared_chat_ids),
+    )
+    add(
+        "malformed_shared_scope",
+        sum(
+            value != "*" and re.fullmatch(r"-[1-9][0-9]*", value) is None
+            for value in policy.telegram_shared_chat_ids
+        ),
+    )
 
     for key in _ALLOW_ALL_KEYS:
         if str(env.get(key, "")).strip().lower() in _TRUE:

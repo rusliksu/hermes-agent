@@ -268,6 +268,40 @@ def store(tmp_path, monkeypatch):
     return s
 
 
+def test_scoped_memory_directories_are_isolated_and_user_profile_is_disabled(tmp_path):
+    scope_a = MemoryStore(
+        memory_dir=tmp_path / "scope-a",
+        allow_user_profile=False,
+    )
+    scope_b = MemoryStore(
+        memory_dir=tmp_path / "scope-b",
+        allow_user_profile=False,
+    )
+    scope_a.load_from_disk()
+    scope_b.load_from_disk()
+
+    assert scope_a.add("memory", "scope A fact")["success"] is True
+    scope_a_reloaded = MemoryStore(
+        memory_dir=tmp_path / "scope-a",
+        allow_user_profile=False,
+    )
+    scope_a_reloaded.load_from_disk()
+    scope_b.load_from_disk()
+
+    assert scope_a_reloaded.memory_entries == ["scope A fact"]
+    assert scope_b.memory_entries == []
+    denied = json.loads(
+        memory_tool(
+            action="add",
+            target="user",
+            content="private profile fact",
+            store=scope_a,
+        )
+    )
+    assert denied["success"] is False
+    assert not (tmp_path / "scope-a" / "USER.md").exists()
+
+
 class TestMemoryStoreAdd:
     def test_add_entry(self, store):
         result = store.add("memory", "Python 3.12 project")

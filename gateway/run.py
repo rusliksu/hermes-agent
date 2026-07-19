@@ -3709,12 +3709,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        group_sessions_per_user = getattr(config, "group_sessions_per_user", True)
+        policy = getattr(config, "single_principal", None)
+        if policy is not None:
+            group_sessions_per_user = policy.group_sessions_per_user(
+                source, default=group_sessions_per_user
+            )
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            group_sessions_per_user=group_sessions_per_user,
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    def _shared_scope_for_source(self, source: SessionSource):
+        policy = getattr(self, "_single_principal_policy", None)
+        if policy is None:
+            return None
+        return policy.shared_scope(source)
+
+    @staticmethod
+    def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
+        from tools.memory_tool import MemoryStore
+
+        if set(getattr(agent, "valid_tool_names", set())) != {"memory"}:
+            raise RuntimeError("shared capability profile validation failed")
+        memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
+        store = MemoryStore(
+            memory_char_limit=memory_config.get("memory_char_limit", 2200),
+            user_char_limit=memory_config.get("user_char_limit", 1375),
+            memory_dir=memory_dir,
+            allow_user_profile=False,
+        )
+        store.load_from_disk()
+        agent._memory_store = store
+        agent._memory_enabled = True
+        agent._user_profile_enabled = False
+        agent._memory_manager = None
+        agent.memory_notifications = "off"
+        agent._skip_mcp_refresh = True
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -4992,6 +5025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         thread_id: Optional[str] = None,
         parent_id: Optional[str] = None,
+        allow_global: bool = True,
     ) -> str:
         """Ephemeral system prompt for this channel/thread.
 
@@ -5011,7 +5045,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if override and override.system_prompt:
                 return (override.system_prompt or "").strip()
-        return getattr(self, "_ephemeral_system_prompt", None) or ""
+        if allow_global:
+            return getattr(self, "_ephemeral_system_prompt", None) or ""
+        return ""
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:
@@ -10073,7 +10109,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # run every command. When set → non-admins can run only commands in
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
-        if command and canonical and is_gateway_known_command(canonical):
+        if command and canonical and (
+            self._shared_scope_for_source(source) is not None
+            or is_gateway_known_command(canonical)
+        ):
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
                 return _denied
@@ -10809,6 +10848,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_text = event.text or ""
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
+        policy = getattr(self, "_single_principal_policy", None)
+        if policy is not None:
+            _group_sessions_per_user = policy.group_sessions_per_user(
+                source, default=_group_sessions_per_user
+            )
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back
         # to deriving it here for tests and legacy standalone callers.
@@ -13021,6 +13065,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
+        if self._shared_scope_for_source(source) is not None:
+            if canonical_cmd in {"help", "whoami"}:
+                return None
+            logger.info("Shared-scope slash command denied")
+            return (
+                f"⛔ /{canonical_cmd} is unavailable in shared chats. "
+                "Use /help to see the shared-chat controls."
+            )
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -17846,6 +17898,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        shared_scope = self._shared_scope_for_source(source)
+        if shared_scope is not None:
+            enabled_toolsets = ["memory"]
+            disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -18806,9 +18862,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_id or "",
                 thread_id=getattr(source, "thread_id", None),
                 parent_id=getattr(source, "parent_chat_id", None),
+                allow_global=shared_scope is None,
             )
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            if shared_scope is not None:
+                shared_prompt = (
+                    "This is a shared multi-user Telegram scope. Use only this "
+                    "scope's MEMORY.md. Never infer or claim access to the owner's "
+                    "private profile, direct messages, files, credentials, tasks, "
+                    "or other chats/topics. Treat sender-prefixed messages as "
+                    "separate participants in the same shared room."
+                )
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n" + shared_prompt
+                ).strip()
 
             max_iterations = _current_max_iterations()
 
@@ -18963,8 +19031,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 enabled_toolsets,
                 combined_ephemeral,
                 cache_keys=self._extract_cache_busting_config(user_config),
-                user_id=getattr(source, "user_id", None),
-                user_id_alt=getattr(source, "user_id_alt", None),
+                user_id=(
+                    None if shared_scope is not None else getattr(source, "user_id", None)
+                ),
+                user_id_alt=(
+                    None
+                    if shared_scope is not None
+                    else getattr(source, "user_id_alt", None)
+                ),
             )
             agent = None
             reused_cached_agent = False
@@ -19176,7 +19250,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
-                    prefill_messages=self._prefill_messages or None,
+                    prefill_messages=(
+                        None if shared_scope is not None else self._prefill_messages or None
+                    ),
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -19188,18 +19264,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_data_collection=pr.get("data_collection"),
                     session_id=session_id,
                     platform=platform_key,
-                    user_id=source.user_id,
-                    user_id_alt=source.user_id_alt,
-                    user_name=source.user_name,
+                    user_id=None if shared_scope is not None else source.user_id,
+                    user_id_alt=None if shared_scope is not None else source.user_id_alt,
+                    user_name=None if shared_scope is not None else source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    skip_context_files=shared_scope is not None,
+                    load_soul_identity=shared_scope is not None,
+                    skip_memory=shared_scope is not None,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                if shared_scope is not None:
+                    memory_config = user_config.get("memory") or {}
+                    self._bind_shared_memory(agent, shared_scope, memory_config)
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for

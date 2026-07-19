@@ -891,6 +891,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
                 )
+                policy = getattr(runner, "_single_principal_policy", None)
+                if (
+                    getattr(policy, "enabled", False)
+                    and policy.shared_scope(source) is not None
+                ):
+                    # Shared rollout exposes no inline admin/control surface.
+                    # Participants invoke the constrained agent via message
+                    # mention/reply/addressed command only.
+                    return False
                 return bool(auth_fn(source))
             except Exception:
                 if single_principal_enabled:
@@ -929,7 +938,8 @@ class TelegramAdapter(BasePlatformAdapter):
             or None
         )
         # Channel posts have no from_user — authorize the sender chat instead.
-        if not user_id:
+        raw_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        if not user_id and raw_chat_type == "channel":
             sender_chat = getattr(message, "sender_chat", None)
             if sender_chat is not None:
                 user_id = str(getattr(sender_chat, "id", "")).strip() or None
@@ -939,28 +949,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
 
         chat_id = str(getattr(chat, "id", "")).strip() or user_id
-        chat_type = str(getattr(chat, "type", "dm")).strip().lower() or "dm"
+        chat_type = raw_chat_type or "dm"
         if chat_type == "private":
             chat_type = "dm"
-        elif chat_type == "supergroup":
-            thread_id_raw = getattr(message, "message_thread_id", None)
-            is_topic_message = bool(getattr(message, "is_topic_message", False))
-            is_forum_group = getattr(chat, "is_forum", False) is True
-            chat_type = (
-                "forum"
-                if thread_id_raw is not None and (is_topic_message or is_forum_group)
-                else "group"
-            )
+        elif chat_type in {"group", "supergroup"}:
+            chat_type = "group"
 
-        thread_id = None
-        thread_id_raw = getattr(message, "message_thread_id", None)
-        if thread_id_raw is not None:
-            is_topic_message = bool(getattr(message, "is_topic_message", False))
-            is_forum_group = getattr(chat, "is_forum", False) is True
-            if chat_type == "forum" and (is_topic_message or is_forum_group):
-                thread_id = str(thread_id_raw)
-            elif chat_type == "dm" and is_topic_message:
-                thread_id = str(thread_id_raw)
+        thread_id = self._effective_message_thread_id(message)
 
         return SessionSource(
             platform=Platform.TELEGRAM,
@@ -969,6 +964,7 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_id,
+            is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
 
     def _telegram_auth_env_configured(self) -> bool:
@@ -7608,6 +7604,21 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return self._telegram_guest_mode() and self._message_mentions_bot(message)
 
+    def _single_principal_shared_scope(self, message: Message):
+        """Resolve the authoritative shared scope without widening legacy grants."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        policy = getattr(runner, "_single_principal_policy", None)
+        if not getattr(policy, "enabled", False):
+            return None, False
+        try:
+            return policy.shared_scope(self._source_from_message_for_auth(message)), True
+        except Exception:
+            logger.warning(
+                "[Telegram] Shared-scope resolution failed",
+                exc_info=True,
+            )
+            return None, True
+
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
@@ -7618,6 +7629,11 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
         if self._is_own_message(message):
+            return False
+        _shared_scope, single_principal_enabled = self._single_principal_shared_scope(
+            message
+        )
+        if single_principal_enabled:
             return False
         if not self._telegram_observe_unmentioned_group_messages():
             return False
@@ -8007,6 +8023,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
+
+        shared_scope, single_principal_enabled = self._single_principal_shared_scope(message)
+        if single_principal_enabled:
+            if shared_scope is None:
+                return False
+            # Shared rooms are intentionally people-active: no ambient
+            # observation, wake-word patterns, guest mode, or free-response
+            # bypasses. Commands must use Telegram's addressed /cmd@bot form.
+            return self._is_reply_to_bot(message) or self._message_mentions_bot(message)
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
