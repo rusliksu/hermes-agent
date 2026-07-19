@@ -119,6 +119,128 @@ def test_sync_external_dry_run_does_not_write(kanban_home):
         ).fetchone()[0] == 0
 
 
+def test_sync_external_attach_existing_task_dry_run_and_apply(kanban_home):
+    with kb.connect_closing() as conn:
+        legacy = kb.create_task(conn, title="legacy title", assignee="old")
+        planned = kb.sync_external_task(
+            conn,
+            external_key="legacy/1",
+            source_path="/queue/legacy-1",
+            title="external title",
+            assignee="codex",
+            desired_status="Ready",
+            task_id=legacy,
+            dry_run=True,
+        )
+
+        assert planned.action == "update"
+        assert planned.task_id == legacy
+        assert planned.after["id"] == legacy
+        assert planned.after["external_key"] == "legacy/1"
+        assert {"external_key", "title", "assignee", "source_path", "created_by"} <= set(
+            planned.changed_fields
+        )
+        assert kb.get_task(conn, legacy).external_key is None
+
+        applied = kb.sync_external_task(
+            conn,
+            external_key="legacy/1",
+            source_path="/queue/legacy-1",
+            title="external title",
+            assignee="codex",
+            desired_status="Ready",
+            task_id=legacy,
+        )
+        task = kb.get_task(conn, legacy)
+
+        assert applied.task_id == legacy
+        assert task.external_key == "legacy/1"
+        assert task.title == "external title"
+        assert task.created_by == "external-sync"
+
+
+def test_sync_external_unknown_task_id_writes_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        with pytest.raises(RuntimeError, match="does not exist"):
+            kb.sync_external_task(
+                conn,
+                external_key="legacy/missing",
+                source_path="/queue/missing",
+                title="missing",
+                assignee="codex",
+                desired_status="Ready",
+                task_id="t_missing",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_sync_external_task_id_occupied_by_different_key_writes_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        existing = kb.sync_external_task(
+            conn,
+            external_key="legacy/occupied",
+            source_path="/queue/occupied",
+            title="occupied",
+            assignee="codex",
+            desired_status="Ready",
+        )
+        with pytest.raises(RuntimeError, match="already attached"):
+            kb.sync_external_task(
+                conn,
+                external_key="legacy/new",
+                source_path="/queue/new",
+                title="new",
+                assignee="codex",
+                desired_status="Ready",
+                task_id=existing.task_id,
+            )
+        assert kb.get_task(conn, existing.task_id).external_key == "legacy/occupied"
+
+
+def test_sync_external_existing_key_task_id_mismatch_writes_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        existing = kb.sync_external_task(
+            conn,
+            external_key="legacy/keyed",
+            source_path="/queue/keyed",
+            title="keyed",
+            assignee="codex",
+            desired_status="Ready",
+        )
+        other = kb.create_task(conn, title="other", assignee="codex")
+        with pytest.raises(RuntimeError, match="not"):
+            kb.sync_external_task(
+                conn,
+                external_key="legacy/keyed",
+                source_path="/queue/keyed",
+                title="should not land",
+                assignee="codex",
+                desired_status="Done",
+                task_id=other,
+            )
+        assert kb.get_task(conn, existing.task_id).status == "ready"
+        assert kb.get_task(conn, other).external_key is None
+
+
+def test_sync_external_expected_status_guard_on_attach_writes_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        legacy = kb.create_task(conn, title="legacy", assignee="codex")
+        with pytest.raises(RuntimeError, match="expected current status"):
+            kb.sync_external_task(
+                conn,
+                external_key="legacy/status",
+                source_path="/queue/status",
+                title="should not land",
+                assignee="codex",
+                desired_status="Done",
+                task_id=legacy,
+                expected_current_status="Done",
+            )
+        task = kb.get_task(conn, legacy)
+        assert task.external_key is None
+        assert task.status == "ready"
+
+
 def test_sync_external_expected_status_guard_mismatch_writes_nothing(kanban_home):
     with kb.connect_closing() as conn:
         created = kb.sync_external_task(
@@ -197,6 +319,90 @@ def test_sync_external_done_writes_completion_run_and_events(kanban_home):
     assert any(ev.kind == "external_synced" for ev in events)
 
 
+def test_sync_external_batch_success_and_failure_rolls_back(kanban_home):
+    with kb.connect_closing() as conn:
+        specs = [
+            kb.ExternalTaskSyncSpec(
+                external_key=f"batch/done-{idx}",
+                source_path=f"/queue/done-{idx}",
+                title=f"done {idx}",
+                assignee="codex",
+                desired_status="Done",
+            )
+            for idx in range(2)
+        ] + [
+            kb.ExternalTaskSyncSpec(
+                external_key=f"batch/ready-{idx}",
+                source_path=f"/queue/ready-{idx}",
+                title=f"ready {idx}",
+                assignee="codex",
+                desired_status="Ready",
+            )
+            for idx in range(3)
+        ]
+
+        results = kb.sync_external_tasks(conn, specs)
+        assert len(results) == 5
+        done_ids = [result.task_id for result in results[:2]]
+        ready_ids = [result.task_id for result in results[2:]]
+        for task_id in done_ids:
+            task = kb.get_task(conn, task_id)
+            assert task.status == "done"
+            assert kb.list_runs(conn, task_id)[0].outcome == "completed"
+            assert any(ev.kind == "completed" for ev in kb.list_events(conn, task_id))
+        assert [kb.get_task(conn, task_id).status for task_id in ready_ids] == [
+            "ready",
+            "ready",
+            "ready",
+        ]
+
+        failing = [
+            kb.ExternalTaskSyncSpec(
+                external_key=f"rollback/{idx}",
+                source_path=f"/queue/rollback-{idx}",
+                title=f"rollback {idx}",
+                assignee="codex",
+                desired_status="Ready",
+            )
+            for idx in range(3)
+        ] + [
+            kb.ExternalTaskSyncSpec(
+                external_key="rollback/bad",
+                source_path="/queue/bad",
+                title="bad",
+                assignee="codex",
+                desired_status="Ready",
+                task_id="t_missing",
+            )
+        ]
+        with pytest.raises(RuntimeError, match="does not exist"):
+            kb.sync_external_tasks(conn, failing)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE external_key LIKE 'rollback/%'"
+        ).fetchone()[0] == 0
+
+
+def test_sync_external_batch_dry_run_writes_nothing(kanban_home):
+    with kb.connect_closing() as conn:
+        results = kb.sync_external_tasks(
+            conn,
+            [
+                kb.ExternalTaskSyncSpec(
+                    external_key="dry/batch",
+                    source_path="/queue/dry",
+                    title="dry",
+                    assignee="codex",
+                    desired_status="Ready",
+                )
+            ],
+            dry_run=True,
+        )
+        assert results[0].dry_run is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE external_key = 'dry/batch'"
+        ).fetchone()[0] == 0
+
+
 def test_sync_external_cli_json(kanban_home):
     raw = run_slash(
         "sync-external --external-key cli/1 --source-path /tmp/cli-1 "
@@ -206,6 +412,68 @@ def test_sync_external_cli_json(kanban_home):
     assert payload["action"] == "create"
     assert payload["external_key"] == "cli/1"
     assert payload["after"]["source_path"] == "/tmp/cli-1"
+
+
+def test_sync_external_cli_task_id_and_batch_json_path(kanban_home, tmp_path):
+    with kb.connect_closing() as conn:
+        legacy = kb.create_task(conn, title="legacy", assignee="old")
+    raw = run_slash(
+        "sync-external --external-key cli/legacy --source-path /tmp/legacy "
+        f"--title 'legacy updated' --assignee codex --status Ready --task-id {legacy} --json"
+    )
+    payload = json.loads(raw)
+    assert payload["task_id"] == legacy
+    assert payload["after"]["external_key"] == "cli/legacy"
+
+    batch_path = tmp_path / "batch.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "external_key": "cli/batch-1",
+                    "source_path": "/tmp/batch-1",
+                    "title": "batch 1",
+                    "assignee": "codex",
+                    "status": "Ready",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    batch_raw = run_slash(f"sync-external-batch {batch_path} --json")
+    batch_payload = json.loads(batch_raw)
+    assert batch_payload[0]["external_key"] == "cli/batch-1"
+
+
+def test_sync_external_batch_cli_stdin_and_validation(kanban_home, monkeypatch):
+    import io
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                [
+                    {
+                        "external_key": "cli/stdin",
+                        "source_path": "/tmp/stdin",
+                        "title": "stdin",
+                        "assignee": "codex",
+                        "status": "Ready",
+                    }
+                ]
+            )
+        ),
+    )
+    payload = json.loads(run_slash("sync-external-batch - --dry-run --json"))
+    assert payload[0]["dry_run"] is True
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE external_key = 'cli/stdin'"
+        ).fetchone()[0] == 0
+
+    bad = kb.ExternalTaskSyncSpec.from_mapping
+    with pytest.raises(ValueError, match="unknown field"):
+        bad({"external_key": "x", "source_path": "x", "title": "x", "assignee": "x", "status": "Ready", "extra": 1})
 
 
 def test_sync_external_exact_key_serializes_racing_writers(kanban_home):
