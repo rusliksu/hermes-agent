@@ -23,6 +23,10 @@ _GROUP_GRANT_KEYS = (
     "TELEGRAM_ALLOW_BOTS",
 )
 _TRUE = frozenset({"1", "true", "yes", "on"})
+_GRANT_ENV_KEYS = frozenset(
+    (*_ALLOW_ALL_KEYS, *_DIRECT_ALLOWLIST_KEYS, *_GROUP_GRANT_KEYS)
+)
+_GRANT_ENV_AUDIT_ERROR = "_HERMES_GRANT_ENV_AUDIT_ERROR"
 
 
 def _config_bool(value: Any, *, default: bool = False) -> tuple[bool, bool]:
@@ -170,6 +174,8 @@ def validate_single_principal_policy(
             counts[category] = counts.get(category, 0) + count
 
     add("malformed_policy", policy.config_error_count)
+    if env.get(_GRANT_ENV_AUDIT_ERROR):
+        add("grant_store_unreadable")
     if not policy.telegram_owner_id and not policy.allow_owner_bound_relay:
         add("missing_owner_mapping")
     if policy.telegram_owner_id == "*":
@@ -254,6 +260,22 @@ def require_valid_single_principal_policy(
     return report
 
 
+def _runtime_grant_environment() -> dict[str, str]:
+    """Merge process env with persisted auth grants without exposing credentials."""
+    environ = dict(os.environ)
+    try:
+        from hermes_cli.config import load_env
+
+        persisted = load_env()
+    except (OSError, UnicodeError, ValueError):
+        environ[_GRANT_ENV_AUDIT_ERROR] = "1"
+        return environ
+    for key in _GRANT_ENV_KEYS:
+        if key in persisted:
+            environ[key] = persisted[key]
+    return environ
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Validate single-principal gateway policy")
     parser.add_argument("--require-enabled", action="store_true")
@@ -269,6 +291,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config.single_principal,
         gateway_config=config,
         pairing_store=store,
+        environ=_runtime_grant_environment(),
         require_enabled=args.require_enabled,
     )
     output = json.dumps(report.as_dict(), sort_keys=True)
