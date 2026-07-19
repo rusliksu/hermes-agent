@@ -75,6 +75,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "started_at": t.started_at,
         "completed_at": t.completed_at,
         "result": t.result,
+        "external_key": t.external_key,
+        "source_path": t.source_path,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
@@ -367,6 +369,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- sync-external ---
+    p_sync_external = sub.add_parser(
+        "sync-external",
+        help="Idempotently create/update a task from an external queue key",
+    )
+    p_sync_external.add_argument(
+        "--external-key",
+        required=True,
+        help="Exact external task identity; never title-matched",
+    )
+    p_sync_external.add_argument(
+        "--source-path",
+        "--source",
+        dest="source_path",
+        required=True,
+        help="External source path/URL for the task",
+    )
+    p_sync_external.add_argument("--title", required=True, help="Task title")
+    p_sync_external.add_argument("--assignee", required=True, help="External lane assignee")
+    p_sync_external.add_argument(
+        "--status",
+        required=True,
+        choices=("Ready", "ready", "Done", "done"),
+        help="Desired Kanban status",
+    )
+    p_sync_external.add_argument(
+        "--expected-current-status",
+        default=None,
+        choices=("Ready", "ready", "Done", "done"),
+        help="Optional guard; aborts if current status differs",
+    )
+    p_sync_external.add_argument("--dry-run", action="store_true", help="Plan without writing")
+    p_sync_external.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -959,6 +995,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "sync-external": _cmd_sync_external,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1389,6 +1426,33 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_sync_external(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.sync_external_task(
+            conn,
+            external_key=args.external_key,
+            source_path=args.source_path,
+            title=args.title,
+            assignee=args.assignee,
+            desired_status=args.status,
+            dry_run=bool(args.dry_run),
+            expected_current_status=args.expected_current_status,
+        )
+    payload = result.as_dict()
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    prefix = "Would " if result.dry_run else ""
+    if result.action == "noop":
+        print(f"No changes for {result.task_id} ({result.external_key})")
+    elif result.action == "create":
+        print(f"{prefix}Create {result.task_id or '(new task)'} from {result.external_key}")
+    else:
+        fields = ", ".join(result.changed_fields) if result.changed_fields else "-"
+        print(f"{prefix}Update {result.task_id}: {fields}")
     return 0
 
 
