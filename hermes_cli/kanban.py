@@ -401,8 +401,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         choices=("Ready", "ready", "Done", "done"),
         help="Optional guard; aborts if current status differs",
     )
+    p_sync_external.add_argument(
+        "--task-id",
+        default=None,
+        help="Optional existing Kanban task id to attach/update exactly",
+    )
     p_sync_external.add_argument("--dry-run", action="store_true", help="Plan without writing")
     p_sync_external.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- sync-external-batch ---
+    p_sync_external_batch = sub.add_parser(
+        "sync-external-batch",
+        help="Apply multiple external queue sync specs atomically",
+    )
+    p_sync_external_batch.add_argument(
+        "input",
+        help="JSON array input path, or '-' to read stdin",
+    )
+    p_sync_external_batch.add_argument("--dry-run", action="store_true", help="Plan without writing")
+    p_sync_external_batch.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -996,6 +1013,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "init":     _cmd_init,
             "create":   _cmd_create,
             "sync-external": _cmd_sync_external,
+            "sync-external-batch": _cmd_sync_external_batch,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1438,6 +1456,7 @@ def _cmd_sync_external(args: argparse.Namespace) -> int:
             title=args.title,
             assignee=args.assignee,
             desired_status=args.status,
+            task_id=args.task_id,
             dry_run=bool(args.dry_run),
             expected_current_status=args.expected_current_status,
         )
@@ -1453,6 +1472,43 @@ def _cmd_sync_external(args: argparse.Namespace) -> int:
     else:
         fields = ", ".join(result.changed_fields) if result.changed_fields else "-"
         print(f"{prefix}Update {result.task_id}: {fields}")
+    return 0
+
+
+def _load_sync_external_batch_specs(input_path: str) -> list[kb.ExternalTaskSyncSpec]:
+    if input_path == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = Path(input_path).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON input: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError("batch input must be a JSON array")
+    return [
+        kb.ExternalTaskSyncSpec.from_mapping(item, item_label=f"item {index + 1}")
+        for index, item in enumerate(payload)
+    ]
+
+
+def _cmd_sync_external_batch(args: argparse.Namespace) -> int:
+    specs = _load_sync_external_batch_specs(args.input)
+    with kb.connect_closing() as conn:
+        results = kb.sync_external_tasks(
+            conn,
+            specs,
+            dry_run=bool(args.dry_run),
+        )
+    payload = [result.as_dict() for result in results]
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    prefix = "Would " if getattr(args, "dry_run", False) else ""
+    print(f"{prefix}Sync {len(results)} external task(s)")
+    for result in results:
+        fields = ", ".join(result.changed_fields) if result.changed_fields else "-"
+        print(f"{result.action:6s} {result.task_id or '(new task)'} ({result.external_key}): {fields}")
     return 0
 
 

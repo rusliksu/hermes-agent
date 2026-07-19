@@ -2458,6 +2458,64 @@ class ExternalTaskSyncResult:
         }
 
 
+@dataclass(frozen=True)
+class ExternalTaskSyncSpec:
+    external_key: str
+    source_path: str
+    title: str
+    assignee: str
+    desired_status: str
+    task_id: Optional[str] = None
+    expected_current_status: Optional[str] = None
+
+    @classmethod
+    def from_mapping(cls, payload: Any, *, item_label: str = "item") -> "ExternalTaskSyncSpec":
+        if not isinstance(payload, dict):
+            raise ValueError(f"{item_label} must be an object")
+        allowed = {
+            "external_key",
+            "source_path",
+            "title",
+            "assignee",
+            "status",
+            "desired_status",
+            "task_id",
+            "expected_current_status",
+        }
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ValueError(f"{item_label} has unknown field(s): {', '.join(unknown)}")
+        has_status = "status" in payload
+        has_desired = "desired_status" in payload
+        if has_status and has_desired and payload["status"] != payload["desired_status"]:
+            raise ValueError(f"{item_label} has conflicting status and desired_status")
+        missing = [
+            name
+            for name in ("external_key", "source_path", "title", "assignee")
+            if name not in payload
+        ]
+        if not has_status and not has_desired:
+            missing.append("status")
+        if missing:
+            raise ValueError(f"{item_label} missing required field(s): {', '.join(missing)}")
+        return cls(
+            external_key=payload["external_key"],
+            source_path=payload["source_path"],
+            title=payload["title"],
+            assignee=payload["assignee"],
+            desired_status=payload["status"] if has_status else payload["desired_status"],
+            task_id=payload.get("task_id"),
+            expected_current_status=payload.get("expected_current_status"),
+        )
+
+
+@dataclass
+class _ExternalTaskSyncCompletion:
+    task_id: str
+    run_id: Optional[int]
+    summary: str
+
+
 def sync_external_task(
     conn: sqlite3.Connection,
     *,
@@ -2466,16 +2524,62 @@ def sync_external_task(
     title: str,
     assignee: str,
     desired_status: str,
+    task_id: Optional[str] = None,
     dry_run: bool = False,
     expected_current_status: Optional[str] = None,
 ) -> ExternalTaskSyncResult:
     """Create/update one task by exact external_key; never title-match."""
-    external_key = str(external_key or "").strip()
-    source_path = str(source_path or "").strip()
-    title = str(title or "").strip()
-    assignee = _canonical_assignee(assignee)
-    desired = _canonical_external_sync_status(desired_status)
-    expected = _canonical_external_sync_status(expected_current_status)
+    spec = ExternalTaskSyncSpec(
+        external_key=external_key,
+        source_path=source_path,
+        title=title,
+        assignee=assignee,
+        desired_status=desired_status,
+        task_id=task_id,
+        expected_current_status=expected_current_status,
+    )
+    completions: list[_ExternalTaskSyncCompletion] = []
+    with write_txn(conn):
+        result, completions = _sync_external_task_locked(conn, spec, dry_run=dry_run)
+    _after_external_sync_commit(conn, completions)
+    return result
+
+
+def sync_external_tasks(
+    conn: sqlite3.Connection,
+    specs: Iterable[ExternalTaskSyncSpec],
+    *,
+    dry_run: bool = False,
+) -> list[ExternalTaskSyncResult]:
+    """Apply external task sync specs in one transaction."""
+    specs = list(specs)
+    if not specs:
+        return []
+    results: list[ExternalTaskSyncResult] = []
+    completions: list[_ExternalTaskSyncCompletion] = []
+    with write_txn(conn):
+        for spec in specs:
+            result, completed = _sync_external_task_locked(conn, spec, dry_run=dry_run)
+            results.append(result)
+            completions.extend(completed)
+    _after_external_sync_commit(conn, completions)
+    return results
+
+
+def _sync_external_task_locked(
+    conn: sqlite3.Connection,
+    spec: ExternalTaskSyncSpec,
+    *,
+    dry_run: bool,
+) -> tuple[ExternalTaskSyncResult, list[_ExternalTaskSyncCompletion]]:
+    """Create/update one external task. Caller owns the write transaction."""
+    external_key = str(spec.external_key or "").strip()
+    source_path = str(spec.source_path or "").strip()
+    title = str(spec.title or "").strip()
+    assignee = _canonical_assignee(spec.assignee)
+    desired = _canonical_external_sync_status(spec.desired_status)
+    expected = _canonical_external_sync_status(spec.expected_current_status)
+    task_id = str(spec.task_id or "").strip() or None
     if not external_key:
         raise ValueError("external_key is required")
     if not source_path:
@@ -2503,73 +2607,215 @@ def sync_external_task(
     completed_run_id: Optional[int] = None
     completed_summary = "External task synchronized as done"
 
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE external_key = ?",
-            (external_key,),
-        ).fetchone()
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE external_key = ?",
+        (external_key,),
+    ).fetchone()
+    if row is not None and task_id is not None and row["id"] != task_id:
+        raise RuntimeError(
+            f"external_key {external_key!r} is already attached to task "
+            f"{row['id']!r}, not {task_id!r}; no changes written"
+        )
+    if row is None and task_id is not None:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
-            if expected is not None:
-                raise RuntimeError(
-                    f"expected current status {expected!r} for external_key "
-                    f"{external_key!r}, but no task exists"
-                )
-            after = {
-                "title": title,
-                "assignee": assignee,
-                "status": desired,
-                "source_path": source_path,
-                "external_key": external_key,
-                "created_by": EXTERNAL_SYNC_CREATED_BY,
-            }
-            if dry_run:
-                return ExternalTaskSyncResult(
+            raise RuntimeError(f"task_id {task_id!r} does not exist; no changes written")
+        existing_key = str(row["external_key"] or "").strip()
+        if existing_key and existing_key != external_key:
+            raise RuntimeError(
+                f"task_id {task_id!r} is already attached to external_key "
+                f"{existing_key!r}; no changes written"
+            )
+
+    if row is None:
+        if expected is not None:
+            raise RuntimeError(
+                f"expected current status {expected!r} for external_key "
+                f"{external_key!r}, but no task exists"
+            )
+        after = {
+            "title": title,
+            "assignee": assignee,
+            "status": desired,
+            "source_path": source_path,
+            "external_key": external_key,
+            "created_by": EXTERNAL_SYNC_CREATED_BY,
+        }
+        if dry_run:
+            return (
+                ExternalTaskSyncResult(
                     action="create",
                     task_id=None,
                     external_key=external_key,
                     dry_run=True,
                     changed_fields=sorted(after.keys()),
                     after=after,
-                )
-            task_id = _new_task_id()
-            conn.execute(
-                """
-                INSERT INTO tasks (
-                    id, title, body, assignee, status, priority,
-                    created_by, created_at, completed_at, workspace_kind,
-                    external_key, source_path
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'scratch', ?, ?)
-                """,
-                (
-                    task_id,
-                    title,
-                    source_path,
-                    assignee,
-                    desired,
-                    EXTERNAL_SYNC_CREATED_BY,
-                    now,
-                    now if desired == "done" else None,
-                    external_key,
-                    source_path,
                 ),
+                [],
             )
-            _append_event(
+        new_task_id = _new_task_id()
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, body, assignee, status, priority,
+                created_by, created_at, completed_at, workspace_kind,
+                external_key, source_path
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 'scratch', ?, ?)
+            """,
+            (
+                new_task_id,
+                title,
+                source_path,
+                assignee,
+                desired,
+                EXTERNAL_SYNC_CREATED_BY,
+                now,
+                now if desired == "done" else None,
+                external_key,
+                source_path,
+            ),
+        )
+        _append_event(
+            conn,
+            new_task_id,
+            "created",
+            {
+                "assignee": assignee,
+                "status": desired,
+                "external_key": external_key,
+                "source_path": source_path,
+                "source": EXTERNAL_SYNC_CREATED_BY,
+            },
+        )
+        changed_fields = sorted(after.keys())
+        if desired == "done":
+            completed_run_id = _synthesize_ended_run(
                 conn,
-                task_id,
-                "created",
-                {
-                    "assignee": assignee,
-                    "status": desired,
+                new_task_id,
+                outcome="completed",
+                summary=completed_summary,
+                metadata={
                     "external_key": external_key,
                     "source_path": source_path,
                     "source": EXTERNAL_SYNC_CREATED_BY,
                 },
             )
-            changed_fields = sorted(after.keys())
+            _append_event(
+                conn,
+                new_task_id,
+                "completed",
+                {
+                    "result_len": 0,
+                    "summary": completed_summary,
+                    "external_key": external_key,
+                    "source": EXTERNAL_SYNC_CREATED_BY,
+                },
+                run_id=completed_run_id,
+            )
+            completed_task = new_task_id
+        _append_event(
+            conn,
+            new_task_id,
+            "external_synced",
+            {"external_key": external_key, "changed_fields": changed_fields},
+        )
+        result = ExternalTaskSyncResult(
+            action="create",
+            task_id=new_task_id,
+            external_key=external_key,
+            dry_run=False,
+            changed_fields=changed_fields,
+            after={**after, "id": new_task_id},
+        )
+    else:
+        before = snapshot(row)
+        if expected is not None and row["status"] != expected:
+            raise RuntimeError(
+                f"expected current status {expected!r} for external_key "
+                f"{external_key!r}, found {row['status']!r}; no changes written"
+            )
+
+        updates: dict[str, Any] = {}
+        if row["external_key"] != external_key:
+            updates["external_key"] = external_key
+        if row["title"] != title:
+            updates["title"] = title
+        if row["assignee"] != assignee:
+            updates["assignee"] = assignee
+        if row["source_path"] != source_path:
+            updates["source_path"] = source_path
+        if row["created_by"] != EXTERNAL_SYNC_CREATED_BY:
+            updates["created_by"] = EXTERNAL_SYNC_CREATED_BY
+        if row["status"] != desired:
+            updates["status"] = desired
+            updates["completed_at"] = now if desired == "done" else None
+            updates["claim_lock"] = None
+            updates["claim_expires"] = None
+            updates["worker_pid"] = None
+            updates["current_run_id"] = None
             if desired == "done":
+                updates["block_kind"] = None
+                updates["block_recurrences"] = 0
+
+        if not updates:
+            return (
+                ExternalTaskSyncResult(
+                    action="noop",
+                    task_id=row["id"],
+                    external_key=external_key,
+                    dry_run=dry_run,
+                    before=before,
+                    after=before,
+                ),
+                [],
+            )
+
+        after = dict(before)
+        for key, value in updates.items():
+            if key in after:
+                after[key] = value
+        changed_fields = sorted(updates.keys())
+        if dry_run:
+            return (
+                ExternalTaskSyncResult(
+                    action="update",
+                    task_id=row["id"],
+                    external_key=external_key,
+                    dry_run=True,
+                    changed_fields=changed_fields,
+                    before=before,
+                    after=after,
+                ),
+                [],
+            )
+
+        if row["status"] != desired and row["current_run_id"]:
+            completed_run_id = _end_run(
+                conn,
+                row["id"],
+                outcome="completed" if desired == "done" else "released",
+                status="done" if desired == "done" else "released",
+                summary=(
+                    completed_summary
+                    if desired == "done"
+                    else "External task synchronized back to ready"
+                ),
+                metadata={
+                    "external_key": external_key,
+                    "source_path": source_path,
+                    "source": EXTERNAL_SYNC_CREATED_BY,
+                },
+            )
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        conn.execute(
+            f"UPDATE tasks SET {assignments} WHERE id = ?",
+            (*updates.values(), row["id"]),
+        )
+        if row["status"] != desired and desired == "done":
+            if completed_run_id is None:
                 completed_run_id = _synthesize_ended_run(
                     conn,
-                    task_id,
+                    row["id"],
                     outcome="completed",
                     summary=completed_summary,
                     metadata={
@@ -2578,157 +2824,54 @@ def sync_external_task(
                         "source": EXTERNAL_SYNC_CREATED_BY,
                     },
                 )
-                _append_event(
-                    conn,
-                    task_id,
-                    "completed",
-                    {
-                        "result_len": 0,
-                        "summary": completed_summary,
-                        "external_key": external_key,
-                        "source": EXTERNAL_SYNC_CREATED_BY,
-                    },
-                    run_id=completed_run_id,
-                )
-                completed_task = task_id
-            _append_event(
-                conn,
-                task_id,
-                "external_synced",
-                {"external_key": external_key, "changed_fields": changed_fields},
-            )
-            result = ExternalTaskSyncResult(
-                action="create",
-                task_id=task_id,
-                external_key=external_key,
-                dry_run=False,
-                changed_fields=changed_fields,
-                after={**after, "id": task_id},
-            )
-        else:
-            before = snapshot(row)
-            if expected is not None and row["status"] != expected:
-                raise RuntimeError(
-                    f"expected current status {expected!r} for external_key "
-                    f"{external_key!r}, found {row['status']!r}; no changes written"
-                )
-
-            updates: dict[str, Any] = {}
-            if row["title"] != title:
-                updates["title"] = title
-            if row["assignee"] != assignee:
-                updates["assignee"] = assignee
-            if row["source_path"] != source_path:
-                updates["source_path"] = source_path
-            if row["created_by"] != EXTERNAL_SYNC_CREATED_BY:
-                updates["created_by"] = EXTERNAL_SYNC_CREATED_BY
-            if row["status"] != desired:
-                updates["status"] = desired
-                updates["completed_at"] = now if desired == "done" else None
-                updates["claim_lock"] = None
-                updates["claim_expires"] = None
-                updates["worker_pid"] = None
-                updates["current_run_id"] = None
-                if desired == "done":
-                    updates["block_kind"] = None
-                    updates["block_recurrences"] = 0
-
-            if not updates:
-                return ExternalTaskSyncResult(
-                    action="noop",
-                    task_id=row["id"],
-                    external_key=external_key,
-                    dry_run=dry_run,
-                    before=before,
-                    after=before,
-                )
-
-            after = dict(before)
-            for key, value in updates.items():
-                if key in after:
-                    after[key] = value
-            changed_fields = sorted(updates.keys())
-            if dry_run:
-                return ExternalTaskSyncResult(
-                    action="update",
-                    task_id=row["id"],
-                    external_key=external_key,
-                    dry_run=True,
-                    changed_fields=changed_fields,
-                    before=before,
-                    after=after,
-                )
-
-            if row["status"] != desired and row["current_run_id"]:
-                completed_run_id = _end_run(
-                    conn,
-                    row["id"],
-                    outcome="completed" if desired == "done" else "released",
-                    status="done" if desired == "done" else "released",
-                    summary=(
-                        completed_summary
-                        if desired == "done"
-                        else "External task synchronized back to ready"
-                    ),
-                    metadata={
-                        "external_key": external_key,
-                        "source_path": source_path,
-                        "source": EXTERNAL_SYNC_CREATED_BY,
-                    },
-                )
-            assignments = ", ".join(f"{name} = ?" for name in updates)
-            conn.execute(
-                f"UPDATE tasks SET {assignments} WHERE id = ?",
-                (*updates.values(), row["id"]),
-            )
-            if row["status"] != desired and desired == "done":
-                if completed_run_id is None:
-                    completed_run_id = _synthesize_ended_run(
-                        conn,
-                        row["id"],
-                        outcome="completed",
-                        summary=completed_summary,
-                        metadata={
-                            "external_key": external_key,
-                            "source_path": source_path,
-                            "source": EXTERNAL_SYNC_CREATED_BY,
-                        },
-                    )
-                _append_event(
-                    conn,
-                    row["id"],
-                    "completed",
-                    {
-                        "result_len": len(row["result"]) if row["result"] else 0,
-                        "summary": completed_summary,
-                        "external_key": external_key,
-                        "source": EXTERNAL_SYNC_CREATED_BY,
-                    },
-                    run_id=completed_run_id,
-                )
-                conn.execute(
-                    "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
-                    "WHERE id = ?",
-                    (row["id"],),
-                )
-                completed_task = row["id"]
             _append_event(
                 conn,
                 row["id"],
-                "external_synced",
-                {"external_key": external_key, "changed_fields": changed_fields},
+                "completed",
+                {
+                    "result_len": len(row["result"]) if row["result"] else 0,
+                    "summary": completed_summary,
+                    "external_key": external_key,
+                    "source": EXTERNAL_SYNC_CREATED_BY,
+                },
+                run_id=completed_run_id,
             )
-            result = ExternalTaskSyncResult(
-                action="update",
-                task_id=row["id"],
-                external_key=external_key,
-                dry_run=False,
-                changed_fields=changed_fields,
-                before=before,
-                after=after,
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ?",
+                (row["id"],),
             )
+            completed_task = row["id"]
+        _append_event(
+            conn,
+            row["id"],
+            "external_synced",
+            {"external_key": external_key, "changed_fields": changed_fields},
+        )
+        result = ExternalTaskSyncResult(
+            action="update",
+            task_id=row["id"],
+            external_key=external_key,
+            dry_run=False,
+            changed_fields=changed_fields,
+            before=before,
+            after=after,
+        )
 
-    if completed_task:
+    completions = (
+        [_ExternalTaskSyncCompletion(completed_task, completed_run_id, completed_summary)]
+        if completed_task
+        else []
+    )
+    return result, completions
+
+
+def _after_external_sync_commit(
+    conn: sqlite3.Connection,
+    completions: Iterable[_ExternalTaskSyncCompletion],
+) -> None:
+    for completion in completions:
+        completed_task = completion.task_id
         recompute_ready(conn)
         _cleanup_workspace(conn, completed_task)
         _done_task = get_task(conn, completed_task)
@@ -2737,10 +2880,9 @@ def sync_external_task(
             completed_task,
             board=get_current_board(),
             assignee=_done_task.assignee if _done_task else None,
-            run_id=completed_run_id,
-            summary=completed_summary,
+            run_id=completion.run_id,
+            summary=completion.summary,
         )
-    return result
 
 
 def create_task(
