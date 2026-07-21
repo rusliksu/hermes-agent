@@ -18,20 +18,25 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.single_principal import SinglePrincipalPolicy
 
 
-def _make_source() -> SessionSource:
+OWNER = "10001"
+FAMILY = "30003"
+
+
+def _make_source(user_id: str = "u1") -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        user_id="u1",
-        chat_id="c1",
+        user_id=user_id,
+        chat_id=user_id,
         user_name="tester",
         chat_type="dm",
     )
 
 
-def _make_event(text: str) -> MessageEvent:
-    return MessageEvent(text=text, source=_make_source(), message_id="m1")
+def _make_event(text: str, user_id: str = "u1") -> MessageEvent:
+    return MessageEvent(text=text, source=_make_source(user_id), message_id="m1")
 
 
 def _make_runner():
@@ -44,6 +49,7 @@ def _make_runner():
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
+    adapter.authorization_is_upstream = False
     # No send_slash_confirm override -> button render returns None,
     # _request_slash_confirm falls back to text path.
     adapter.send_slash_confirm = AsyncMock(return_value=None)
@@ -65,6 +71,7 @@ def _make_runner():
 
     runner._running_agents = {}
     runner._pending_messages = {}
+    runner._update_prompt_pending = {}
     import itertools as _it
     runner._slash_confirm_counter = _it.count(1)
     runner.hooks = SimpleNamespace(
@@ -75,6 +82,16 @@ def _make_runner():
     runner._thread_metadata_for_source = lambda *a, **kw: None
     runner._reply_anchor_for_event = lambda _e: None
     return runner
+
+
+def _single_principal_policy():
+    return SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": OWNER,
+            "telegram_allowed_user_ids": [FAMILY],
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -259,3 +276,68 @@ async def test_resolve_always_persists_opt_out_and_runs_execute(monkeypatch):
     assert resolved is not None
     assert "✨ fresh" in resolved
     assert "config.yaml" in resolved
+
+
+@pytest.mark.asyncio
+async def test_family_slash_confirm_text_fallback_is_owner_only(monkeypatch):
+    from tools import slash_confirm as _slash_confirm_mod
+
+    policy = _single_principal_policy()
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        single_principal=policy,
+    )
+    runner._single_principal_policy = policy
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    session_key = build_session_key(_make_source(FAMILY))
+    choices = []
+
+    async def handler(choice):
+        choices.append(choice)
+        return "done"
+
+    _slash_confirm_mod.clear(session_key)
+    _slash_confirm_mod.register(session_key, "cid-family", "new", handler)
+
+    result = await runner._handle_message(_make_event("/approve", FAMILY))
+
+    assert "not authorized" in result.lower()
+    assert choices == []
+    assert _slash_confirm_mod.get_pending(session_key) is not None
+    _slash_confirm_mod.clear(session_key)
+
+
+@pytest.mark.asyncio
+async def test_owner_slash_confirm_text_fallback_still_resolves(monkeypatch):
+    from tools import slash_confirm as _slash_confirm_mod
+
+    policy = _single_principal_policy()
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        single_principal=policy,
+    )
+    runner._single_principal_policy = policy
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    session_key = build_session_key(_make_source(OWNER))
+    choices = []
+
+    async def handler(choice):
+        choices.append(choice)
+        return "done"
+
+    _slash_confirm_mod.clear(session_key)
+    _slash_confirm_mod.register(session_key, "cid-owner", "new", handler)
+
+    result = await runner._handle_message(_make_event("/approve", OWNER))
+
+    assert result == "done"
+    assert choices == ["once"]
+    assert _slash_confirm_mod.get_pending(session_key) is None

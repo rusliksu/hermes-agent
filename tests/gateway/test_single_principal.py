@@ -520,6 +520,44 @@ def test_family_user_is_not_single_principal_slash_admin():
     assert runner._check_slash_access(_source(FAMILY, chat_id=FAMILY), "whoami") is None
 
 
+def test_normalized_family_user_is_not_single_principal_slash_admin():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={},
+            )
+        },
+        single_principal=policy,
+    )
+
+    denial = runner._check_slash_access(
+        _source(f"0{FAMILY}", chat_id=f"0{FAMILY}"),
+        "restart",
+    )
+    assert denial is not None
+    assert "/restart is admin-only here" in denial
+
+
+def test_single_principal_normalized_owner_family_and_elevated_helpers():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+
+    owner = _source(f"0{OWNER}", chat_id=f"0{OWNER}")
+    family = _source(f"0{FAMILY}", chat_id=f"0{FAMILY}")
+    outsider = _source(OUTSIDER, chat_id=OUTSIDER)
+
+    assert policy.is_telegram_owner(owner) is True
+    assert policy.is_telegram_family_ordinary_dm(family) is True
+    assert policy.authorizes_telegram_ordinary_dm(owner) is True
+    assert policy.authorizes_telegram_ordinary_dm(family) is True
+    assert policy.authorizes_telegram_ordinary_dm(outsider) is False
+    assert policy.authorize_elevated(owner) is True
+    assert policy.authorize_elevated(family) is False
+
+
 def test_family_user_can_run_explicit_user_command_but_not_admin_command():
     policy = _policy(telegram_allowed_user_ids=[FAMILY])
     runner = _runner(policy)
@@ -749,6 +787,9 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
         def _is_user_authorized(self, source):
             return bool(self._single_principal_policy.authorize(source))
 
+        def _is_elevated_user_authorized(self, source):
+            return bool(self._single_principal_policy.authorize_elevated(source))
+
     adapter = object.__new__(TelegramAdapter)
     adapter.config = PlatformConfig(enabled=True, token="test", extra={})
     adapter._message_handler = Runner().handle
@@ -768,3 +809,11 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
     assert adapter._is_callback_user_authorized(OWNER) is True
     assert adapter._is_callback_user_authorized(FAMILY) is True
     assert adapter._is_callback_user_authorized(OUTSIDER) is False
+    assert adapter._is_callback_user_authorized(
+        OWNER,
+        require_elevated=True,
+    ) is True
+    assert adapter._is_callback_user_authorized(
+        FAMILY,
+        require_elevated=True,
+    ) is False

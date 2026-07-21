@@ -55,6 +55,11 @@ def _normalize_positive_telegram_id(value: Any) -> Optional[str]:
     return normalized if normalized != "0" else None
 
 
+def normalize_telegram_user_id(value: Any) -> Optional[str]:
+    """Normalize a positive Telegram user id for policy-owned comparisons."""
+    return _normalize_positive_telegram_id(value)
+
+
 def _normalize_negative_telegram_chat_id(value: Any) -> Optional[str]:
     raw = str(value or "").strip()
     if not _TELEGRAM_SHARED_CHAT_ID_RE.fullmatch(raw):
@@ -216,26 +221,57 @@ class SinglePrincipalPolicy:
         """Force allowlisted shared scopes onto one session per chat/topic."""
         return False if self.shared_scope(source) is not None else default
 
+    def _telegram_dm_user_id(self, source: Any) -> Optional[str]:
+        if not self.enabled:
+            return None
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if platform != "telegram" or chat_type not in {"dm", "direct", "private"}:
+            return None
+        return _normalize_positive_telegram_id(getattr(source, "user_id", None))
+
+    def is_telegram_owner(self, source: Any) -> bool:
+        """Return True when source is the configured owner Telegram DM user."""
+        normalized_user_id = self._telegram_dm_user_id(source)
+        return bool(
+            normalized_user_id is not None
+            and normalized_user_id == self.telegram_owner_id
+        )
+
+    def is_telegram_family_ordinary_dm(self, source: Any) -> bool:
+        """Return True for a family allowlisted ordinary Telegram DM user."""
+        normalized_user_id = self._telegram_dm_user_id(source)
+        return bool(
+            normalized_user_id is not None
+            and normalized_user_id in self.telegram_allowed_user_ids
+        )
+
+    def authorizes_telegram_ordinary_dm(self, source: Any) -> bool:
+        """Owner and family can talk to the ordinary Telegram DM surface."""
+        return self.is_telegram_owner(source) or self.is_telegram_family_ordinary_dm(
+            source
+        )
+
+    def authorize_elevated(
+        self, source: Any, *, upstream_authenticated: bool = False
+    ) -> Optional[bool]:
+        """Authorize owner-only elevated actions, or None when disabled."""
+        if not self.enabled:
+            return None
+        if upstream_authenticated:
+            return self.allow_owner_bound_relay
+        return self.is_telegram_owner(source)
+
     def authorize(self, source: Any, *, upstream_authenticated: bool = False) -> Optional[bool]:
         """Return an authoritative decision, or ``None`` when mode is disabled."""
         if not self.enabled:
             return None
-        if getattr(source, "chat_type", None) != "dm":
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if chat_type not in {"dm", "direct", "private"}:
             return self.shared_scope(source) is not None
         if upstream_authenticated:
             return self.allow_owner_bound_relay
-        platform = getattr(getattr(source, "platform", None), "value", None)
-        user_id = getattr(source, "user_id", None)
-        normalized_user_id = _normalize_positive_telegram_id(user_id)
-        allowed_user_ids = {
-            self.telegram_owner_id,
-            *self.telegram_allowed_user_ids,
-        }
-        return bool(
-            platform == "telegram"
-            and normalized_user_id is not None
-            and normalized_user_id in allowed_user_ids
-        )
+        return self.authorizes_telegram_ordinary_dm(source)
 
     def pairing_identity_allowed(self, platform: str, user_id: str) -> bool:
         if not self.enabled:

@@ -49,6 +49,11 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.config import PlatformConfig
+from gateway.single_principal import SinglePrincipalPolicy
+
+
+OWNER = "10001"
+FAMILY = "30003"
 
 
 def _make_adapter(extra=None):
@@ -65,6 +70,26 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+
+
+class _SinglePrincipalRunner:
+    def __init__(self):
+        self._single_principal_policy = SinglePrincipalPolicy.from_dict(
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [FAMILY],
+            }
+        )
+
+    async def _handle_message(self, event):
+        return None
+
+    def _is_user_authorized(self, source):
+        return bool(self._single_principal_policy.authorize(source))
+
+    def _is_elevated_user_authorized(self, source):
+        return bool(self._single_principal_policy.authorize_elevated(source))
 
 
 # ===========================================================================
@@ -240,6 +265,40 @@ class TestTelegramClarifyCallback:
         assert entry.response == "green"
         assert entry.event.is_set()
         query.answer.assert_called_once()
+        query.edit_message_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_family_numeric_choice_callback_is_allowed(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        adapter._message_handler = _SinglePrincipalRunner()._handle_message
+        cm.register("cidF", "sk-family", "Pick", ["red", "green"])
+        adapter._clarify_state["cidF"] = "sk-family"
+
+        query = AsyncMock()
+        query.data = "cl:cidF:1"
+        query.message = MagicMock()
+        query.message.chat_id = int(FAMILY)
+        query.message.chat.type = "private"
+        query.message.text = "Pick"
+        query.from_user = MagicMock()
+        query.from_user.id = f"0{FAMILY}"
+        query.from_user.first_name = "Family"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        with cm._lock:
+            entry = cm._entries.get("cidF")
+        assert entry is not None
+        assert entry.response == "green"
+        assert entry.event.is_set()
+        assert "cidF" not in adapter._clarify_state
         query.edit_message_text.assert_called_once()
 
     @pytest.mark.asyncio

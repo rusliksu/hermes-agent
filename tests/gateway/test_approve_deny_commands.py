@@ -19,6 +19,11 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.single_principal import SinglePrincipalPolicy
+
+
+OWNER = "10001"
+FAMILY = "30003"
 
 
 def _make_source() -> SessionSource:
@@ -39,6 +44,20 @@ def _make_event(text: str) -> MessageEvent:
     )
 
 
+def _make_tg_source(user_id: str) -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=user_id,
+        chat_id=user_id,
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_tg_event(text: str, user_id: str) -> MessageEvent:
+    return MessageEvent(text=text, source=_make_tg_source(user_id), message_id="m1")
+
+
 def _make_runner():
     from gateway.run import GatewayRunner
 
@@ -48,6 +67,7 @@ def _make_runner():
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
+    adapter.authorization_is_upstream = False
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
@@ -63,6 +83,28 @@ def _make_runner():
     runner._show_reasoning = False
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    return runner
+
+
+def _single_principal_policy():
+    return SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": OWNER,
+            "telegram_allowed_user_ids": [FAMILY],
+        }
+    )
+
+
+def _make_single_principal_runner():
+    runner = _make_runner()
+    policy = _single_principal_policy()
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        single_principal=policy,
+    )
+    runner._single_principal_policy = policy
+    runner.__dict__.pop("_is_user_authorized", None)
     return runner
 
 
@@ -272,6 +314,38 @@ class TestApproveCommand:
         assert "expired" in result.lower() or "no longer waiting" in result.lower()
         assert session_key not in runner._pending_approvals
 
+    @pytest.mark.asyncio
+    async def test_family_approve_command_is_owner_only(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_single_principal_runner()
+        session_key = runner._session_key_for_source(_make_tg_source(FAMILY))
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(
+            _make_tg_event("/approve", FAMILY)
+        )
+
+        assert "not authorized" in result.lower()
+        assert not entry.event.is_set()
+        assert entry.result is None
+
+    @pytest.mark.asyncio
+    async def test_owner_approve_command_still_resolves(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_single_principal_runner()
+        session_key = runner._session_key_for_source(_make_tg_source(OWNER))
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(_make_tg_event("/approve", OWNER))
+
+        assert "approved" in result.lower()
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
 
 # ------------------------------------------------------------------
 # /deny command
@@ -342,6 +416,21 @@ class TestDenyCommand:
         assert entry.result == "deny"
         assert entry.reason == "that path is still in use"
         assert "that path is still in use" in result
+
+    @pytest.mark.asyncio
+    async def test_family_deny_command_is_owner_only(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_single_principal_runner()
+        session_key = runner._session_key_for_source(_make_tg_source(FAMILY))
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_deny_command(_make_tg_event("/deny", FAMILY))
+
+        assert "not authorized" in result.lower()
+        assert not entry.event.is_set()
+        assert entry.result is None
 
     @pytest.mark.asyncio
     async def test_deny_all_with_reason(self):

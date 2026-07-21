@@ -9639,6 +9639,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif _norm_reply in {"cancel", "nevermind", "no"}:
                 _confirm_choice = "cancel"
             if _confirm_choice is not None:
+                if not self._is_elevated_user_authorized(source):
+                    return "⛔ You are not authorized to answer this confirmation."
                 _resolved = await _slash_confirm_mod.resolve(
                     _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
                 )
@@ -13106,9 +13108,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             getattr(single_principal, "enabled", False)
             and source.platform == Platform.TELEGRAM
-            and (source.chat_type or "dm").lower() in {"dm", "direct", "private"}
-            and str(source.user_id or "").strip()
-            in set(getattr(single_principal, "telegram_allowed_user_ids", ()))
+            and single_principal.is_telegram_family_ordinary_dm(source)
         ):
             if policy.enabled and policy.can_run(source.user_id, canonical_cmd):
                 return None
