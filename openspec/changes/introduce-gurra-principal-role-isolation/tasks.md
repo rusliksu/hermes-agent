@@ -4,7 +4,7 @@
 - [x] 1.2 Описать typed contracts для `RolePolicy`, `PrincipalBinding`, `SharedScopeBinding`, redacted audit metadata и server-bound delivery target.
 - [x] 1.3 Реализовать resolver, который принимает transport/account/peer identity только как вход и не добавляет эти значения в authority-поля downstream context.
 - [x] 1.4 Добавить registry roles и bindings для owner, 9 family principals и 2 shared rooms с fail-closed validation.
-- [ ] 1.5 Ввести compare mode, который показывает различия legacy routing и нового resolver без изменения active routing.
+- [x] 1.5 Ввести compare mode, который показывает различия legacy routing и нового resolver без изменения active routing.
 - [ ] 1.6 Запретить model args, command args и callback payload выбирать foreign profile, namespace, role, session или delivery target.
 
 ## 2. Exact multiplex routing и request-path hardening
@@ -67,7 +67,7 @@
 
 ## 8. Focused и full tests
 
-- [ ] 8.1 Добавить focused tests для typed contracts, resolver, registry validation, compare mode и redacted audit metadata.
+- [x] 8.1 Добавить focused tests для typed contracts, resolver, registry validation, compare mode и redacted audit metadata.
 - [ ] 8.2 Добавить pairwise isolation tests для owner, Юли, мамы, остальных семи family principals и обеих rooms.
 - [ ] 8.3 Добавить tests для guessed IDs: session IDs, profile IDs, memory namespaces, attachment paths, delivery targets и callback payloads.
 - [ ] 8.4 Добавить concurrent/background/callback/cron/delegation/compaction/reset/restart tests с persisted context validation.

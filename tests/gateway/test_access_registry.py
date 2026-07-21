@@ -6,6 +6,7 @@ import pytest
 
 from gateway.access_registry import (
     AccessDeniedError,
+    AccessComparisonResult,
     AccessRegistry,
     DeliveryTarget,
     ParticipantIdentity,
@@ -16,6 +17,7 @@ from gateway.access_registry import (
     RolePolicy,
     SharedScopeBinding,
     TransportIdentity,
+    compare_legacy_access_resolution,
 )
 
 
@@ -543,3 +545,145 @@ def test_redacted_audit_metadata_sanitizes_malformed_platform_and_peer_kind():
     assert metadata.peer_kind == "unknown"
     assert "raw-platform-secret" not in rendered
     assert "raw-peer-secret" not in rendered
+
+
+def test_compare_mode_matching_allow_and_profile():
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id="family-profile-0",
+        registry=_registry(),
+        identity=_dm_identity("opaque-family-0"),
+    )
+
+    assert result.legacy_outcome == "allow"
+    assert result.resolved_outcome == "allow"
+    assert result.outcome_agrees is True
+    assert result.profile_agrees is True
+    assert result.legacy_profile == "explicit"
+    assert result.comparison_reason == "profiles_match"
+
+
+def test_compare_mode_reports_wrong_profile_without_raw_profile_ids():
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id="family-profile-1",
+        registry=_registry(),
+        identity=_dm_identity("opaque-family-0"),
+    )
+
+    assert result.outcome_agrees is True
+    assert result.profile_agrees is False
+    assert result.comparison_reason == "profile_mismatch"
+    rendered = json.dumps(result.as_dict())
+    assert "family-profile-0" not in rendered
+    assert "family-profile-1" not in rendered
+
+
+@pytest.mark.parametrize("legacy_profile_id", [None, "", "default"])
+def test_compare_mode_legacy_allow_with_implicit_profile_is_mismatch(legacy_profile_id):
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id=legacy_profile_id,
+        registry=_registry(),
+        identity=_dm_identity("opaque-owner"),
+    )
+
+    assert result.legacy_outcome == "allow"
+    assert result.resolved_outcome == "allow"
+    assert result.outcome_agrees is True
+    assert result.profile_agrees is False
+    assert result.legacy_profile == "implicit_fallback"
+    assert result.comparison_reason == "legacy_implicit_profile"
+
+
+def test_compare_mode_legacy_allow_new_deny():
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id="owner-profile",
+        registry=_registry(),
+        identity=_dm_identity("unknown-principal"),
+    )
+
+    assert result.legacy_outcome == "allow"
+    assert result.resolved_outcome == "deny"
+    assert result.outcome_agrees is False
+    assert result.profile_agrees is None
+    assert result.resolved_reason == "missing_principal_binding"
+    assert result.comparison_reason == "outcome_mismatch"
+
+
+def test_compare_mode_both_deny():
+    result = compare_legacy_access_resolution(
+        legacy_allowed=False,
+        legacy_profile_id=None,
+        registry=_registry(),
+        identity=_dm_identity("unknown-principal"),
+    )
+
+    assert result.legacy_outcome == "deny"
+    assert result.resolved_outcome == "deny"
+    assert result.outcome_agrees is True
+    assert result.profile_agrees is None
+    assert result.legacy_profile == "not_applicable"
+    assert result.resolved_reason == "missing_principal_binding"
+    assert result.comparison_reason == "outcomes_match"
+
+
+def test_compare_mode_invalid_registry_is_expected_new_denial():
+    bindings = _principal_bindings()
+    registry = _registry(principal_bindings=bindings + (bindings[0],))
+
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id="owner-profile",
+        registry=registry,
+        identity=_dm_identity("opaque-owner"),
+    )
+
+    assert result.legacy_outcome == "allow"
+    assert result.resolved_outcome == "deny"
+    assert result.outcome_agrees is False
+    assert result.resolved_reason == "registry_validation_failed"
+    assert result.comparison_reason == "outcome_mismatch"
+
+
+def test_compare_mode_result_is_frozen():
+    result = compare_legacy_access_resolution(
+        legacy_allowed=False,
+        legacy_profile_id=None,
+        registry=_registry(),
+        identity=_dm_identity("unknown-principal"),
+    )
+
+    assert isinstance(result, AccessComparisonResult)
+    with pytest.raises(FrozenInstanceError):
+        result.resolved_reason = "changed"
+
+
+def test_compare_mode_as_dict_is_redacted_and_categorical():
+    identity = TransportIdentity(
+        platform="telegram",
+        account="raw-account-secret",
+        peer_kind="dm",
+        user_id="raw-user-secret",
+        chat_id="raw-user-secret",
+    )
+    result = compare_legacy_access_resolution(
+        legacy_allowed=True,
+        legacy_profile_id="raw-legacy-profile-secret",
+        registry=_registry(),
+        identity=identity,
+    )
+
+    rendered = json.dumps(result.as_dict(), sort_keys=True)
+    assert result.audit.event == "compare"
+    for raw_value in (
+        "raw-account-secret",
+        "raw-user-secret",
+        "raw-legacy-profile-secret",
+        "owner-profile",
+    ):
+        assert raw_value not in rendered
+        sha_prefix = hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:12]
+        assert sha_prefix not in rendered
+    assert result.as_dict()["audit"]["account_ref"] == "present"

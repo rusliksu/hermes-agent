@@ -181,6 +181,30 @@ class AccessDeniedError(PermissionError):
 
 
 @dataclass(frozen=True)
+class AccessComparisonResult:
+    legacy_outcome: str
+    resolved_outcome: str
+    outcome_agrees: bool
+    profile_agrees: Optional[bool]
+    legacy_profile: str
+    resolved_reason: str
+    comparison_reason: str
+    audit: RedactedAuditMetadata
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "legacy_outcome": self.legacy_outcome,
+            "resolved_outcome": self.resolved_outcome,
+            "outcome_agrees": self.outcome_agrees,
+            "profile_agrees": self.profile_agrees,
+            "legacy_profile": self.legacy_profile,
+            "resolved_reason": self.resolved_reason,
+            "comparison_reason": self.comparison_reason,
+            "audit": self.audit.as_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class RegistryValidationReport:
     verdict: str
     conflicts: tuple[tuple[str, int], ...] = ()
@@ -551,3 +575,59 @@ def _delivery_matches_identity(target: Any, identity: TransportIdentity) -> bool
         and target.chat_id == getattr(identity, "chat_id", None)
         and target.thread_id == getattr(identity, "thread_id", None)
     )
+
+
+def compare_legacy_access_resolution(
+    *,
+    legacy_allowed: bool,
+    legacy_profile_id: Optional[str],
+    registry: AccessRegistry,
+    identity: TransportIdentity,
+) -> AccessComparisonResult:
+    """Shadow-compare legacy auth/profile facts with the fail-closed resolver."""
+    audit = RedactedAuditMetadata.from_transport("compare", identity)
+    try:
+        resolved = registry.resolve(identity)
+        resolved_allowed = True
+        resolved_reason = "allowed"
+    except AccessDeniedError as exc:
+        resolved = None
+        resolved_allowed = False
+        resolved_reason = exc.reason
+
+    legacy_outcome = "allow" if legacy_allowed else "deny"
+    resolved_outcome = "allow" if resolved_allowed else "deny"
+    outcome_agrees = legacy_allowed == resolved_allowed
+    legacy_profile = _legacy_profile_category(legacy_allowed, legacy_profile_id)
+    profile_agrees: Optional[bool] = None
+
+    if legacy_allowed and resolved_allowed:
+        if legacy_profile == "explicit":
+            profile_agrees = resolved.profile_id == legacy_profile_id
+            comparison_reason = "profiles_match" if profile_agrees else "profile_mismatch"
+        else:
+            profile_agrees = False
+            comparison_reason = "legacy_implicit_profile"
+    elif outcome_agrees:
+        comparison_reason = "outcomes_match"
+    else:
+        comparison_reason = "outcome_mismatch"
+
+    return AccessComparisonResult(
+        legacy_outcome=legacy_outcome,
+        resolved_outcome=resolved_outcome,
+        outcome_agrees=outcome_agrees,
+        profile_agrees=profile_agrees,
+        legacy_profile=legacy_profile,
+        resolved_reason=resolved_reason,
+        comparison_reason=comparison_reason,
+        audit=audit,
+    )
+
+
+def _legacy_profile_category(legacy_allowed: bool, profile_id: Optional[str]) -> str:
+    if not legacy_allowed:
+        return "not_applicable"
+    if not _is_nonempty_str(profile_id) or str(profile_id).strip() == "default":
+        return "implicit_fallback"
+    return "explicit"
