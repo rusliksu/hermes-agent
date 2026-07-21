@@ -1,0 +1,553 @@
+"""Fail-closed principal/role access contracts for gateway ingress."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
+
+
+def _immutable_capabilities(values: Any) -> frozenset[str]:
+    if values is None:
+        return frozenset()
+    return frozenset(str(value) for value in values if isinstance(value, str) and value)
+
+
+def _is_nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _redact(value: Any) -> Optional[str]:
+    if not _is_nonempty_str(value):
+        return None
+    return "present"
+
+
+_AUDIT_PLATFORMS = frozenset({"telegram"})
+_AUDIT_PEER_KINDS = frozenset({"dm", "group", "supergroup", "channel"})
+
+
+def _audit_label(value: Any, allowed: frozenset[str]) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    label = value.strip().lower()
+    return label if label in allowed else "unknown"
+
+
+@dataclass(frozen=True)
+class DeliveryTarget:
+    """Server-owned destination for replies after access resolution."""
+
+    platform: str
+    account: str
+    peer_kind: str
+    chat_id: str
+    thread_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for value in (self.platform, self.account, self.peer_kind, self.chat_id):
+            if not _is_nonempty_str(value):
+                raise ValueError("delivery target requires nonempty string fields")
+        if self.thread_id is not None and not _is_nonempty_str(self.thread_id):
+            raise ValueError("delivery target thread_id must be nonempty when set")
+
+
+@dataclass(frozen=True)
+class ResolvedAccessContext:
+    principal_id: str
+    role_id: str
+    profile_id: str
+    conversation_scope: str
+    capabilities: frozenset[str]
+    delivery_target: DeliveryTarget
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
+
+
+@dataclass(frozen=True)
+class RolePolicy:
+    role_id: str
+    capabilities: frozenset[str]
+    active: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
+
+
+@dataclass(frozen=True)
+class TransportIdentity:
+    """Trusted adapter identity input; never copied into ResolvedAccessContext."""
+
+    platform: Any
+    account: Any
+    peer_kind: Any
+    user_id: Any
+    chat_id: Any
+    thread_id: Any = None
+
+    @classmethod
+    def from_session_source(cls, source: Any, *, account: str) -> "TransportIdentity":
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        return cls(
+            platform=platform,
+            account=account,
+            peer_kind=getattr(source, "chat_type", None),
+            user_id=getattr(source, "user_id", None),
+            chat_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+        )
+
+
+@dataclass(frozen=True)
+class ParticipantIdentity:
+    platform: str
+    account: str
+    user_id: str
+
+    def key(self) -> tuple[str, str, str]:
+        return (self.platform, self.account, self.user_id)
+
+
+@dataclass(frozen=True)
+class PrincipalBinding:
+    principal_id: str
+    role_id: str
+    profile_id: str
+    transport_identity: TransportIdentity
+    conversation_scope: str
+    delivery_target: DeliveryTarget
+    active: bool = True
+
+
+@dataclass(frozen=True)
+class SharedScopeBinding:
+    principal_id: str
+    role_id: str
+    profile_id: str
+    room_identity: TransportIdentity
+    conversation_scope: str
+    delivery_target: DeliveryTarget
+    participant_identities: tuple[ParticipantIdentity, ...] = field(default_factory=tuple)
+    active: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "participant_identities", tuple(self.participant_identities))
+
+
+@dataclass(frozen=True)
+class RedactedAuditMetadata:
+    event: str
+    platform: Optional[str] = None
+    account_ref: Optional[str] = None
+    peer_kind: Optional[str] = None
+    user_ref: Optional[str] = None
+    chat_ref: Optional[str] = None
+    thread_ref: Optional[str] = None
+
+    @classmethod
+    def from_transport(cls, event: str, identity: Optional[TransportIdentity]) -> "RedactedAuditMetadata":
+        if identity is None:
+            return cls(event=event)
+        return cls(
+            event=event,
+            platform=_audit_label(getattr(identity, "platform", None), _AUDIT_PLATFORMS),
+            account_ref=_redact(getattr(identity, "account", None)),
+            peer_kind=_audit_label(getattr(identity, "peer_kind", None), _AUDIT_PEER_KINDS),
+            user_ref=_redact(getattr(identity, "user_id", None)),
+            chat_ref=_redact(getattr(identity, "chat_id", None)),
+            thread_ref=_redact(getattr(identity, "thread_id", None)),
+        )
+
+    def as_dict(self) -> dict[str, Optional[str]]:
+        return {
+            "event": self.event,
+            "platform": self.platform,
+            "account_ref": self.account_ref,
+            "peer_kind": self.peer_kind,
+            "user_ref": self.user_ref,
+            "chat_ref": self.chat_ref,
+            "thread_ref": self.thread_ref,
+        }
+
+
+class AccessDeniedError(PermissionError):
+    """Typed fail-closed denial that carries only redacted diagnostics."""
+
+    def __init__(self, reason: str, audit: RedactedAuditMetadata):
+        self.reason = reason
+        self.audit = audit
+        super().__init__(f"access denied: {reason}")
+
+
+@dataclass(frozen=True)
+class RegistryValidationReport:
+    verdict: str
+    conflicts: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        return self.verdict == "pass"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "conflicts": [
+                {"category": category, "count": count}
+                for category, count in self.conflicts
+            ],
+        }
+
+
+class RegistryValidationError(ValueError):
+    """Raised without transport IDs or human labels when registry validation fails."""
+
+    def __init__(self, report: RegistryValidationReport):
+        self.report = report
+        categories = ",".join(category for category, _ in report.conflicts)
+        super().__init__(f"access registry validation failed: categories={categories}")
+
+
+@dataclass(frozen=True)
+class AccessRegistry:
+    roles: Mapping[str, RolePolicy]
+    profiles: frozenset[str]
+    principal_bindings: tuple[PrincipalBinding, ...] = field(default_factory=tuple)
+    shared_scope_bindings: tuple[SharedScopeBinding, ...] = field(default_factory=tuple)
+    scope_capabilities: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    backend_capabilities: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        roles = dict(self.roles.items())
+        scopes = {
+            str(key): _immutable_capabilities(value)
+            for key, value in self.scope_capabilities.items()
+        }
+        object.__setattr__(self, "roles", MappingProxyType(roles))
+        object.__setattr__(self, "profiles", frozenset(self.profiles))
+        object.__setattr__(self, "principal_bindings", tuple(self.principal_bindings))
+        object.__setattr__(self, "shared_scope_bindings", tuple(self.shared_scope_bindings))
+        object.__setattr__(self, "scope_capabilities", MappingProxyType(scopes))
+        object.__setattr__(self, "backend_capabilities", _immutable_capabilities(self.backend_capabilities))
+
+    def validate(self) -> RegistryValidationReport:
+        counts: dict[str, int] = {}
+
+        def add(category: str, count: int = 1) -> None:
+            if count:
+                counts[category] = counts.get(category, 0) + count
+
+        for key, role in self.roles.items():
+            if not _is_nonempty_str(key):
+                add("malformed_role_key")
+            if not isinstance(role, RolePolicy):
+                add("malformed_role")
+                continue
+            if key != role.role_id:
+                add("mismatched_role_key")
+
+        principal_keys: dict[tuple[str, str, str, str], int] = {}
+        principal_ids: dict[str, int] = {}
+        principal_profiles: dict[str, int] = {}
+        for binding in self.principal_bindings:
+            if not isinstance(binding, PrincipalBinding):
+                add("malformed_principal_binding")
+                continue
+            if not binding.active:
+                continue
+            if not _valid_principal_binding_identity(binding.transport_identity):
+                add("malformed_principal_binding")
+            else:
+                principal_keys[_principal_key(binding.transport_identity)] = (
+                    principal_keys.get(_principal_key(binding.transport_identity), 0) + 1
+                )
+            self._validate_binding_authority(
+                binding.principal_id,
+                binding.role_id,
+                binding.profile_id,
+                binding.conversation_scope,
+                add,
+            )
+            if not _delivery_matches_identity(binding.delivery_target, binding.transport_identity):
+                add("delivery_target_mismatch")
+            if _is_nonempty_str(binding.principal_id):
+                principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
+            if _is_nonempty_str(binding.profile_id):
+                principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
+
+        room_keys: dict[tuple[str, str, str, str, Optional[str]], int] = {}
+        room_profiles: dict[str, int] = {}
+        for binding in self.shared_scope_bindings:
+            if not isinstance(binding, SharedScopeBinding):
+                add("malformed_shared_scope_binding")
+                continue
+            if not binding.active:
+                continue
+            if not _valid_room_identity(binding.room_identity):
+                add("malformed_shared_scope_binding")
+            else:
+                room_keys[_room_key(binding.room_identity)] = (
+                    room_keys.get(_room_key(binding.room_identity), 0) + 1
+                )
+            if binding.role_id != "shared_room":
+                add("invalid_shared_room_role")
+            self._validate_binding_authority(
+                binding.principal_id,
+                binding.role_id,
+                binding.profile_id,
+                binding.conversation_scope,
+                add,
+            )
+            if not _delivery_matches_identity(binding.delivery_target, binding.room_identity):
+                add("delivery_target_mismatch")
+            if not binding.participant_identities:
+                add("missing_shared_room_membership")
+            participant_keys: dict[tuple[str, str, str], int] = {}
+            for participant in binding.participant_identities:
+                if not isinstance(participant, ParticipantIdentity):
+                    add("malformed_shared_room_membership")
+                    continue
+                if not all(_is_nonempty_str(value) for value in participant.key()):
+                    add("malformed_shared_room_membership")
+                    continue
+                participant_keys[participant.key()] = participant_keys.get(participant.key(), 0) + 1
+            add(
+                "duplicate_shared_room_member",
+                sum(count - 1 for count in participant_keys.values() if count > 1),
+            )
+            if _is_nonempty_str(binding.principal_id):
+                principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
+            if _is_nonempty_str(binding.profile_id):
+                principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
+                room_profiles[binding.profile_id] = room_profiles.get(binding.profile_id, 0) + 1
+
+        add("duplicate_principal_binding", sum(count - 1 for count in principal_keys.values() if count > 1))
+        add("duplicate_principal_id", sum(count - 1 for count in principal_ids.values() if count > 1))
+        add("duplicate_principal_profile", sum(count - 1 for count in principal_profiles.values() if count > 1))
+        add("duplicate_shared_scope_binding", sum(count - 1 for count in room_keys.values() if count > 1))
+        add("duplicate_shared_room_profile", sum(count - 1 for count in room_profiles.values() if count > 1))
+
+        conflicts = tuple(sorted(counts.items()))
+        return RegistryValidationReport(
+            verdict="fail" if conflicts else "pass",
+            conflicts=conflicts,
+        )
+
+    def validate_rollout_shape(self) -> RegistryValidationReport:
+        counts = dict(self.validate().conflicts)
+        active_principals = [
+            binding
+            for binding in self.principal_bindings
+            if isinstance(binding, PrincipalBinding) and binding.active
+        ]
+        active_rooms = [
+            binding
+            for binding in self.shared_scope_bindings
+            if isinstance(binding, SharedScopeBinding) and binding.active
+        ]
+        owner_count = sum(binding.role_id == "owner" for binding in active_principals)
+        standard_count = sum(binding.role_id == "family_standard" for binding in active_principals)
+        sandbox_count = sum(binding.role_id == "family_sandbox" for binding in active_principals)
+        shared_count = sum(binding.role_id == "shared_room" for binding in active_rooms)
+        allowed_private_roles = {"owner", "family_standard", "family_sandbox"}
+        expected = {
+            "active_principal_binding_count": (len(active_principals), 10),
+            "invalid_private_role_count": (
+                sum(binding.role_id not in allowed_private_roles for binding in active_principals),
+                0,
+            ),
+            "owner_count": (owner_count, 1),
+            "family_standard_count": (standard_count, 8),
+            "family_sandbox_count": (sandbox_count, 1),
+            "active_shared_scope_binding_count": (len(active_rooms), 2),
+            "shared_room_count": (shared_count, 2),
+        }
+        for category, (actual, wanted) in expected.items():
+            if actual != wanted:
+                counts[category] = abs(actual - wanted) or 1
+        conflicts = tuple(sorted(counts.items()))
+        return RegistryValidationReport(
+            verdict="fail" if conflicts else "pass",
+            conflicts=conflicts,
+        )
+
+    def require_valid(self) -> RegistryValidationReport:
+        report = self.validate()
+        if not report.valid:
+            raise RegistryValidationError(report)
+        return report
+
+    def require_valid_rollout_shape(self) -> RegistryValidationReport:
+        report = self.validate_rollout_shape()
+        if not report.valid:
+            raise RegistryValidationError(report)
+        return report
+
+    def resolve(self, identity: TransportIdentity) -> ResolvedAccessContext:
+        audit = RedactedAuditMetadata.from_transport("resolve", identity)
+        if not self.validate().valid:
+            raise AccessDeniedError("registry_validation_failed", audit)
+        if not _valid_ingress_identity(identity):
+            raise AccessDeniedError("malformed_identity", audit)
+        if identity.platform != "telegram":
+            raise AccessDeniedError("unknown_platform", audit)
+        if identity.peer_kind == "dm":
+            return self._resolve_dm(identity, audit)
+        return self._resolve_shared_room(identity, audit)
+
+    def effective_capabilities(self, role_id: str, conversation_scope: str) -> frozenset[str]:
+        role = self.roles.get(role_id)
+        if not isinstance(role, RolePolicy) or not role.active:
+            return frozenset()
+        scope_caps = self.scope_capabilities.get(conversation_scope, frozenset())
+        return role.capabilities & scope_caps & self.backend_capabilities
+
+    def _resolve_dm(
+        self,
+        identity: TransportIdentity,
+        audit: RedactedAuditMetadata,
+    ) -> ResolvedAccessContext:
+        if identity.user_id != identity.chat_id:
+            raise AccessDeniedError("dm_identity_mismatch", audit)
+        matches = [
+            binding
+            for binding in self.principal_bindings
+            if binding.active and _valid_principal_binding_identity(binding.transport_identity)
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
+        ]
+        binding = _single_match(matches, "principal_binding", audit)
+        self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
+        return ResolvedAccessContext(
+            principal_id=binding.principal_id,
+            role_id=binding.role_id,
+            profile_id=binding.profile_id,
+            conversation_scope=binding.conversation_scope,
+            capabilities=self.effective_capabilities(binding.role_id, binding.conversation_scope),
+            delivery_target=binding.delivery_target,
+        )
+
+    def _resolve_shared_room(
+        self,
+        identity: TransportIdentity,
+        audit: RedactedAuditMetadata,
+    ) -> ResolvedAccessContext:
+        matches = [
+            binding
+            for binding in self.shared_scope_bindings
+            if binding.active and _valid_room_identity(binding.room_identity)
+            and _room_key(binding.room_identity) == _room_key(identity)
+        ]
+        binding = _single_match(matches, "shared_scope_binding", audit)
+        member = ParticipantIdentity(identity.platform, identity.account, identity.user_id)
+        if member.key() not in {participant.key() for participant in binding.participant_identities}:
+            raise AccessDeniedError("participant_not_member", audit)
+        self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
+        return ResolvedAccessContext(
+            principal_id=binding.principal_id,
+            role_id=binding.role_id,
+            profile_id=binding.profile_id,
+            conversation_scope=binding.conversation_scope,
+            capabilities=self.effective_capabilities(binding.role_id, binding.conversation_scope),
+            delivery_target=binding.delivery_target,
+        )
+
+    def _validate_binding_authority(
+        self,
+        principal_id: str,
+        role_id: str,
+        profile_id: str,
+        conversation_scope: str,
+        add: Any,
+    ) -> None:
+        if not all(_is_nonempty_str(value) for value in (principal_id, role_id, profile_id, conversation_scope)):
+            add("malformed_binding_authority")
+            return
+        role = self.roles.get(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != role_id or not role.active:
+            add("unknown_role")
+        if profile_id not in self.profiles:
+            add("unknown_profile")
+        if conversation_scope not in self.scope_capabilities:
+            add("unknown_scope")
+
+    def _require_known_authority(
+        self,
+        role_id: str,
+        profile_id: str,
+        conversation_scope: str,
+        audit: RedactedAuditMetadata,
+    ) -> None:
+        role = self.roles.get(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != role_id or not role.active:
+            raise AccessDeniedError("unknown_role", audit)
+        if profile_id not in self.profiles:
+            raise AccessDeniedError("unknown_profile", audit)
+        if conversation_scope not in self.scope_capabilities:
+            raise AccessDeniedError("unknown_scope", audit)
+
+
+def _single_match(matches: list[Any], kind: str, audit: RedactedAuditMetadata) -> Any:
+    if not matches:
+        raise AccessDeniedError(f"missing_{kind}", audit)
+    if len(matches) > 1:
+        raise AccessDeniedError(f"duplicate_{kind}", audit)
+    return matches[0]
+
+
+def _valid_ingress_identity(identity: TransportIdentity) -> bool:
+    values = (
+        getattr(identity, "platform", None),
+        getattr(identity, "account", None),
+        getattr(identity, "peer_kind", None),
+        getattr(identity, "user_id", None),
+        getattr(identity, "chat_id", None),
+    )
+    return all(_is_nonempty_str(value) for value in values) and (
+        getattr(identity, "thread_id", None) is None
+        or _is_nonempty_str(getattr(identity, "thread_id", None))
+    )
+
+
+def _valid_principal_binding_identity(identity: TransportIdentity) -> bool:
+    return _valid_ingress_identity(identity) and identity.peer_kind == "dm" and identity.user_id == identity.chat_id
+
+
+def _valid_room_identity(identity: TransportIdentity) -> bool:
+    return all(
+        _is_nonempty_str(value)
+        for value in (
+            getattr(identity, "platform", None),
+            getattr(identity, "account", None),
+            getattr(identity, "peer_kind", None),
+            getattr(identity, "chat_id", None),
+        )
+    ) and getattr(identity, "peer_kind", None) != "dm" and (
+        getattr(identity, "thread_id", None) is None
+        or _is_nonempty_str(getattr(identity, "thread_id", None))
+    )
+
+
+def _principal_key(identity: TransportIdentity) -> tuple[str, str, str, str]:
+    return (identity.platform, identity.account, identity.peer_kind, identity.user_id)
+
+
+def _room_key(identity: TransportIdentity) -> tuple[str, str, str, str, Optional[str]]:
+    return (
+        identity.platform,
+        identity.account,
+        identity.peer_kind,
+        identity.chat_id,
+        identity.thread_id,
+    )
+
+
+def _delivery_matches_identity(target: Any, identity: TransportIdentity) -> bool:
+    if not isinstance(target, DeliveryTarget):
+        return False
+    return (
+        target.platform == getattr(identity, "platform", None)
+        and target.account == getattr(identity, "account", None)
+        and target.peer_kind == getattr(identity, "peer_kind", None)
+        and target.chat_id == getattr(identity, "chat_id", None)
+        and target.thread_id == getattr(identity, "thread_id", None)
+    )
