@@ -19,6 +19,7 @@ from tools.session_search_tool import (
     _format_timestamp,
     session_search,
 )
+from tools.registry import registry
 
 
 @pytest.fixture
@@ -80,6 +81,10 @@ class TestSchema:
         # Mode is inferred from which args are set — no explicit mode param
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
         assert "mode" not in params
+
+    def test_no_profile_parameter(self):
+        params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        assert "profile" not in params
 
     def test_sort_enum(self):
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
@@ -490,86 +495,76 @@ class TestReadShape:
 
 
 # =========================================================================
-# Cross-profile read — `profile` swaps in another profile's DB (read-only)
+# Profile isolation
 # =========================================================================
 
-class TestCrossProfileRead:
-    def _patch_profiles(self, monkeypatch, home, exists=True):
-        from hermes_cli import profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
-        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
-        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: exists)
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
-
-    def test_profile_param_reads_other_db(self, db, tmp_path, monkeypatch):
+class TestProfileIsolation:
+    def _make_other_db(self, tmp_path, session_id="s_other"):
         other_home = tmp_path / "other_home"
         other_home.mkdir()
         other = SessionDB(other_home / "state.db")
-        other.create_session("s_other", source="cli")
+        other.create_session(session_id, source="cli")
         other._conn.execute(
-            "UPDATE sessions SET title = ? WHERE id = ?", ("Other Profile Chat", "s_other")
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Other Profile Chat", session_id)
         )
-        other.append_message("s_other", role="user", content="hello from the other profile")
+        other.append_message(session_id, role="user", content="hello from the other profile")
         other._conn.commit()
+        return other_home, other
 
-        self._patch_profiles(monkeypatch, other_home)
+    def test_public_function_rejects_profile_argument(self, db):
+        with pytest.raises(TypeError):
+            session_search(session_id="s_other", profile="other", db=db)  # type: ignore[call-arg]
 
-        # s_other lives only in the other profile; the current `db` lacks it.
-        result = json.loads(session_search(session_id="s_other", profile="other", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["session_meta"]["title"] == "Other Profile Chat"
+    def test_registry_dispatch_ignores_foreign_profile_argument(self, db, tmp_path):
+        self._make_other_db(tmp_path, "s_other")
 
-    def test_bare_id_locates_across_profiles(self, db, tmp_path, monkeypatch):
-        # The real-world failure: model dropped the owning profile and passed a
-        # bare id. The tool must scan profiles and find it anyway.
-        other_home = tmp_path / "asdf_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_far", source="cli")
-        other.append_message("s_far", role="user", content="hi")
-        other._conn.commit()
-
-        from collections import namedtuple
-        from hermes_cli import profiles as profiles_mod
-        Info = namedtuple("Info", "name path")
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
-        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
-
-        # `db` (current profile) lacks s_far; no profile passed → scan finds it.
-        result = json.loads(session_search(session_id="s_far", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["profile"] == "asdf"
-
-    def test_unknown_profile_errors(self, db, monkeypatch, tmp_path):
-        self._patch_profiles(monkeypatch, tmp_path, exists=False)
-        result = json.loads(session_search(session_id="x", profile="ghost", db=db))
+        result = json.loads(registry.dispatch(
+            "session_search",
+            {"session_id": "s_other", "profile": "other"},
+            db=db,
+        ))
         assert result["success"] is False
-        assert "ghost" in result.get("error", "")
+        assert "s_other" in result.get("error", "")
 
-    def test_combined_value_autosplits(self, db, tmp_path, monkeypatch):
-        # Agent passed the raw "@session:<profile>/<id>" value as session_id with
-        # no separate profile — the tool should recover both.
-        other_home = tmp_path / "other_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_other", source="cli")
-        other.append_message("s_other", role="user", content="hi")
-        other._conn.commit()
+    def test_embedded_profile_session_id_does_not_traverse(self, db, tmp_path):
+        self._make_other_db(tmp_path, "s_other")
 
-        self._patch_profiles(monkeypatch, other_home)
+        result = json.loads(session_search(session_id="other/s_other", db=db))
 
-        # Every permutation the model might send must resolve to (asdf, s_other).
-        for kwargs in (
-            {"session_id": "asdf/s_other"},                    # full value, no profile
-            {"session_id": "asdf/s_other", "profile": "asdf"},  # full value AND profile
-            {"session_id": "s_other", "profile": "asdf"},       # bare id + profile
-        ):
-            result = json.loads(session_search(db=db, **kwargs))
-            assert result["success"] is True, kwargs
-            assert result["mode"] == "read"
-            assert result["session_id"] == "s_other"
+        assert result["success"] is False
+        assert "other/s_other" in result.get("error", "")
+
+    def test_bare_foreign_id_is_not_located_across_profiles(self, db, tmp_path, monkeypatch):
+        other_home, _other = self._make_other_db(tmp_path, "s_far")
+
+        from hermes_cli import profiles as profiles_mod
+        monkeypatch.setattr(
+            profiles_mod,
+            "get_profile_dir",
+            lambda _name: pytest.fail("session_search must not scan profile homes"),
+        )
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: pytest.fail("session_search must not list profiles"),
+        )
+
+        result = json.loads(session_search(session_id="s_far", db=db))
+
+        assert result["success"] is False
+        assert "s_far" in result.get("error", "")
+        assert other_home.exists()
+
+    def test_own_db_reads_still_work(self, db):
+        db.create_session("s_own", source="cli")
+        db.append_message("s_own", role="user", content="own profile content")
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_own", db=db))
+
+        assert result["success"] is True
+        assert result["mode"] == "read"
+        assert result["session_id"] == "s_own"
 
 
 # =========================================================================
