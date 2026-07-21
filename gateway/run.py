@@ -17798,8 +17798,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                account=getattr(source, "route_account", None),
+                peer_kind=getattr(source, "chat_type", None),
+                user_id=getattr(source, "user_id", None),
             )
-        except Exception:
+        except Exception as exc:
+            from gateway.profile_routing import ProfileRoutingError
+
+            if isinstance(exc, ProfileRoutingError):
+                logger.warning(
+                    "Exact Telegram DM profile routing denied: %s",
+                    exc.reason,
+                )
+                raise
             logger.warning(
                 "Profile route matching failed for %s/%s, falling back to default",
                 source.platform, source.chat_id, exc_info=True,
@@ -17857,7 +17868,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return get_hermes_home()
             return profile_dir
-        except Exception:
+        except Exception as exc:
+            from gateway.profile_routing import ProfileRoutingError
+
+            if isinstance(exc, ProfileRoutingError):
+                raise
             # Catch normalization errors, path errors, etc.
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "

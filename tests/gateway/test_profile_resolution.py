@@ -8,8 +8,8 @@ import pytest
 
 from gateway.session import SessionSource, build_session_key
 from gateway.run import GatewayRunner
-from gateway.profile_routing import ProfileRoute
-from gateway.config import Platform
+from gateway.profile_routing import ProfileRoute, ProfileRoutingError
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 
 
@@ -309,6 +309,93 @@ class TestNonDiscordProfileRouting:
         assert mock_runner._profile_name_for_source(telegram_source) is None
 
 
+class TestExactTelegramDmProfileRouting:
+    @staticmethod
+    def _route(profile: str = "family-profile"):
+        return ProfileRoute(
+            name="family",
+            platform="telegram",
+            profile=profile,
+            account="bot-a",
+            peer_kind="dm",
+            user_id="u1",
+        )
+
+    @staticmethod
+    def _source(*, account="bot-a", user_id="u1", chat_id="u1"):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
+            route_account=account,
+        )
+
+    def test_exact_telegram_dm_route_resolves(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [self._route()]
+
+        assert mock_runner._profile_name_for_source(self._source()) == "family-profile"
+
+    @pytest.mark.parametrize(
+        "source_kwargs,reason",
+        [
+            ({"account": "bot-b"}, "unknown_exact_telegram_dm_route"),
+            ({"account": None}, "missing_exact_telegram_dm_identity"),
+            ({"user_id": 1, "chat_id": "1"}, "malformed_exact_telegram_dm_identity"),
+            ({"user_id": "unknown", "chat_id": "unknown"}, "unknown_exact_telegram_dm_route"),
+            ({"user_id": "u1", "chat_id": "other"}, "mismatched_telegram_dm_identity"),
+        ],
+    )
+    def test_exact_telegram_dm_route_denies_without_fallback(self, mock_runner, source_kwargs, reason, caplog):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [self._route()]
+        source = self._source(**source_kwargs)
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ProfileRoutingError) as exc:
+                mock_runner._profile_name_for_source(source)
+
+        assert exc.value.reason == reason
+        rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "u1" not in rendered_logs
+        assert "bot-a" not in rendered_logs
+        assert "other" not in rendered_logs
+
+    def test_duplicate_exact_telegram_dm_routes_deny(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [self._route("a"), self._route("b")]
+
+        with pytest.raises(ProfileRoutingError) as exc:
+            mock_runner._profile_name_for_source(self._source())
+
+        assert exc.value.reason == "duplicate_exact_telegram_dm_route"
+
+    def test_resolve_profile_home_does_not_fallback_to_active_profile(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [self._route()]
+        source = self._source(account="bot-b")
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            with patch("hermes_cli.profiles.get_profile_dir") as get_profile_dir:
+                with pytest.raises(ProfileRoutingError):
+                    mock_runner._resolve_profile_home_for_source(source)
+
+        get_profile_dir.assert_not_called()
+
+    def test_legacy_non_exact_telegram_route_still_falls_back_to_active(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [
+            ProfileRoute(name="legacy", platform="telegram", profile="legacy", chat_id="chat-1")
+        ]
+        source = self._source(account=None, user_id="u1", chat_id="unknown-chat")
+        source.profile = None
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            with patch("hermes_cli.profiles.get_profile_dir", return_value=Path("/hermes/profiles/owner")):
+                assert mock_runner._resolve_profile_home_for_source(source) == Path("/hermes/profiles/owner")
+
+
 class TestGatewayRunnerInjection:
     """``BasePlatformAdapter`` declares ``gateway_runner`` so the gateway's
     unconditional injection reaches every platform adapter — the foundation
@@ -351,6 +438,7 @@ def _stub_adapter(platform: Platform, runner) -> "_StubAdapter":
     a = _StubAdapter.__new__(_StubAdapter)
     a.platform = platform
     a.gateway_runner = runner
+    a.config = PlatformConfig()
     return a
 
 
@@ -404,6 +492,45 @@ class TestAdapterToSessionKeyIntegration:
         key = build_session_key(source, profile=source.profile)
         assert key.startswith("agent:ops:"), key
         assert key != build_session_key(source, profile=None)
+
+    def test_telegram_adapter_passes_config_account_to_exact_route(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="tg",
+                platform="telegram",
+                profile="family-profile",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+            )
+        ]
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+        adapter.config.extra = {"account": "bot-a"}
+
+        source = adapter.build_source(chat_id="u1", chat_type="dm", user_id="u1")
+
+        assert source.profile == "family-profile"
+        assert source.to_dict().get("route_account") is None
+
+    def test_telegram_adapter_exact_route_missing_account_fails_closed(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="tg",
+                platform="telegram",
+                profile="family-profile",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+            )
+        ]
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+
+        with pytest.raises(ProfileRoutingError) as exc:
+            adapter.build_source(chat_id="u1", chat_type="dm", user_id="u1")
+
+        assert exc.value.reason == "missing_exact_telegram_dm_identity"
 
     def test_adapter_without_runner_falls_back_to_default_namespace(self, mock_runner):
         """Regression anchor: with no ``gateway_runner`` injected (the pre-fix

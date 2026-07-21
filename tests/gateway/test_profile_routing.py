@@ -3,6 +3,7 @@
 import pytest
 from gateway.profile_routing import (
     ProfileRoute,
+    ProfileRoutingError,
     parse_profile_routes,
     match_profile_route,
 )
@@ -70,6 +71,20 @@ class TestProfileRouteMatching:
                          guild_id="111")
         assert r.matches("discord", guild_id="111", chat_id="any")
 
+    def test_trusted_transport_fields_are_conjunctive(self):
+        r = ProfileRoute(
+            name="dm",
+            platform="telegram",
+            profile="family",
+            account="bot-a",
+            peer_kind="dm",
+            user_id="u1",
+        )
+        assert r.matches("telegram", account="bot-a", peer_kind="dm", user_id="u1")
+        assert not r.matches("telegram", account="bot-b", peer_kind="dm", user_id="u1")
+        assert not r.matches("telegram", account="bot-a", peer_kind="group", user_id="u1")
+        assert not r.matches("telegram", account="bot-a", peer_kind="dm", user_id="u2")
+
     def test_guild_and_chat_are_conjunctive(self):
         # A route declaring BOTH guild_id and chat_id requires both to match.
         # Regression guard: previously chat_id was checked first and returned
@@ -123,6 +138,28 @@ class TestParseProfileRoutes:
         assert not routes[0].enabled
         assert routes[1].enabled
 
+    def test_parses_exact_telegram_dm_fields(self):
+        routes = parse_profile_routes([
+            {
+                "name": "family",
+                "platform": "telegram",
+                "profile": "family-profile",
+                "account": "bot-a",
+                "peer_kind": "dm",
+                "user_id": "u1",
+            }
+        ])
+        assert routes == [
+            ProfileRoute(
+                name="family",
+                platform="telegram",
+                profile="family-profile",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+            )
+        ]
+
 
 class TestMatchProfileRoute:
     def test_no_routes(self):
@@ -155,6 +192,146 @@ class TestMatchProfileRoute:
             ProfileRoute(name="r", platform="telegram", profile="p"),
         ]
         assert match_profile_route(routes, "discord") is None
+
+
+class TestExactTelegramDmRouting:
+    @staticmethod
+    def _routes():
+        return [
+            ProfileRoute(
+                name="family",
+                platform="telegram",
+                profile="family-profile",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+            )
+        ]
+
+    def test_exact_match_returns_profile_route(self):
+        matched = match_profile_route(
+            self._routes(),
+            "telegram",
+            account="bot-a",
+            peer_kind="dm",
+            user_id="u1",
+            chat_id="u1",
+        )
+        assert matched is not None
+        assert matched.profile == "family-profile"
+
+    @pytest.mark.parametrize(
+        "kwargs,reason",
+        [
+            ({"account": "bot-b", "user_id": "u1", "chat_id": "u1"}, "unknown_exact_telegram_dm_route"),
+            ({"account": None, "user_id": "u1", "chat_id": "u1"}, "missing_exact_telegram_dm_identity"),
+            ({"account": "bot-a", "user_id": 1, "chat_id": "1"}, "malformed_exact_telegram_dm_identity"),
+            ({"account": "bot-a", "user_id": "unknown", "chat_id": "unknown"}, "unknown_exact_telegram_dm_route"),
+            ({"account": "bot-a", "user_id": "u1", "chat_id": "other"}, "mismatched_telegram_dm_identity"),
+        ],
+    )
+    def test_exact_mode_denies_bad_dm_identity(self, kwargs, reason):
+        with pytest.raises(ProfileRoutingError) as exc:
+            match_profile_route(self._routes(), "telegram", peer_kind="dm", **kwargs)
+
+        assert exc.value.reason == reason
+        assert "u1" not in str(exc.value)
+        assert "bot-a" not in str(exc.value)
+
+    def test_exact_mode_denies_malformed_peer_kind(self):
+        for peer_kind in ("private", 1):
+            with pytest.raises(ProfileRoutingError) as exc:
+                match_profile_route(
+                    self._routes(),
+                    "telegram",
+                    account="bot-a",
+                    peer_kind=peer_kind,
+                    user_id="u1",
+                    chat_id="u1",
+                )
+
+            assert exc.value.reason == "malformed_exact_telegram_dm_identity"
+
+    @pytest.mark.parametrize("peer_kind", [None, ""])
+    def test_exact_mode_denies_missing_peer_kind(self, peer_kind):
+        with pytest.raises(ProfileRoutingError) as exc:
+            match_profile_route(
+                self._routes(),
+                "telegram",
+                account="bot-a",
+                peer_kind=peer_kind,
+                user_id="u1",
+                chat_id="u1",
+            )
+
+        assert exc.value.reason == "missing_exact_telegram_dm_identity"
+
+    def test_exact_route_with_mismatched_extra_discriminator_denies_redacted(self):
+        routes = [
+            ProfileRoute(
+                name="family",
+                platform="telegram",
+                profile="family-profile",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+                chat_id="other-chat",
+            )
+        ]
+        with pytest.raises(ProfileRoutingError) as exc:
+            match_profile_route(
+                routes,
+                "telegram",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+                chat_id="u1",
+            )
+
+        assert exc.value.reason == "unknown_exact_telegram_dm_route"
+        assert "u1" not in str(exc.value)
+        assert "bot-a" not in str(exc.value)
+        assert "other-chat" not in str(exc.value)
+
+    def test_duplicate_exact_routes_deny(self):
+        routes = self._routes() + self._routes()
+        with pytest.raises(ProfileRoutingError) as exc:
+            match_profile_route(
+                routes,
+                "telegram",
+                account="bot-a",
+                peer_kind="dm",
+                user_id="u1",
+                chat_id="u1",
+            )
+
+        assert exc.value.reason == "duplicate_exact_telegram_dm_route"
+
+    def test_no_exact_dm_routes_preserves_legacy_telegram_fallback(self):
+        routes = [
+            ProfileRoute(name="legacy", platform="telegram", profile="legacy", chat_id="chat-1")
+        ]
+        assert match_profile_route(
+            routes,
+            "telegram",
+            account=None,
+            peer_kind="dm",
+            user_id="u1",
+            chat_id="chat-1",
+        ).profile == "legacy"
+
+    def test_non_dm_routes_unchanged_when_exact_dm_routes_exist(self):
+        routes = self._routes() + [
+            ProfileRoute(name="group", platform="telegram", profile="group", chat_id="group-1")
+        ]
+        assert match_profile_route(
+            routes,
+            "telegram",
+            account=None,
+            peer_kind="group",
+            user_id="u1",
+            chat_id="group-1",
+        ).profile == "group"
 
 
 class TestSessionKeyIntegration:

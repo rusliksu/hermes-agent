@@ -5521,6 +5521,17 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def _profile_route_account_label(self) -> Optional[str]:
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        if not isinstance(extra, dict):
+            return None
+        account = extra.get("account")
+        if account is None and self.platform == Platform.WEIXIN:
+            account = extra.get("account_id")
+        if isinstance(account, str) and account.strip():
+            return account.strip()
+        return None
     
     def build_source(
         self,
@@ -5557,6 +5568,7 @@ class BasePlatformAdapter(ABC):
         # Resolve profile from configured routes (None when no match / no routes)
         profile = None
         runner = getattr(self, "gateway_runner", None)
+        route_account = self._profile_route_account_label()
         if runner is not None:
             try:
                 profile = runner._profile_name_for_source(
@@ -5575,9 +5587,14 @@ class BasePlatformAdapter(ABC):
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
+                        route_account=route_account,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                from gateway.profile_routing import ProfileRoutingError
+
+                if isinstance(exc, ProfileRoutingError):
+                    raise
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
@@ -5599,6 +5616,7 @@ class BasePlatformAdapter(ABC):
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
+            route_account=route_account,
             profile=profile,
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,

@@ -175,6 +175,10 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    # Wire-invisible trusted account label from server config, used only for
+    # profile route matching. Deliberately excluded from to_dict/from_dict and
+    # prompt context so it is not persisted or exposed to the model.
+    route_account: Optional[str] = None
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
