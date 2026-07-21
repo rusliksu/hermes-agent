@@ -1,118 +1,118 @@
 ## ADDED Requirements
 
-### Requirement: Ordinary family DM использует explicit allowlist
-Система MUST разрешать ordinary Telegram DM-доступ только для пользователей,
+### Requirement: Обычный семейный DM-доступ использует явный список разрешённых пользователей
+Система MUST разрешать обычный Telegram DM-доступ только для пользователей,
 которые явно присутствуют в `telegram_allowed_user_ids`. Реальные ID и значения
-MUST NOT храниться в репозитории, OpenSpec artifacts или diagnostics.
+MUST NOT храниться в репозитории, OpenSpec-артефактах или диагностике.
 
 #### Scenario: Разрешённый семейный пользователь пишет в DM
-- **WHEN** Telegram DM приходит от идентифицируемого пользователя из explicit
+- **WHEN** Telegram DM приходит от идентифицируемого пользователя из явного
   `telegram_allowed_user_ids`
-- **THEN** система разрешает ordinary DM turn в isolated user scope
-- **AND** не выдаёт admin, pairing, elevated или approval права
+- **THEN** система разрешает обычный DM turn в изолированной пользовательской области
+- **AND** не выдаёт права admin, pairing, elevated или approval
 
-#### Scenario: Пользователь отсутствует в allowlist
-- **WHEN** Telegram DM приходит от идентифицируемого пользователя вне explicit
+#### Scenario: Пользователь отсутствует в списке разрешённых
+- **WHEN** Telegram DM приходит от идентифицируемого пользователя вне явного
   `telegram_allowed_user_ids`
-- **THEN** система fail-closed до session lookup, memory access, tools и model
+- **THEN** система закрывает доступ до поиска сессии, доступа к памяти, tools и model
   turn
 
-#### Scenario: Allowlist отсутствует или пуст
+#### Scenario: Список разрешённых отсутствует или пуст
 - **WHEN** `telegram_allowed_user_ids` отсутствует, пуст или не может быть
   прочитан как явный список
-- **THEN** ordinary family DM-доступ не включается
+- **THEN** обычный семейный DM-доступ не включается
 - **AND** система не использует fallback по username, display name, owner ID или
-  legacy group grants
+  legacy-групповым разрешениям
 
-### Requirement: Elevated surface остаётся owner-only
-Система MUST разрешать admin commands, pairing setup, elevated actions и
-approvals только owner principal. Наличие пользователя в
-`telegram_allowed_user_ids` MUST NOT расширять elevated surface.
+### Requirement: Elevated-поверхность остаётся только для владельца
+Система MUST разрешать admin-команды, настройку pairing, elevated-действия и
+approval только owner principal. Наличие пользователя в
+`telegram_allowed_user_ids` MUST NOT расширять elevated-поверхность.
 
-#### Scenario: Семейный пользователь вызывает admin command
-- **WHEN** user из ordinary DM allowlist вызывает admin-only command
+#### Scenario: Семейный пользователь вызывает admin-команду
+- **WHEN** user из списка обычного DM вызывает admin-only command
 - **THEN** система отказывает как non-owner
-- **AND** отказ не раскрывает owner ID, raw Telegram ID или private config values
+- **AND** отказ не раскрывает owner ID, raw Telegram ID или значения приватной конфигурации
 
 #### Scenario: Семейный пользователь создаёт approval
-- **WHEN** ordinary family DM turn требует approval или elevated action
-- **THEN** approval route остаётся owner-only
+- **WHEN** обычный семейный DM turn требует approval или elevated action
+- **THEN** маршрут approval остаётся только для владельца
 - **AND** семейный пользователь не может approve, deny или bypass elevated gate
 
-#### Scenario: Owner выполняет elevated action
+#### Scenario: Владелец выполняет elevated action
 - **WHEN** owner principal вызывает admin, pairing, elevated action или approval
-- **THEN** owner-only behavior остаётся прежним
-- **AND** ordinary family allowlist не меняет owner checks
+- **THEN** поведение только для владельца остаётся прежним
+- **AND** список обычного семейного доступа не меняет проверки владельца
 
-### Requirement: Shared groups остаются неизменными
-Система MUST NOT менять две существующие shared Telegram groups, их group/topic
-scope, passive context policy или shared capability profile при восстановлении
-ordinary family DM-доступа.
+### Requirement: Общие группы остаются неизменными
+Система MUST NOT менять две существующие общие Telegram-группы, их область
+group/topic, политику passive context или общий профиль возможностей при
+восстановлении обычного семейного DM-доступа.
 
-#### Scenario: Shared group получает сообщение
-- **WHEN** Telegram update приходит из одной из существующих shared groups
-- **THEN** routing и authorization используют прежний shared group scope
-- **AND** `telegram_allowed_user_ids` не добавляет новых group participants или
-  capabilities
+#### Scenario: Общая группа получает сообщение
+- **WHEN** Telegram update приходит из одной из существующих общих групп
+- **THEN** routing и authorization используют прежнюю область общей группы
+- **AND** `telegram_allowed_user_ids` не добавляет новых участников группы или
+  возможностей
 
-#### Scenario: DM allowlist не расширяет group access
-- **WHEN** user есть в ordinary DM allowlist, но не имеет отдельного group
-  scope grant
-- **THEN** этот факт сам по себе не разрешает shared group access
+#### Scenario: DM-список разрешённых не расширяет доступ к группе
+- **WHEN** user есть в списке обычного DM, но не имеет отдельного group
+  разрешения области
+- **THEN** этот факт сам по себе не разрешает доступ к общей группе
 
-### Requirement: Unknown или missing principals fail-closed
-Система MUST fail-closed для unknown, missing, anonymous, bot-authored или
-неполных Telegram principals до stateful side effects.
+### Requirement: Неизвестные или отсутствующие principal закрывают доступ
+Система MUST закрывать доступ для unknown, missing, anonymous, bot-authored или
+неполных Telegram principal до stateful side effects.
 
 #### Scenario: Отсутствует Telegram user ID
 - **WHEN** DM или group update не содержит идентифицируемого human user principal
-- **THEN** система отказывает до transcript write, memory lookup, tools, model
+- **THEN** система отказывает до записи transcript, поиска памяти, tools, model
   turn, callbacks и visible response
 
-#### Scenario: Bot-authored update
+#### Scenario: Обновление от имени бота
 - **WHEN** Telegram update создан bot-authored principal
 - **THEN** система отказывает до stateful side effects
 
-### Requirement: Diagnostics redacted
-Система MUST выводить diagnostics и logs без raw Telegram IDs, message contents,
-tokens, secrets и private config values.
+### Requirement: Диагностика скрывает чувствительные данные
+Система MUST выводить диагностику и logs без raw Telegram IDs, содержимого сообщений,
+tokens, secrets и значения приватной конфигурации.
 
-#### Scenario: Access denied diagnostic
-- **WHEN** ordinary DM access отклонён policy gate
-- **THEN** diagnostic содержит только redacted категорию отказа
-- **AND** не содержит raw Telegram user ID, chat ID, message text или private
-  config values
+#### Scenario: Диагностика отказа в доступе
+- **WHEN** обычный DM-доступ отклонён policy gate
+- **THEN** diagnostic содержит только скрытую категорию отказа
+- **AND** не содержит raw Telegram user ID, chat ID, message text или значения
+  приватной конфигурации
 
-#### Scenario: Access allowed diagnostic
-- **WHEN** ordinary DM access разрешён
-- **THEN** diagnostic может показывать non-sensitive категорию результата
+#### Scenario: Диагностика разрешённого доступа
+- **WHEN** обычный DM-доступ разрешён
+- **THEN** diagnostic может показывать нечувствительную категорию результата
 - **AND** не содержит raw identities или private values
 
-### Requirement: Ordinary DM state изолирован per-user
+### Requirement: Состояние обычного DM изолировано по пользователям
 Система MUST сохранять отдельные session, transcript, memory и approval/elevated
-state для каждого ordinary DM user.
+состояние для каждого обычного DM user.
 
 #### Scenario: Два семейных пользователя пишут в DM
-- **WHEN** два different users из ordinary DM allowlist пишут Gurra в личный чат
-- **THEN** каждый turn использует отдельный user/session/memory scope
-- **AND** один пользователь не видит transcript, memory или approvals другого
+- **WHEN** два разных user из списка обычного DM пишут Gurra в личный чат
+- **THEN** каждый turn использует отдельную область user/session/memory
+- **AND** один пользователь не видит transcript, memory или approval другого
 
 #### Scenario: Семейный пользователь и owner
-- **WHEN** ordinary family user и owner пишут в DM
-- **THEN** ordinary user scope не смешивается с owner scope
-- **AND** owner-only elevated state не становится доступен ordinary user
+- **WHEN** обычный семейный user и owner пишут в DM
+- **THEN** область обычного user не смешивается с областью owner
+- **AND** elevated-состояние только для владельца не становится доступно обычному user
 
-### Requirement: Live activation requires separate gate
+### Requirement: Live-активация требует отдельного разрешения
 После repo-local implementation и tests система MUST NOT выполнять live patch,
-private config update, symlink switch, service restart, deploy, push или merge
-без отдельного explicit live gate.
+обновление приватной конфигурации, переключение symlink, restart сервиса, deploy,
+push или merge без отдельного явного live-разрешения.
 
-#### Scenario: Repo-local checks pass
-- **WHEN** OpenSpec artifacts, implementation evidence и tests готовы локально
-- **THEN** agent reports status, commit SHA, files и pending live tasks
+#### Scenario: Локальные проверки репозитория прошли
+- **WHEN** OpenSpec-артефакты, evidence реализации и tests готовы локально
+- **THEN** agent сообщает status, commit SHA, files и ожидающие live-задачи
 - **AND** active checkout, symlink, private config, systemd/service, push и
-  deploy остаются untouched
+  deploy остаются нетронутыми
 
-#### Scenario: Live gate ещё не выдан
-- **WHEN** explicit live gate отсутствует
-- **THEN** live patch/config/restart tasks остаются pending
+#### Scenario: Live-разрешение ещё не выдано
+- **WHEN** явное live-разрешение отсутствует
+- **THEN** live patch/config/restart задачи остаются ожидающими

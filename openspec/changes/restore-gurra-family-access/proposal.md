@@ -1,56 +1,56 @@
-## Why
+## Почему
 
-После single-principal hardening Gurra должен оставаться fail-closed для
-неизвестных Telegram principals, но ordinary family DM-доступ не должен
-зависеть от owner-only прав. Семейные пользователи должны иметь возможность
+После ужесточения single-principal Gurra должен закрывать доступ для
+неизвестных Telegram-principal, но обычный семейный DM-доступ не должен
+зависеть от прав только для владельца. Семейные пользователи должны иметь возможность
 писать Gurra в личный чат как обычные разрешённые пользователи, при этом
-административные, pairing, elevated и approval-действия остаются доступны
+административные действия, настройка pairing, elevated-действия и approval остаются доступны
 только владельцу.
 
-## What Changes
+## Что меняется
 
-- Ввести явный список `telegram_allowed_user_ids` для ordinary family DM-доступа
+- Ввести явный список `telegram_allowed_user_ids` для обычного семейного DM-доступа
   без включения реальных ID или значений в репозиторий.
-- Сохранить owner-only gate для admin, pairing, elevated actions и approvals.
-- Не менять две существующие shared Telegram group scopes и их group/topic
-  semantics.
-- Unknown, missing или неполный Telegram principal должен fail-closed до
-  session lookup, memory access, tools и model turn.
-- Диагностика должна быть redacted: без raw Telegram ID, message text, secrets
-  или private config values.
-- Per-user DM isolation должна сохраняться: семейные пользователи не видят
-  память, transcript, approvals или elevated state друг друга и владельца.
-- Live patch, private config update, symlink switch, restart, deploy и push
-  требуют отдельного explicit live gate после локальных доказательств.
+- Сохранить проверку только владельца для admin, pairing, elevated-действий и approval.
+- Не менять две существующие общие области Telegram-групп и их семантику
+  групп/топиков.
+- Неизвестный, отсутствующий или неполный Telegram-principal должен закрывать
+  доступ до поиска сессии, доступа к памяти, tools и model turn.
+- Диагностика должна скрывать чувствительные данные: без raw Telegram ID,
+  текста сообщений, secrets или приватных значений конфигурации.
+- Изоляция DM по пользователям должна сохраняться: семейные пользователи не видят
+  память, transcript, approval или elevated-состояние друг друга и владельца.
+- Live patch, обновление приватной конфигурации, переключение symlink, restart,
+  deploy и push требуют отдельного явного live-разрешения после локальных доказательств.
 
-## Capabilities
+## Возможности
 
-### New Capabilities
+### Новые возможности
 
-- `gurra-family-telegram-access`: ordinary Telegram DM-доступ для явно
-  разрешённых семейных пользователей с owner-only административными действиями,
-  fail-closed policy и per-user isolation.
+- `gurra-family-telegram-access`: обычный Telegram DM-доступ для явно
+  разрешённых семейных пользователей с административными действиями только для
+  владельца, закрытой политикой отказа и изоляцией по пользователям.
 
-### Modified Capabilities
+### Изменённые возможности
 
-Нет: change фиксирует отдельный Gurra access policy rollout и не расширяет
-существующие shared group scopes.
+Нет: change фиксирует отдельный rollout политики доступа Gurra и не расширяет
+существующие области общих групп.
 
-## Impact
+## Влияние
 
-- Policy/config contract: explicit `telegram_allowed_user_ids` для ordinary DM
-  access; реальные значения живут только в private config вне репозитория.
-- Gateway/session/memory behavior: DM user principal остаётся частью scope для
-  per-user isolation; shared group scopes не меняются.
-- Tests: privacy isolation suite и group/policy affected suite из утверждённого
-  checklist.
-- Diagnostics: redacted status/log output без raw identities и private values.
-- Delivery: no push, no deploy, no restart, no active checkout/symlink/private
-  config/systemd/service changes in this change; live activation только после
+- Контракт политики/конфигурации: явный `telegram_allowed_user_ids` для обычного
+  DM-доступа; реальные значения живут только в приватной конфигурации вне репозитория.
+- Поведение gateway/session/memory: DM user principal остаётся частью области для
+  изоляции по пользователям; области общих групп не меняются.
+- Тесты: набор privacy isolation и group/policy affected из утверждённого
+  чеклиста.
+- Диагностика: скрытый status/log output без raw identities и private values.
+- Доставка: без push, deploy, restart, изменений active checkout/symlink/private
+  config/systemd/service в этом change; live-активация только после
   отдельного разрешения.
 
-## Approval
+## Одобрение
 
-- 2026-07-21: Руслан задал утверждённый scope для repo-local OpenSpec change,
-  локальных тестов и additive commit только OpenSpec artifacts. Live activation,
-  private config patch и service restart оставлены за отдельным gate.
+- 2026-07-21: Руслан задал утверждённую область для repo-local OpenSpec change,
+  локальных тестов и additive commit только OpenSpec-артефактов. Live-активация,
+  patch приватной конфигурации и restart сервиса оставлены за отдельным разрешением.

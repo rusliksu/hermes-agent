@@ -1,98 +1,98 @@
-## Context
+## Контекст
 
 Gurra использует Telegram gateway поверх Hermes single-principal policy.
-Ужесточение principal checks должно защищать memory/session isolation и
-administrative actions, но ordinary family DM является отдельным, более узким
+Ужесточение проверок principal должно защищать изоляцию памяти/сессий и
+административные действия, но обычный семейный DM является отдельным, более узким
 правом: разрешённый человек может вести свой личный диалог с Gurra без доступа
-к owner-only операциям.
+к операциям только для владельца.
 
-Две shared Telegram groups уже являются отдельными group scopes. Этот change не
-меняет их allowlist, thread semantics, passive context, session key shape или
-capability profile.
+Две общие Telegram-группы уже являются отдельными групповыми областями. Этот change не
+меняет их список разрешений, семантику тредов, passive context, форму ключа сессии или
+профиль возможностей.
 
-## Goals / Non-Goals
+## Цели / вне целей
 
-**Goals:**
+**Цели:**
 
-- добавить явный policy contract для `telegram_allowed_user_ids` как ordinary
-  DM allowlist;
-- сохранить owner-only admin, pairing, elevated actions и approvals;
-- сохранить fail-closed behavior для unknown, missing и неполных principals;
-- подтвердить per-user memory/session isolation targeted-тестами;
-- зафиксировать redacted diagnostics и отдельный live gate.
+- добавить явный контракт политики для `telegram_allowed_user_ids` как списка
+  разрешённых пользователей для обычного DM;
+- сохранить admin, pairing, elevated-действия и approval только для владельца;
+- сохранить закрытый отказ для неизвестных, отсутствующих и неполных principal;
+- подтвердить изоляцию памяти/сессий по пользователям targeted-тестами;
+- зафиксировать диагностику со скрытием чувствительных данных и отдельное live-разрешение.
 
-**Non-Goals:**
+**Вне целей:**
 
-- добавлять реальные Telegram ID, tokens, private config values или message
-  contents в репозиторий;
-- менять две shared groups, group/topic routing или passive group context;
-- выдавать семейным пользователям admin/elevated/pairing/approval rights;
-- выполнять live patch, symlink switch, service restart, deploy или push;
-- читать private data, active checkout или systemd/service state.
+- добавлять реальные Telegram ID, tokens, приватные значения конфигурации или
+  содержимое сообщений в репозиторий;
+- менять две общие группы, маршрутизацию групп/топиков или passive group context;
+- выдавать семейным пользователям права admin/elevated/pairing/approval;
+- выполнять live patch, переключение symlink, restart сервиса, deploy или push;
+- читать private data, active checkout или состояние systemd/service.
 
-## Decisions
+## Решения
 
-### 1. Явный ordinary DM allowlist
+### 1. Явный список разрешённых пользователей для обычного DM
 
-Ordinary family DM access задаётся только через explicit
+Обычный семейный DM-доступ задаётся только через явный
 `telegram_allowed_user_ids`. Отсутствующий, пустой или нераспознанный principal
-не получает fallback-доступ через owner identity, group grants, display name,
-username или legacy heuristics.
+не получает fallback-доступ через owner identity, групповые разрешения,
+display name, username или legacy-эвристики.
 
 Реальные значения не документируются и не коммитятся. OpenSpec описывает только
-contract и required behavior.
+контракт и обязательное поведение.
 
-### 2. Owner-only elevated surface остаётся отдельной
+### 2. Elevated-поверхность только для владельца остаётся отдельной
 
-Admin commands, pairing setup, elevated actions и approvals проверяются через
-owner-only gate даже если Telegram user есть в ordinary DM allowlist. Это
+Admin-команды, настройка pairing, elevated-действия и approval проверяются через
+разрешение только владельца, даже если Telegram user есть в списке обычного DM. Это
 разделяет право написать Gurra в личный чат и право управлять системой.
 
-### 3. Shared groups не участвуют в family DM rollout
+### 3. Общие группы не участвуют в rollout семейного DM
 
-Существующие две shared groups остаются неизменными. Их allowlist, topic
-isolation, shared session scope и passive behavior не расширяются
-`telegram_allowed_user_ids`, потому что ordinary family DM и shared room access
-являются разными principal scopes.
+Существующие две общие группы остаются неизменными. Их список разрешений,
+изоляция топиков, область общей сессии и passive behavior не расширяются
+`telegram_allowed_user_ids`, потому что обычный семейный DM и доступ к общей
+комнате являются разными областями principal.
 
-### 4. Fail-closed до stateful side effects
+### 4. Закрытый отказ до stateful side effects
 
-Unknown, missing, anonymous, bot-authored или неполный Telegram principal
-отклоняется до session lookup, transcript write, memory access, tools, model
-turn, callback и visible response. Ошибка диагностики должна показывать только
+Неизвестный, отсутствующий, anonymous, bot-authored или неполный Telegram-principal
+отклоняется до поиска сессии, записи transcript, доступа к памяти, tools,
+model turn, callback и visible response. Ошибка диагностики должна показывать только
 категорию отказа.
 
-### 5. Per-user isolation является delivery gate
+### 5. Изоляция по пользователям является delivery gate
 
-Каждый ordinary DM user получает собственный isolated user/session/memory scope.
-Тесты должны покрывать memory tool isolation, session search isolation,
-Hermes state isolation, gateway session behavior и OpenAI client kwargs
-isolation. Family access не должен менять эти файлы и контракты без отдельного
-material delta.
+Каждый обычный DM user получает собственную изолированную область user/session/memory.
+Тесты должны покрывать изоляцию memory tool, изоляцию session search,
+изоляцию Hermes state, поведение gateway session и изоляцию OpenAI client kwargs.
+Семейный доступ не должен менять эти файлы и контракты без отдельной
+существенной дельты.
 
-## Risks / Trade-offs
+## Риски / компромиссы
 
-- [Смешение ordinary и elevated прав] → owner-only checks остаются отдельным
+- [Смешение обычных и elevated-прав] → проверки только владельца остаются отдельным
   requirement и проверяются targeted policy tests.
 - [Случайный доступ неизвестного Telegram user] → missing/unknown principals
-  fail-closed без fallback по имени или group grants.
-- [Утечка private identity в logs/status] → diagnostics redacted и не содержат
-  raw Telegram ID, message text или private values.
+  получают закрытый отказ без fallback по имени или групповым разрешениям.
+- [Утечка private identity в logs/status] → диагностика скрывает чувствительные
+  данные и не содержит raw Telegram ID, текста сообщений или private values.
 - [Live drift между repo и private config] → live patch/config/restart
-  остаются pending до отдельного explicit gate и rollback-ready проверки.
+  остаются pending до отдельного явного разрешения и rollback-ready проверки.
 
-## Migration Plan
+## План миграции
 
-1. Зафиксировать OpenSpec contract и локальные delivery gates.
+1. Зафиксировать OpenSpec-контракт и локальные delivery gates.
 2. Проверить exact privacy isolation suite и group/policy affected suite из
-   checklist через venv Python без cache/bytecode, private data и live state.
-3. Убедиться, что family changes не модифицируют isolation files.
-4. Закоммитить только OpenSpec artifacts отдельным additive commit.
-5. После отдельного explicit live gate подготовить private config patch,
-   backup/rollback и restart только утверждённого Gurra/Hermes target.
+   чеклиста через venv Python без cache/bytecode, private data и live state.
+3. Убедиться, что family changes не модифицируют файлы изоляции.
+4. Закоммитить только OpenSpec-артефакты отдельным additive commit.
+5. После отдельного явного live-разрешения подготовить patch приватной
+   конфигурации, backup/rollback и restart только утверждённого Gurra/Hermes target.
 
-## Open Questions
+## Открытые вопросы
 
-Нет блокирующих вопросов в repo-local scope. Реальные ID, private config patch,
-active checkout update и service restart остаются live-only материалом за
-отдельным gate.
+Нет блокирующих вопросов в repo-local scope. Реальные ID, patch приватной
+конфигурации, обновление active checkout и restart сервиса остаются live-only
+материалом за отдельным разрешением.
