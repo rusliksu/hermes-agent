@@ -8,7 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 
 _ALLOW_ALL_KEYS = (
@@ -29,6 +29,8 @@ _GRANT_ENV_KEYS = frozenset(
     (*_ALLOW_ALL_KEYS, *_DIRECT_ALLOWLIST_KEYS, *_GROUP_GRANT_KEYS)
 )
 _GRANT_ENV_AUDIT_ERROR = "_HERMES_GRANT_ENV_AUDIT_ERROR"
+_TELEGRAM_USER_ID_RE = re.compile(r"[0-9]+")
+_TELEGRAM_SHARED_CHAT_ID_RE = re.compile(r"-[0-9]+")
 
 
 def _config_bool(value: Any, *, default: bool = False) -> tuple[bool, bool]:
@@ -45,6 +47,22 @@ def _config_bool(value: Any, *, default: bool = False) -> tuple[bool, bool]:
     return default, False
 
 
+def _normalize_positive_telegram_id(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not _TELEGRAM_USER_ID_RE.fullmatch(raw):
+        return None
+    normalized = str(int(raw))
+    return normalized if normalized != "0" else None
+
+
+def _normalize_negative_telegram_chat_id(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not _TELEGRAM_SHARED_CHAT_ID_RE.fullmatch(raw):
+        return None
+    normalized = str(int(raw))
+    return normalized if normalized.startswith("-") and normalized != "0" else None
+
+
 @dataclass(frozen=True)
 class SharedTelegramScope:
     """Opaque server-bound identity for one shared Telegram memory scope."""
@@ -59,9 +77,11 @@ class SinglePrincipalPolicy:
 
     enabled: bool = False
     telegram_owner_id: Optional[str] = None
+    telegram_allowed_user_ids: tuple[str, ...] = field(default_factory=tuple, repr=False)
     telegram_shared_chat_ids: tuple[str, ...] = field(default_factory=tuple, repr=False)
     allow_owner_bound_relay: bool = False
     config_error_count: int = field(default=0, repr=False)
+    config_issues: tuple[tuple[str, int], ...] = field(default_factory=tuple, repr=False)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "SinglePrincipalPolicy":
@@ -73,6 +93,7 @@ class SinglePrincipalPolicy:
         known_keys = {
             "enabled",
             "telegram_owner_id",
+            "telegram_allowed_user_ids",
             "telegram_shared_chat_ids",
             "allow_owner_bound_relay",
         }
@@ -83,33 +104,84 @@ class SinglePrincipalPolicy:
         enabled, enabled_ok = _config_bool(raw.get("enabled"))
         relay, relay_ok = _config_bool(raw.get("allow_owner_bound_relay"))
         owner_raw = raw.get("telegram_owner_id")
-        owner_ok = owner_raw is None or (
-            not isinstance(owner_raw, (bool, dict, list, tuple, set))
+        owner_ok = owner_raw is None or not isinstance(
+            owner_raw, (bool, dict, list, tuple, set, frozenset)
         )
         owner = str(owner_raw).strip() if owner_ok and owner_raw is not None else None
+        if owner and owner != "*":
+            owner = _normalize_positive_telegram_id(owner) or owner
 
-        shared_raw = raw.get("telegram_shared_chat_ids")
-        shared_ok = shared_raw is None or isinstance(
-            shared_raw, (list, tuple, set, frozenset)
-        )
-        shared_values: list[str] = []
-        if shared_ok and shared_raw is not None:
-            for value in shared_raw:
+        issue_counts: dict[str, int] = {}
+
+        def add_issue(category: str, count: int = 1) -> None:
+            if count:
+                issue_counts[category] = issue_counts.get(category, 0) + count
+
+        def normalize_sequence(
+            values: Any,
+            *,
+            wildcard_category: str,
+            malformed_category: str,
+            duplicate_category: str,
+            normalizer: Callable[[Any], Optional[str]],
+        ) -> tuple[bool, list[str]]:
+            ok = values is None or isinstance(values, (list, tuple, set, frozenset))
+            normalized_values: list[str] = []
+            seen: set[str] = set()
+            if not ok or values is None:
+                return ok, normalized_values
+            for value in values:
                 if isinstance(value, (bool, dict, list, tuple, set, frozenset)):
-                    shared_ok = False
+                    add_issue(malformed_category)
                     continue
-                normalized = str(value).strip()
-                if normalized and normalized not in shared_values:
-                    shared_values.append(normalized)
+                raw_value = str(value).strip()
+                if raw_value == "*":
+                    add_issue(wildcard_category)
+                    continue
+                normalized = normalizer(raw_value)
+                if normalized is None:
+                    add_issue(malformed_category)
+                    continue
+                if normalized in seen:
+                    add_issue(duplicate_category)
+                    continue
+                seen.add(normalized)
+                normalized_values.append(normalized)
+            return ok, normalized_values
+
+        family_ok, family_values = normalize_sequence(
+            raw.get("telegram_allowed_user_ids"),
+            wildcard_category="wildcard_family_user",
+            malformed_category="malformed_family_user",
+            duplicate_category="duplicate_family_user",
+            normalizer=_normalize_positive_telegram_id,
+        )
+        shared_ok, shared_values = normalize_sequence(
+            raw.get("telegram_shared_chat_ids"),
+            wildcard_category="wildcard_shared_scope",
+            malformed_category="malformed_shared_scope",
+            duplicate_category="duplicate_shared_scope",
+            normalizer=_normalize_negative_telegram_chat_id,
+        )
         return cls(
             enabled=enabled,
             telegram_owner_id=owner or None,
+            telegram_allowed_user_ids=tuple(family_values),
             telegram_shared_chat_ids=tuple(shared_values),
             allow_owner_bound_relay=relay,
             config_error_count=(
                 shape_errors
-                + sum((not enabled_ok, not relay_ok, not owner_ok, not shared_ok))
+                + sum(
+                    (
+                        not enabled_ok,
+                        not relay_ok,
+                        not owner_ok,
+                        not family_ok,
+                        not shared_ok,
+                    )
+                )
             ),
+            config_issues=tuple(sorted(issue_counts.items())),
         )
 
     def shared_scope(self, source: Any) -> Optional[SharedTelegramScope]:
@@ -154,24 +226,36 @@ class SinglePrincipalPolicy:
             return self.allow_owner_bound_relay
         platform = getattr(getattr(source, "platform", None), "value", None)
         user_id = getattr(source, "user_id", None)
+        normalized_user_id = _normalize_positive_telegram_id(user_id)
+        allowed_user_ids = {
+            self.telegram_owner_id,
+            *self.telegram_allowed_user_ids,
+        }
         return bool(
             platform == "telegram"
-            and user_id is not None
-            and str(user_id) == self.telegram_owner_id
+            and normalized_user_id is not None
+            and normalized_user_id in allowed_user_ids
         )
 
     def pairing_identity_allowed(self, platform: str, user_id: str) -> bool:
         if not self.enabled:
             return True
-        return platform == "telegram" and str(user_id) == self.telegram_owner_id
+        normalized_user_id = _normalize_positive_telegram_id(user_id)
+        return (
+            platform == "telegram"
+            and normalized_user_id is not None
+            and normalized_user_id == self.telegram_owner_id
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        result = {
+        result: dict[str, Any] = {
             "enabled": self.enabled,
             "allow_owner_bound_relay": self.allow_owner_bound_relay,
         }
         if self.telegram_owner_id:
             result["telegram_owner_id"] = self.telegram_owner_id
+        if self.telegram_allowed_user_ids:
+            result["telegram_allowed_user_ids"] = list(self.telegram_allowed_user_ids)
         if self.telegram_shared_chat_ids:
             result["telegram_shared_chat_ids"] = list(self.telegram_shared_chat_ids)
         return result
@@ -182,6 +266,7 @@ class PolicyReport:
     mode: str
     verdict: str
     conflicts: tuple[tuple[str, int], ...] = ()
+    family_user_count: int = 0
 
     @property
     def valid(self) -> bool:
@@ -191,6 +276,8 @@ class PolicyReport:
         return {
             "mode": self.mode,
             "verdict": self.verdict,
+            "categories": [category for category, _ in self.conflicts],
+            "family_user_count": self.family_user_count,
             "conflicts": [
                 {"category": category, "count": count}
                 for category, count in self.conflicts
@@ -206,6 +293,23 @@ def _csv_values(raw: str) -> list[str]:
     return [value.strip() for value in raw.split(",") if value.strip()]
 
 
+def _normalized_duplicate_count(
+    values: tuple[str, ...],
+    normalizer: Callable[[Any], Optional[str]],
+) -> int:
+    seen: set[str] = set()
+    duplicates = 0
+    for value in values:
+        normalized = normalizer(value)
+        if normalized is None:
+            continue
+        if normalized in seen:
+            duplicates += 1
+        else:
+            seen.add(normalized)
+    return duplicates
+
+
 def validate_single_principal_policy(
     policy: SinglePrincipalPolicy,
     *,
@@ -219,6 +323,9 @@ def validate_single_principal_policy(
         disabled_counts = {}
         if policy.config_error_count:
             disabled_counts["malformed_policy"] = policy.config_error_count
+        for category, count in policy.config_issues:
+            if count:
+                disabled_counts[category] = disabled_counts.get(category, 0) + count
         if require_enabled:
             disabled_counts["policy_disabled"] = 1
         conflicts = tuple(sorted(disabled_counts.items()))
@@ -226,6 +333,7 @@ def validate_single_principal_policy(
             mode="single_principal",
             verdict="fail" if conflicts else "disabled",
             conflicts=conflicts,
+            family_user_count=len(policy.telegram_allowed_user_ids),
         )
 
     env = environ if environ is not None else os.environ
@@ -236,12 +344,45 @@ def validate_single_principal_policy(
             counts[category] = counts.get(category, 0) + count
 
     add("malformed_policy", policy.config_error_count)
+    for category, count in policy.config_issues:
+        add(category, count)
     if env.get(_GRANT_ENV_AUDIT_ERROR):
         add("grant_store_unreadable")
     if not policy.telegram_owner_id and not policy.allow_owner_bound_relay:
         add("missing_owner_mapping")
     if policy.telegram_owner_id == "*":
         add("wildcard_owner")
+    elif (
+        policy.telegram_owner_id
+        and _normalize_positive_telegram_id(policy.telegram_owner_id) is None
+    ):
+        add("malformed_owner")
+
+    add(
+        "wildcard_family_user",
+        sum(value == "*" for value in policy.telegram_allowed_user_ids),
+    )
+    add(
+        "malformed_family_user",
+        sum(
+            value != "*" and _normalize_positive_telegram_id(value) is None
+            for value in policy.telegram_allowed_user_ids
+        ),
+    )
+    add(
+        "duplicate_family_user",
+        _normalized_duplicate_count(
+            policy.telegram_allowed_user_ids,
+            _normalize_positive_telegram_id,
+        ),
+    )
+    add(
+        "owner_in_family_users",
+        sum(
+            value == policy.telegram_owner_id
+            for value in policy.telegram_allowed_user_ids
+        ),
+    )
     add(
         "wildcard_shared_scope",
         sum(value == "*" for value in policy.telegram_shared_chat_ids),
@@ -249,8 +390,15 @@ def validate_single_principal_policy(
     add(
         "malformed_shared_scope",
         sum(
-            value != "*" and re.fullmatch(r"-[1-9][0-9]*", value) is None
+            value != "*" and _normalize_negative_telegram_chat_id(value) is None
             for value in policy.telegram_shared_chat_ids
+        ),
+    )
+    add(
+        "duplicate_shared_scope",
+        _normalized_duplicate_count(
+            policy.telegram_shared_chat_ids,
+            _normalize_negative_telegram_chat_id,
         ),
     )
 
@@ -317,6 +465,7 @@ def validate_single_principal_policy(
         mode="single_principal",
         verdict="fail" if conflicts else "pass",
         conflicts=conflicts,
+        family_user_count=len(policy.telegram_allowed_user_ids),
     )
 
 

@@ -13102,6 +13102,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Use /help to see the shared-chat controls."
             )
         policy = _policy_for_source(self.config, source)
+        single_principal = getattr(self, "_single_principal_policy", None)
+        if (
+            getattr(single_principal, "enabled", False)
+            and source.platform == Platform.TELEGRAM
+            and (source.chat_type or "dm").lower() in {"dm", "direct", "private"}
+            and str(source.user_id or "").strip()
+            in set(getattr(single_principal, "telegram_allowed_user_ids", ()))
+        ):
+            if policy.enabled and policy.can_run(source.user_id, canonical_cmd):
+                return None
+            if canonical_cmd in {"help", "whoami"}:
+                return None
+            logger.info("Single-principal family slash command denied")
+            return (
+                f"⛔ /{canonical_cmd} is admin-only here. "
+                "Use /whoami for the commands available to you."
+            )
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(

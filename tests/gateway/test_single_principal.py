@@ -16,6 +16,7 @@ from gateway.single_principal import (
 
 
 OWNER = "10001"
+FAMILY = "30003"
 OUTSIDER = "20002"
 
 
@@ -60,11 +61,13 @@ def _runner(policy=None):
 
 
 def test_policy_parser_and_redacted_validation():
-    policy = _policy()
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
     assert policy.enabled is True
     assert policy.authorize(_source()) is True
+    assert policy.authorize(_source(FAMILY, chat_id=FAMILY)) is True
     assert policy.authorize(_source(thread_id="77")) is True
     assert policy.authorize(_source(OUTSIDER)) is False
+    assert policy.authorize(_source(None)) is False
     assert policy.authorize(_source(chat_type="group")) is False
 
     report = validate_single_principal_policy(
@@ -77,13 +80,17 @@ def test_policy_parser_and_redacted_validation():
     )
     rendered = json.dumps(report.as_dict())
     assert report.verdict == "fail"
+    assert report.family_user_count == 1
     assert {category for category, _ in report.conflicts} == {
         "allow_all",
         "group_grant",
         "non_owner_allowlist",
         "wildcard_grant",
     }
+    assert "family_user_count" in rendered
+    assert "categories" in rendered
     assert OWNER not in rendered
+    assert FAMILY not in rendered
     assert OUTSIDER not in rendered
     assert "-123" not in rendered
 
@@ -121,6 +128,27 @@ def test_shared_policy_authorizes_exact_group_and_hashes_scope_identity():
     assert root_scope.memory_namespace != topic_scope.memory_namespace
     assert "-10001" not in root_scope.memory_namespace
     assert "31" not in topic_scope.memory_namespace
+
+
+def test_family_list_does_not_expand_shared_group_access():
+    policy = _policy(
+        telegram_allowed_user_ids=[FAMILY],
+        telegram_shared_chat_ids=["-10001", "-20002"],
+    )
+
+    assert policy.authorize(_source(FAMILY, chat_id=FAMILY)) is True
+    assert policy.authorize(
+        _source(FAMILY, chat_id="-10001", chat_type="group")
+    ) is True
+    assert policy.authorize(
+        _source(OUTSIDER, chat_id="-20002", chat_type="forum")
+    ) is True
+    assert policy.authorize(
+        _source(FAMILY, chat_id="-30003", chat_type="group")
+    ) is False
+    assert _policy(telegram_allowed_user_ids=[FAMILY]).authorize(
+        _source(FAMILY, chat_id="-10001", chat_type="group")
+    ) is False
 
 
 def test_shared_policy_session_keys_are_per_chat_and_topic_not_sender(tmp_path):
@@ -365,6 +393,14 @@ def test_owner_session_keys_remain_byte_compatible():
     )
 
 
+def test_family_session_keys_remain_isolated_from_owner():
+    owner_key = build_session_key(_source())
+    family_key = build_session_key(_source(FAMILY, chat_id=FAMILY))
+
+    assert family_key == "agent:main:telegram:dm:30003"
+    assert family_key != owner_key
+
+
 def test_pairing_rejects_non_owner_without_writing(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway.pairing import PairingStore
@@ -376,6 +412,20 @@ def test_pairing_rejects_non_owner_without_writing(monkeypatch, tmp_path):
     assert store.list_approved("telegram") == []
     store._approve_user("telegram", OWNER)
     assert len(store.list_approved("telegram")) == 1
+
+
+def test_family_user_is_not_pairing_owner(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.pairing import PairingStore
+
+    store = PairingStore(
+        profile="test",
+        single_principal_policy=_policy(telegram_allowed_user_ids=[FAMILY]),
+    )
+    with pytest.raises(SinglePrincipalPolicyError):
+        store._approve_user("telegram", FAMILY)
+
+    assert store.list_approved("telegram") == []
 
 
 def test_pairing_approve_rejects_preexisting_non_owner_request(monkeypatch, tmp_path):
@@ -417,12 +467,97 @@ async def test_non_owner_stops_before_pre_dispatch_hook(monkeypatch, caplog):
     assert "private input" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_family_dm_authorizes_but_unknown_and_missing_sender_stop_early(
+    monkeypatch, caplog
+):
+    runner = _runner(_policy(telegram_allowed_user_ids=[FAMILY]))
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner.session_store = MagicMock()
+    runner._handle_message_with_agent = AsyncMock(return_value="ok")
+    hook = MagicMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+
+    assert runner._is_user_authorized(_source(FAMILY, chat_id=FAMILY)) is True
+    unknown_result = await runner._handle_message(
+        MessageEvent(text="unknown input", source=_source(OUTSIDER))
+    )
+    missing_result = await runner._handle_message(
+        MessageEvent(text="missing input", source=_source(None))
+    )
+
+    assert unknown_result is None
+    assert missing_result is None
+    hook.assert_not_called()
+    runner.session_store.assert_not_called()
+    runner._handle_message_with_agent.assert_not_called()
+    assert "unknown input" not in caplog.text
+    assert "missing input" not in caplog.text
+
+
+def test_family_user_is_not_single_principal_slash_admin():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={},
+            )
+        },
+        single_principal=policy,
+    )
+
+    assert runner._check_slash_access(_source(), "restart") is None
+    denial = runner._check_slash_access(
+        _source(FAMILY, chat_id=FAMILY),
+        "restart",
+    )
+    assert denial is not None
+    assert "/restart is admin-only here" in denial
+    assert runner._check_slash_access(_source(FAMILY, chat_id=FAMILY), "whoami") is None
+
+
+def test_family_user_can_run_explicit_user_command_but_not_admin_command():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={
+                    "allow_admin_from": [OWNER],
+                    "user_allowed_commands": ["status"],
+                },
+            )
+        },
+        single_principal=policy,
+    )
+    family = _source(FAMILY, chat_id=FAMILY)
+
+    assert runner._check_slash_access(family, "status") is None
+    assert "/restart is admin-only here" in runner._check_slash_access(
+        family,
+        "restart",
+    )
+
+
 def test_gateway_config_parses_single_principal_policy():
     config = GatewayConfig.from_dict(
-        {"single_principal": {"enabled": True, "telegram_owner_id": OWNER}}
+        {
+            "single_principal": {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [FAMILY],
+            }
+        }
     )
-    assert config.single_principal == _policy()
-    assert GatewayConfig.from_dict(config.to_dict()).single_principal == _policy()
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    assert config.single_principal == policy
+    assert GatewayConfig.from_dict(config.to_dict()).single_principal == policy
 
 
 def test_validator_rejects_pairing_drift_and_unsupported_ingress():
@@ -445,6 +580,66 @@ def test_validator_rejects_pairing_drift_and_unsupported_ingress():
         "non_owner_pairing": 1,
         "unsupported_external_platform": 1,
     }
+
+
+@pytest.mark.parametrize(
+    "raw,category",
+    [
+        (
+            {"enabled": True, "telegram_owner_id": "not-numeric"},
+            "malformed_owner",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["*"],
+            },
+            "wildcard_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["", "not-numeric"],
+            },
+            "malformed_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["030003", FAMILY],
+            },
+            "duplicate_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [OWNER],
+            },
+            "owner_in_family_users",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_shared_chat_ids": ["-010001", "-10001"],
+            },
+            "duplicate_shared_scope",
+        ),
+    ],
+)
+def test_numeric_policy_validation_is_redacted(raw, category):
+    policy = SinglePrincipalPolicy.from_dict(raw)
+    report = validate_single_principal_policy(policy, environ={})
+    rendered = json.dumps(report.as_dict())
+    assert report.verdict == "fail"
+    assert category in dict(report.conflicts)
+    assert OWNER not in rendered
+    assert FAMILY not in rendered
+    assert "not-numeric" not in rendered
 
 
 def test_validator_fails_closed_when_pairing_store_is_unreadable():
@@ -546,7 +741,7 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     class Runner:
-        _single_principal_policy = _policy()
+        _single_principal_policy = _policy(telegram_allowed_user_ids=[FAMILY])
 
         async def handle(self, _event):
             return None
@@ -568,6 +763,8 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
         )
 
     assert adapter._is_user_authorized_from_message(message(OWNER)) is True
+    assert adapter._is_user_authorized_from_message(message(FAMILY)) is True
     assert adapter._is_user_authorized_from_message(message(OUTSIDER)) is False
     assert adapter._is_callback_user_authorized(OWNER) is True
+    assert adapter._is_callback_user_authorized(FAMILY) is True
     assert adapter._is_callback_user_authorized(OUTSIDER) is False
