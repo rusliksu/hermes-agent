@@ -32,7 +32,8 @@ approval только owner principal. Наличие пользователя �
 #### Scenario: Семейный пользователь вызывает admin-команду
 - **WHEN** user из списка обычного DM вызывает admin-only command
 - **THEN** система отказывает как non-owner
-- **AND** отказ не раскрывает owner ID, raw Telegram ID или значения приватной конфигурации
+- **AND** отказ не раскрывает owner ID, raw Telegram ID или значения приватной
+  конфигурации
 
 #### Scenario: Семейный пользователь создаёт approval
 - **WHEN** обычный семейный DM turn требует approval или elevated action
