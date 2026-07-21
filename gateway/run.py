@@ -44,7 +44,10 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from gateway.access_registry import AccessRegistry
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -3000,14 +3003,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    access_registry: Optional["AccessRegistry"] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(
+        self,
+        config: Optional[GatewayConfig] = None,
+        access_registry: Optional["AccessRegistry"] = None,
+    ):
         global _gateway_runner_ref
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self.access_registry = access_registry
         self._single_principal_policy = self.config.single_principal
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
@@ -9311,6 +9320,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _allow_access_registry_ingress(self, event: MessageEvent) -> bool:
+        registry = getattr(self, "access_registry", None)
+        if registry is None or getattr(event, "internal", False):
+            return True
+
+        source = getattr(event, "source", None)
+        try:
+            from gateway.access_registry import (
+                AccessDeniedError,
+                RedactedAuditMetadata,
+                TransportIdentity,
+            )
+
+            identity = TransportIdentity.from_session_source(
+                source,
+                account=getattr(source, "route_account", None),
+            )
+            context = registry.resolve(identity)
+            requested_profile = (getattr(source, "profile", None) or "").strip()
+            if requested_profile and requested_profile != context.profile_id:
+                audit = RedactedAuditMetadata.from_transport(
+                    "profile_route_mismatch",
+                    identity,
+                )
+                logger.warning(
+                    "AccessRegistry ingress denied: reason=%s audit=%s",
+                    "profile_route_mismatch",
+                    audit.as_dict(),
+                )
+                return False
+            source.resolved_access_context = context
+            source.profile = context.profile_id
+            return True
+        except AccessDeniedError as exc:
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s audit=%s",
+                exc.reason,
+                exc.audit.as_dict(),
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": "resolve"},
+            )
+            return False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9342,6 +9399,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+
+        if not self._allow_access_registry_ingress(event):
+            return None
 
         if (
             getattr(self, "_startup_restore_in_progress", False)

@@ -11,6 +11,7 @@
 
 - [x] 2.1 Подключить exact Telegram DM routing по `platform + account + peer_kind + user_id` с обязательным `user_id == chat_id`.
 - [ ] 2.2 Реализовать deny-before-model/session/tools для unknown, missing, malformed, disabled binding и mismatched DM identity.
+  - 2026-07-22: добавлен optional runtime `AccessRegistry` gate в `GatewayRunner._handle_message` и focused ingress tests; checkbox остаётся открытым до config/schema loader и cutover без legacy fallback.
 - [ ] 2.3 Удалить owner/default/last-used fallback из private ingress, shared ingress, slash commands, callbacks и resume path.
 - [ ] 2.4 Укрепить request path так, чтобы `HERMES_HOME` и profile home брались из server-bound context, а не из module/import-time cache.
 - [ ] 2.5 Заменить request-path `os.getenv` authority/auth fallbacks на server-bound config/policy providers.

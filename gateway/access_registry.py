@@ -433,12 +433,26 @@ class AccessRegistry:
     ) -> ResolvedAccessContext:
         if identity.user_id != identity.chat_id:
             raise AccessDeniedError("dm_identity_mismatch", audit)
+        disabled_matches = [
+            binding
+            for binding in self.principal_bindings
+            if (
+                not binding.active
+                and _valid_principal_binding_identity(binding.transport_identity)
+            )
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
+        ]
         matches = [
             binding
             for binding in self.principal_bindings
-            if binding.active and _valid_principal_binding_identity(binding.transport_identity)
+            if (
+                binding.active
+                and _valid_principal_binding_identity(binding.transport_identity)
+            )
             and _principal_key(binding.transport_identity) == _principal_key(identity)
         ]
+        if not matches and disabled_matches:
+            raise AccessDeniedError("disabled_principal_binding", audit)
         binding = _single_match(matches, "principal_binding", audit)
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
         return ResolvedAccessContext(
@@ -455,12 +469,26 @@ class AccessRegistry:
         identity: TransportIdentity,
         audit: RedactedAuditMetadata,
     ) -> ResolvedAccessContext:
+        disabled_matches = [
+            binding
+            for binding in self.shared_scope_bindings
+            if (
+                not binding.active
+                and _valid_room_identity(binding.room_identity)
+            )
+            and _room_key(binding.room_identity) == _room_key(identity)
+        ]
         matches = [
             binding
             for binding in self.shared_scope_bindings
-            if binding.active and _valid_room_identity(binding.room_identity)
+            if (
+                binding.active
+                and _valid_room_identity(binding.room_identity)
+            )
             and _room_key(binding.room_identity) == _room_key(identity)
         ]
+        if not matches and disabled_matches:
+            raise AccessDeniedError("disabled_shared_scope_binding", audit)
         binding = _single_match(matches, "shared_scope_binding", audit)
         member = ParticipantIdentity(identity.platform, identity.account, identity.user_id)
         if member.key() not in {participant.key() for participant in binding.participant_identities}:

@@ -17,8 +17,11 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateway.access_registry import ResolvedAccessContext
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +209,15 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+
+    # Internal, wire-INVISIBLE server-resolved authority context. Set only by
+    # gateway ingress after AccessRegistry resolution; excluded from
+    # to_dict/from_dict and prompt construction.
+    resolved_access_context: Optional["ResolvedAccessContext"] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
