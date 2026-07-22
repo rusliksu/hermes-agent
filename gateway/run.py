@@ -15870,6 +15870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            resolved_access_context=getattr(context.source, "resolved_access_context", None),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

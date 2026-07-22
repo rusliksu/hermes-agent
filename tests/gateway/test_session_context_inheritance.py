@@ -32,10 +32,12 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import (
+    _RESOLVED_ACCESS_CONTEXT,
     _SESSION_ASYNC_DELIVERY,
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    get_resolved_access_context,
     reset_session_vars,
     set_session_vars,
 )
@@ -71,6 +73,7 @@ def _isolate_session_context():
     saved_env = {k: os.environ.get(k) for k in SESSION_VARS}
     saved_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
     saved_async = _SESSION_ASYNC_DELIVERY.get()
+    saved_access = _RESOLVED_ACCESS_CONTEXT.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
         var.set(_UNSET)
@@ -82,6 +85,7 @@ def _isolate_session_context():
         for var, val in zip(_VAR_MAP.values(), saved_ctx.values()):
             var.set(val)
         _SESSION_ASYNC_DELIVERY.set(saved_async)
+        _RESOLVED_ACCESS_CONTEXT.set(saved_access)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
             if v is None:
@@ -176,6 +180,44 @@ def test_reset_session_vars_restores_unset_not_empty():
     reset_session_vars()
     for name, var in _VAR_MAP.items():
         assert var.get() is _UNSET, f"{name} is {var.get()!r}, expected _UNSET"
+
+
+async def _child_resolved_access(reset_first: bool):
+    captured = {}
+
+    def _b_body():
+        if reset_first:
+            reset_session_vars()
+        captured["window"] = get_resolved_access_context()
+        set_session_vars(**FOREIGN, resolved_access_context={"principal_id": "foreign"})
+        captured["bound"] = get_resolved_access_context()
+
+    await asyncio.create_task(_async_noop(_b_body))
+    return captured
+
+
+def test_child_task_inherits_foreign_resolved_access_without_reset():
+    set_session_vars(**MINE, resolved_access_context={"principal_id": "mine"})
+
+    captured = asyncio.run(_child_resolved_access(reset_first=False))
+
+    assert captured["window"] == {"principal_id": "mine"}
+
+
+def test_reset_session_vars_closes_resolved_access_context_leak():
+    set_session_vars(**MINE, resolved_access_context={"principal_id": "mine"})
+
+    captured = asyncio.run(_child_resolved_access(reset_first=True))
+
+    assert captured["window"] is None
+    assert captured["bound"] == {"principal_id": "foreign"}
+
+
+def test_reset_session_vars_restores_resolved_access_context_unset():
+    set_session_vars(**MINE, resolved_access_context={"principal_id": "mine"})
+    reset_session_vars()
+    assert _RESOLVED_ACCESS_CONTEXT.get() is _UNSET
+    assert get_resolved_access_context() is None
 
 
 # ---------------------------------------------------------------------------

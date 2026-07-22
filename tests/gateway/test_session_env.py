@@ -7,7 +7,9 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    _RESOLVED_ACCESS_CONTEXT,
     get_session_env,
+    get_resolved_access_context,
     set_session_vars,
     clear_session_vars,
     _VAR_MAP,
@@ -24,10 +26,14 @@ def _reset_contextvars():
     context, so a clear_session_vars() from test A (which sets vars to "")
     would leak into test B.  This fixture ensures each test starts clean.
     """
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
+    _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
     yield
     for var in _VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
+    _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -145,6 +151,19 @@ def test_get_session_env_default_when_nothing_set(monkeypatch):
 
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
     assert get_session_env("HERMES_SESSION_PLATFORM", "fallback") == "fallback"
+
+
+def test_resolved_access_context_never_falls_back_to_env(monkeypatch):
+    monkeypatch.setenv("HERMES_RESOLVED_ACCESS_CONTEXT", "foreign")
+
+    assert get_resolved_access_context() is None
+    assert get_resolved_access_context("fallback") == "fallback"
+
+    tokens = set_session_vars(resolved_access_context={"principal_id": "ctx"})
+    assert get_resolved_access_context() == {"principal_id": "ctx"}
+
+    clear_session_vars(tokens)
+    assert get_resolved_access_context() is None
 
 
 def test_set_session_env_handles_missing_optional_fields():
@@ -393,4 +412,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
             await runner._run_in_executor_with_context(lambda: "second")
     finally:
         runner._shutdown_executor()
-

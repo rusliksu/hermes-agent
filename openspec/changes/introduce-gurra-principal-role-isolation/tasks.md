@@ -34,6 +34,7 @@
   - 2026-07-22: локальный slice закрыл Kanban notify/wakeup callbacks под configured `AccessRegistry`: delivery/wake идут только через persisted session origin context и canonical source после ingress validation; добавлено focused 8.4-покрытие для positive/missing/mismatch, checkbox остаётся открытым до handoff/cron/delegation/compaction/reset/concurrency.
   - 2026-07-22: локальный slice добавил fail-closed handoff watcher path для configured registry без persisted context: no side effects до propagation, failed state redacted; полноценная передача server-issued/persisted handoff context остаётся.
   - 2026-07-22: локальный slice добавил revalidation captured `ResolvedAccessContext` для slash-confirm registration и execution; callbacks не принимают authority из payload/session_key/choice, checkbox остаётся открытым до broader command args/cron/delegation/compaction/reset/restart/concurrency покрытия.
+  - 2026-07-22: локальный slice добавил task-local `ResolvedAccessContext` в `gateway.session_context`, gateway propagation из `source.resolved_access_context`, cron job persistence/restoration и inheritance reset/clear checks; checkbox остаётся открытым до broader provider/callback/delegation/compaction/reset/restart/concurrency покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
@@ -43,7 +44,9 @@
 - [ ] 4.4 Реализовать `shared_room`: room sessions/memory, documents, attachments, vision и public web без private memory, cron, private delivery, shell и cross-principal/profile search.
   - 2026-07-22: локально устранён legacy omission для shared public web: gateway shared turn теперь берёт `public_web` только из runtime `source.resolved_access_context.capabilities` и валидирует точную model tool surface memory/web; checkbox остаётся открытым до полной shared_room роли.
 - [ ] 4.5 Реализовать self reminder cron для family roles только с server-bound `delivery_target`.
+  - 2026-07-22: локальный slice ограничил configured family cron self-reminder путём: create/update допускают только omitted/literal origin, persisted origin должен exactly match server-bound `delivery_target`, explicit target/model-selected delivery denied; scheduler требует deliver=origin + exact origin; checkbox остаётся открытым до полного cron/provider/cutover покрытия.
 - [ ] 4.6 Запретить shared room cron/private delivery и family delivery к чужим principals, rooms или owner default target.
+  - 2026-07-22: локальный slice запретил model cron actions для `shared_room`, скрыл/запретил cross-context family job list/mutation/run, и добавил scheduler fail-closed для malformed/tampered persisted context до script/model/delivery; checkbox остаётся открытым до полного private-delivery/provider/cutover покрытия.
 - [ ] 4.7 Убедиться, что scoped model secrets используются только model client construction и не попадают в terminal, Docker, browser или MCP tool env.
 
 ## 5. Юлин Docker, browser, Wolfram и delegation
