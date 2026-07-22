@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
@@ -57,6 +58,46 @@ def _runner(policy=None):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
     return runner
+
+
+def _resolved_shared_context(capabilities):
+    return ResolvedAccessContext(
+        principal_id="principal-room",
+        role_id="shared_room",
+        profile_id="room-profile",
+        conversation_scope="room",
+        capabilities=frozenset(capabilities),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="group",
+            chat_id="-10001",
+        ),
+    )
+
+
+def _tool_names_for_toolsets(enabled_toolsets):
+    from model_tools import get_tool_definitions
+
+    return {
+        definition["function"]["name"]
+        for definition in get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=["kanban"],
+            quiet_mode=True,
+        )
+    }
+
+
+def _force_web_tools_available(monkeypatch):
+    import tools.web_tools  # noqa: F401
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    for name in ("web_search", "web_extract"):
+        monkeypatch.setattr(registry._tools[name], "check_fn", lambda: True)
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
 
 
 def test_policy_parser_and_redacted_validation():
@@ -186,8 +227,13 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
     import gateway.run as run_module
 
     monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+    assert enabled_toolsets == ["memory"]
+    assert expected_tools == frozenset({"memory"})
+    assert _tool_names_for_toolsets(enabled_toolsets) == {"memory"}
+
     agent = SimpleNamespace(valid_tool_names={"memory"})
-    runner._bind_shared_memory(agent, scope, {})
+    runner._bind_shared_memory(agent, scope, {}, expected_tool_names=expected_tools)
 
     assert agent._memory_enabled is True
     assert agent._user_profile_enabled is False
@@ -198,22 +244,107 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
         tmp_path / "memories" / "shared" / "telegram"
     )
 
-    from model_tools import get_tool_definitions
-
-    tool_names = {
-        definition["function"]["name"]
-        for definition in get_tool_definitions(
-            enabled_toolsets=["memory"], disabled_toolsets=["kanban"]
-        )
-    }
-    assert tool_names == {"memory"}
-
     with pytest.raises(RuntimeError, match="shared capability profile"):
         runner._bind_shared_memory(
             SimpleNamespace(valid_tool_names={"memory", "terminal"}),
             scope,
             {},
+            expected_tool_names=expected_tools,
         )
+
+
+def test_shared_scope_public_web_context_adds_only_public_web_tools(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    source.resolved_access_context = _resolved_shared_context({"public_web"})
+    scope = policy.shared_scope(source)
+    runner = _runner(policy)
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+
+    assert enabled_toolsets == ["memory", "web"]
+    assert expected_tools == frozenset({"memory", "web_search", "web_extract"})
+    try:
+        _force_web_tools_available(monkeypatch)
+        assert _tool_names_for_toolsets(enabled_toolsets) == set(expected_tools)
+    finally:
+        _clear_tool_defs_cache()
+        invalidate_check_fn_cache()
+
+    agent = SimpleNamespace(valid_tool_names=set(expected_tools))
+    runner._bind_shared_memory(agent, scope, {}, expected_tool_names=expected_tools)
+    assert agent._memory_enabled is True
+    assert agent._skip_mcp_refresh is True
+
+
+def test_shared_scope_context_without_public_web_stays_memory_only(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    source.resolved_access_context = _resolved_shared_context({"room_memory"})
+    scope = policy.shared_scope(source)
+    runner = _runner(policy)
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+
+    assert enabled_toolsets == ["memory"]
+    assert expected_tools == frozenset({"memory"})
+    assert _tool_names_for_toolsets(enabled_toolsets) == {"memory"}
+
+    agent = SimpleNamespace(valid_tool_names={"memory"})
+    runner._bind_shared_memory(agent, scope, {}, expected_tool_names=expected_tools)
+
+
+def test_shared_scope_public_web_validation_rejects_extra_runtime_tools():
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    source.resolved_access_context = _resolved_shared_context({"public_web"})
+    scope = policy.shared_scope(source)
+    runner = _runner(policy)
+    _, expected_tools = runner._shared_tool_profile_for_source(source)
+
+    with pytest.raises(RuntimeError, match="shared capability profile"):
+        runner._bind_shared_memory(
+            SimpleNamespace(
+                valid_tool_names=set(expected_tools)
+                | {"terminal", "browser_navigate"}
+            ),
+            scope,
+            {},
+            expected_tool_names=expected_tools,
+        )
+
+
+def test_shared_scope_agent_cache_signature_separates_public_web_tool_profile():
+    from gateway.run import GatewayRunner
+
+    base = dict(
+        model="model",
+        runtime={},
+        ephemeral_prompt="",
+        cache_keys={},
+        user_id=None,
+        user_id_alt=None,
+    )
+
+    assert GatewayRunner._agent_config_signature(
+        enabled_toolsets=["memory"],
+        **base,
+    ) != GatewayRunner._agent_config_signature(
+        enabled_toolsets=["memory", "web"],
+        **base,
+    )
 
 
 def test_shared_memory_canary_matrix_survives_reload_without_cross_scope_leakage(

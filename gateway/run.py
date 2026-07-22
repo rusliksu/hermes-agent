@@ -3766,10 +3766,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return policy.shared_scope(source)
 
     @staticmethod
-    def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
+    def _shared_tool_profile_for_source(source: SessionSource) -> tuple[list[str], frozenset[str]]:
+        toolsets = ["memory"]
+        expected_tools = {"memory"}
+        context = getattr(source, "resolved_access_context", None)
+        capabilities = getattr(context, "capabilities", None)
+        if isinstance(capabilities, frozenset) and "public_web" in capabilities:
+            toolsets.append("web")
+            expected_tools.update({"web_search", "web_extract"})
+        return toolsets, frozenset(expected_tools)
+
+    @staticmethod
+    def _bind_shared_memory(
+        agent: Any,
+        scope: Any,
+        memory_config: dict,
+        *,
+        expected_tool_names: frozenset[str] = frozenset({"memory"}),
+    ) -> None:
         from tools.memory_tool import MemoryStore
 
-        if set(getattr(agent, "valid_tool_names", set())) != {"memory"}:
+        if set(getattr(agent, "valid_tool_names", set())) != set(expected_tool_names):
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -18002,8 +18019,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
+        shared_expected_tool_names = frozenset()
         if shared_scope is not None:
-            enabled_toolsets = ["memory"]
+            enabled_toolsets, shared_expected_tool_names = (
+                self._shared_tool_profile_for_source(source)
+            )
             disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
@@ -19384,7 +19404,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if shared_scope is not None:
                     memory_config = user_config.get("memory") or {}
-                    self._bind_shared_memory(agent, shared_scope, memory_config)
+                    self._bind_shared_memory(
+                        agent,
+                        shared_scope,
+                        memory_config,
+                        expected_tool_names=shared_expected_tool_names,
+                    )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for

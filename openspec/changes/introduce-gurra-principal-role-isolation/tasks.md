@@ -32,6 +32,7 @@
 - [ ] 4.2 Реализовать `family_standard`: личные memory/session search, documents, attachments, vision, public web, image/voice generation и reminders самому себе.
 - [ ] 4.3 Запретить для `family_standard` host shell, host filesystem, logged-in/persistent browser, arbitrary MCP, Wolfram MCP, delegation, owner credentials и cross-profile search.
 - [ ] 4.4 Реализовать `shared_room`: room sessions/memory, documents, attachments, vision и public web без private memory, cron, private delivery, shell и cross-principal/profile search.
+  - 2026-07-22: локально устранён legacy omission для shared public web: gateway shared turn теперь берёт `public_web` только из runtime `source.resolved_access_context.capabilities` и валидирует точную model tool surface memory/web; checkbox остаётся открытым до полной shared_room роли.
 - [ ] 4.5 Реализовать self reminder cron для family roles только с server-bound `delivery_target`.
 - [ ] 4.6 Запретить shared room cron/private delivery и family delivery к чужим principals, rooms или owner default target.
 - [ ] 4.7 Убедиться, что scoped model secrets используются только model client construction и не попадают в terminal, Docker, browser или MCP tool env.
