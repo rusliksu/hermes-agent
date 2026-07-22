@@ -170,7 +170,10 @@ def test_shared_room_public_web_registry_resolves_to_memory_and_web_profile():
     )
     source.resolved_access_context = context
 
-    toolsets, expected_tools = GatewayRunner._shared_tool_profile_for_source(source)
+    toolsets, expected_tools = GatewayRunner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    )
 
     assert isinstance(registry.shared_scope_bindings[0], SharedScopeBinding)
     assert toolsets == ["memory", "web"]

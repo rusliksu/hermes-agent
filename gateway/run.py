@@ -56,6 +56,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from gateway.access_registry import ResolvedAccessContext
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -3805,10 +3806,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return policy.shared_scope(source)
 
     @staticmethod
-    def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
+    def _toolsets_for_resolved_access_context(
+        configured_toolsets: list[str],
+        context: Any,
+    ) -> list[str]:
+        """Intersect configured toolsets with the trusted role capabilities."""
+        if context is None:
+            return list(configured_toolsets)
+        if not isinstance(context, ResolvedAccessContext):
+            return []
+        role_id = context.role_id
+        capabilities = context.capabilities
+        if not isinstance(role_id, str) or not isinstance(capabilities, frozenset):
+            return []
+        if role_id == "owner":
+            return list(configured_toolsets)
+
+        role_capability_toolsets = {
+            "family_standard": {
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+            },
+            "family_sandbox": {
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+                "delegation": "delegation",
+            },
+            "shared_room": {
+                "public_web": "web",
+                "vision": "vision",
+            },
+        }
+        capability_toolsets = role_capability_toolsets.get(role_id)
+        if capability_toolsets is None:
+            return []
+
+        configured = {str(toolset) for toolset in configured_toolsets}
+        allowed = {
+            toolset
+            for capability, toolset in capability_toolsets.items()
+            if capability in capabilities and toolset in configured
+        }
+        return sorted(allowed)
+
+    @staticmethod
+    def _shared_tool_profile_for_source(
+        source: SessionSource,
+        configured_toolsets: list[str] | None = None,
+    ) -> tuple[list[str], frozenset[str]]:
+        """Build the room-only tool profile from trusted room capabilities."""
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            return ["memory"], frozenset({"memory"})
+        if (
+            not isinstance(context, ResolvedAccessContext)
+            or context.role_id != "shared_room"
+            or not isinstance(context.capabilities, frozenset)
+        ):
+            return [], frozenset()
+
+        configured = {str(toolset) for toolset in (configured_toolsets or [])}
+        toolsets: list[str] = []
+        expected_tools: set[str] = set()
+        if "room_memory" in context.capabilities and "memory" in configured:
+            toolsets.append("memory")
+            expected_tools.add("memory")
+        if "public_web" in context.capabilities and "web" in configured:
+            toolsets.append("web")
+            expected_tools.update({"web_search", "web_extract"})
+        if "vision" in context.capabilities and "vision" in configured:
+            toolsets.append("vision")
+            expected_tools.add("vision_analyze")
+        return sorted(toolsets), frozenset(expected_tools)
+
+    @staticmethod
+    def _bind_shared_memory(
+        agent: Any,
+        scope: Any,
+        memory_config: dict,
+        *,
+        expected_tool_names: frozenset[str] = frozenset({"memory"}),
+    ) -> None:
         from tools.memory_tool import MemoryStore
 
-        if "memory" not in set(getattr(agent, "valid_tool_names", set())):
+        if set(getattr(agent, "valid_tool_names", set())) != set(expected_tool_names):
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -18320,10 +18409,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._toolsets_for_resolved_access_context(
+            configured_toolsets,
+            getattr(source, "resolved_access_context", None),
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
+        shared_expected_tool_names = frozenset()
+        if shared_scope is not None:
+            enabled_toolsets, shared_expected_tool_names = (
+                self._shared_tool_profile_for_source(
+                    source,
+                    configured_toolsets=configured_toolsets,
+                )
+            )
+            disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -19718,9 +19820,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                if shared_scope is not None:
+                if shared_scope is not None and "memory" in enabled_toolsets:
                     memory_config = user_config.get("memory") or {}
-                    self._bind_shared_memory(agent, shared_scope, memory_config)
+                    self._bind_shared_memory(
+                        agent,
+                        shared_scope,
+                        memory_config,
+                        expected_tool_names=shared_expected_tool_names,
+                    )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
