@@ -59,7 +59,11 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
-from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+from gateway.access_registry import (
+    AccessDeniedError,
+    RedactedAuditMetadata,
+    ResolvedAccessContext,
+)
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -3771,15 +3775,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return policy.shared_scope(source)
 
     @staticmethod
-    def _shared_tool_profile_for_source(source: SessionSource) -> tuple[list[str], frozenset[str]]:
+    def _toolsets_for_resolved_access_context(
+        configured_toolsets: list[str],
+        context: Any,
+    ) -> list[str]:
+        if context is None:
+            return list(configured_toolsets)
+        if not isinstance(context, ResolvedAccessContext):
+            return []
+        role_id = context.role_id
+        capabilities = context.capabilities
+        if not isinstance(role_id, str) or not isinstance(capabilities, frozenset):
+            return []
+        if role_id == "owner":
+            return list(configured_toolsets)
+
+        role_capability_toolsets = {
+            "family_standard": {
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+            },
+            "family_sandbox": {
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+                "delegation": "delegation",
+            },
+            "shared_room": {
+                "public_web": "web",
+                "vision": "vision",
+            },
+        }
+        capability_toolsets = role_capability_toolsets.get(role_id)
+        if capability_toolsets is None:
+            return []
+
+        configured = {str(toolset) for toolset in configured_toolsets}
+        allowed = {
+            toolset
+            for capability, toolset in capability_toolsets.items()
+            if capability in capabilities and toolset in configured
+        }
+        return sorted(allowed)
+
+    @staticmethod
+    def _shared_tool_profile_for_source(
+        source: SessionSource,
+        configured_toolsets: list[str] | None = None,
+    ) -> tuple[list[str], frozenset[str]]:
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            toolsets = ["memory"]
+            expected_tools = {"memory"}
+            return toolsets, frozenset(expected_tools)
+        if (
+            not isinstance(context, ResolvedAccessContext)
+            or context.role_id != "shared_room"
+            or not isinstance(context.capabilities, frozenset)
+        ):
+            return [], frozenset()
+
+        configured = {str(toolset) for toolset in (configured_toolsets or [])}
         toolsets = ["memory"]
         expected_tools = {"memory"}
-        context = getattr(source, "resolved_access_context", None)
-        capabilities = getattr(context, "capabilities", None)
-        if isinstance(capabilities, frozenset) and "public_web" in capabilities:
+        if "room_memory" not in context.capabilities or "memory" not in configured:
+            toolsets = []
+            expected_tools = set()
+        if "public_web" in context.capabilities and "web" in configured:
             toolsets.append("web")
             expected_tools.update({"web_search", "web_extract"})
-        return toolsets, frozenset(expected_tools)
+        if "vision" in context.capabilities and "vision" in configured:
+            toolsets.append("vision")
+            expected_tools.add("vision_analyze")
+        return sorted(toolsets), frozenset(expected_tools)
 
     @staticmethod
     def _bind_shared_memory(
@@ -18146,14 +18221,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._toolsets_for_resolved_access_context(
+            configured_toolsets,
+            getattr(source, "resolved_access_context", None),
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
         shared_expected_tool_names = frozenset()
         if shared_scope is not None:
             enabled_toolsets, shared_expected_tool_names = (
-                self._shared_tool_profile_for_source(source)
+                self._shared_tool_profile_for_source(
+                    source,
+                    configured_toolsets=configured_toolsets,
+                )
             )
             disabled_toolsets = ["kanban"]
 
@@ -19533,7 +19615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                if shared_scope is not None:
+                if shared_scope is not None and "memory" in enabled_toolsets:
                     memory_config = user_config.get("memory") or {}
                     self._bind_shared_memory(
                         agent,

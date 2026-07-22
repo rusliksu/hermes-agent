@@ -227,7 +227,10 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
     import gateway.run as run_module
 
     monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
-    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    )
     assert enabled_toolsets == ["memory"]
     assert expected_tools == frozenset({"memory"})
     assert _tool_names_for_toolsets(enabled_toolsets) == {"memory"}
@@ -262,12 +265,17 @@ def test_shared_scope_public_web_context_adds_only_public_web_tools(
 
     policy = _policy(telegram_shared_chat_ids=["-10001"])
     source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
-    source.resolved_access_context = _resolved_shared_context({"public_web"})
+    source.resolved_access_context = _resolved_shared_context(
+        {"room_memory", "public_web"}
+    )
     scope = policy.shared_scope(source)
     runner = _runner(policy)
 
     monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
-    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    )
 
     assert enabled_toolsets == ["memory", "web"]
     assert expected_tools == frozenset({"memory", "web_search", "web_extract"})
@@ -296,7 +304,10 @@ def test_shared_scope_context_without_public_web_stays_memory_only(
     runner = _runner(policy)
 
     monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
-    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(source)
+    enabled_toolsets, expected_tools = runner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    )
 
     assert enabled_toolsets == ["memory"]
     assert expected_tools == frozenset({"memory"})
@@ -309,10 +320,15 @@ def test_shared_scope_context_without_public_web_stays_memory_only(
 def test_shared_scope_public_web_validation_rejects_extra_runtime_tools():
     policy = _policy(telegram_shared_chat_ids=["-10001"])
     source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
-    source.resolved_access_context = _resolved_shared_context({"public_web"})
+    source.resolved_access_context = _resolved_shared_context(
+        {"room_memory", "public_web"}
+    )
     scope = policy.shared_scope(source)
     runner = _runner(policy)
-    _, expected_tools = runner._shared_tool_profile_for_source(source)
+    _, expected_tools = runner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    )
 
     with pytest.raises(RuntimeError, match="shared capability profile"):
         runner._bind_shared_memory(
