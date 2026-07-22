@@ -147,6 +147,47 @@ def _is_session_key_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+def _serialize_origin_resolved_access_context(origin: "SessionSource") -> Optional[Dict[str, Any]]:
+    context = getattr(origin, "resolved_access_context", None)
+    if context is None:
+        return None
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        logger.warning(
+            "gateway.session: omitted malformed resolved access context: reason=%s",
+            str(exc),
+        )
+        return None
+
+
+def _restore_origin_resolved_access_context(
+    origin: Optional["SessionSource"],
+    data: Dict[str, Any],
+) -> None:
+    if "resolved_access_context" not in data:
+        return
+    if origin is None:
+        logger.warning(
+            "gateway.session: ignored resolved access context without origin: reason=%s",
+            "missing_origin",
+        )
+        return
+    try:
+        from gateway.access_registry import deserialize_resolved_access_context
+
+        context = deserialize_resolved_access_context(data["resolved_access_context"])
+    except ValueError as exc:
+        logger.warning(
+            "gateway.session: ignored malformed resolved access context: reason=%s",
+            str(exc),
+        )
+        return
+    origin.resolved_access_context = context
+
+
 @dataclass
 class SessionSource:
     """
@@ -689,6 +730,19 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+def _source_with_serializable_context(source: SessionSource) -> bool:
+    context = getattr(source, "resolved_access_context", None)
+    if context is None:
+        return False
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+
+        serialize_resolved_access_context(context)
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass
 class SessionEntry:
     """
@@ -805,6 +859,9 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+            resolved_context = _serialize_origin_resolved_access_context(self.origin)
+            if resolved_context is not None:
+                result["resolved_access_context"] = resolved_context
         return result
     
     @classmethod
@@ -812,6 +869,7 @@ class SessionEntry:
         origin = None
         if "origin" in data and isinstance(data["origin"], dict):
             origin = SessionSource.from_dict(data["origin"])
+        _restore_origin_resolved_access_context(origin, data)
         
         platform = None
         if data.get("platform"):
@@ -2055,6 +2113,8 @@ class SessionStore:
                     # Another thread handled this entry during our lock-free
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
+                    if _source_with_serializable_context(source):
+                        entry.origin = source
                     _needs_save = True
                 else:
                     # Stale check clean.  Apply reset decision.
@@ -2068,6 +2128,8 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
+                        if _source_with_serializable_context(source):
+                            entry.origin = source
                         _needs_save = True
             else:
                 if not force_new:

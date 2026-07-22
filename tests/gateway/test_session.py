@@ -3,6 +3,7 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
@@ -19,6 +20,23 @@ from gateway.session import (
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
 # working without duplicating the suite.
 normalize_whatsapp_identifier = canonical_whatsapp_identifier
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"public_web", "memory_search"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-1",
+            thread_id=None,
+        ),
+    )
 
 
 class TestSessionSourceRoundtrip:
@@ -69,6 +87,27 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_resolved_access_context_stays_out_of_source_and_session_context_dicts(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="chat-1",
+            profile="family-alpha",
+        )
+        source.resolved_access_context = _resolved_context()
+
+        source_dict = source.to_dict()
+        context = build_session_context(source, GatewayConfig())
+        context_dict = context.to_dict()
+        prompt = build_session_context_prompt(context)
+
+        assert "resolved_access_context" not in source_dict
+        assert "resolved_access_context" not in context_dict
+        assert "resolved_access_context" not in context_dict["source"]
+        assert SessionSource.from_dict(source_dict).resolved_access_context is None
+        assert "principal-family" not in prompt
+        assert "family-alpha" not in prompt
+
     def test_chat_id_coerced_to_string(self):
         """from_dict should handle numeric chat_id (common from Telegram)."""
         restored = SessionSource.from_dict({
@@ -98,7 +137,6 @@ class TestSessionSourceRoundtrip:
         """
         with pytest.raises(ValueError):
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
-
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
@@ -1406,6 +1444,93 @@ class TestSessionStoreEntriesAttribute:
         assert not hasattr(store, "_sessions")
 
 
+class TestSessionEntryResolvedAccessContextPersistence:
+    def _entry(self, *, source_context=True):
+        from datetime import datetime
+        from gateway.session import SessionEntry
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="chat-1",
+            profile="family-alpha",
+        )
+        if source_context:
+            source.resolved_access_context = _resolved_context()
+        return SessionEntry(
+            session_key="agent:family-alpha:telegram:dm:chat-1",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+
+    def test_entry_persists_and_restores_context_top_level_only(self):
+        from gateway.session import SessionEntry
+
+        data = self._entry().to_dict()
+
+        assert "resolved_access_context" in data
+        assert "resolved_access_context" not in data["origin"]
+        data["origin"].pop("profile")
+        restored = SessionEntry.from_dict(data)
+        assert restored.origin is not None
+        assert restored.origin.resolved_access_context == _resolved_context()
+        assert restored.origin.profile is None
+
+    def test_entry_omits_malformed_in_memory_context_with_categorical_warning(self, caplog):
+        entry = self._entry(source_context=False)
+        entry.origin.resolved_access_context = _resolved_context(profile_id="")
+
+        with caplog.at_level("WARNING"):
+            data = entry.to_dict()
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert "resolved_access_context" not in data
+        assert "omitted malformed resolved access context" in rendered
+        assert "principal-family" not in rendered
+        assert "family-alpha" not in rendered
+        assert "chat-1" not in rendered
+
+    def test_malformed_persisted_context_keeps_entry_and_unsets_context(self, caplog):
+        from gateway.session import SessionEntry
+
+        data = self._entry().to_dict()
+        data["resolved_access_context"]["delivery_target"]["thread_id"] = ""
+
+        with caplog.at_level("WARNING"):
+            restored = SessionEntry.from_dict(data)
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert restored.session_id == "sid"
+        assert restored.origin is not None
+        assert restored.origin.resolved_access_context is None
+        assert "ignored malformed resolved access context" in rendered
+        assert "principal-family" not in rendered
+        assert "family-alpha" not in rendered
+        assert "chat-1" not in rendered
+
+    def test_originless_persisted_context_keeps_entry_and_warns_categorically(self, caplog):
+        from gateway.session import SessionEntry
+
+        data = self._entry().to_dict()
+        data.pop("origin")
+
+        with caplog.at_level("WARNING"):
+            restored = SessionEntry.from_dict(data)
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert restored.session_id == "sid"
+        assert restored.origin is None
+        assert "ignored resolved access context without origin" in rendered
+        assert "principal-family" not in rendered
+        assert "family-alpha" not in rendered
+        assert "chat-1" not in rendered
+
+
 class TestHasAnySessions:
     """Tests for has_any_sessions() fix (issue #351)."""
 
@@ -1941,6 +2066,47 @@ class TestGatewayRoutingTable:
         assert rehydrated.suspended is True
         assert rehydrated.model_override == {"model": "test-model"}
         restarted._db.close()
+
+    def test_index_retains_resolved_context_without_sessions_json(self, tmp_path):
+        config = GatewayConfig(multiplex_profiles=True)
+        source = self._source(chat_id="chat-1", user_id="chat-1")
+        source.profile = "family-alpha"
+        source.resolved_access_context = _resolved_context()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        rehydrated = restarted._entries[entry.session_key]
+        assert rehydrated.origin is not None
+        assert rehydrated.origin.resolved_access_context == _resolved_context()
+        assert rehydrated.origin.profile == "family-alpha"
+        restarted._db.close()
+
+    def test_legacy_entry_seeded_with_context_on_verified_inbound(self, tmp_path):
+        config = GatewayConfig(multiplex_profiles=True)
+        source = self._source(chat_id="chat-1", user_id="chat-1")
+        source.profile = "family-alpha"
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        assert entry.origin is not None
+        assert entry.origin.resolved_access_context is None
+
+        verified = self._source(chat_id="chat-1", user_id="chat-1")
+        verified.profile = "family-alpha"
+        verified.resolved_access_context = _resolved_context()
+        seeded = store.get_or_create_session(verified)
+
+        assert seeded.session_id == entry.session_id
+        assert seeded.origin is verified
+        assert seeded.origin.resolved_access_context == _resolved_context()
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        persisted = json.loads(rows[seeded.session_key])
+        assert "resolved_access_context" in persisted
+        store._db.close()
 
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)

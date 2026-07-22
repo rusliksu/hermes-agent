@@ -8,13 +8,16 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.session import SessionEntry, SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,23 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
     if thread_id:
         d["thread_id"] = thread_id
     return d
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="group",
+            chat_id="-100",
+            thread_id="42",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +270,6 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
-    from gateway.session import SessionSource
-
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
@@ -281,6 +299,50 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "123"
     assert synth_event.source.user_name == "Emiliyan"
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_uses_profile_adapter_from_restored_origin(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    default_adapter = runner.adapters[Platform.TELEGRAM]
+    profile_adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    runner._profile_adapters = {"family-alpha": {Platform.TELEGRAM: profile_adapter}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        thread_id="42",
+        user_id="123",
+        profile="family-alpha",
+    )
+    source.resolved_access_context = _resolved_context()
+    restored = SessionEntry.from_dict(
+        SessionEntry(
+            session_key="agent:family-alpha:telegram:group:-100:42",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+        ).to_dict()
+    )
+    runner.session_store._entries[restored.session_key] = restored
+
+    await runner._inject_watch_notification(
+        "[SYSTEM: Background process matched]",
+        {"session_id": "proc_watch", "session_key": restored.session_key},
+    )
+
+    default_adapter.handle_message.assert_not_called()
+    profile_adapter.handle_message.assert_awaited_once()
+    synth_event = profile_adapter.handle_message.await_args.args[0]
+    assert synth_event.internal is True
+    assert synth_event.source.profile == "family-alpha"
+    assert synth_event.source.resolved_access_context == _resolved_context()
 
 
 @pytest.mark.asyncio

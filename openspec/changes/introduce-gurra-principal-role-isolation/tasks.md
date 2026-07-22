@@ -28,6 +28,7 @@
 - [ ] 3.4 Исключить private USER/memory из shared room prompts и не импортировать private context между profiles.
 - [ ] 3.5 Привязать attachments, generated files и workspaces к resolved profile boundary и room scope.
 - [ ] 3.6 Передавать шесть authority-полей context через callbacks, background, cron, delegation, compaction, reset, restart и concurrent turns без расширения.
+  - 2026-07-22: локальный slice добавил strict persistence/restoration `ResolvedAccessContext` в authoritative gateway routing store и fail-closed startup resume/watch synthetic routing через restored context/profile adapter; checkbox остаётся открытым до kanban/handoff/cron/delegation/compaction/reset/restart/concurrency покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 

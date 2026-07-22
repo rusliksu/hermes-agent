@@ -25,6 +25,21 @@ def _redact(value: Any) -> Optional[str]:
 
 _AUDIT_PLATFORMS = frozenset({"telegram"})
 _AUDIT_PEER_KINDS = frozenset({"dm", "group", "supergroup", "channel"})
+_RESOLVED_ACCESS_CONTEXT_KEYS = frozenset({
+    "principal_id",
+    "role_id",
+    "profile_id",
+    "conversation_scope",
+    "capabilities",
+    "delivery_target",
+})
+_DELIVERY_TARGET_KEYS = frozenset({
+    "platform",
+    "account",
+    "peer_kind",
+    "chat_id",
+    "thread_id",
+})
 
 
 def _audit_label(value: Any, allowed: frozenset[str]) -> Optional[str]:
@@ -63,6 +78,125 @@ class ResolvedAccessContext:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
+
+
+def _require_exact_keys(data: Any, keys: frozenset[str], reason: str) -> Mapping[str, Any]:
+    if not isinstance(data, dict) or frozenset(data.keys()) != keys:
+        raise ValueError(reason)
+    return data
+
+
+def _require_serialized_string(value: Any, reason: str) -> str:
+    if not _is_nonempty_str(value):
+        raise ValueError(reason)
+    return value
+
+
+def _require_serialized_thread_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not _is_nonempty_str(value):
+        raise ValueError("invalid_thread_id")
+    return value
+
+
+def _serialize_delivery_target(target: Any) -> dict[str, Any]:
+    if not isinstance(target, DeliveryTarget):
+        raise ValueError("malformed_delivery_target")
+    return {
+        "platform": _require_serialized_string(target.platform, "malformed_delivery_target"),
+        "account": _require_serialized_string(target.account, "malformed_delivery_target"),
+        "peer_kind": _require_serialized_string(target.peer_kind, "malformed_delivery_target"),
+        "chat_id": _require_serialized_string(target.chat_id, "malformed_delivery_target"),
+        "thread_id": _require_serialized_thread_id(target.thread_id),
+    }
+
+
+def _deserialize_delivery_target(data: Any) -> DeliveryTarget:
+    target = _require_exact_keys(data, _DELIVERY_TARGET_KEYS, "malformed_delivery_target")
+    return DeliveryTarget(
+        platform=_require_serialized_string(target["platform"], "malformed_delivery_target"),
+        account=_require_serialized_string(target["account"], "malformed_delivery_target"),
+        peer_kind=_require_serialized_string(target["peer_kind"], "malformed_delivery_target"),
+        chat_id=_require_serialized_string(target["chat_id"], "malformed_delivery_target"),
+        thread_id=_require_serialized_thread_id(target["thread_id"]),
+    )
+
+
+def _serialize_capabilities(values: Any) -> list[str]:
+    if not isinstance(values, frozenset):
+        raise ValueError("malformed_capabilities")
+    if any(not _is_nonempty_str(value) for value in values):
+        raise ValueError("malformed_capabilities")
+    return sorted(values)
+
+
+def _deserialize_capabilities(values: Any) -> frozenset[str]:
+    if not isinstance(values, list):
+        raise ValueError("malformed_capabilities")
+    seen: set[str] = set()
+    for value in values:
+        if not _is_nonempty_str(value):
+            raise ValueError("malformed_capabilities")
+        if value in seen:
+            raise ValueError("duplicate_capabilities")
+        seen.add(value)
+    return frozenset(values)
+
+
+def serialize_resolved_access_context(context: Any) -> dict[str, Any]:
+    """Serialize a trusted access context for the authoritative routing store."""
+    if not isinstance(context, ResolvedAccessContext):
+        raise ValueError("malformed_resolved_access_context")
+    return {
+        "principal_id": _require_serialized_string(
+            context.principal_id,
+            "malformed_resolved_access_context",
+        ),
+        "role_id": _require_serialized_string(
+            context.role_id,
+            "malformed_resolved_access_context",
+        ),
+        "profile_id": _require_serialized_string(
+            context.profile_id,
+            "malformed_resolved_access_context",
+        ),
+        "conversation_scope": _require_serialized_string(
+            context.conversation_scope,
+            "malformed_resolved_access_context",
+        ),
+        "capabilities": _serialize_capabilities(context.capabilities),
+        "delivery_target": _serialize_delivery_target(context.delivery_target),
+    }
+
+
+def deserialize_resolved_access_context(data: Any) -> ResolvedAccessContext:
+    """Strictly restore a routing-store access context."""
+    context = _require_exact_keys(
+        data,
+        _RESOLVED_ACCESS_CONTEXT_KEYS,
+        "malformed_resolved_access_context",
+    )
+    return ResolvedAccessContext(
+        principal_id=_require_serialized_string(
+            context["principal_id"],
+            "malformed_resolved_access_context",
+        ),
+        role_id=_require_serialized_string(
+            context["role_id"],
+            "malformed_resolved_access_context",
+        ),
+        profile_id=_require_serialized_string(
+            context["profile_id"],
+            "malformed_resolved_access_context",
+        ),
+        conversation_scope=_require_serialized_string(
+            context["conversation_scope"],
+            "malformed_resolved_access_context",
+        ),
+        capabilities=_deserialize_capabilities(context["capabilities"]),
+        delivery_target=_deserialize_delivery_target(context["delivery_target"]),
+    )
 
 
 @dataclass(frozen=True)

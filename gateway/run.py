@@ -6968,34 +6968,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if entry.session_key in self._running_agents:
                 continue
 
+            # Empty-text internal event — the _is_resume_pending branch in
+            # _handle_message_with_agent prepends the proper reason-aware
+            # system note before the turn runs.
             source = entry.origin
+            event = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            if getattr(self, "access_registry", None) is not None:
+                if not self._allow_access_registry_ingress(event):
+                    logger.warning(
+                        "Skipping auto-resume: access registry denied internal event"
+                    )
+                    continue
+            else:
+                # Validate the session owner against the current allowlist
+                # before auto-resuming. A session created before
+                # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
+                # before the owner was removed from it, must not silently
+                # receive a full agent response on gateway restart just
+                # because it has a resume-pending marker (issue #23778).
+                try:
+                    if not self._is_user_authorized(source):
+                        logger.warning(
+                            "Skipping auto-resume for %s: session owner is no "
+                            "longer authorized under the current allowlist",
+                            entry.session_key,
+                        )
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping auto-resume for %s: authorization check failed: %s",
+                        entry.session_key, exc,
+                    )
+                    continue
+
+            source = event.source
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
                     "Skipping auto-resume for %s: adapter not ready for %s",
                     entry.session_key,
                     getattr(source.platform, "value", source.platform),
-                )
-                continue
-
-            # Validate the session owner against the current allowlist
-            # before auto-resuming. A session created before
-            # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
-            # before the owner was removed from it, must not silently
-            # receive a full agent response on gateway restart just
-            # because it has a resume-pending marker (issue #23778).
-            try:
-                if not self._is_user_authorized(source):
-                    logger.warning(
-                        "Skipping auto-resume for %s: session owner is no "
-                        "longer authorized under the current allowlist",
-                        entry.session_key,
-                    )
-                    continue
-            except Exception as exc:
-                logger.warning(
-                    "Skipping auto-resume for %s: authorization check failed: %s",
-                    entry.session_key, exc,
                 )
                 continue
 
@@ -7008,15 +7025,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = MessageEvent(
-                text="",
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -16256,11 +16264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         try:

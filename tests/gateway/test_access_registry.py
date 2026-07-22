@@ -18,6 +18,8 @@ from gateway.access_registry import (
     SharedScopeBinding,
     TransportIdentity,
     compare_legacy_access_resolution,
+    deserialize_resolved_access_context,
+    serialize_resolved_access_context,
 )
 
 
@@ -230,6 +232,67 @@ def test_validate_resolved_context_accepts_current_active_context():
     context = registry.resolve(_dm_identity("opaque-family-0"))
 
     assert registry.validate_resolved_context(context) == context
+
+
+def test_resolved_access_context_codec_roundtrips_exact_six_field_shape():
+    context = _registry().resolve(_dm_identity("opaque-family-0"))
+    encoded = serialize_resolved_access_context(context)
+
+    assert list(encoded) == [
+        "principal_id",
+        "role_id",
+        "profile_id",
+        "conversation_scope",
+        "capabilities",
+        "delivery_target",
+    ]
+    assert list(encoded["delivery_target"]) == [
+        "platform",
+        "account",
+        "peer_kind",
+        "chat_id",
+        "thread_id",
+    ]
+    assert encoded["capabilities"] == sorted(SANDBOX_CAPS)
+    assert deserialize_resolved_access_context(encoded) == context
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw.pop("principal_id"),
+        lambda raw: raw.__setitem__("version", 1),
+        lambda raw: raw.__setitem__("profile_id", ""),
+        lambda raw: raw.__setitem__("role_id", 7),
+        lambda raw: raw.__setitem__("capabilities", ("public_web",)),
+        lambda raw: raw.__setitem__("capabilities", ["public_web", "public_web"]),
+        lambda raw: raw.__setitem__("capabilities", [""]),
+        lambda raw: raw.__setitem__("capabilities", ["public_web", 7]),
+        lambda raw: raw["delivery_target"].pop("account"),
+        lambda raw: raw["delivery_target"].__setitem__("extra", "x"),
+        lambda raw: raw["delivery_target"].__setitem__("thread_id", ""),
+        lambda raw: raw["delivery_target"].__setitem__("thread_id", 7),
+    ],
+)
+def test_resolved_access_context_codec_rejects_malformed_without_raw_values(mutate):
+    raw_secret = "raw-secret-profile"
+    raw = serialize_resolved_access_context(_registry().resolve(_dm_identity("opaque-family-0")))
+    raw["profile_id"] = raw_secret
+    mutate(raw)
+
+    with pytest.raises(ValueError) as exc:
+        deserialize_resolved_access_context(raw)
+
+    assert str(exc.value) in {
+        "malformed_resolved_access_context",
+        "malformed_delivery_target",
+        "malformed_capabilities",
+        "duplicate_capabilities",
+        "invalid_thread_id",
+    }
+    assert raw_secret not in str(exc.value)
+    assert "opaque-family-0" not in str(exc.value)
+    assert ACCOUNT not in str(exc.value)
 
 
 @pytest.mark.parametrize(
