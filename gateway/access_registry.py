@@ -159,6 +159,19 @@ class RedactedAuditMetadata:
             thread_ref=_redact(getattr(identity, "thread_id", None)),
         )
 
+    @classmethod
+    def from_delivery_target(cls, event: str, target: Optional["DeliveryTarget"]) -> "RedactedAuditMetadata":
+        if not isinstance(target, DeliveryTarget):
+            return cls(event=event)
+        return cls(
+            event=event,
+            platform=_audit_label(getattr(target, "platform", None), _AUDIT_PLATFORMS),
+            account_ref=_redact(getattr(target, "account", None)),
+            peer_kind=_audit_label(getattr(target, "peer_kind", None), _AUDIT_PEER_KINDS),
+            chat_ref=_redact(getattr(target, "chat_id", None)),
+            thread_ref=_redact(getattr(target, "thread_id", None)),
+        )
+
     def as_dict(self) -> dict[str, Optional[str]]:
         return {
             "event": self.event,
@@ -419,6 +432,29 @@ class AccessRegistry:
             return self._resolve_dm(identity, audit)
         return self._resolve_shared_room(identity, audit)
 
+    def validate_resolved_context(self, context: Any) -> ResolvedAccessContext:
+        audit = RedactedAuditMetadata.from_delivery_target(
+            "validate_context",
+            getattr(context, "delivery_target", None),
+        )
+        if context is None:
+            raise AccessDeniedError("missing_resolved_access_context", audit)
+        if not isinstance(context, ResolvedAccessContext):
+            raise AccessDeniedError("malformed_resolved_access_context", audit)
+
+        matches = [
+            candidate
+            for candidate in self._active_resolved_contexts()
+            if candidate == context
+        ]
+        if len(matches) > 1:
+            raise AccessDeniedError("ambiguous_resolved_access_context", audit)
+        if not self.validate().valid:
+            raise AccessDeniedError("registry_validation_failed", audit)
+        if not matches:
+            raise AccessDeniedError("resolved_access_context_mismatch", audit)
+        return matches[0]
+
     def effective_capabilities(self, role_id: str, conversation_scope: str) -> frozenset[str]:
         role = self.roles.get(role_id)
         if not isinstance(role, RolePolicy) or not role.active:
@@ -455,14 +491,7 @@ class AccessRegistry:
             raise AccessDeniedError("disabled_principal_binding", audit)
         binding = _single_match(matches, "principal_binding", audit)
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
-        return ResolvedAccessContext(
-            principal_id=binding.principal_id,
-            role_id=binding.role_id,
-            profile_id=binding.profile_id,
-            conversation_scope=binding.conversation_scope,
-            capabilities=self.effective_capabilities(binding.role_id, binding.conversation_scope),
-            delivery_target=binding.delivery_target,
-        )
+        return self._context_from_binding(binding)
 
     def _resolve_shared_room(
         self,
@@ -494,6 +523,12 @@ class AccessRegistry:
         if member.key() not in {participant.key() for participant in binding.participant_identities}:
             raise AccessDeniedError("participant_not_member", audit)
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
+        return self._context_from_binding(binding)
+
+    def _context_from_binding(
+        self,
+        binding: PrincipalBinding | SharedScopeBinding,
+    ) -> ResolvedAccessContext:
         return ResolvedAccessContext(
             principal_id=binding.principal_id,
             role_id=binding.role_id,
@@ -502,6 +537,14 @@ class AccessRegistry:
             capabilities=self.effective_capabilities(binding.role_id, binding.conversation_scope),
             delivery_target=binding.delivery_target,
         )
+
+    def _active_resolved_contexts(self) -> tuple[ResolvedAccessContext, ...]:
+        bindings = (
+            binding
+            for binding in self.principal_bindings + self.shared_scope_bindings
+            if isinstance(binding, (PrincipalBinding, SharedScopeBinding)) and binding.active
+        )
+        return tuple(self._context_from_binding(binding) for binding in bindings)
 
     def _validate_binding_authority(
         self,

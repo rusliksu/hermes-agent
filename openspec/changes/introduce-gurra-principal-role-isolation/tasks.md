@@ -15,6 +15,7 @@
   - 2026-07-22: добавлен strict `access_registry` parser в `GatewayConfig.from_dict`, process-only `GatewayConfig.access_registry` и fallback wiring в `GatewayRunner.__init__`; checkbox остаётся открытым до downstream/cutover завершения.
 - [ ] 2.3 Удалить owner/default/last-used fallback из private ingress, shared ingress, slash commands, callbacks и resume path.
   - 2026-07-22: локальный slice убрал owner/default/global fallback после server-resolved `ResolvedAccessContext` в profile home resolution, SessionStore key namespace и `/resume` same-origin guards; legacy path без context оставлен прежним, checkbox остаётся открытым до callbacks/background и оставшихся ingress путей.
+  - 2026-07-22: локальный slice убрал configured-registry bypass для `internal=True` gateway events: in-process events теперь проходят validation существующего typed `ResolvedAccessContext` и exact delivery target match; persistence/restart/callback propagation ещё не добавлены, поэтому потерявшие context события fail-closed и 2.3/3.6 остаются открытыми.
 - [ ] 2.4 Укрепить request path так, чтобы `HERMES_HOME` и profile home брались из server-bound context, а не из module/import-time cache.
 - [ ] 2.5 Заменить request-path `os.getenv` authority/auth fallbacks на server-bound config/policy providers.
 - [ ] 2.6 Проверить outbound delivery routing только через resolved `delivery_target` без owner default delivery.

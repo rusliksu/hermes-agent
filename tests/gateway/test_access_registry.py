@@ -225,6 +225,89 @@ def test_exact_telegram_dm_success_and_capability_intersection():
     assert context.delivery_target.chat_id == "opaque-family-0"
 
 
+def test_validate_resolved_context_accepts_current_active_context():
+    registry = _registry()
+    context = registry.resolve(_dm_identity("opaque-family-0"))
+
+    assert registry.validate_resolved_context(context) == context
+
+
+@pytest.mark.parametrize(
+    "context,reason",
+    [
+        (None, "missing_resolved_access_context"),
+        ({"profile_id": "family-profile-0"}, "malformed_resolved_access_context"),
+    ],
+)
+def test_validate_resolved_context_rejects_missing_or_wrong_type(context, reason):
+    with pytest.raises(AccessDeniedError) as exc:
+        _registry().validate_resolved_context(context)
+
+    assert exc.value.reason == reason
+    rendered = json.dumps(exc.value.audit.as_dict())
+    assert "family-profile-0" not in rendered
+
+
+def test_validate_resolved_context_rejects_stale_or_forged_context_without_ids():
+    context = _registry().resolve(_dm_identity("opaque-family-0"))
+    forged = replace(context, profile_id="family-profile-1")
+
+    with pytest.raises(AccessDeniedError) as exc:
+        _registry().validate_resolved_context(forged)
+
+    assert exc.value.reason == "resolved_access_context_mismatch"
+    rendered = json.dumps(exc.value.audit.as_dict()) + str(exc.value)
+    assert "principal-family-0" not in rendered
+    assert "family-profile-0" not in rendered
+    assert "family-profile-1" not in rendered
+    assert "opaque-family-0" not in rendered
+    assert ACCOUNT not in rendered
+
+
+def test_validate_resolved_context_rejects_invalid_registry_without_ids():
+    binding = PrincipalBinding(
+        principal_id="principal-family-0",
+        role_id="missing-role",
+        profile_id="family-profile-0",
+        transport_identity=_dm_identity("opaque-family-0"),
+        conversation_scope="private",
+        delivery_target=_target(_dm_identity("opaque-family-0")),
+    )
+    registry = _registry(principal_bindings=(binding,))
+    context = ResolvedAccessContext(
+        principal_id="principal-family-0",
+        role_id="missing-role",
+        profile_id="family-profile-0",
+        conversation_scope="private",
+        capabilities=frozenset(),
+        delivery_target=_target(_dm_identity("opaque-family-0")),
+    )
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.validate_resolved_context(context)
+
+    assert exc.value.reason == "registry_validation_failed"
+    rendered = json.dumps(exc.value.audit.as_dict())
+    assert "principal-family-0" not in rendered
+    assert "family-profile-0" not in rendered
+    assert "opaque-family-0" not in rendered
+
+
+def test_validate_resolved_context_rejects_ambiguous_context_without_ids():
+    context = _registry().resolve(_dm_identity("opaque-family-0"))
+    bindings = _principal_bindings()
+    registry = _registry(principal_bindings=bindings + (bindings[1],))
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.validate_resolved_context(context)
+
+    assert exc.value.reason == "ambiguous_resolved_access_context"
+    rendered = json.dumps(exc.value.audit.as_dict()) + str(exc.value)
+    assert "principal-family-0" not in rendered
+    assert "family-profile-0" not in rendered
+    assert "opaque-family-0" not in rendered
+
+
 @pytest.mark.parametrize(
     "identity,reason",
     [

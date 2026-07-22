@@ -9343,7 +9343,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _allow_access_registry_ingress(self, event: MessageEvent) -> bool:
         registry = getattr(self, "access_registry", None)
-        if registry is None or getattr(event, "internal", False):
+        if registry is None:
             return True
 
         source = getattr(event, "source", None)
@@ -9360,17 +9360,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 TransportIdentity,
             )
 
-            identity = TransportIdentity.from_session_source(
-                source,
-                account=getattr(source, "route_account", None),
-            )
-            context = registry.resolve(identity)
-            requested_profile = (getattr(source, "profile", None) or "").strip()
-            if requested_profile and requested_profile != context.profile_id:
-                audit = RedactedAuditMetadata.from_transport(
-                    "profile_route_mismatch",
-                    identity,
+            if source is None:
+                raise AccessDeniedError(
+                    "malformed_session_source",
+                    RedactedAuditMetadata("ingress"),
                 )
+            if getattr(event, "internal", False):
+                context = registry.validate_resolved_context(
+                    getattr(source, "resolved_access_context", None)
+                )
+                target = context.delivery_target
+                audit = RedactedAuditMetadata.from_delivery_target(
+                    "internal_delivery_target",
+                    target,
+                )
+                source_platform = getattr(getattr(source, "platform", None), "value", None)
+                if (
+                    source_platform != target.platform
+                    or getattr(source, "chat_type", None) != target.peer_kind
+                    or getattr(source, "chat_id", None) != target.chat_id
+                    or getattr(source, "thread_id", None) != target.thread_id
+                    or (
+                        target.peer_kind == "dm"
+                        and getattr(source, "user_id", None) != target.chat_id
+                    )
+                ):
+                    raise AccessDeniedError("internal_delivery_target_mismatch", audit)
+                route_account = getattr(source, "route_account", None)
+                if isinstance(route_account, str):
+                    route_account = route_account.strip()
+                elif route_account is not None:
+                    raise AccessDeniedError("internal_route_account_mismatch", audit)
+                if route_account and route_account != target.account:
+                    raise AccessDeniedError("internal_route_account_mismatch", audit)
+                source.route_account = target.account
+            else:
+                identity = TransportIdentity.from_session_source(
+                    source,
+                    account=getattr(source, "route_account", None),
+                )
+                context = registry.resolve(identity)
+            requested = getattr(source, "profile", None)
+            if requested is not None and not isinstance(requested, str):
+                audit = RedactedAuditMetadata.from_delivery_target(
+                    "malformed_profile_route",
+                    context.delivery_target,
+                )
+                raise AccessDeniedError("malformed_profile_route", audit)
+            requested_profile = requested.strip() if isinstance(requested, str) else ""
+            if requested_profile and requested_profile != context.profile_id:
+                if getattr(event, "internal", False):
+                    audit = RedactedAuditMetadata.from_delivery_target(
+                        "profile_route_mismatch",
+                        context.delivery_target,
+                    )
+                else:
+                    audit = RedactedAuditMetadata.from_transport(
+                        "profile_route_mismatch",
+                        identity,
+                    )
                 logger.warning(
                     "AccessRegistry ingress denied: reason=%s audit=%s",
                     "profile_route_mismatch",

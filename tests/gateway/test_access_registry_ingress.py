@@ -20,6 +20,16 @@ from gateway.run import GatewayRunner
 
 ACCOUNT = "bot-a"
 CAPS = frozenset({"public_web"})
+RAW_LOG_VALUES = (
+    ACCOUNT,
+    "wrong-account",
+    "u1",
+    "u2",
+    "other-chat",
+    "principal-family",
+    "family-profile",
+    "other-profile",
+)
 
 
 class _Adapter(BasePlatformAdapter):
@@ -141,6 +151,49 @@ def _event(
     )
 
 
+def _rendered_logs(caplog):
+    return "\n".join(record.getMessage() for record in caplog.records)
+
+
+def _assert_no_raw_access_values(rendered):
+    for raw_value in RAW_LOG_VALUES:
+        assert raw_value not in rendered
+
+
+def _guard_denied_downstream(monkeypatch, runner):
+    called = {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+
+    def queue(event):
+        called["queued"] = True
+
+    def scale():
+        called["scaled"] = True
+
+    def auth(source):
+        called["authorized"] = True
+        return True
+
+    async def downstream(*args, **kwargs):
+        raise AssertionError("denied ingress must not reach the agent")
+
+    def plugin_hook(*args, **kwargs):
+        called["plugin"] = True
+        return []
+
+    runner._startup_restore_in_progress = True
+    runner._queue_startup_restore_event = queue
+    runner._scale_to_zero_note_real_inbound = scale
+    runner._is_user_authorized = auth
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", plugin_hook)
+    monkeypatch.setattr(GatewayRunner, "_handle_message_with_agent", downstream)
+    return called
+
+
 @pytest.fixture(autouse=True)
 def _gateway_stubs(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -179,6 +232,29 @@ async def test_registry_allow_binds_context_and_profile_before_agent():
 
 
 @pytest.mark.asyncio
+async def test_registry_internal_event_with_valid_context_binds_target_and_profile_before_agent():
+    registry = _registry()
+    runner = _runner(registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter, text="/status")
+    event.internal = True
+    event.source.route_account = None
+    event.source.resolved_access_context = registry.resolve(_identity("u1"))
+
+    async def status_handler(event):
+        source = event.source
+        assert source.profile == "family-profile"
+        assert source.route_account == ACCOUNT
+        assert source.resolved_access_context.profile_id == "family-profile"
+        assert source.resolved_access_context.delivery_target.account == ACCOUNT
+        return "status ok"
+
+    runner._handle_status_command = status_handler
+
+    assert await runner._handle_message(event) == "status ok"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_kwargs,registry",
     [
@@ -190,50 +266,77 @@ async def test_registry_allow_binds_context_and_profile_before_agent():
 )
 async def test_registry_denials_stop_before_gateway_downstream(
     monkeypatch,
+    caplog,
     event_kwargs,
     registry,
 ):
     runner = _runner(registry)
     adapter = _Adapter(runner=runner)
-    runner._startup_restore_in_progress = True
-    queued = False
-    scaled = False
-    authorized = False
+    called = _guard_denied_downstream(monkeypatch, runner)
 
-    def queue(event):
-        nonlocal queued
-        queued = True
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(_event(adapter, **event_kwargs)) is None
+    assert called == {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+    _assert_no_raw_access_values(_rendered_logs(caplog))
 
-    def scale():
-        nonlocal scaled
-        scaled = True
 
-    def auth(source):
-        nonlocal authorized
-        authorized = True
-        return True
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("missing_context", "missing_resolved_access_context"),
+        ("stale_context", "resolved_access_context_mismatch"),
+        ("chat_mismatch", "internal_delivery_target_mismatch"),
+        ("route_account_mismatch", "internal_route_account_mismatch"),
+        ("profile_mismatch", "profile_route_mismatch"),
+        ("malformed_profile_route", "malformed_profile_route"),
+    ],
+)
+async def test_registry_internal_denials_stop_before_gateway_downstream(
+    monkeypatch,
+    caplog,
+    case,
+    reason,
+):
+    registry = _registry()
+    runner = _runner(registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+    event.internal = True
+    if case == "missing_context":
+        event.source.resolved_access_context = None
+    elif case == "stale_context":
+        stale_registry = _registry(user_id="u2")
+        event.source.resolved_access_context = stale_registry.resolve(_identity("u2"))
+    else:
+        event.source.resolved_access_context = registry.resolve(_identity("u1"))
+        if case == "chat_mismatch":
+            event.source.chat_id = "other-chat"
+        elif case == "route_account_mismatch":
+            event.source.route_account = "wrong-account"
+        elif case == "profile_mismatch":
+            event.source.profile = "other-profile"
+        elif case == "malformed_profile_route":
+            event.source.profile = 123
+    called = _guard_denied_downstream(monkeypatch, runner)
 
-    async def downstream(*args, **kwargs):
-        raise AssertionError("denied ingress must not reach the agent")
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(event) is None
 
-    runner._queue_startup_restore_event = queue
-    runner._scale_to_zero_note_real_inbound = scale
-    runner._is_user_authorized = auth
-    plugin_called = False
-
-    def plugin_hook(*args, **kwargs):
-        nonlocal plugin_called
-        plugin_called = True
-        return []
-
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", plugin_hook)
-    monkeypatch.setattr(GatewayRunner, "_handle_message_with_agent", downstream)
-
-    assert await runner._handle_message(_event(adapter, **event_kwargs)) is None
-    assert queued is False
-    assert scaled is False
-    assert authorized is False
-    assert plugin_called is False
+    assert called == {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+    rendered = _rendered_logs(caplog)
+    assert reason in rendered
+    _assert_no_raw_access_values(rendered)
 
 
 @pytest.mark.asyncio
@@ -282,13 +385,24 @@ async def test_registry_with_multiplex_off_denies_before_resolution_and_downstre
     assert plugin_called is False
     rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
     assert "access_registry_requires_multiplex" in rendered_logs
-    assert "u1" not in rendered_logs
-    assert ACCOUNT not in rendered_logs
+    _assert_no_raw_access_values(rendered_logs)
 
 
 @pytest.mark.asyncio
-async def test_registry_internal_event_bypass_unchanged_when_multiplex_off():
+async def test_registry_internal_event_no_longer_bypasses_configured_registry_when_multiplex_off():
     runner = _runner(_ExplodingRegistry())
+    runner.config.multiplex_profiles = False
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+    event.internal = True
+
+    assert runner._allow_access_registry_ingress(event) is False
+    assert getattr(event.source, "resolved_access_context", None) is None
+
+
+@pytest.mark.asyncio
+async def test_registry_none_internal_legacy_behavior_remains_allowed():
+    runner = _runner(None)
     runner.config.multiplex_profiles = False
     adapter = _Adapter(runner=runner)
     event = _event(adapter)
