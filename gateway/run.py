@@ -3035,7 +3035,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _startup_restore_in_progress: bool = False
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(
+        self,
+        config: Optional[GatewayConfig] = None,
+        access_registry: Optional[Any] = None,
+    ):
         global _gateway_runner_ref
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
@@ -3047,7 +3051,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # outside user YAML parsing in this compatibility slice: when absent,
         # legacy single-profile behavior remains unchanged; when present, all
         # user ingress and profile-home resolution become fail-closed.
-        self.access_registry = getattr(self.config, "access_registry", None)
+        self.access_registry = (
+            access_registry
+            if access_registry is not None
+            else getattr(self.config, "access_registry", None)
+        )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
