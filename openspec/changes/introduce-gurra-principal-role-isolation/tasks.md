@@ -29,6 +29,7 @@
 - [ ] 3.5 Привязать attachments, generated files и workspaces к resolved profile boundary и room scope.
 - [ ] 3.6 Передавать шесть authority-полей context через callbacks, background, cron, delegation, compaction, reset, restart и concurrent turns без расширения.
   - 2026-07-22: локальный slice добавил strict persistence/restoration `ResolvedAccessContext` в authoritative gateway routing store и fail-closed startup resume/watch synthetic routing через restored context/profile adapter; checkbox остаётся открытым до kanban/handoff/cron/delegation/compaction/reset/restart/concurrency покрытия.
+  - 2026-07-22: локальный slice закрыл Kanban notify/wakeup callbacks под configured `AccessRegistry`: delivery/wake идут только через persisted session origin context и canonical source после ingress validation; добавлено focused 8.4-покрытие для positive/missing/mismatch, checkbox остаётся открытым до handoff/cron/delegation/compaction/reset/concurrency.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
