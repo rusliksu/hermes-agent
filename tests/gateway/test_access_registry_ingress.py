@@ -111,6 +111,11 @@ def _runner(registry, *, profile_routes=None):
     return runner
 
 
+class _ExplodingRegistry:
+    def resolve(self, identity):
+        raise AssertionError("multiplex-off ingress must not resolve identity")
+
+
 def _event(
     adapter,
     *,
@@ -229,6 +234,68 @@ async def test_registry_denials_stop_before_gateway_downstream(
     assert scaled is False
     assert authorized is False
     assert plugin_called is False
+
+
+@pytest.mark.asyncio
+async def test_registry_with_multiplex_off_denies_before_resolution_and_downstream(
+    monkeypatch,
+    caplog,
+):
+    runner = _runner(_ExplodingRegistry())
+    runner.config.multiplex_profiles = False
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+    scaled = False
+    authorized = False
+
+    def scale():
+        nonlocal scaled
+        scaled = True
+
+    def auth(source):
+        nonlocal authorized
+        authorized = True
+        return True
+
+    async def downstream(*args, **kwargs):
+        raise AssertionError("denied ingress must not reach the agent")
+
+    runner._scale_to_zero_note_real_inbound = scale
+    runner._is_user_authorized = auth
+    plugin_called = False
+
+    def plugin_hook(*args, **kwargs):
+        nonlocal plugin_called
+        plugin_called = True
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", plugin_hook)
+    monkeypatch.setattr(GatewayRunner, "_handle_message_with_agent", downstream)
+
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(event) is None
+
+    assert getattr(event.source, "resolved_access_context", None) is None
+    assert event.source.profile in (None, "")
+    assert scaled is False
+    assert authorized is False
+    assert plugin_called is False
+    rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "access_registry_requires_multiplex" in rendered_logs
+    assert "u1" not in rendered_logs
+    assert ACCOUNT not in rendered_logs
+
+
+@pytest.mark.asyncio
+async def test_registry_internal_event_bypass_unchanged_when_multiplex_off():
+    runner = _runner(_ExplodingRegistry())
+    runner.config.multiplex_profiles = False
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+    event.internal = True
+
+    assert runner._allow_access_registry_ingress(event) is True
+    assert getattr(event.source, "resolved_access_context", None) is None
 
 
 @pytest.mark.asyncio

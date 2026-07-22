@@ -723,7 +723,34 @@ class GatewaySlashCommandsMixin:
         return None
 
     @staticmethod
-    def _same_matrix_room(current: SessionSource, origin: Optional[SessionSource]) -> bool:
+    def _resolved_context_profile_id(source: SessionSource) -> Optional[str]:
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            return None
+        profile_id = getattr(context, "profile_id", None)
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            return ""
+        return profile_id.strip()
+
+    def _origin_matches_resolved_profile(
+        self, current: SessionSource, origin: Optional[SessionSource]
+    ) -> bool:
+        context_profile = self._resolved_context_profile_id(current)
+        if context_profile is None:
+            return True
+        origin_profile = (getattr(origin, "profile", "") or "").strip()
+        return bool(context_profile) and bool(origin_profile) and origin_profile == context_profile
+
+    def _row_matches_resolved_profile(self, source: SessionSource, row: dict) -> bool:
+        context_profile = self._resolved_context_profile_id(source)
+        if context_profile is None:
+            return True
+        row_profile = str(row.get("profile_name") or "").strip()
+        return bool(context_profile) and bool(row_profile) and row_profile == context_profile
+
+    def _same_matrix_room(self, current: SessionSource, origin: Optional[SessionSource]) -> bool:
+        if not self._origin_matches_resolved_profile(current, origin):
+            return False
         return (
             origin is not None
             and origin.platform == Platform.MATRIX
@@ -754,6 +781,8 @@ class GatewaySlashCommandsMixin:
         contract via ``is_shared_multi_user_session``.
         """
         if origin is None or current is None:
+            return False
+        if not self._origin_matches_resolved_profile(current, origin):
             return False
         if origin.platform != current.platform:
             return False
@@ -836,9 +865,11 @@ class GatewaySlashCommandsMixin:
         otherwise falls back to the DB row's source + user_id (the sessions
         table has no chat_id). An identity-bearing caller is allowed only when
         the row PROVES the same owner; a row that lacks enough ownership data
-        fails closed. An explicit admin ``--all`` override bypasses scoping.
+        fails closed. An explicit admin ``--all`` override bypasses scoping only
+        on the legacy no-resolved-context path.
         """
-        if allow_override and self._resume_caller_is_admin(source):
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
+        if allow_override and not has_resolved_context and self._resume_caller_is_admin(source):
             return True
         # Use the live origin only when it resolves to a real SessionSource; a
         # store that can't resolve it (or an unexpected lookup error) must not
@@ -853,6 +884,8 @@ class GatewaySlashCommandsMixin:
         try:
             row = await self._session_db.get_session(target_id) or {}
         except Exception:
+            return False
+        if not self._row_matches_resolved_profile(source, row):
             return False
         caller_src = source.platform.value if source.platform else None
         row_src = row.get("source")
@@ -885,7 +918,8 @@ class GatewaySlashCommandsMixin:
         # otherwise rely on row_uid == caller_uid must fail closed here to stay
         # in lock-step with the key boundary (CWE-639). Shared group/thread
         # sessions are unaffected (they don't scope by participant at all), and
-        # an admin --all override still bypasses this above.
+        # a legacy no-resolved-context admin --all override still bypasses this
+        # above.
         caller_keys_on_alt = bool(str(getattr(source, "user_id_alt", "") or ""))
         if caller_uid:
             # Identity-bearing caller: allow only when the row PROVES the same
@@ -965,7 +999,8 @@ class GatewaySlashCommandsMixin:
         # enumerate, a persisted session by id/title. Fail closed. A legitimate
         # same-chat resume of an ACTIVE session still works through the
         # live-origin branch above (which compares chat_id), and an operator can
-        # use the admin --all override. (CWE-639: IDOR on session routing.)
+        # use the admin --all override only on the legacy no-resolved-context
+        # path. (CWE-639: IDOR on session routing.)
         return False
 
     async def _resume_row_visible(
@@ -976,19 +1011,20 @@ class GatewaySlashCommandsMixin:
         Prevents cross-origin enumeration of session ids/previews via the
         numbered /resume list. Preserves the existing Matrix room-scoping
         semantics; scopes every other platform to the caller's own sessions
-        unless an admin passes ``--all``.
+        unless a legacy no-resolved-context admin passes ``--all``.
         """
         sid = str(row.get("id") or "")
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
         if source.platform == Platform.MATRIX:
             # Cross-room enumeration is cross-ORIGIN data access: gate the
             # ``--all`` short-circuit behind a real configured admin, exactly
             # like the non-Matrix branch below. A non-admin Matrix ``--all``
             # falls back to same-room scoping rather than exposing every Matrix
             # titled session.
-            if allow_all and self._resume_caller_is_admin(source):
+            if allow_all and not has_resolved_context and self._resume_caller_is_admin(source):
                 return True
             return self._same_matrix_room(source, self._gateway_session_origin_for_id(sid))
-        if allow_all and self._resume_caller_is_admin(source):
+        if allow_all and not has_resolved_context and self._resume_caller_is_admin(source):
             return True
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
@@ -3850,9 +3886,16 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
         if source.platform == Platform.MATRIX:
             target_origin = self._gateway_session_origin_for_id(target_id)
-            if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
+            effective_cross_room = allow_cross_room and not has_resolved_context
+            if not self._same_matrix_room(source, target_origin) and not effective_cross_room:
+                if has_resolved_context:
+                    return t(
+                        "gateway.resume.blocked_not_owner",
+                        name=t("gateway.topic.untitled_session"),
+                    )
                 if target_origin is None:
                     return t("gateway.resume.matrix_blocked_no_origin", name=name)
                 return t(
@@ -3867,6 +3910,11 @@ class GatewaySlashCommandsMixin:
             # Bind /resume to the caller's own platform/user/chat on every
             # non-Matrix adapter so one user can't attach to another's
             # persisted transcript.
+            if self._resolved_context_profile_id(source) is not None:
+                return t(
+                    "gateway.resume.blocked_not_owner",
+                    name=t("gateway.topic.untitled_session"),
+                )
             return t("gateway.resume.blocked_not_owner", name=name)
 
         # Check if already on that session
@@ -3919,7 +3967,7 @@ class GatewaySlashCommandsMixin:
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
-        if source.platform == Platform.MATRIX and allow_cross_room:
+        if source.platform == Platform.MATRIX and allow_cross_room and not has_resolved_context:
             return t(
                 "gateway.resume.matrix_cross_room_success",
                 title=title,

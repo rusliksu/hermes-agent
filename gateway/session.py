@@ -1381,6 +1381,20 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
+        context = getattr(source, "resolved_access_context", None) if source is not None else None
+        if context is not None:
+            from gateway.profile_routing import ProfileRoutingError
+
+            context_profile = getattr(context, "profile_id", None)
+            if not isinstance(context_profile, str) or not context_profile.strip():
+                raise ProfileRoutingError("missing_resolved_profile")
+            context_profile = context_profile.strip()
+            source_profile = (getattr(source, "profile", "") or "").strip()
+            if source_profile and source_profile != context_profile:
+                raise ProfileRoutingError("resolved_profile_mismatch")
+            if not getattr(self.config, "multiplex_profiles", False):
+                raise ProfileRoutingError("resolved_profile_requires_multiplex")
+            return context_profile
         if not getattr(self.config, "multiplex_profiles", False):
             return None
         if source is not None and source.profile:

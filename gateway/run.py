@@ -9347,6 +9347,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
 
         source = getattr(event, "source", None)
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s",
+                "access_registry_requires_multiplex",
+            )
+            return False
         try:
             from gateway.access_registry import (
                 AccessDeniedError,
@@ -17922,6 +17928,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
+        from gateway.profile_routing import ProfileRoutingError
+
+        context = getattr(source, "resolved_access_context", None)
+        if context is not None:
+            context_profile = getattr(context, "profile_id", None)
+            if not isinstance(context_profile, str) or not context_profile.strip():
+                raise ProfileRoutingError("missing_resolved_profile")
+            context_profile = context_profile.strip()
+            source_profile = (getattr(source, "profile", "") or "").strip()
+            if source_profile and source_profile != context_profile:
+                raise ProfileRoutingError("resolved_profile_mismatch")
+            try:
+                if not profile_exists(context_profile):
+                    logger.warning(
+                        "Resolved access profile routing denied: missing_resolved_profile"
+                    )
+                    raise ProfileRoutingError("missing_resolved_profile")
+                return get_profile_dir(context_profile)
+            except ProfileRoutingError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Resolved access profile routing denied: resolved_profile_lookup_failed",
+                    exc_info=True,
+                )
+                raise ProfileRoutingError("resolved_profile_lookup_failed")
         
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
@@ -17950,8 +17982,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return get_hermes_home()
             return profile_dir
         except Exception as exc:
-            from gateway.profile_routing import ProfileRoutingError
-
             if isinstance(exc, ProfileRoutingError):
                 raise
             # Catch normalization errors, path errors, etc.

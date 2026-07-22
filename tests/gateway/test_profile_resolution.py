@@ -11,6 +11,23 @@ from gateway.run import GatewayRunner
 from gateway.profile_routing import ProfileRoute, ProfileRoutingError
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="dm:alpha",
+        capabilities=frozenset({"chat"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-alpha",
+        ),
+    )
 
 
 @pytest.fixture
@@ -116,6 +133,54 @@ class TestResolutionOrder:
                 
                 assert result == Path("/hermes")
                 mock_get_dir.assert_called_once_with("default")
+
+    def test_resolved_context_uses_context_profile_when_source_profile_blank(
+        self, mock_runner, discord_source
+    ):
+        discord_source.profile = None
+        discord_source.resolved_access_context = _resolved_context("family-alpha")
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            with patch("hermes_cli.profiles.profile_exists", return_value=True):
+                with patch(
+                    "hermes_cli.profiles.get_profile_dir",
+                    return_value=Path("/profiles/family-alpha"),
+                ) as get_profile_dir:
+                    result = mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert result == Path("/profiles/family-alpha")
+        get_profile_dir.assert_called_once_with("family-alpha")
+
+    def test_resolved_context_source_profile_mismatch_denied(
+        self, mock_runner, discord_source
+    ):
+        discord_source.profile = "owner"
+        discord_source.resolved_access_context = _resolved_context("family-alpha")
+
+        with pytest.raises(ProfileRoutingError) as exc:
+            mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert exc.value.reason == "resolved_profile_mismatch"
+
+    def test_missing_resolved_profile_home_denied_without_global_fallback(
+        self, mock_runner, discord_source, caplog
+    ):
+        discord_source.profile = None
+        discord_source.resolved_access_context = _resolved_context("family-alpha")
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=False):
+            with patch("hermes_cli.profiles.get_profile_dir") as get_profile_dir:
+                with patch("hermes_constants.get_hermes_home") as get_hermes_home:
+                    with caplog.at_level(logging.WARNING):
+                        with pytest.raises(ProfileRoutingError) as exc:
+                            mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert exc.value.reason == "missing_resolved_profile"
+        get_profile_dir.assert_not_called()
+        get_hermes_home.assert_not_called()
+        rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "family-alpha" not in rendered_logs
+        assert "principal-alpha" not in rendered_logs
 
 
 class TestMissingProfileWarning:

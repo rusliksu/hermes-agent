@@ -14,7 +14,9 @@ from unittest.mock import patch
 import yaml
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform
+from gateway.profile_routing import ProfileRoutingError
 from gateway.session import SessionSource, SessionStore, build_session_key
 
 
@@ -23,6 +25,22 @@ def _src(**kw) -> SessionSource:
     kw.setdefault("chat_id", "99")
     kw.setdefault("chat_type", "dm")
     return SessionSource(**kw)
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="dm:alpha",
+        capabilities=frozenset({"chat"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-alpha",
+        ),
+    )
 
 
 class TestSessionKeyByteIdenticalWhenOff:
@@ -190,6 +208,16 @@ class TestSessionStoreProfileResolution:
         store = self._store(tmp_path)
         assert store._resolve_profile_for_key() is None
 
+    def test_flag_off_rejects_resolved_context_before_legacy_namespace(self, tmp_path):
+        store = self._store(tmp_path)
+        s = _src(chat_id="99", chat_type="dm")
+        s.resolved_access_context = _resolved_context("family-alpha")
+
+        with pytest.raises(ProfileRoutingError) as exc:
+            store._resolve_profile_for_key(s)
+
+        assert exc.value.reason == "resolved_profile_requires_multiplex"
+
     def test_flag_on_uses_active_profile_namespace(self, tmp_path):
         store = self._store(tmp_path, multiplex_profiles=True)
         s = _src(chat_id="99", chat_type="dm")
@@ -201,6 +229,41 @@ class TestSessionStoreProfileResolution:
         s = _src(chat_id="99", chat_type="dm")
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
             assert store._generate_session_key(s) == "agent:main:telegram:dm:99"
+
+    def test_resolved_context_uses_context_profile_when_source_profile_blank(self, tmp_path):
+        store = self._store(tmp_path, multiplex_profiles=True)
+        s = _src(chat_id="99", chat_type="dm")
+        s.resolved_access_context = _resolved_context("family-alpha")
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            assert store._resolve_profile_for_key(s) == "family-alpha"
+            assert store._generate_session_key(s) == "agent:family-alpha:telegram:dm:99"
+
+    def test_resolved_context_profile_mismatch_denied(self, tmp_path):
+        store = self._store(tmp_path, multiplex_profiles=True)
+        s = _src(chat_id="99", chat_type="dm", profile="owner")
+        s.resolved_access_context = _resolved_context("family-alpha")
+
+        with pytest.raises(ProfileRoutingError) as exc:
+            store._resolve_profile_for_key(s)
+
+        assert exc.value.reason == "resolved_profile_mismatch"
+
+    def test_resolved_context_missing_profile_never_falls_back_active(self, tmp_path):
+        store = self._store(tmp_path, multiplex_profiles=True)
+        s = _src(chat_id="99", chat_type="dm")
+        s.resolved_access_context = _resolved_context("")
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            with pytest.raises(ProfileRoutingError) as exc:
+                store._resolve_profile_for_key(s)
+
+        assert exc.value.reason == "missing_resolved_profile"
+
+    def test_no_context_fallback_behavior_unchanged(self, tmp_path):
+        store = self._store(tmp_path, multiplex_profiles=True)
+        s = _src(chat_id="99", chat_type="dm")
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            assert store._resolve_profile_for_key(s) == "owner"
 
 
 class _RecoveringDB:
