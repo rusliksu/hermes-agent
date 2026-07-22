@@ -1519,6 +1519,37 @@ class SessionStore:
             profile=self._resolve_profile_for_key(source),
         )
 
+    def _validate_incoming_session_authority(self, source: SessionSource) -> Any:
+        registry = getattr(self.config, "access_registry", None)
+        if registry is None:
+            return None
+        return registry.validate_resolved_context(
+            getattr(source, "resolved_access_context", None)
+        )
+
+    def _validate_persisted_session_authority(
+        self,
+        entry: SessionEntry,
+        incoming_context: Any,
+    ) -> None:
+        registry = getattr(self.config, "access_registry", None)
+        if registry is None:
+            return
+        persisted_origin = getattr(entry, "origin", None)
+        persisted_context = registry.validate_resolved_context(
+            getattr(persisted_origin, "resolved_access_context", None)
+        )
+        if persisted_context != incoming_context:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+
+            raise AccessDeniedError(
+                "persisted_resolved_access_context_mismatch",
+                RedactedAuditMetadata.from_delivery_target(
+                    "session_authority_mismatch",
+                    getattr(incoming_context, "delivery_target", None),
+                ),
+            )
+
     def _create_entry_from_recovered_row(
         self,
         *,
@@ -1955,6 +1986,7 @@ class SessionStore:
         same key share the owner's result, including concurrent ``force_new``
         deliveries, so only one routing transition and SQLite row is created.
         """
+        incoming_context = self._validate_incoming_session_authority(source)
         session_key = self._generate_session_key(source)
         inflight_lock = getattr(self, "_inflight_lock", None)
         if inflight_lock is None:
@@ -1979,7 +2011,11 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(source, force_new=force_new)
+            result = self._get_or_create_session_impl(
+                source,
+                force_new=force_new,
+                incoming_context=incoming_context,
+            )
             slot.result = result
             return result
         except BaseException as exc:
@@ -1994,6 +2030,7 @@ class SessionStore:
         self,
         source: SessionSource,
         force_new: bool = False,
+        incoming_context: Any = None,
     ) -> SessionEntry:
         """Perform one session routing transition for the single-flight owner.
 
@@ -2001,6 +2038,8 @@ class SessionStore:
         recovery DB queries) is performed *outside* ``self._lock``. The lock
         protects only ``_entries`` / ``_loaded`` mutations.
         """
+        if incoming_context is None:
+            incoming_context = self._validate_incoming_session_authority(source)
         session_key = self._generate_session_key(source)
         now = _now()
 
@@ -2008,13 +2047,16 @@ class SessionStore:
         db_create_kwargs = None
         existing_session_id = None
         force_new_observed_entry = None
+        had_authoritative_entry = False
 
-        # ---- Phase 0: lock read -- existing session_id for compression tip ----
-        if not force_new:
-            with self._lock:
-                self._ensure_loaded_locked()
-                entry = self._entries.get(session_key)
-                if entry is not None:
+        # ---- Phase 0: lock read -- authority + existing session_id for compression tip ----
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is not None:
+                had_authoritative_entry = True
+                self._validate_persisted_session_authority(entry, incoming_context)
+                if not force_new:
                     existing_session_id = entry.session_id
 
         # Compression tip lookup outside the lock (DB I/O).
@@ -2136,7 +2178,11 @@ class SessionStore:
                     _needs_recover = True
 
         # ---- Phase 3: no-lock I/O -- recovery + create + save + DB ops ----
-        if _needs_recover and db_end_session_id is None:
+        recovery_allowed = (
+            incoming_context is None
+            or had_authoritative_entry
+        )
+        if _needs_recover and db_end_session_id is None and recovery_allowed:
             recovered = self._query_recoverable_session(
                 session_key=session_key, source=source, now=now,
             )

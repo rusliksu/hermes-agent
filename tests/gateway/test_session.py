@@ -3,8 +3,23 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
-from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
-from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
+from gateway.access_registry import (
+    AccessDeniedError,
+    AccessRegistry,
+    DeliveryTarget,
+    PrincipalBinding,
+    ResolvedAccessContext,
+    RolePolicy,
+    serialize_resolved_access_context,
+    TransportIdentity,
+)
+from gateway.config import (
+    Platform,
+    HomeChannel,
+    GatewayConfig,
+    PlatformConfig,
+    SessionResetPolicy,
+)
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
     SessionSource,
@@ -22,9 +37,14 @@ from gateway.session import (
 normalize_whatsapp_identifier = canonical_whatsapp_identifier
 
 
-def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+def _resolved_context(
+    profile_id="family-alpha",
+    *,
+    principal_id="principal-family",
+    chat_id="chat-1",
+) -> ResolvedAccessContext:
     return ResolvedAccessContext(
-        principal_id="principal-family",
+        principal_id=principal_id,
         role_id="family",
         profile_id=profile_id,
         conversation_scope="private",
@@ -33,9 +53,39 @@ def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
             platform="telegram",
             account="bot-a",
             peer_kind="dm",
-            chat_id="chat-1",
+            chat_id=chat_id,
             thread_id=None,
         ),
+    )
+
+
+def _access_registry(*contexts: ResolvedAccessContext) -> AccessRegistry:
+    if not contexts:
+        contexts = (_resolved_context(),)
+    caps = frozenset({"public_web", "memory_search"})
+    return AccessRegistry(
+        roles={"family": RolePolicy("family", caps)},
+        profiles=frozenset(context.profile_id for context in contexts),
+        principal_bindings=tuple(
+            PrincipalBinding(
+                principal_id=context.principal_id,
+                role_id=context.role_id,
+                profile_id=context.profile_id,
+                transport_identity=TransportIdentity(
+                    platform=context.delivery_target.platform,
+                    account=context.delivery_target.account,
+                    peer_kind=context.delivery_target.peer_kind,
+                    user_id=context.delivery_target.chat_id,
+                    chat_id=context.delivery_target.chat_id,
+                    thread_id=context.delivery_target.thread_id,
+                ),
+                conversation_scope=context.conversation_scope,
+                delivery_target=context.delivery_target,
+            )
+            for context in contexts
+        ),
+        scope_capabilities={"private": caps},
+        backend_capabilities=caps,
     )
 
 
@@ -2045,6 +2095,16 @@ class TestGatewayRoutingTable:
             user_id=user_id,
         )
 
+    def _verified_source(self, context=None):
+        context = context or _resolved_context()
+        source = self._source(
+            chat_id=context.delivery_target.chat_id,
+            user_id=context.delivery_target.chat_id,
+        )
+        source.profile = context.profile_id
+        source.resolved_access_context = context
+        return source
+
     def test_index_survives_restart_without_sessions_json(self, tmp_path):
         """Full SessionEntry state rehydrates from state.db alone."""
         config = GatewayConfig()
@@ -2106,6 +2166,178 @@ class TestGatewayRoutingTable:
         rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
         persisted = json.loads(rows[seeded.session_key])
         assert "resolved_access_context" in persisted
+        store._db.close()
+
+    def test_registry_restart_validates_context_before_healing_compression_tip(self, tmp_path):
+        context = _resolved_context()
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            access_registry=_access_registry(context),
+        )
+        source = self._verified_source(context)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db.get_compression_tip = MagicMock(return_value="tip-session")
+
+        rehydrated = restarted.get_or_create_session(source)
+
+        restarted._db.get_compression_tip.assert_called_once_with(entry.session_id)
+        assert rehydrated.session_id == "tip-session"
+        assert rehydrated.origin is not None
+        assert rehydrated.origin.resolved_access_context == context
+        restarted._db.close()
+
+    @pytest.mark.parametrize("shape", ["missing", "malformed"])
+    def test_registry_denies_missing_or_malformed_persisted_context_before_io(
+        self, tmp_path, shape
+    ):
+        context = _resolved_context()
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            access_registry=_access_registry(context),
+        )
+        source = self._verified_source(context)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        data = json.loads(rows[entry.session_key])
+        if shape == "missing":
+            data.pop("resolved_access_context")
+        else:
+            data["resolved_access_context"]["delivery_target"]["thread_id"] = ""
+        store._db.replace_gateway_routing_entries(
+            {entry.session_key: json.dumps(data)},
+            scope=store._routing_scope(),
+        )
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db.get_compression_tip = MagicMock(
+            side_effect=AssertionError("compression lookup must not run")
+        )
+        restarted._db.find_latest_gateway_session_for_peer = MagicMock(
+            side_effect=AssertionError("DB recovery must not run")
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            restarted.get_or_create_session(source)
+
+        assert exc_info.value.reason == "missing_resolved_access_context"
+        restarted._db.get_compression_tip.assert_not_called()
+        restarted._db.find_latest_gateway_session_for_peer.assert_not_called()
+        rendered = str(exc_info.value)
+        assert "principal-family" not in rendered
+        assert "family-alpha" not in rendered
+        assert "chat-1" not in rendered
+        restarted._db.close()
+
+    def test_registry_denies_mismatched_persisted_context_before_io(self, tmp_path):
+        incoming = _resolved_context()
+        persisted = _resolved_context(
+            "family-beta",
+            principal_id="principal-family-beta",
+            chat_id="chat-2",
+        )
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            access_registry=_access_registry(incoming, persisted),
+        )
+        source = self._verified_source(incoming)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        data = json.loads(rows[entry.session_key])
+        data["resolved_access_context"] = serialize_resolved_access_context(persisted)
+        store._db.replace_gateway_routing_entries(
+            {entry.session_key: json.dumps(data)},
+            scope=store._routing_scope(),
+        )
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db.get_compression_tip = MagicMock(
+            side_effect=AssertionError("compression lookup must not run")
+        )
+        restarted._db.find_latest_gateway_session_for_peer = MagicMock(
+            side_effect=AssertionError("DB recovery must not run")
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            restarted.get_or_create_session(source)
+
+        assert exc_info.value.reason == "persisted_resolved_access_context_mismatch"
+        restarted._db.get_compression_tip.assert_not_called()
+        restarted._db.find_latest_gateway_session_for_peer.assert_not_called()
+        assert "chat-1" not in str(exc_info.value)
+        assert "chat-2" not in str(exc_info.value)
+        restarted._db.close()
+
+    def test_registry_missing_routing_entry_does_not_recover_legacy_transcript(
+        self, tmp_path
+    ):
+        context = _resolved_context()
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            access_registry=_access_registry(context),
+        )
+        source = self._verified_source(context)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+        store.append_to_transcript(
+            entry.session_id,
+            {"role": "user", "content": "legacy transcript"},
+        )
+        store._db.replace_gateway_routing_entries({}, scope=store._routing_scope())
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db.find_latest_gateway_session_for_peer = MagicMock(
+            side_effect=AssertionError("DB recovery must not run")
+        )
+
+        fresh = restarted.get_or_create_session(source)
+
+        restarted._db.find_latest_gateway_session_for_peer.assert_not_called()
+        assert fresh.session_id != entry.session_id
+        assert restarted.load_transcript(entry.session_id)[0]["content"] == "legacy transcript"
+        assert restarted.load_transcript(fresh.session_id) == []
+        restarted._db.close()
+
+    def test_registry_reset_and_auto_reset_keep_exact_context(self, tmp_path):
+        from datetime import datetime, timedelta
+
+        context = _resolved_context()
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            access_registry=_access_registry(context),
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1),
+        )
+        source = self._verified_source(context)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(source)
+
+        manual_reset = store.reset_session(entry.session_key)
+        assert manual_reset is not None
+        assert manual_reset.origin is not None
+        assert manual_reset.origin.resolved_access_context == context
+
+        manual_reset.updated_at = datetime.now() - timedelta(minutes=5)
+        manual_reset.last_prompt_tokens = 1
+        store._save()
+        auto_reset = store.get_or_create_session(source)
+
+        assert auto_reset.session_id != manual_reset.session_id
+        assert auto_reset.was_auto_reset is True
+        assert auto_reset.auto_reset_reason == "idle"
+        assert auto_reset.origin is not None
+        assert auto_reset.origin.resolved_access_context == context
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        persisted = json.loads(rows[auto_reset.session_key])
+        assert persisted["resolved_access_context"] == serialize_resolved_access_context(context)
         store._db.close()
 
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
