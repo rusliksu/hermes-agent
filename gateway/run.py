@@ -15123,6 +15123,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools import slash_confirm as _slash_confirm_mod
 
         source = event.source
+        captured_context = getattr(source, "resolved_access_context", None)
+        registry = getattr(self, "access_registry", None)
+
+        def _captured_context_is_current() -> bool:
+            if registry is None:
+                return True
+            try:
+                registry.validate_resolved_context(captured_context)
+            except AccessDeniedError as exc:
+                logger.warning(
+                    "Slash-confirm access denied: reason=%s audit=%s",
+                    exc.reason,
+                    exc.audit.as_dict(),
+                )
+                return False
+            return True
+
+        if not _captured_context_is_current():
+            return None
+
         session_key = self._session_key_for_source(source)
         # Bare-runner test harnesses (object.__new__(GatewayRunner)) skip
         # __init__ and don't have the counter attribute — fall back to a
@@ -15137,7 +15157,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
-        _slash_confirm_mod.register(session_key, confirm_id, command, handler)
+        if registry is not None:
+            async def _guarded_handler(choice: str):
+                if not _captured_context_is_current():
+                    return None
+                return await handler(choice)
+
+            registered_handler = _guarded_handler
+        else:
+            registered_handler = handler
+
+        _slash_confirm_mod.register(session_key, confirm_id, command, registered_handler)
 
         adapter = self._adapter_for_source(source)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))

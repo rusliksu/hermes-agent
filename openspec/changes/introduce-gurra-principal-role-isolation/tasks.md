@@ -6,6 +6,7 @@
 - [x] 1.4 Добавить registry roles и bindings для owner, 9 family principals и 2 shared rooms с fail-closed validation.
 - [x] 1.5 Ввести compare mode, который показывает различия legacy routing и нового resolver без изменения active routing.
 - [ ] 1.6 Запретить model args, command args и callback payload выбирать foreign profile, namespace, role, session или delivery target.
+  - 2026-07-22: локальный slice закрыл slash-confirm callbacks для `/new`, `/undo` и `/reload-mcp`: callback payload/session_key/choice больше не могут заменить authority, handler запускается только после revalidate captured server-bound context; broader command args/model args/cron/delegation остаются.
 
 ## 2. Exact multiplex routing и request-path hardening
 
@@ -32,6 +33,7 @@
   - 2026-07-22: локальный slice добавил strict persistence/restoration `ResolvedAccessContext` в authoritative gateway routing store и fail-closed startup resume/watch synthetic routing через restored context/profile adapter; checkbox остаётся открытым до kanban/handoff/cron/delegation/compaction/reset/restart/concurrency покрытия.
   - 2026-07-22: локальный slice закрыл Kanban notify/wakeup callbacks под configured `AccessRegistry`: delivery/wake идут только через persisted session origin context и canonical source после ingress validation; добавлено focused 8.4-покрытие для positive/missing/mismatch, checkbox остаётся открытым до handoff/cron/delegation/compaction/reset/concurrency.
   - 2026-07-22: локальный slice добавил fail-closed handoff watcher path для configured registry без persisted context: no side effects до propagation, failed state redacted; полноценная передача server-issued/persisted handoff context остаётся.
+  - 2026-07-22: локальный slice добавил revalidation captured `ResolvedAccessContext` для slash-confirm registration и execution; callbacks не принимают authority из payload/session_key/choice, checkbox остаётся открытым до broader command args/cron/delegation/compaction/reset/restart/concurrency покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
