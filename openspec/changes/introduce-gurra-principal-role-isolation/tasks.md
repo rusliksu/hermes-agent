@@ -7,6 +7,7 @@
 - [x] 1.5 Ввести compare mode, который показывает различия legacy routing и нового resolver без изменения active routing.
 - [ ] 1.6 Запретить model args, command args и callback payload выбирать foreign profile, namespace, role, session или delivery target.
   - 2026-07-22: локальный slice закрыл slash-confirm callbacks для `/new`, `/undo` и `/reload-mcp`: callback payload/session_key/choice больше не могут заменить authority, handler запускается только после revalidate captured server-bound context; broader command args/model args/cron/delegation остаются.
+  - 2026-07-22: локальный slice запретил `session_search` принимать profile/role/delivery/session authority из model args: tool читает только task-local `ResolvedAccessContext`, registry-extra args игнорируются, public schema/signature не расширены; остальные model/command surfaces остаются.
 
 ## 2. Exact multiplex routing и request-path hardening
 
@@ -25,6 +26,7 @@
 ## 3. Sessions, memory, prompt, attachments и context propagation
 
 - [ ] 3.1 Изолировать SQLite sessions по `profile_id` и `conversation_scope` для search, resume, reset, compaction, transcript access, export и delete.
+  - 2026-07-22: локальный slice добавил SQL-level scope для `session_search` browse/FTS/title и ownership-check до read/scroll/bookend I/O по `profile_name + delivery_target` origin; resume/reset/compaction/export/delete и полноценная migration остаются.
 - [ ] 3.2 Привязать memory namespaces, memory hydration, memory commit и memory tools к server-bound context.
 - [ ] 3.3 Реализовать prompt layering: security layer -> read-only role layer -> scope layer -> private USER/memory layer.
 - [ ] 3.4 Исключить private USER/memory из shared room prompts и не импортировать private context между profiles.
@@ -43,11 +45,14 @@
 - [ ] 4.1 Реализовать owner policy как текущий полный профиль Руслана с owner-approved admin, cron и delegation behavior.
 - [ ] 4.2 Реализовать `family_standard`: личные memory/session search, documents, attachments, vision, public web, image/voice generation и reminders самому себе.
   - 2026-07-22: локальный slice сузил gateway agent-construction tool surface для typed `family_standard` до пересечения configured platform toolsets с guarded capabilities `public_web`, `vision`, `image_generation`, `voice_generation`, `session_search`, `self_reminder`; memory/documents/attachments и backend enforcement остаются.
+  - 2026-07-22: локальный slice разрешил backend `session_search` только для `family_standard`/`family_sandbox` при literal capability `session_search` и только в собственном DM SQL scope; memory/documents/attachments остаются.
 - [ ] 4.3 Запретить для `family_standard` host shell, host filesystem, logged-in/persistent browser, arbitrary MCP, Wolfram MCP, delegation, owner credentials и cross-profile search.
   - 2026-07-22: локальный slice fail-closed исключает `terminal`, `file`, `browser`, `delegation`, Wolfram/arbitrary MCP-like toolsets и прочие не-mapped toolsets из `family_standard` constructor surface даже при platform config; filesystem/memory/attachments/browser/MCP/backend execution guards ещё не завершены.
+  - 2026-07-22: локальный slice запретил cross-profile/cross-DM/cross-thread SQLite session search/read/scroll для `family_standard`/`family_sandbox`; остальные backend guards ещё не завершены.
 - [ ] 4.4 Реализовать `shared_room`: room sessions/memory, documents, attachments, vision и public web без private memory, cron, private delivery, shell и cross-principal/profile search.
   - 2026-07-22: локально устранён legacy omission для shared public web: gateway shared turn теперь берёт `public_web` только из runtime `source.resolved_access_context.capabilities` и валидирует точную model tool surface memory/web; checkbox остаётся открытым до полной shared_room роли.
   - 2026-07-22: локальный slice добавил configured intersection для typed `shared_room`: generic helper даёт только `public_web -> web` и `vision -> vision`, а shared memory binder включается только при `room_memory` capability и configured `memory`; private/user memory extras, cron, shell, delivery и cross-profile backend enforcement остаются.
+  - 2026-07-22: локальный slice оставил backend `session_search` для `shared_room` fail-closed; room memory/documents/attachments остаются.
 - [ ] 4.5 Реализовать self reminder cron для family roles только с server-bound `delivery_target`.
   - 2026-07-22: локальный slice ограничил configured family cron self-reminder путём: create/update допускают только omitted/literal origin, persisted origin должен exactly match server-bound `delivery_target`, explicit target/model-selected delivery denied; scheduler требует deliver=origin + exact origin; checkbox остаётся открытым до полного cron/provider/cutover покрытия.
 - [ ] 4.6 Запретить shared room cron/private delivery и family delivery к чужим principals, rooms или owner default target.
@@ -92,6 +97,7 @@
 - [ ] 8.2 Добавить pairwise isolation tests для owner, Юли, мамы, остальных семи family principals и обеих rooms.
 - [ ] 8.3 Добавить tests для guessed IDs: session IDs, profile IDs, memory namespaces, attachment paths, delivery targets и callback payloads.
   - 2026-07-22: добавлены focused tests для typed role/capability/config toolset intersection, malformed/unknown role empty surface, no-tools as `[]`, typed shared memory/web/vision intersection и mocked `_run_agent` assertion, что shared override не открывает memory без `room_memory`; guessed IDs по attachments/filesystem/browser/sandbox/MCP остаются.
+  - 2026-07-22: добавлены focused tests для guessed `session_id`, model-supplied profile, foreign profile, same-profile foreign DM/thread и malformed/shared/unknown/missing-db `session_search` denial before transcript I/O; memory namespaces/attachments/delivery broader coverage остаётся.
 - [ ] 8.4 Добавить concurrent/background/callback/cron/delegation/compaction/reset/restart tests с persisted context validation.
   - 2026-07-22: добавлены focused session-store tests для restart compression-tip heal с exact persisted context, missing/malformed/mismatch denial before IO, no DB recovery без routing entry и reset/auto-reset context continuity; checkbox остаётся открытым до broader concurrent/background/callback/cron/delegation/compaction покрытия.
   - 2026-07-22: добавлены focused delegate tests для early deny без credential/child side effects, owner/family_sandbox+delegation allow, immutable six-field context visibility after inner executor hop, batch worker propagation и role=`orchestrator` как child-tree role без access-role изменения; checkbox остаётся открытым до broader background/callback/cron/compaction/restart покрытия.
