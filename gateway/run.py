@@ -3016,7 +3016,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
-        self.access_registry = access_registry
+        self.access_registry = (
+            access_registry
+            if access_registry is not None
+            else getattr(self.config, "access_registry", None)
+        )
         self._single_principal_policy = self.config.single_principal
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
