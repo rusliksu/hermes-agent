@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextvars
 import json
 import logging
 
@@ -32,6 +33,8 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from gateway.access_registry import ResolvedAccessContext
+from gateway.session_context import get_resolved_access_context
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -657,6 +660,20 @@ _LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
     return True
+
+
+def _validate_delegation_access_context() -> Optional[str]:
+    """Return a categorical denial reason for resolved-context delegation."""
+    access_context = get_resolved_access_context()
+    if access_context is None:
+        return None
+    if not isinstance(access_context, ResolvedAccessContext):
+        return "malformed_access_context"
+    if access_context.role_id not in {"owner", "family_sandbox"}:
+        return "delegation_not_permitted"
+    if "delegation" not in access_context.capabilities:
+        return "delegation_not_permitted"
+    return None
 
 
 def _build_child_system_prompt(
@@ -2008,7 +2025,10 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_context = contextvars.copy_context()
+        _child_future = _timeout_executor.submit(
+            _child_context.run, _run_with_thread_capture
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2449,6 +2469,13 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    access_denial = _validate_delegation_access_context()
+    if access_denial is not None:
+        return tool_error(
+            "Delegation is not permitted for this access context.",
+            code=access_denial,
+        )
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -2626,7 +2653,9 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    submit_context = contextvars.copy_context()
                     future = executor.submit(
+                        submit_context.run,
                         _run_single_child,
                         task_index=i,
                         goal=t["goal"],

@@ -36,6 +36,7 @@
   - 2026-07-22: локальный slice добавил revalidation captured `ResolvedAccessContext` для slash-confirm registration и execution; callbacks не принимают authority из payload/session_key/choice, checkbox остаётся открытым до broader command args/cron/delegation/compaction/reset/restart/concurrency покрытия.
   - 2026-07-22: локальный slice добавил task-local `ResolvedAccessContext` в `gateway.session_context`, gateway propagation из `source.resolved_access_context`, cron job persistence/restoration и inheritance reset/clear checks; checkbox остаётся открытым до broader provider/callback/delegation/compaction/reset/restart/concurrency покрытия.
   - 2026-07-22: локальный slice добавил fail-closed validation incoming и persisted `ResolvedAccessContext` в `SessionStore.get_or_create_session` до compression-tip/recovery; configured registry без authoritative routing entry больше не восстанавливает legacy transcript по peer metadata, checkbox остаётся открытым до callbacks/background/cron/delegation/compaction/concurrency покрытия.
+  - 2026-07-22: локальный slice протащил текущий task-local `ResolvedAccessContext` через batch worker submit и inner `child.run_conversation` submit в `delegate_task` через отдельный `contextvars.copy_context()` на каждый concurrent submit; legacy path без context оставлен byte-compatible, checkbox остаётся открытым до полного callback/provider/completion/restart покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
@@ -58,6 +59,7 @@
 - [ ] 5.4 Подключить isolated public browser только для `family_sandbox` без owner cookies, logged-in browser profile, localhost access или persistent owner profile.
 - [ ] 5.5 Подключить Wolfram MCP allowlist только для `family_sandbox` и запретить arbitrary MCP.
 - [ ] 5.6 Разрешить delegation только для `family_sandbox` и только внутри same `profile_id`, `conversation_scope`, `capabilities` и `delivery_target`.
+  - 2026-07-22: локальный slice добавил pre-config/pre-credential/pre-child guard в `delegate_task`: при task-local typed `ResolvedAccessContext` delegation разрешён только для `owner`/`family_sandbox` с literal capability `delegation`; `family_standard`, `shared_room`, unknown и malformed получают categorical redacted tool_error, checkbox остаётся открытым до полного same-profile/sandbox/tool/provider enforcement.
 
 ## 6. Dashboard Access/Users, lease и audit
 
@@ -87,6 +89,7 @@
 - [ ] 8.3 Добавить tests для guessed IDs: session IDs, profile IDs, memory namespaces, attachment paths, delivery targets и callback payloads.
 - [ ] 8.4 Добавить concurrent/background/callback/cron/delegation/compaction/reset/restart tests с persisted context validation.
   - 2026-07-22: добавлены focused session-store tests для restart compression-tip heal с exact persisted context, missing/malformed/mismatch denial before IO, no DB recovery без routing entry и reset/auto-reset context continuity; checkbox остаётся открытым до broader concurrent/background/callback/cron/delegation/compaction покрытия.
+  - 2026-07-22: добавлены focused delegate tests для early deny без credential/child side effects, owner/family_sandbox+delegation allow, immutable six-field context visibility after inner executor hop, batch worker propagation и role=`orchestrator` как child-tree role без access-role изменения; checkbox остаётся открытым до broader background/callback/cron/compaction/restart покрытия.
 - [ ] 8.5 Добавить sandbox tests для symlink escape, host mount denial, network disabled, quotas и owner credential absence.
 - [ ] 8.6 Добавить dashboard lease tests для localhost/SSH tunnel, preview+confirm atomic apply, expiry, manual revoke, no restart resurrection и no content audit.
 - [ ] 8.7 Запустить focused tests for changed modules and specs without live effects.
