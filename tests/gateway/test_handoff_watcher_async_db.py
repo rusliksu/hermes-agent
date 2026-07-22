@@ -20,6 +20,7 @@ import types
 
 import pytest
 
+from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
 import gateway.run as run
 
 
@@ -31,10 +32,13 @@ class _RecordingSessionDB:
     (the fix), they run on a *different* worker thread.
     """
 
-    def __init__(self, loop_thread_ident):
+    def __init__(self, loop_thread_ident, *, pending=None):
         self._loop_thread_ident = loop_thread_ident
+        self._pending = pending or [{"id": "sess-1"}]
         self.threads = {}
         self.calls = []
+        self.failures = []
+        self.completions = []
 
     def _record(self, name):
         import threading
@@ -49,7 +53,7 @@ class _RecordingSessionDB:
 
     def list_pending_handoffs(self):
         self._record("list_pending_handoffs")
-        return [{"id": "sess-1"}]
+        return self._pending
 
     def claim_handoff(self, session_id):
         self._record("claim_handoff")
@@ -57,9 +61,11 @@ class _RecordingSessionDB:
 
     def complete_handoff(self, session_id):
         self._record("complete_handoff")
+        self.completions.append(session_id)
 
     def fail_handoff(self, session_id, error):
         self._record("fail_handoff")
+        self.failures.append((session_id, error))
 
 
 def _make_fake_runner(session_db, *, fail_process=False):
@@ -142,6 +148,45 @@ async def test_watcher_offloads_fail_handoff_to_thread(monkeypatch):
 
     assert "fail_handoff" in db.calls
     assert db.ran_off_loop("fail_handoff")
+
+
+@pytest.mark.asyncio
+async def test_watcher_denied_handoff_fails_with_redacted_reason(monkeypatch, caplog):
+    """AccessDeniedError is a security denial, not a successful handoff."""
+    import threading
+
+    sentinel_session_id = "raw-session-sentinel"
+    db = _RecordingSessionDB(
+        threading.get_ident(),
+        pending=[{"id": sentinel_session_id, "handoff_platform": "raw-platform-sentinel"}],
+    )
+    fake = _make_fake_runner(db)
+
+    async def _process_handoff(row):
+        raise AccessDeniedError(
+            "handoff_missing_resolved_access_context",
+            RedactedAuditMetadata("handoff_missing_resolved_access_context"),
+        )
+
+    fake._process_handoff = _process_handoff
+
+    with caplog.at_level("WARNING"):
+        await _run_one_tick(fake, monkeypatch)
+
+    warning_records = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert all(record.exc_info is None for record in warning_records)
+
+    assert db.failures == [
+        (sentinel_session_id, "handoff_missing_resolved_access_context")
+    ]
+    assert db.completions == []
+    assert "complete_handoff" not in db.calls
+    assert db.ran_off_loop("fail_handoff")
+
+    rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "handoff_missing_resolved_access_context" in rendered_logs
+    assert sentinel_session_id not in rendered_logs
+    assert "raw-platform-sentinel" not in rendered_logs
 
 
 @pytest.mark.asyncio

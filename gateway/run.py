@@ -59,6 +59,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -7847,6 +7848,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         await self._process_handoff(row)
                         await self._session_db.complete_handoff(session_id)
+                    except AccessDeniedError as exc:
+                        logger.warning(
+                            "Handoff denied: reason=%s audit=%s",
+                            exc.reason,
+                            exc.audit.as_dict(),
+                        )
+                        await self._session_db.fail_handoff(session_id, exc.reason)
                     except Exception as exc:
                         logger.warning(
                             "Handoff for session %s failed: %s",
@@ -7861,6 +7869,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
+        if getattr(self, "access_registry", None) is not None:
+            raise AccessDeniedError(
+                "handoff_missing_resolved_access_context",
+                RedactedAuditMetadata("handoff_missing_resolved_access_context"),
+            )
+
         from gateway.config import Platform
         from gateway.session import SessionSource, build_session_key
         from gateway.platforms.base import MessageEvent

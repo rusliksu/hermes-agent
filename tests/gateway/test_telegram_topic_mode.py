@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import AccessDeniedError
 from hermes_state import SessionDB
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -804,6 +805,56 @@ async def test_first_message_inside_topic_records_topic_binding(tmp_path, monkey
     assert binding["session_key"] == build_session_key(_make_source(thread_id="17585"))
 
 
+
+
+@pytest.mark.asyncio
+async def test_handoff_with_registry_fails_before_destination_side_effects():
+    from gateway.run import GatewayRunner
+
+    class _Runner:
+        access_registry = object()
+
+        @property
+        def adapters(self):
+            pytest.fail("adapter selection must not run")
+
+        @property
+        def config(self):
+            pytest.fail("home/model config must not be read")
+
+        @property
+        def async_session_store(self):
+            pytest.fail("thread/session store must not be touched")
+
+        def _evict_cached_agent(self, *args, **kwargs):
+            pytest.fail("cache must not be touched")
+
+        def _release_running_agent_state(self, *args, **kwargs):
+            pytest.fail("running-agent state must not be touched")
+
+        async def _handle_message(self, event):
+            pytest.fail("_handle_message must not run")
+
+    with pytest.raises(AccessDeniedError) as exc:
+        await GatewayRunner._process_handoff(
+            _Runner(),
+            {
+                "id": "raw-session-sentinel",
+                "title": "raw-title-sentinel",
+                "handoff_platform": "telegram",
+            },
+        )
+
+    assert exc.value.reason == "handoff_missing_resolved_access_context"
+    assert exc.value.audit.as_dict() == {
+        "event": "handoff_missing_resolved_access_context",
+        "platform": None,
+        "account_ref": None,
+        "peer_kind": None,
+        "user_ref": None,
+        "chat_ref": None,
+        "thread_ref": None,
+    }
 
 
 @pytest.mark.asyncio

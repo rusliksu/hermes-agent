@@ -16,6 +16,7 @@
 - [ ] 2.3 Удалить owner/default/last-used fallback из private ingress, shared ingress, slash commands, callbacks и resume path.
   - 2026-07-22: локальный slice убрал owner/default/global fallback после server-resolved `ResolvedAccessContext` в profile home resolution, SessionStore key namespace и `/resume` same-origin guards; legacy path без context оставлен прежним, checkbox остаётся открытым до callbacks/background и оставшихся ingress путей.
   - 2026-07-22: локальный slice убрал configured-registry bypass для `internal=True` gateway events: in-process events теперь проходят validation существующего typed `ResolvedAccessContext` и exact delivery target match; persistence/restart/callback propagation ещё не добавлены, поэтому потерявшие context события fail-closed и 2.3/3.6 остаются открытыми.
+  - 2026-07-22: локальный slice запретил registry CLI handoff без server-owned persisted `ResolvedAccessContext` до выбора adapter/home/thread/session/cache/model/delivery; row переводится в failed с categorical reason и redacted audit, checkbox остаётся открытым до полноценного server-issued handoff context propagation.
 - [ ] 2.4 Укрепить request path так, чтобы `HERMES_HOME` и profile home брались из server-bound context, а не из module/import-time cache.
 - [ ] 2.5 Заменить request-path `os.getenv` authority/auth fallbacks на server-bound config/policy providers.
 - [ ] 2.6 Проверить outbound delivery routing только через resolved `delivery_target` без owner default delivery.
@@ -30,6 +31,7 @@
 - [ ] 3.6 Передавать шесть authority-полей context через callbacks, background, cron, delegation, compaction, reset, restart и concurrent turns без расширения.
   - 2026-07-22: локальный slice добавил strict persistence/restoration `ResolvedAccessContext` в authoritative gateway routing store и fail-closed startup resume/watch synthetic routing через restored context/profile adapter; checkbox остаётся открытым до kanban/handoff/cron/delegation/compaction/reset/restart/concurrency покрытия.
   - 2026-07-22: локальный slice закрыл Kanban notify/wakeup callbacks под configured `AccessRegistry`: delivery/wake идут только через persisted session origin context и canonical source после ingress validation; добавлено focused 8.4-покрытие для positive/missing/mismatch, checkbox остаётся открытым до handoff/cron/delegation/compaction/reset/concurrency.
+  - 2026-07-22: локальный slice добавил fail-closed handoff watcher path для configured registry без persisted context: no side effects до propagation, failed state redacted; полноценная передача server-issued/persisted handoff context остаётся.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
