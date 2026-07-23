@@ -6220,10 +6220,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source is None:
                 source = self._get_cached_session_source(session_key)
 
-            if source is not None:
+            registry = getattr(self, "access_registry", None)
+            chat_type = None
+            if registry is not None:
+                try:
+                    context = registry.validate_resolved_context(
+                        getattr(source, "resolved_access_context", None)
+                    )
+                except AccessDeniedError as exc:
+                    logger.warning(
+                        "Skipping shutdown notification for unresolved access context: reason=%s audit=%s",
+                        exc.reason,
+                        exc.audit.as_dict(),
+                    )
+                    continue
+                except Exception:
+                    audit = RedactedAuditMetadata.from_delivery_target(
+                        "shutdown_notification",
+                        getattr(getattr(source, "resolved_access_context", None), "delivery_target", None),
+                    )
+                    logger.warning(
+                        "Skipping shutdown notification after access registry error: audit=%s",
+                        audit.as_dict(),
+                    )
+                    continue
+
+                target = context.delivery_target
+                platform_str = target.platform
+                chat_id = str(target.chat_id)
+                thread_id = target.thread_id
+                chat_type = target.peer_kind
+            elif source is not None:
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                chat_type = getattr(source, "chat_type", None)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -6255,22 +6286,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
-                reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
-                if reply_to_message_id is None and restart_source is not None:
-                    try:
-                        restart_platform = restart_source.platform.value
-                        restart_chat_id = str(restart_source.chat_id)
-                        restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
-                            reply_to_message_id = getattr(restart_source, "message_id", None)
-                    except Exception:
-                        pass
+                reply_to_message_id = None
+                if registry is None:
+                    reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
+                    if reply_to_message_id is None and restart_source is not None:
+                        try:
+                            restart_platform = restart_source.platform.value
+                            restart_chat_id = str(restart_source.chat_id)
+                            restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
+                            if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
+                                reply_to_message_id = getattr(restart_source, "message_id", None)
+                        except Exception:
+                            pass
 
                 metadata = self._thread_metadata_for_target(
                     platform,
                     chat_id,
                     thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
+                    chat_type=chat_type,
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
