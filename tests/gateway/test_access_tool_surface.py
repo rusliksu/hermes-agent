@@ -585,6 +585,84 @@ def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
     bind_shared_memory.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    (
+        "access_context",
+        "profile_system_prompt",
+        "expected_prompt",
+        "expected_shared",
+    ),
+    [
+        (
+            _context("family_standard", {"public_web"}),
+            " FAMILY PROFILE ",
+            "Context prompt\n\nFAMILY PROFILE",
+            False,
+        ),
+        (
+            _shared_context({"public_web"}),
+            "FAMILY PROFILE",
+            None,
+            True,
+        ),
+    ],
+    ids=["family_standard", "shared_room"],
+)
+def test_typed_prompt_isolation_uses_access_context_prompt_rules(
+    monkeypatch,
+    access_context,
+    profile_system_prompt,
+    expected_prompt,
+    expected_shared,
+):
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "agent": {"system_prompt": profile_system_prompt},
+            "platform_toolsets": {"telegram": ["web"]},
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda *a, **k: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **k: "model")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner()
+    runner._ephemeral_system_prompt = "OWNER GLOBAL"
+    runner._get_system_prompt_for_channel = MagicMock(return_value="OWNER OVERRIDE")
+
+    _CapturingAgent.last_init = None
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="Context prompt",
+            history=[],
+            source=_source(access_context),
+            session_id="session-1",
+            session_key=f"agent:{access_context.profile_id}:telegram:group:-10001",
+            channel_prompt="OWNER EVENT",
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    runner._get_system_prompt_for_channel.assert_not_called()
+    prompt = _CapturingAgent.last_init["ephemeral_system_prompt"]
+    if expected_shared:
+        assert prompt.startswith(
+            "Context prompt\n\nThis is a shared multi-user Telegram scope."
+        )
+        assert "Use only this scope's MEMORY.md" in prompt
+        assert "FAMILY PROFILE" not in prompt
+    else:
+        assert prompt == expected_prompt
+    assert "OWNER" not in prompt
+    assert _CapturingAgent.last_init["skip_context_files"] is expected_shared
+    assert _CapturingAgent.last_init["skip_memory"] is expected_shared
+
+
 def test_run_agent_access_registry_shared_room_binds_only_room_memory_namespace(
     monkeypatch,
 ):

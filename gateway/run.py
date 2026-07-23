@@ -19215,22 +19215,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
-            # Combine platform context, YAML channel_prompts hint for this chat,
-            # channel_overrides system_prompt (or global ephemeral), and gateway
-            # ephemeral prompt from _get_system_prompt_for_channel.
+            access_context = getattr(source, "resolved_access_context", None)
             combined_ephemeral = context_prompt or ""
-            event_channel_prompt = (channel_prompt or "").strip()
-            if event_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            cfg_channel_prompt = self._get_system_prompt_for_channel(
-                source.platform,
-                source.chat_id or "",
-                thread_id=getattr(source, "thread_id", None),
-                parent_id=getattr(source, "parent_chat_id", None),
-                allow_global=shared_scope is None,
-            )
-            if cfg_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            if access_context is None:
+                # Legacy path: preserve event channel_prompts plus
+                # channel_overrides/global ephemeral prompt behavior.
+                event_channel_prompt = (channel_prompt or "").strip()
+                if event_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+                cfg_channel_prompt = self._get_system_prompt_for_channel(
+                    source.platform,
+                    source.chat_id or "",
+                    thread_id=getattr(source, "thread_id", None),
+                    parent_id=getattr(source, "parent_chat_id", None),
+                    allow_global=shared_scope is None,
+                )
+                if cfg_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            elif shared_scope is None:
+                # Security: event/startup/default-profile prompts are
+                # process-scoped, not authority-safe for multiplexed profiles.
+                profile_prompt = str(
+                    cfg_get(user_config, "agent", "system_prompt", default="") or ""
+                ).strip()
+                if profile_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + profile_prompt).strip()
             if shared_scope is not None:
                 shared_prompt = (
                     "This is a shared multi-user Telegram scope. Use only this "
