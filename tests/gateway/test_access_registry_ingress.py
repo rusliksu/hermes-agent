@@ -3,8 +3,10 @@ import pytest
 from gateway.access_registry import (
     AccessRegistry,
     DeliveryTarget,
+    ParticipantIdentity,
     PrincipalBinding,
     RolePolicy,
+    SharedScopeBinding,
     TransportIdentity,
 )
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -63,13 +65,14 @@ def _target(identity):
     )
 
 
-def _identity(user_id="u1", *, account=ACCOUNT, chat_id=None):
+def _identity(user_id="u1", *, account=ACCOUNT, chat_id=None, peer_kind="dm", thread_id=None):
     return TransportIdentity(
         platform="telegram",
         account=account,
-        peer_kind="dm",
+        peer_kind=peer_kind,
         user_id=user_id,
         chat_id=user_id if chat_id is None else chat_id,
+        thread_id=thread_id,
     )
 
 
@@ -90,6 +93,35 @@ def _registry(*, active=True, user_id="u1", profile_id="family-profile"):
             ),
         ),
         scope_capabilities={"private": CAPS},
+        backend_capabilities=CAPS,
+    )
+
+
+def _shared_room_registry(*, active=True):
+    room_identity = _identity(
+        "u1",
+        chat_id="room-1",
+        peer_kind="group",
+    )
+    return AccessRegistry(
+        roles={"shared_room": RolePolicy("shared_room", CAPS)},
+        profiles=frozenset({"family-profile"}),
+        shared_scope_bindings=(
+            SharedScopeBinding(
+                principal_id="principal-family",
+                role_id="shared_room",
+                profile_id="family-profile",
+                room_identity=room_identity,
+                conversation_scope="room",
+                delivery_target=_target(room_identity),
+                participant_identities=(
+                    ParticipantIdentity("telegram", ACCOUNT, "u1"),
+                    ParticipantIdentity("telegram", ACCOUNT, "u2"),
+                ),
+                active=active,
+            ),
+        ),
+        scope_capabilities={"room": CAPS},
         backend_capabilities=CAPS,
     )
 
@@ -132,6 +164,7 @@ def _event(
     text="hello",
     user_id="u1",
     chat_id=None,
+    chat_type="dm",
     profile=None,
     account=ACCOUNT,
 ):
@@ -139,7 +172,7 @@ def _event(
         adapter.config.extra["account"] = account
     source = adapter.build_source(
         chat_id=user_id if chat_id is None else chat_id,
-        chat_type="dm",
+        chat_type=chat_type,
         user_id=user_id,
     )
     if profile is not None:
@@ -223,7 +256,9 @@ async def test_registry_allow_binds_context_and_profile_before_agent():
         assert source.resolved_access_context.principal_id == "principal-family"
         wire = source.to_dict()
         assert "resolved_access_context" not in wire
+        assert "_trusted_transport_identity_fingerprint" not in wire
         assert type(source).from_dict(wire).resolved_access_context is None
+        assert type(source).from_dict(wire)._trusted_transport_identity_fingerprint is None
         return "status ok"
 
     runner._handle_status_command = status_handler
@@ -336,6 +371,161 @@ async def test_registry_internal_denials_stop_before_gateway_downstream(
     }
     rendered = _rendered_logs(caplog)
     assert reason in rendered
+    _assert_no_raw_access_values(rendered)
+
+
+@pytest.mark.asyncio
+async def test_registry_prebound_external_context_is_idempotent_and_does_not_resolve_twice():
+    registry = _registry()
+
+    class CountingRegistry:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.resolve_calls = 0
+
+        def resolve(self, identity):
+            self.resolve_calls += 1
+            return self.wrapped.resolve(identity)
+
+        def validate_resolved_context(self, context):
+            return self.wrapped.validate_resolved_context(context)
+
+    counting_registry = CountingRegistry(registry)
+    runner = _runner(counting_registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+
+    assert runner._allow_access_registry_ingress(event)
+    assert event.source.resolved_access_context is not None
+    assert event.source.profile == "family-profile"
+    assert event.source._trusted_transport_identity_fingerprint
+
+    assert runner._allow_access_registry_ingress(event)
+    assert counting_registry.resolve_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["account", "chat", "user", "thread", "platform"],
+)
+async def test_registry_prebound_context_mismatch_denies_external_before_downstream(
+    monkeypatch,
+    caplog,
+    field,
+):
+    registry = _registry()
+    runner = _runner(registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter)
+    assert runner._allow_access_registry_ingress(event)
+    if field == "account":
+        event.source.route_account = "wrong-account"
+    elif field == "chat":
+        event.source.chat_id = "other-chat"
+    elif field == "user":
+        event.source.user_id = "u2"
+    elif field == "thread":
+        event.source.thread_id = "thread-1"
+    elif field == "platform":
+        event.source.platform = Platform.DISCORD
+    called = _guard_denied_downstream(monkeypatch, runner)
+
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(event) is None
+
+    assert called == {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+    rendered = _rendered_logs(caplog)
+    assert "trusted_transport_identity_mismatch" in rendered
+    _assert_no_raw_access_values(rendered)
+
+
+@pytest.mark.asyncio
+async def test_registry_shared_room_initial_resolve_stamps_marker_and_second_call_is_idempotent():
+    registry = _shared_room_registry()
+
+    class CountingRegistry:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.resolve_calls = 0
+
+        def resolve(self, identity):
+            self.resolve_calls += 1
+            return self.wrapped.resolve(identity)
+
+        def validate_resolved_context(self, context):
+            return self.wrapped.validate_resolved_context(context)
+
+    counting_registry = CountingRegistry(registry)
+    runner = _runner(counting_registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter, user_id="u1", chat_id="room-1", chat_type="group")
+
+    assert runner._allow_access_registry_ingress(event)
+    assert event.source.resolved_access_context.role_id == "shared_room"
+    assert event.source._trusted_transport_identity_fingerprint
+
+    assert runner._allow_access_registry_ingress(event)
+    assert counting_registry.resolve_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_registry_shared_room_changed_participant_denies_external_before_downstream(
+    monkeypatch,
+    caplog,
+):
+    runner = _runner(_shared_room_registry())
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter, user_id="u1", chat_id="room-1", chat_type="group")
+    assert runner._allow_access_registry_ingress(event)
+    event.source.user_id = "u2"
+    called = _guard_denied_downstream(monkeypatch, runner)
+
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(event) is None
+
+    assert called == {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+    rendered = _rendered_logs(caplog)
+    assert "trusted_transport_identity_mismatch" in rendered
+    _assert_no_raw_access_values(rendered)
+
+
+@pytest.mark.asyncio
+async def test_registry_shared_room_copied_context_without_marker_denies_external_ingress(
+    monkeypatch,
+    caplog,
+):
+    registry = _shared_room_registry()
+    runner = _runner(registry)
+    adapter = _Adapter(runner=runner)
+    event = _event(adapter, user_id="u1", chat_id="room-1", chat_type="group")
+    event.source.resolved_access_context = registry.resolve(
+        _identity("u1", chat_id="room-1", peer_kind="group")
+    )
+    event.source.profile = "family-profile"
+    called = _guard_denied_downstream(monkeypatch, runner)
+
+    with caplog.at_level("WARNING"):
+        assert await runner._handle_message(event) is None
+
+    assert called == {
+        "queued": False,
+        "scaled": False,
+        "authorized": False,
+        "plugin": False,
+    }
+    rendered = _rendered_logs(caplog)
+    assert "missing_trusted_transport_identity" in rendered
     _assert_no_raw_access_values(rendered)
 
 

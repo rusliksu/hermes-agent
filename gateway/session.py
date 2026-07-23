@@ -259,6 +259,11 @@ class SessionSource:
         repr=False,
         compare=False,
     )
+    _trusted_transport_identity_fingerprint: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`

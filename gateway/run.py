@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -115,6 +116,23 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+
+def _transport_identity_fingerprint(identity: Any) -> str:
+    canonical = json.dumps(
+        {
+            "platform": getattr(identity, "platform", None),
+            "account": getattr(identity, "account", None),
+            "peer_kind": getattr(identity, "peer_kind", None),
+            "user_id": getattr(identity, "user_id", None),
+            "chat_id": getattr(identity, "chat_id", None),
+            "thread_id": getattr(identity, "thread_id", None),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
@@ -9480,15 +9498,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "malformed_session_source",
                     RedactedAuditMetadata("ingress"),
                 )
-            if getattr(event, "internal", False):
+            context_prebound = getattr(source, "resolved_access_context", None) is not None
+            if context_prebound:
                 context = registry.validate_resolved_context(
                     getattr(source, "resolved_access_context", None)
                 )
                 target = context.delivery_target
-                audit = RedactedAuditMetadata.from_delivery_target(
-                    "internal_delivery_target",
-                    target,
-                )
+                audit = RedactedAuditMetadata.from_delivery_target("delivery_target", target)
+                route_account = getattr(source, "route_account", None)
+                if not getattr(event, "internal", False):
+                    marker = getattr(
+                        source,
+                        "_trusted_transport_identity_fingerprint",
+                        None,
+                    )
+                    if not isinstance(marker, str) or not marker:
+                        raise AccessDeniedError("missing_trusted_transport_identity", audit)
+                    identity = TransportIdentity.from_session_source(
+                        source,
+                        account=route_account,
+                    )
+                    if marker != _transport_identity_fingerprint(identity):
+                        raise AccessDeniedError("trusted_transport_identity_mismatch", audit)
                 source_platform = getattr(getattr(source, "platform", None), "value", None)
                 if (
                     source_platform != target.platform
@@ -9500,21 +9531,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and getattr(source, "user_id", None) != target.chat_id
                     )
                 ):
-                    raise AccessDeniedError("internal_delivery_target_mismatch", audit)
-                route_account = getattr(source, "route_account", None)
+                    reason = (
+                        "internal_delivery_target_mismatch"
+                        if getattr(event, "internal", False)
+                        else "delivery_target_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
                 if isinstance(route_account, str):
                     route_account = route_account.strip()
                 elif route_account is not None:
-                    raise AccessDeniedError("internal_route_account_mismatch", audit)
+                    reason = (
+                        "internal_route_account_mismatch"
+                        if getattr(event, "internal", False)
+                        else "route_account_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
                 if route_account and route_account != target.account:
-                    raise AccessDeniedError("internal_route_account_mismatch", audit)
+                    reason = (
+                        "internal_route_account_mismatch"
+                        if getattr(event, "internal", False)
+                        else "route_account_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
                 source.route_account = target.account
+            elif getattr(event, "internal", False):
+                raise AccessDeniedError(
+                    "missing_resolved_access_context",
+                    RedactedAuditMetadata("internal_ingress"),
+                )
             else:
                 identity = TransportIdentity.from_session_source(
                     source,
                     account=getattr(source, "route_account", None),
                 )
                 context = registry.resolve(identity)
+                source.route_account = context.delivery_target.account
+                source._trusted_transport_identity_fingerprint = (
+                    _transport_identity_fingerprint(identity)
+                )
             requested = getattr(source, "profile", None)
             if requested is not None and not isinstance(requested, str):
                 audit = RedactedAuditMetadata.from_delivery_target(
@@ -9524,7 +9578,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise AccessDeniedError("malformed_profile_route", audit)
             requested_profile = requested.strip() if isinstance(requested, str) else ""
             if requested_profile and requested_profile != context.profile_id:
-                if getattr(event, "internal", False):
+                if context_prebound or getattr(event, "internal", False):
                     audit = RedactedAuditMetadata.from_delivery_target(
                         "profile_route_mismatch",
                         context.delivery_target,

@@ -145,6 +145,7 @@ class TestSessionSourceRoundtrip:
             profile="family-alpha",
         )
         source.resolved_access_context = _resolved_context()
+        source._trusted_transport_identity_fingerprint = "opaque-test-fingerprint"
 
         source_dict = source.to_dict()
         context = build_session_context(source, GatewayConfig())
@@ -152,9 +153,21 @@ class TestSessionSourceRoundtrip:
         prompt = build_session_context_prompt(context)
 
         assert "resolved_access_context" not in source_dict
+        assert "_trusted_transport_identity_fingerprint" not in source_dict
         assert "resolved_access_context" not in context_dict
+        assert "_trusted_transport_identity_fingerprint" not in context_dict
         assert "resolved_access_context" not in context_dict["source"]
+        assert "_trusted_transport_identity_fingerprint" not in context_dict["source"]
         assert SessionSource.from_dict(source_dict).resolved_access_context is None
+        forged_source_dict = {
+            **source_dict,
+            "_trusted_transport_identity_fingerprint": "opaque-test-fingerprint",
+        }
+        assert (
+            SessionSource.from_dict(forged_source_dict)
+            ._trusted_transport_identity_fingerprint
+            is None
+        )
         assert "principal-family" not in prompt
         assert "family-alpha" not in prompt
 
