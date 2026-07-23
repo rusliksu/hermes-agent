@@ -103,6 +103,37 @@ class TestCodingContextBlock:
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
 
+    def test_skip_context_files_keeps_soul_but_skips_context_and_coding(
+        self, monkeypatch, tmp_path
+    ):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            platform="cli",
+            skip_context_files=True,
+            load_soul_identity=True,
+        )
+
+        with (
+            patch("run_agent.load_soul_md", return_value="PROFILE SOUL") as load_soul,
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt") as context_files,
+            patch(
+                "agent.coding_context.coding_system_blocks",
+                return_value=["You are a coding agent.", "Workspace"],
+            ) as coding_blocks,
+        ):
+            stable = build_system_prompt_parts(agent)["stable"]
+
+        load_soul.assert_called_once()
+        context_files.assert_not_called()
+        coding_blocks.assert_not_called()
+        assert "PROFILE SOUL" in stable
+        assert "coding agent" not in stable
+        assert "Workspace" not in stable
+
 
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""

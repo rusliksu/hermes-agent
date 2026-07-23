@@ -19216,6 +19216,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
             access_context = getattr(source, "resolved_access_context", None)
+            isolate_context_files = shared_scope is not None or (
+                isinstance(access_context, ResolvedAccessContext)
+                and access_context.role_id != "owner"
+            )
             combined_ephemeral = context_prompt or ""
             if access_context is None:
                 # Legacy path: preserve event channel_prompts plus
@@ -19647,8 +19651,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
-                    skip_context_files=shared_scope is not None,
-                    load_soul_identity=shared_scope is not None,
+                    skip_context_files=isolate_context_files,
+                    load_soul_identity=isolate_context_files,
                     skip_memory=shared_scope is not None,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).

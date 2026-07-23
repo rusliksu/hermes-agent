@@ -348,7 +348,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # git/workspace snapshot are built once here and cached for the session;
     # the snapshot is never re-probed per turn (that would break the prompt
     # cache), so the brief tells the model to re-check git before relying on it.
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and not agent.skip_context_files:
         try:
             from agent.coding_context import coding_system_blocks
 

@@ -585,18 +585,79 @@ def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
     bind_shared_memory.assert_not_called()
 
 
+def test_run_agent_legacy_untyped_private_no_context_keeps_personal_context(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"platform_toolsets": {"telegram": ["memory", "web"]}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda *a, **k: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **k: "model")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="10001",
+        chat_type="private",
+        user_id="10001",
+    )
+
+    _CapturingAgent.last_init = None
+    result = asyncio.run(
+        runner._run_agent(
+            message="ping",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:telegram:private:10001",
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["skip_context_files"] is False
+    assert _CapturingAgent.last_init["load_soul_identity"] is False
+    assert _CapturingAgent.last_init["skip_memory"] is False
+
+
 @pytest.mark.parametrize(
     (
         "access_context",
         "profile_system_prompt",
         "expected_prompt",
-        "expected_shared",
+        "expected_skip_context_files",
+        "expected_load_soul_identity",
+        "expected_skip_memory",
     ),
     [
+        (
+            _context("owner", {"public_web"}),
+            " PROFILE ",
+            "Context prompt\n\nPROFILE",
+            False,
+            False,
+            False,
+        ),
         (
             _context("family_standard", {"public_web"}),
             " FAMILY PROFILE ",
             "Context prompt\n\nFAMILY PROFILE",
+            True,
+            True,
+            False,
+        ),
+        (
+            _context("family_sandbox", {"public_web", "delegation"}),
+            " FAMILY PROFILE ",
+            "Context prompt\n\nFAMILY PROFILE",
+            True,
+            True,
             False,
         ),
         (
@@ -604,16 +665,20 @@ def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
             "FAMILY PROFILE",
             None,
             True,
+            True,
+            True,
         ),
     ],
-    ids=["family_standard", "shared_room"],
+    ids=["owner", "family_standard", "family_sandbox", "shared_room"],
 )
 def test_typed_prompt_isolation_uses_access_context_prompt_rules(
     monkeypatch,
     access_context,
     profile_system_prompt,
     expected_prompt,
-    expected_shared,
+    expected_skip_context_files,
+    expected_load_soul_identity,
+    expected_skip_memory,
 ):
     monkeypatch.setattr(
         gateway_run,
@@ -650,7 +715,7 @@ def test_typed_prompt_isolation_uses_access_context_prompt_rules(
     assert result["final_response"] == "ok"
     runner._get_system_prompt_for_channel.assert_not_called()
     prompt = _CapturingAgent.last_init["ephemeral_system_prompt"]
-    if expected_shared:
+    if expected_skip_memory:
         assert prompt.startswith(
             "Context prompt\n\nThis is a shared multi-user Telegram scope."
         )
@@ -659,8 +724,15 @@ def test_typed_prompt_isolation_uses_access_context_prompt_rules(
     else:
         assert prompt == expected_prompt
     assert "OWNER" not in prompt
-    assert _CapturingAgent.last_init["skip_context_files"] is expected_shared
-    assert _CapturingAgent.last_init["skip_memory"] is expected_shared
+    assert (
+        _CapturingAgent.last_init["skip_context_files"]
+        is expected_skip_context_files
+    )
+    assert (
+        _CapturingAgent.last_init["load_soul_identity"]
+        is expected_load_soul_identity
+    )
+    assert _CapturingAgent.last_init["skip_memory"] is expected_skip_memory
 
 
 def test_run_agent_access_registry_shared_room_binds_only_room_memory_namespace(
