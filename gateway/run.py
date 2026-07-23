@@ -63,6 +63,7 @@ from gateway.access_registry import (
     AccessDeniedError,
     RedactedAuditMetadata,
     ResolvedAccessContext,
+    canonical_access_context_fingerprint,
     shared_memory_namespace_for_access_context,
 )
 from hermes_cli.config import cfg_get
@@ -16895,8 +16896,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        resolved_access_context: Any = None,
     ) -> str:
-        """Compute a stable string key from agent config values.
+        """Compute a stable opaque key from agent config and access context.
 
         When this signature changes between messages, the cached AIAgent is
         discarded and rebuilt.  When it stays the same, the cached agent is
@@ -16922,6 +16924,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``resolved_access_context`` is optional for legacy callers.  When
+        present, only its canonical opaque six-field fingerprint enters the
+        signature; malformed context objects fail closed with ``ValueError``.
         """
         import hashlib, json as _j
 
@@ -16934,21 +16940,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _cache_keys_sorted = sorted((cache_keys or {}).items())
 
+        signature_values = [
+            model,
+            _api_key_fingerprint,
+            runtime.get("base_url", ""),
+            runtime.get("provider", ""),
+            runtime.get("api_mode", ""),
+            sorted(enabled_toolsets) if enabled_toolsets else [],
+            # reasoning_config excluded — it's set per-message on the
+            # cached agent and doesn't affect system prompt or tools.
+            ephemeral_prompt or "",
+            _cache_keys_sorted,
+            str(user_id or ""),
+            str(user_id_alt or ""),
+        ]
+        if resolved_access_context is not None:
+            signature_values.append(
+                canonical_access_context_fingerprint(resolved_access_context)
+            )
+
         blob = _j.dumps(
-            [
-                model,
-                _api_key_fingerprint,
-                runtime.get("base_url", ""),
-                runtime.get("provider", ""),
-                runtime.get("api_mode", ""),
-                sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
-                ephemeral_prompt or "",
-                _cache_keys_sorted,
-                str(user_id or ""),
-                str(user_id_alt or ""),
-            ],
+            signature_values,
             sort_keys=True,
             default=str,
         )
@@ -19392,6 +19404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if shared_scope is not None
                     else getattr(source, "user_id_alt", None)
                 ),
+                resolved_access_context=getattr(source, "resolved_access_context", None),
             )
             agent = None
             reused_cached_agent = False

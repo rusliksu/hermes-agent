@@ -34,6 +34,7 @@
   - 2026-07-22: локальный slice привязал built-in `MemoryStore` load/snapshot/tool writes к task-local `ResolvedAccessContext`, добавил fail-closed guard до memory mkdir/read/write и redacted `memory_access_denied`; external provider commit/full prompt layering/migration ещё остаются.
   - 2026-07-23: локальный slice добавил delivery thread dimension в opaque shared memory namespace: root и разные topics одного room теперь получают разные `access/<sha256>` namespaces без raw IDs.
 - [ ] 3.3 Реализовать prompt layering: security layer -> read-only role layer -> scope layer -> private USER/memory layer.
+  - 2026-07-23: локальный slice добавил cache bust agent constructor по canonical opaque SHA-256 fingerprint typed six-field `ResolvedAccessContext`; смена authority context больше не переиспользует frozen prompt/tool surface, checkbox остаётся открытым до полноценного prompt layering.
 - [ ] 3.4 Исключить private USER/memory из shared room prompts и не импортировать private context между profiles.
 - [ ] 3.5 Привязать attachments, generated files и workspaces к resolved profile boundary и room scope.
 - [ ] 3.6 Передавать шесть authority-полей context через callbacks, background, cron, delegation, compaction, reset, restart и concurrent turns без расширения.
@@ -44,6 +45,7 @@
   - 2026-07-22: локальный slice добавил task-local `ResolvedAccessContext` в `gateway.session_context`, gateway propagation из `source.resolved_access_context`, cron job persistence/restoration и inheritance reset/clear checks; checkbox остаётся открытым до broader provider/callback/delegation/compaction/reset/restart/concurrency покрытия.
   - 2026-07-22: локальный slice добавил fail-closed validation incoming и persisted `ResolvedAccessContext` в `SessionStore.get_or_create_session` до compression-tip/recovery; configured registry без authoritative routing entry больше не восстанавливает legacy transcript по peer metadata, checkbox остаётся открытым до callbacks/background/cron/delegation/compaction/concurrency покрытия.
   - 2026-07-22: локальный slice протащил текущий task-local `ResolvedAccessContext` через batch worker submit и inner `child.run_conversation` submit в `delegate_task` через отдельный `contextvars.copy_context()` на каждый concurrent submit; legacy path без context оставлен byte-compatible, checkbox остаётся открытым до полного callback/provider/completion/restart покрытия.
+  - 2026-07-23: локальный slice протащил `source.resolved_access_context` в gateway agent cache signature как canonical six-field context fingerprint без raw IDs; malformed context fail-closed через `ValueError`, checkbox остаётся открытым до полного callback/background/cron/compaction/reset/restart/concurrency покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
@@ -112,6 +114,7 @@
 - [ ] 8.4 Добавить concurrent/background/callback/cron/delegation/compaction/reset/restart tests с persisted context validation.
   - 2026-07-22: добавлены focused session-store tests для restart compression-tip heal с exact persisted context, missing/malformed/mismatch denial before IO, no DB recovery без routing entry и reset/auto-reset context continuity; checkbox остаётся открытым до broader concurrent/background/callback/cron/delegation/compaction покрытия.
   - 2026-07-22: добавлены focused delegate tests для early deny без credential/child side effects, owner/family_sandbox+delegation allow, immutable six-field context visibility after inner executor hop, batch worker propagation и role=`orchestrator` как child-tree role без access-role изменения; checkbox остаётся открытым до broader background/callback/cron/compaction/restart покрытия.
+  - 2026-07-23: добавлены focused agent-cache tests для canonical six-field context fingerprint: omitted==None legacy parity, stable typed context, bust по каждому authority field, malformed dict/object `ValueError` и call-site wiring `source.resolved_access_context` в `_agent_config_signature`; checkbox остаётся открытым до broader concurrent/background/callback/cron/compaction/restart покрытия.
 - [ ] 8.5 Добавить sandbox tests для symlink escape, host mount denial, network disabled, quotas и owner credential absence.
 - [ ] 8.6 Добавить dashboard lease tests для localhost/SSH tunnel, preview+confirm atomic apply, expiry, manual revoke, no restart resurrection и no content audit.
 - [ ] 8.7 Запустить focused tests for changed modules and specs without live effects.

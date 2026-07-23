@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-
 def _make_runner():
     """Create a minimal GatewayRunner with just the cache infrastructure."""
     from gateway.run import GatewayRunner
@@ -24,6 +23,27 @@ def _make_runner():
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
     return runner
+
+
+def _access_context(**overrides):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+    values = {
+        "principal_id": "principal-a",
+        "role_id": "family_standard",
+        "profile_id": "profile-a",
+        "conversation_scope": "dm:a",
+        "capabilities": frozenset({"public_web", "session_search"}),
+        "delivery_target": DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-a",
+            thread_id=None,
+        ),
+    }
+    values.update(overrides)
+    return ResolvedAccessContext(**values)
 
 
 class TestAgentConfigSignature:
@@ -199,6 +219,126 @@ class TestAgentConfigSignature:
         )
 
         assert sig_before != sig_after
+
+    def test_resolved_access_context_omitted_matches_none(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_omitted = GatewayRunner._agent_config_signature("m", runtime, [], "")
+        sig_none = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            [],
+            "",
+            resolved_access_context=None,
+        )
+
+        assert sig_omitted == sig_none
+
+    def test_resolved_access_context_same_typed_context_is_stable(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        context = _access_context()
+
+        sig_1 = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            [],
+            "",
+            resolved_access_context=context,
+        )
+        sig_2 = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            [],
+            "",
+            resolved_access_context=_access_context(),
+        )
+
+        assert sig_1 == sig_2
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("principal_id", "principal-b"),
+            ("role_id", "family_sandbox"),
+            ("profile_id", "profile-b"),
+            ("conversation_scope", "dm:b"),
+            ("capabilities", frozenset({"public_web"})),
+            ("delivery_target", "chat-b"),
+        ),
+    )
+    def test_resolved_access_context_authority_fields_bust_cache(self, field, value):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        base = _access_context()
+        if field == "delivery_target":
+            from gateway.access_registry import DeliveryTarget
+
+            value = DeliveryTarget(
+                platform=base.delivery_target.platform,
+                account=base.delivery_target.account,
+                peer_kind=base.delivery_target.peer_kind,
+                chat_id=value,
+                thread_id=base.delivery_target.thread_id,
+            )
+        changed = {field: value}
+        changed_context = _access_context(**changed)
+
+        base_sig = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["telegram"],
+            "",
+            user_id="same-user",
+            user_id_alt="@same",
+            resolved_access_context=base,
+        )
+        changed_sig = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["telegram"],
+            "",
+            user_id="same-user",
+            user_id_alt="@same",
+            resolved_access_context=changed_context,
+        )
+
+        assert base_sig != changed_sig
+
+    @pytest.mark.parametrize("malformed", ({}, object()))
+    def test_resolved_access_context_malformed_raises_value_error(self, malformed):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+
+        with pytest.raises(ValueError):
+            GatewayRunner._agent_config_signature(
+                "m",
+                runtime,
+                [],
+                "",
+                resolved_access_context=malformed,
+            )
+
+    def test_run_agent_inner_wires_resolved_access_context_into_signature(self):
+        import inspect
+        from gateway.run import GatewayRunner
+
+        src = inspect.getsource(GatewayRunner._run_agent_inner)
+        src_no_ws = "".join(src.split())
+        call_marker = "_sig=self._agent_config_signature("
+        assert call_marker in src_no_ws
+
+        signature_call = src_no_ws[src_no_ws.index(call_marker):]
+        signature_call = signature_call[: signature_call.index("agent=None")]
+
+        assert (
+            'resolved_access_context=getattr(source,"resolved_access_context",None)'
+            in signature_call
+        )
 
 
 class TestExtractCacheBustingConfig:
