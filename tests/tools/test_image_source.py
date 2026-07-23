@@ -10,9 +10,12 @@ import base64
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
@@ -26,6 +29,22 @@ def _reload(monkeypatch, hermes_home: Path):
     import tools.image_source as isrc
     importlib.reload(isrc)
     return isrc
+
+
+def _access_context(profile_id: str = "profile-a") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="dm:principal-a",
+        capabilities=frozenset(),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="10001",
+        ),
+    )
 
 
 class TestDataUrl:
@@ -59,6 +78,105 @@ class TestLocalBackend:
         res = await isrc.resolve_image_source(str(img), isrc.ResolveContext())
         assert res.data == PNG
         assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_legacy_none_context_local_backend_reads_arbitrary_host_path(
+        self, tmp_path, monkeypatch
+    ):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "outside" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(None):
+            res = await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_typed_current_profile_local_path_allowed(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = home / "profiles" / "profile-a" / "cache" / "images" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(_access_context("profile-a")):
+            res = await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_typed_sibling_profile_local_path_rejected(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (home / "profiles" / "profile-a").mkdir(parents=True)
+        img = home / "profiles" / "profile-b" / "cache" / "images" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(_access_context("profile-a")):
+            with pytest.raises(isrc.SourceUnsafe):
+                await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "context",
+        [
+            {"profile_id": "profile-a"},
+            _access_context(""),
+            _access_context("missing-profile"),
+        ],
+    )
+    async def test_typed_malformed_blank_unknown_context_rejected(
+        self, context, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "pic.png"
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(context):
+            with pytest.raises(isrc.SourceUnsafe):
+                await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+
+    @pytest.mark.asyncio
+    async def test_context_accessor_exception_rejected(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = tmp_path / "pic.png"
+        img.write_bytes(PNG)
+
+        with patch(
+            "gateway.session_context.get_resolved_access_context",
+            side_effect=RuntimeError("task-local internals"),
+        ):
+            with pytest.raises(isrc.SourceUnsafe) as excinfo:
+                await isrc.resolve_image_source(str(img), isrc.ResolveContext())
+
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert "task-local internals" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_non_string_profile_id_rejected_even_when_matching_dir_exists(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        img = home / "profiles" / "profile-a" / "cache" / "images" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(_access_context(Path("profile-a"))):
+            with pytest.raises(isrc.SourceUnsafe):
+                await isrc.resolve_image_source(str(img), isrc.ResolveContext())
 
     @pytest.mark.asyncio
     async def test_file_uri_scheme_stripped(self, tmp_path, monkeypatch):
@@ -188,6 +306,66 @@ class TestNonLocalBackendConfinement:
         with patch("tools.image_source._get_active_env", return_value=None):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(str(link), isrc.ResolveContext(task_id="t1"))
+
+    @pytest.mark.asyncio
+    async def test_typed_current_profile_cache_host_read(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        img = home / "profiles" / "profile-a" / "cache" / "images" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+
+        with bind_resolved_access_context(_access_context("profile-a")):
+            res = await isrc.resolve_image_source(str(img), isrc.ResolveContext(task_id="t1"))
+
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_typed_nonlocal_container_only_path_fallback(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        (home / "profiles" / "profile-a").mkdir(parents=True)
+        container_png_b64 = base64.b64encode(PNG).decode()
+
+        def fake_execute(cmd, **kw):
+            return {"returncode": 0, "output": container_png_b64}
+
+        with bind_resolved_access_context(_access_context("profile-a")):
+            with patch(
+                "tools.image_source._get_active_env",
+                return_value=SimpleNamespace(execute=fake_execute),
+            ):
+                res = await isrc.resolve_image_source(
+                    "/workspace/shot.png", isrc.ResolveContext(task_id="t1")
+                )
+
+        assert res.data == PNG
+        assert res.origin == "container"
+
+    @pytest.mark.asyncio
+    async def test_typed_existing_out_of_profile_host_path_skips_sandbox(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        (home / "profiles" / "profile-a").mkdir(parents=True)
+        img = tmp_path / "outside" / "pic.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG)
+        execute = Mock(return_value={"returncode": 0, "output": base64.b64encode(PNG).decode()})
+        env = SimpleNamespace(execute=execute)
+
+        with bind_resolved_access_context(_access_context("profile-a")):
+            with patch("tools.image_source._get_active_env", return_value=env):
+                with pytest.raises(isrc.SourceUnsafe):
+                    await isrc.resolve_image_source(
+                        str(img), isrc.ResolveContext(task_id="t1")
+                    )
+        execute.assert_not_called()
 
 
 class TestExecReadSafety:

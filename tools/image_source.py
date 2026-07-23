@@ -7,9 +7,13 @@ once.  Returns raw bytes (not a path): the downstream step is base64 -> data URL
 
 Security (terminal-backend confinement, GHSA-gpxw-6wxv-w3qq): under a non-local
 terminal backend the file tools are confined to the sandbox (SECURITY.md 2.2),
-but vision read images host-side. This resolver enforces the same boundary:
+but vision read images host-side. This resolver enforces the same boundary,
+with one stricter gateway rule when a task-local ``ResolvedAccessContext`` is
+bound:
 
   * local backend            -> read any host path (chosen posture, unchanged)
+                                 unless a gateway access context is bound; then
+                                 host reads must resolve inside that profile
   * non-local backend:
       path in a media cache   -> host-read (the gateway/download caches live on
                                  the host and are bind-mounted into the sandbox)
@@ -18,11 +22,14 @@ but vision read images host-side. This resolver enforces the same boundary:
                                  this stays within the sandbox boundary and never
                                  reaches the host's ``/etc/passwd`` / ``~/.ssh``).
 
-So a prompt-injected ``vision_analyze('/etc/passwd')`` under Docker reads the
-*container's* file (what every other tool sees), not the host's — no escape —
-while container-only images (tmpfs ``/workspace``, root-owned) are still
-deliverable. This is the unified delivery + confinement model: the same
-mechanism that fixes "vision can't see container files" also closes the escape.
+When a gateway context is present it must be an actual
+``gateway.access_registry.ResolvedAccessContext`` with an existing profile id;
+existing host targets outside ``get_profile_dir(profile_id).resolve()`` fail
+closed before credential guards, reads, or Docker fallback. Thus a
+prompt-injected ``vision_analyze('/etc/passwd')`` under Docker reads the
+*container's* file only when there is no same-named host target to protect,
+while container-only images (tmpfs ``/workspace``, root-owned) remain
+deliverable.
 """
 from __future__ import annotations
 
@@ -231,17 +238,27 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     """Return the host path to read, or ``None`` if a host read is not permitted.
 
     - Local backend: any path is permitted (chosen posture). Returns ``p``.
+      With a gateway ``ResolvedAccessContext`` bound, only paths that resolve
+      inside that context's existing profile directory are permitted.
     - Non-local backend: permitted only if the path resolves inside a media
       cache root. A container-visible cache path (e.g. ``/root/.hermes/cache/
       images/x.png``) is first translated back to its host mount; anything that
       is not under a cache returns ``None`` so the caller routes it to the
       in-sandbox exec-read instead of reading the host filesystem.
+      With a gateway ``ResolvedAccessContext`` bound, the cache allowlist is
+      replaced by the current profile root; existing host targets outside it
+      are denied instead of falling back to the sandbox.
     """
+    profile_root = _access_context_profile_root()
     if _is_local_terminal_backend():
         try:
-            return p.resolve()
+            real = p.resolve()
         except Exception:  # noqa: BLE001 — unresolved path: let is_file() fail downstream
-            return p
+            real = p
+        if profile_root is None:
+            return real
+        _raise_if_existing_outside_profile(real, profile_root, str(p))
+        return real
 
     from tools.credential_files import from_agent_visible_cache_path
 
@@ -250,6 +267,11 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
         real = host_candidate.resolve()
     except Exception:  # noqa: BLE001 — cannot resolve -> not a safe host read
         return None
+    if profile_root is not None:
+        if real.exists():
+            _raise_if_existing_outside_profile(real, profile_root, str(p))
+            return real
+        return None
     for root in _media_cache_roots():
         try:
             real.relative_to(root.resolve())
@@ -257,6 +279,55 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
         except ValueError:
             continue
     return None
+
+
+def _access_context_profile_root() -> Optional[Path]:
+    """Return the bound gateway profile root, ``None`` for legacy/no context."""
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        context = get_resolved_access_context(None)
+    except Exception as exc:  # noqa: BLE001 — fail closed on context accessor errors
+        raise SourceUnsafe("invalid resolved access context", origin="file") from exc
+    if context is None:
+        return None
+
+    try:
+        from gateway.access_registry import ResolvedAccessContext
+    except Exception as exc:  # noqa: BLE001 — fail closed on context type import errors
+        raise SourceUnsafe("invalid resolved access context", origin="file") from exc
+
+    if not isinstance(context, ResolvedAccessContext):
+        raise SourceUnsafe("malformed resolved access context", origin="file")
+    profile_id = context.profile_id
+    if not isinstance(profile_id, str):
+        raise SourceUnsafe("resolved access context profile_id is required", origin="file")
+    profile_id = profile_id.strip()
+    if not profile_id:
+        raise SourceUnsafe("resolved access context profile_id is required", origin="file")
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        if not profile_exists(profile_id):
+            raise SourceUnsafe("resolved access context profile does not exist", origin="file")
+        return get_profile_dir(profile_id).resolve()
+    except SourceUnsafe:
+        raise
+    except Exception as exc:  # noqa: BLE001 — fail closed on malformed profile state
+        raise SourceUnsafe("invalid resolved access context profile", origin="file") from exc
+
+
+def _raise_if_existing_outside_profile(target: Path, profile_root: Path, src: str) -> None:
+    if not target.exists():
+        return
+    try:
+        target.relative_to(profile_root)
+    except ValueError:
+        raise SourceUnsafe(
+            "image source host path is outside the resolved access profile",
+            src=src,
+            origin="file",
+        )
 
 
 def _get_active_env(task_id: Optional[str]):
