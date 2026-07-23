@@ -4,13 +4,23 @@ Topic mode makes the root Telegram DM a system lobby while user-created
 Telegram topics act as independent Hermes session lanes.
 """
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.access_registry import AccessDeniedError
+from gateway.access_registry import (
+    AccessDeniedError,
+    AccessRegistry,
+    DeliveryTarget,
+    PrincipalBinding,
+    ResolvedAccessContext,
+    RolePolicy,
+    TransportIdentity,
+    serialize_resolved_access_context,
+)
 from hermes_state import SessionDB
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -33,6 +43,61 @@ def _make_event(text: str, *, thread_id: str | None = None) -> MessageEvent:
         text=text,
         source=_make_source(thread_id=thread_id),
         message_id="m1",
+    )
+
+
+def _handoff_registry_context(*, chat_id: str = "208214988") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family_standard",
+        profile_id="family-alpha",
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id=chat_id,
+            thread_id=None,
+        ),
+    )
+
+
+def _handoff_registry(*, chat_id: str = "208214988") -> AccessRegistry:
+    identity = TransportIdentity(
+        platform="telegram",
+        account="bot-a",
+        peer_kind="dm",
+        user_id=chat_id,
+        chat_id=chat_id,
+        thread_id=None,
+    )
+    return AccessRegistry(
+        roles={
+            "family_standard": RolePolicy(
+                "family_standard",
+                frozenset({"public_web"}),
+            )
+        },
+        profiles=frozenset({"family-alpha"}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id="principal-alpha",
+                role_id="family_standard",
+                profile_id="family-alpha",
+                transport_identity=identity,
+                conversation_scope="private",
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account="bot-a",
+                    peer_kind="dm",
+                    chat_id=chat_id,
+                    thread_id=None,
+                ),
+            ),
+        ),
+        scope_capabilities={"private": frozenset({"public_web"})},
+        backend_capabilities=frozenset({"public_web"}),
     )
 
 
@@ -813,14 +878,11 @@ async def test_handoff_with_registry_fails_before_destination_side_effects():
 
     class _Runner:
         access_registry = object()
+        config = SimpleNamespace(multiplex_profiles=True)
 
         @property
         def adapters(self):
             pytest.fail("adapter selection must not run")
-
-        @property
-        def config(self):
-            pytest.fail("home/model config must not be read")
 
         @property
         def async_session_store(self):
@@ -847,7 +909,7 @@ async def test_handoff_with_registry_fails_before_destination_side_effects():
 
     assert exc.value.reason == "handoff_missing_resolved_access_context"
     assert exc.value.audit.as_dict() == {
-        "event": "handoff_missing_resolved_access_context",
+        "event": "handoff",
         "platform": None,
         "account_ref": None,
         "peer_kind": None,
@@ -855,6 +917,216 @@ async def test_handoff_with_registry_fails_before_destination_side_effects():
         "chat_ref": None,
         "thread_ref": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_handoff_with_registry_uses_persisted_telegram_dm_context(tmp_path):
+    from gateway.run import GatewayRunner
+
+    registry = _handoff_registry()
+    context = registry.resolve(
+        TransportIdentity(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            user_id="208214988",
+            chat_id="208214988",
+        )
+    )
+    runner = _make_runner()
+    runner.access_registry = registry
+    runner.config.access_registry = registry
+    runner.config.multiplex_profiles = True
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"account": "bot-a"},
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="208214988",
+            name="Tester DM",
+        ),
+    )
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.send.return_value = SimpleNamespace(success=True)
+    captured = {}
+
+    class _AsyncStore:
+        _store = runner.session_store
+
+        async def get_or_create_session(self, source):
+            captured["store_source"] = source
+            return runner.session_store.get_or_create_session(source)
+
+        async def switch_session(self, session_key, target_session_id):
+            captured["switch"] = (session_key, target_session_id)
+            return runner.session_store.switch_session(session_key, target_session_id)
+
+    runner._async_session_store = _AsyncStore()
+
+    async def fake_handle_message(event):
+        assert GatewayRunner._allow_access_registry_ingress(runner, event)
+        captured["source"] = event.source
+        return "handoff ok"
+
+    runner._handle_message = AsyncMock(side_effect=fake_handle_message)
+
+    await runner._process_handoff({
+        "id": "cli-session",
+        "title": "CLI work",
+        "handoff_platform": "telegram",
+        "handoff_context_json": json.dumps(
+            serialize_resolved_access_context(context),
+            sort_keys=True,
+        ),
+    })
+
+    source = captured["source"]
+    assert source.resolved_access_context == context
+    assert source.profile == "family-alpha"
+    assert source.route_account == "bot-a"
+    assert source.chat_type == "dm"
+    assert source.user_id == "208214988"
+    assert source.chat_id == "208214988"
+    assert source.thread_id is None
+    assert captured["store_source"].resolved_access_context == context
+    assert captured["switch"][1] == "cli-session"
+    adapter.create_handoff_thread.assert_not_called()
+    adapter.send.assert_awaited_once_with(
+        chat_id="208214988",
+        content="handoff ok",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,reason",
+    [
+        ("not-json", "handoff_malformed_resolved_access_context"),
+        (json.dumps([]), "handoff_malformed_resolved_access_context"),
+    ],
+)
+async def test_handoff_with_registry_rejects_malformed_payload_before_side_effects(
+    payload,
+    reason,
+):
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    runner.access_registry = _handoff_registry()
+    runner.config.access_registry = runner.access_registry
+    runner.config.multiplex_profiles = True
+
+    with pytest.raises(AccessDeniedError) as exc:
+        await runner._process_handoff({
+            "id": "cli-session",
+            "handoff_platform": "telegram",
+            "handoff_context_json": payload,
+        })
+
+    assert exc.value.reason == reason
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.switch_session.assert_not_called()
+    runner.adapters[Platform.TELEGRAM].send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handoff_with_registry_rejects_tampered_valid_context_before_side_effects():
+    from gateway.run import GatewayRunner
+
+    home_context = _handoff_registry_context(chat_id="208214988")
+    other_context = _handoff_registry_context(chat_id="999")
+    registry = AccessRegistry(
+        roles={
+            "family_standard": RolePolicy(
+                "family_standard",
+                frozenset({"public_web"}),
+            )
+        },
+        profiles=frozenset({"family-alpha", "family-beta"}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id=home_context.principal_id,
+                role_id=home_context.role_id,
+                profile_id=home_context.profile_id,
+                transport_identity=TransportIdentity(
+                    platform="telegram",
+                    account="bot-a",
+                    peer_kind="dm",
+                    user_id="208214988",
+                    chat_id="208214988",
+                ),
+                conversation_scope=home_context.conversation_scope,
+                delivery_target=home_context.delivery_target,
+            ),
+            PrincipalBinding(
+                principal_id="principal-beta",
+                role_id=other_context.role_id,
+                profile_id="family-beta",
+                transport_identity=TransportIdentity(
+                    platform="telegram",
+                    account="bot-a",
+                    peer_kind="dm",
+                    user_id="999",
+                    chat_id="999",
+                ),
+                conversation_scope=other_context.conversation_scope,
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account="bot-a",
+                    peer_kind="dm",
+                    chat_id="999",
+                    thread_id=None,
+                ),
+            ),
+        ),
+        scope_capabilities={"private": frozenset({"public_web"})},
+        backend_capabilities=frozenset({"public_web"}),
+    )
+    payload = ResolvedAccessContext(
+        principal_id="principal-beta",
+        role_id=other_context.role_id,
+        profile_id="family-beta",
+        conversation_scope=other_context.conversation_scope,
+        capabilities=other_context.capabilities,
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="999",
+            thread_id=None,
+        ),
+    )
+    runner = _make_runner()
+    runner.access_registry = registry
+    runner.config.access_registry = registry
+    runner.config.multiplex_profiles = True
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"account": "bot-a"},
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="208214988",
+            name="Tester DM",
+        ),
+    )
+
+    with pytest.raises(AccessDeniedError) as exc:
+        await runner._process_handoff({
+            "id": "cli-session",
+            "handoff_platform": "telegram",
+            "handoff_context_json": json.dumps(
+                serialize_resolved_access_context(payload),
+                sort_keys=True,
+            ),
+        })
+
+    assert exc.value.reason == "handoff_destination_mismatch"
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.switch_session.assert_not_called()
+    runner.adapters[Platform.TELEGRAM].send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -879,6 +1151,17 @@ async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_
     adapter.create_handoff_thread = AsyncMock(return_value="17585")
     adapter.send.return_value = SimpleNamespace(success=True)
     captured = {}
+
+    class _AsyncStore:
+        _store = runner.session_store
+
+        async def get_or_create_session(self, source):
+            return runner.session_store.get_or_create_session(source)
+
+        async def switch_session(self, session_key, target_session_id):
+            return runner.session_store.switch_session(session_key, target_session_id)
+
+    runner._async_session_store = _AsyncStore()
 
     async def fake_handle_message(event):
         captured["source"] = event.source

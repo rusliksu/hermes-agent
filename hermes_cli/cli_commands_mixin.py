@@ -577,6 +577,15 @@ class CLICommandsMixin:
             _cprint("  Set one with /sethome on the destination chat first.")
             return True
 
+        try:
+            from gateway.access_registry import AccessDeniedError
+            from gateway.handoff import resolve_handoff_access_context
+
+            handoff_context = resolve_handoff_access_context(gw_config, platform)
+        except AccessDeniedError as exc:
+            _cprint(f"  Handoff denied: {exc.reason}")
+            return True
+
         # Refuse mid-turn: an in-flight agent run would race with the
         # gateway's switch_session and the synthetic turn dispatch.
         if getattr(self, "_agent_running", False):
@@ -623,7 +632,11 @@ class CLICommandsMixin:
             session_title = self.session_id[:8]
 
         # Mark pending — gateway watcher will pick this up.
-        ok = self._session_db.request_handoff(self.session_id, platform_name)
+        ok = self._session_db.request_handoff(
+            self.session_id,
+            platform_name,
+            resolved_access_context=handoff_context,
+        )
         if not ok:
             _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
             return True

@@ -68,7 +68,26 @@ class _RecordingSessionDB:
         self.failures.append((session_id, error))
 
 
-def _make_fake_runner(session_db, *, fail_process=False):
+class _AsyncHandoffDB:
+    def __init__(self, *, pending):
+        self._pending = pending
+        self.failures = []
+        self.completions = []
+
+    async def list_pending_handoffs(self):
+        return self._pending
+
+    async def claim_handoff(self, session_id):
+        return True
+
+    async def complete_handoff(self, session_id):
+        self.completions.append(session_id)
+
+    async def fail_handoff(self, session_id, error):
+        self.failures.append((session_id, error))
+
+
+def _make_fake_runner(session_db, *, fail_process=False, access_registry=None):
     """Build a minimal object that exposes exactly what the loop body touches.
 
     The watcher now talks to the SessionDB through the AsyncSessionDB facade,
@@ -78,6 +97,8 @@ def _make_fake_runner(session_db, *, fail_process=False):
 
     fake = types.SimpleNamespace()
     fake._session_db = AsyncSessionDB(session_db)
+    if access_registry is not None:
+        fake.access_registry = access_registry
     # _running yields True for the first loop check, then False so the loop
     # exits after a single tick.
     states = iter([True, False])
@@ -96,6 +117,23 @@ def _make_fake_runner(session_db, *, fail_process=False):
             raise RuntimeError("boom")
 
     fake._process_handoff = _process_handoff
+    return fake
+
+
+def _make_async_fake_runner(session_db, *, access_registry=None):
+    fake = types.SimpleNamespace()
+    fake._session_db = session_db
+    fake.access_registry = access_registry
+    states = iter([True, False])
+
+    class _Running:
+        def __bool__(_self):
+            try:
+                return next(states)
+            except StopIteration:
+                return False
+
+    fake._running = _Running()
     return fake
 
 
@@ -148,6 +186,60 @@ async def test_watcher_offloads_fail_handoff_to_thread(monkeypatch):
 
     assert "fail_handoff" in db.calls
     assert db.ran_off_loop("fail_handoff")
+
+
+@pytest.mark.asyncio
+async def test_watcher_registry_handoff_failure_is_categorical(monkeypatch, caplog):
+    """Registry-mode handoff failures must not persist/log adapter details."""
+    raw_marker = "RAW_CHAT_208214988_REQUEST_PAYLOAD"
+    sentinel_session_id = "raw-session-sentinel"
+    db = _AsyncHandoffDB(
+        pending=[{"id": sentinel_session_id, "handoff_platform": "telegram"}],
+    )
+    fake = _make_async_fake_runner(db, access_registry=object())
+
+    async def _process_handoff(row):
+        raise RuntimeError(
+            f"adapter.send failed: chat_id={raw_marker} request={{'chat_id': '{raw_marker}'}}"
+        )
+
+    fake._process_handoff = _process_handoff
+
+    with caplog.at_level("WARNING"):
+        await _run_one_tick(fake, monkeypatch)
+
+    assert db.failures == [(sentinel_session_id, "handoff_processing_failed")]
+    assert db.completions == []
+
+    rendered_logs = caplog.text
+    assert "handoff_processing_failed" in rendered_logs
+    assert raw_marker not in rendered_logs
+    assert sentinel_session_id not in rendered_logs
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_watcher_legacy_handoff_failure_keeps_detail(monkeypatch, caplog):
+    """No-registry handoff keeps the historical diagnostic error text."""
+    raw_marker = "RAW_LEGACY_CHAT_REQUEST_MARKER"
+    sentinel_session_id = "legacy-session-sentinel"
+    db = _AsyncHandoffDB(
+        pending=[{"id": sentinel_session_id, "handoff_platform": "telegram"}],
+    )
+    fake = _make_async_fake_runner(db)
+
+    async def _process_handoff(row):
+        raise RuntimeError(f"adapter.send failed: {raw_marker}")
+
+    fake._process_handoff = _process_handoff
+
+    with caplog.at_level("WARNING"):
+        await _run_one_tick(fake, monkeypatch)
+
+    assert db.failures == [(sentinel_session_id, f"adapter.send failed: {raw_marker}")]
+    assert raw_marker in caplog.text
+    assert sentinel_session_id in caplog.text
+    assert any(record.exc_info is not None for record in caplog.records)
 
 
 @pytest.mark.asyncio

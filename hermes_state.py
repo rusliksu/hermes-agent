@@ -828,6 +828,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    handoff_context_json TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
@@ -7647,21 +7648,37 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        resolved_access_context: Any = None,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
+        context_json = None
+        if resolved_access_context is not None:
+            from gateway.access_registry import serialize_resolved_access_context
+
+            context_json = json.dumps(
+                serialize_resolved_access_context(resolved_access_context),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
-                "    handoff_error = NULL "
+                "    handoff_error = NULL, "
+                "    handoff_context_json = ? "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
+                (platform, context_json, session_id),
             )
             return cur.rowcount > 0
         return self._execute_write(_do)
@@ -7720,7 +7737,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
-                "handoff_error = NULL WHERE id = ?",
+                "handoff_error = NULL, handoff_context_json = NULL WHERE id = ?",
                 (session_id,),
             )
         self._execute_write(_do)
@@ -7730,7 +7747,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
+                "handoff_error = ?, handoff_context_json = NULL WHERE id = ?",
                 (error[:500], session_id),
             )
         self._execute_write(_do)

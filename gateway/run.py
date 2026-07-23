@@ -65,8 +65,10 @@ from gateway.access_registry import (
     RedactedAuditMetadata,
     ResolvedAccessContext,
     canonical_access_context_fingerprint,
+    deserialize_resolved_access_context,
     shared_memory_namespace_for_access_context,
 )
+from gateway.handoff import categorize_handoff_failure, resolve_handoff_access_context
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -7967,25 +7969,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         await self._session_db.fail_handoff(session_id, exc.reason)
                     except Exception as exc:
-                        logger.warning(
-                            "Handoff for session %s failed: %s",
-                            session_id, exc, exc_info=True,
+                        safe_reason = categorize_handoff_failure(
+                            exc,
+                            registry_configured=(
+                                getattr(self, "access_registry", None) is not None
+                            ),
                         )
-                        await self._session_db.fail_handoff(session_id, str(exc))
+                        if safe_reason is None:
+                            logger.warning(
+                                "Handoff for session %s failed: %s",
+                                session_id, exc, exc_info=True,
+                            )
+                            await self._session_db.fail_handoff(session_id, str(exc))
+                        else:
+                            logger.warning("Handoff failed: reason=%s", safe_reason)
+                            await self._session_db.fail_handoff(session_id, safe_reason)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+                safe_reason = categorize_handoff_failure(
+                    exc,
+                    registry_configured=(
+                        getattr(self, "access_registry", None) is not None
+                    ),
+                )
+                if safe_reason is None:
+                    logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+                else:
+                    logger.debug("Handoff watcher tick error: reason=%s", safe_reason)
             await asyncio.sleep(interval)
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
-        if getattr(self, "access_registry", None) is not None:
-            raise AccessDeniedError(
-                "handoff_missing_resolved_access_context",
-                RedactedAuditMetadata("handoff_missing_resolved_access_context"),
-            )
-
         from gateway.config import Platform
         from gateway.session import SessionSource, build_session_key
         from gateway.platforms.base import MessageEvent
@@ -8000,6 +8015,142 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform = Platform(platform_name)
         except (ValueError, KeyError):
             raise RuntimeError(f"unknown platform '{platform_name}'")
+
+        registry = getattr(self, "access_registry", None)
+        if registry is not None:
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                raise AccessDeniedError(
+                    "access_registry_requires_multiplex",
+                    RedactedAuditMetadata("handoff"),
+                )
+            raw_context = row.get("handoff_context_json")
+            if not isinstance(raw_context, str) or not raw_context.strip():
+                raise AccessDeniedError(
+                    "handoff_missing_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                )
+            try:
+                payload = json.loads(raw_context)
+            except (TypeError, ValueError):
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                ) from None
+            if not isinstance(payload, dict):
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                )
+            try:
+                context = registry.validate_resolved_context(
+                    deserialize_resolved_access_context(payload)
+                )
+                expected_context = resolve_handoff_access_context(
+                    self.config,
+                    platform,
+                    access_registry=registry,
+                )
+            except AccessDeniedError:
+                raise
+            except Exception:
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                ) from None
+            if expected_context != context:
+                raise AccessDeniedError(
+                    "handoff_destination_mismatch",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_destination_mismatch",
+                        getattr(context, "delivery_target", None),
+                    ),
+                )
+
+            target = context.delivery_target
+            if target.platform != platform.value:
+                raise AccessDeniedError(
+                    "handoff_platform_mismatch",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_platform_mismatch",
+                        target,
+                    ),
+                )
+            if (
+                platform != Platform.TELEGRAM
+                or target.peer_kind != "dm"
+                or target.thread_id is not None
+            ):
+                raise AccessDeniedError(
+                    "handoff_registry_unsupported_destination",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_registry_unsupported_destination",
+                        target,
+                    ),
+                )
+
+            adapter = self.adapters.get(platform)
+            if not adapter:
+                raise RuntimeError(
+                    f"platform '{platform_name}' is not active in this gateway"
+                )
+
+            cli_title = row.get("title") or cli_session_id[:8]
+            dest_source = SessionSource(
+                platform=platform,
+                chat_id=target.chat_id,
+                chat_type=target.peer_kind,
+                user_id=target.chat_id,
+                thread_id=None,
+                profile=context.profile_id,
+                route_account=target.account,
+                resolved_access_context=context,
+            )
+            session_key = build_session_key(
+                dest_source,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+            )
+            await self.async_session_store.get_or_create_session(dest_source)
+            switched = await self.async_session_store.switch_session(
+                session_key,
+                cli_session_id,
+            )
+            if switched is None:
+                raise RuntimeError("could not switch handoff session")
+            self._evict_cached_agent(session_key)
+            self._release_running_agent_state(session_key)
+
+            synthetic_event = MessageEvent(
+                text=(
+                    f"[Session was just handed off from CLI (\"{cli_title}\") "
+                    "to this Telegram DM. The full prior conversation history "
+                    "is loaded above. Briefly confirm you're working here and "
+                    "summarize what we were working on, so the user can "
+                    "continue from this device.]"
+                ),
+                source=dest_source,
+                internal=True,
+            )
+            logger.info(
+                "Handoff: dispatching registry-bound synthetic turn "
+                "for CLI session (platform=%s)",
+                platform_name,
+            )
+            response_text = await self._handle_message(synthetic_event)
+            if not response_text:
+                return
+            try:
+                result = await adapter.send(
+                    chat_id=target.chat_id,
+                    content=response_text,
+                    metadata=None,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"adapter.send failed: {exc}") from exc
+            if not getattr(result, "success", True):
+                err = getattr(result, "error", "send returned success=False")
+                raise RuntimeError(f"adapter.send failed: {err}")
+            return
 
         # Adapter must be live
         adapter = self.adapters.get(platform)

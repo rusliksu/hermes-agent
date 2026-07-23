@@ -6776,6 +6776,13 @@ def _(rid, params: dict) -> dict:
             f"no home channel configured for {platform_name} — set one with "
             "/sethome on the destination chat first",
         )
+    try:
+        from gateway.access_registry import AccessDeniedError
+        from gateway.handoff import resolve_handoff_access_context
+
+        handoff_context = resolve_handoff_access_context(gw_config, platform)
+    except AccessDeniedError as e:
+        return _err(rid, 4028, f"handoff denied: {e.reason}")
 
     # The watcher transfers a persisted DB row, so make sure one exists even
     # for a brand-new empty chat (mirrors the CLI's set_session_title stub).
@@ -6788,7 +6795,11 @@ def _(rid, params: dict) -> dict:
         try:
             if not db.get_session(key):
                 db.set_session_title(key, f"handoff-{key[:8]}")
-            ok = db.request_handoff(key, platform_name)
+            ok = db.request_handoff(
+                key,
+                platform_name,
+                resolved_access_context=handoff_context,
+            )
         except Exception as e:
             return _err(rid, 5007, str(e))
 

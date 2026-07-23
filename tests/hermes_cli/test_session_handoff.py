@@ -13,10 +13,33 @@ flip pending → running, and finishes with ``complete_handoff`` or
 from __future__ import annotations
 
 import time
+import json
 
 import pytest
 
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
+)
 from hermes_state import SessionDB
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="u1",
+            thread_id=None,
+        ),
+    )
 
 
 class TestHandoffStateDB:
@@ -41,7 +64,7 @@ class TestHandoffStateDB:
 
     def test_columns_exist(self, db):
         db._conn.execute(
-            "SELECT handoff_state, handoff_platform, handoff_error "
+            "SELECT handoff_state, handoff_platform, handoff_error, handoff_context_json "
             "FROM sessions LIMIT 0"
         )
 
@@ -57,6 +80,50 @@ class TestHandoffStateDB:
             "platform": "telegram",
             "error": None,
         }
+
+    def test_request_handoff_persists_context_for_pending_list(self, db):
+        sid = "sess-context"
+        context = _resolved_context()
+        self._make_session(db, sid)
+
+        assert db.request_handoff(sid, "telegram", resolved_access_context=context) is True
+
+        pending = db.list_pending_handoffs()
+        assert len(pending) == 1
+        assert json.loads(pending[0]["handoff_context_json"]) == serialize_resolved_access_context(context)
+
+    def test_retry_without_context_clears_prior_payload(self, db):
+        sid = "sess-clear"
+        self._make_session(db, sid)
+        assert db.request_handoff(sid, "telegram", resolved_access_context=_resolved_context()) is True
+        db.claim_handoff(sid)
+        db.fail_handoff(sid, "denied")
+
+        assert db.request_handoff(sid, "telegram") is True
+
+        row = db.list_pending_handoffs()[0]
+        assert row["handoff_context_json"] is None
+
+    def test_terminal_states_clear_context_payload(self, db):
+        sid = "sess-terminal-clear"
+        self._make_session(db, sid)
+        db.request_handoff(sid, "telegram", resolved_access_context=_resolved_context())
+        db.claim_handoff(sid)
+        db.complete_handoff(sid)
+        row = db._conn.execute(
+            "SELECT handoff_context_json FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        assert row["handoff_context_json"] is None
+
+        db.request_handoff(sid, "telegram", resolved_access_context=_resolved_context())
+        db.claim_handoff(sid)
+        db.fail_handoff(sid, "denied")
+        row = db._conn.execute(
+            "SELECT handoff_context_json FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        assert row["handoff_context_json"] is None
 
     def test_request_handoff_rejects_in_flight(self, db):
         sid = "sess-2"
