@@ -78,6 +78,7 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+ASYNC_DELEGATION_ACCESS_CONTEXT_KEY = "__hermes_resolved_access_context"
 
 
 def _db_path():
@@ -124,6 +125,19 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _capture_resolved_access_context() -> Optional[Dict[str, Any]]:
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    try:
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        raise ValueError("malformed_resolved_access_context") from exc
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -136,6 +150,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
+    if record.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY) is not None:
+        task_payload[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = record[
+            ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+        ]
     with _DB_LOCK, _connect() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
@@ -252,6 +270,10 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            if task.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY) is not None:
+                event[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = task[
+                    ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+                ]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -483,6 +505,10 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    try:
+        access_context_payload = _capture_resolved_access_context()
+    except ValueError as exc:
+        return {"status": "rejected", "error": str(exc)}
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -500,6 +526,8 @@ def dispatch_async_delegation(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
     }
+    if access_context_payload is not None:
+        record[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = access_context_payload
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
@@ -631,6 +659,10 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    if record.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY) is not None:
+        evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = record[
+            ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+        ]
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
@@ -676,6 +708,10 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    try:
+        access_context_payload = _capture_resolved_access_context()
+    except ValueError as exc:
+        return {"status": "rejected", "error": str(exc)}
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -700,6 +736,8 @@ def dispatch_async_delegation_batch(
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
     }
+    if access_context_payload is not None:
+        record[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = access_context_payload
     with _records_lock:
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
@@ -810,6 +848,10 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    if event_record.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY) is not None:
+        evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = event_record[
+            ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+        ]
     _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)

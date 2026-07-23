@@ -9553,7 +9553,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else "route_account_mismatch"
                     )
                     raise AccessDeniedError(reason, audit)
-                source.route_account = target.account
             elif getattr(event, "internal", False):
                 raise AccessDeniedError(
                     "missing_resolved_access_context",
@@ -9565,7 +9564,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     account=getattr(source, "route_account", None),
                 )
                 context = registry.resolve(identity)
-                source.route_account = context.delivery_target.account
                 source._trusted_transport_identity_fingerprint = (
                     _transport_identity_fingerprint(identity)
                 )
@@ -9596,6 +9594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
             source.resolved_access_context = context
             source.profile = context.profile_id
+            source.route_account = context.delivery_target.account
             return True
         except AccessDeniedError as exc:
             logger.warning(
@@ -16436,6 +16435,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
+    def _async_delegation_access_context_for_event(self, evt: dict):
+        registry = getattr(self, "access_registry", None)
+        if registry is None or evt.get("type") != "async_delegation":
+            return True, None
+
+        try:
+            from gateway.access_registry import (
+                AccessDeniedError,
+                RedactedAuditMetadata,
+                deserialize_resolved_access_context,
+            )
+            from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+        except Exception:
+            logger.warning(
+                "Async delegation access denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": "async_delegation"},
+            )
+            return False, None
+
+        payload = evt.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY)
+        try:
+            if payload is None:
+                raise AccessDeniedError(
+                    "missing_resolved_access_context",
+                    RedactedAuditMetadata("async_delegation"),
+                )
+            try:
+                context = deserialize_resolved_access_context(payload)
+            except ValueError as exc:
+                raise AccessDeniedError(
+                    "malformed_resolved_access_context",
+                    RedactedAuditMetadata("async_delegation"),
+                ) from exc
+            context = registry.validate_resolved_context(context)
+            return True, context
+        except AccessDeniedError as exc:
+            logger.warning(
+                "Async delegation access denied: reason=%s audit=%s",
+                exc.reason,
+                exc.audit.as_dict(),
+            )
+            return False, None
+
+    def _restore_async_delegation_access_context(self, source, context) -> bool:
+        registry = getattr(self, "access_registry", None)
+        if registry is None or context is None:
+            return True
+
+        try:
+            source.resolved_access_context = context
+            gate_event = type(
+                "_AsyncDelegationAccessEvent",
+                (),
+                {"source": source, "internal": True},
+            )()
+            if not self._allow_access_registry_ingress(gate_event):
+                return False
+            return True
+        except Exception:
+            logger.warning(
+                "Async delegation access denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": "async_delegation"},
+            )
+            return False
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -16448,12 +16514,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        context_ok, access_context = self._async_delegation_access_context_for_event(evt)
+        if not context_ok:
+            return None
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
+            return None
+        if not self._restore_async_delegation_access_context(source, access_context):
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = self._adapter_for_source(source)
