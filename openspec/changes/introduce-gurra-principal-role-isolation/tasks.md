@@ -91,6 +91,7 @@
 - [ ] 4.6 Запретить shared room cron/private delivery и family delivery к чужим principals, rooms или owner default target.
   - 2026-07-22: локальный slice запретил model cron actions для `shared_room`, скрыл/запретил cross-context family job list/mutation/run, и добавил scheduler fail-closed для malformed/tampered persisted context до script/model/delivery; checkbox остаётся открытым до полного private-delivery/provider/cutover покрытия.
 - [ ] 4.7 Убедиться, что scoped model secrets используются только model client construction и не попадают в terminal, Docker, browser или MCP tool env.
+  - 2026-07-23: локальный privacy slice подключил `hermes_subprocess_env(inherit_credentials=False)` ко всем actual TTS subprocess paths в `tools/tts_tool.py`: command provider `Popen`, cleanup `taskkill`, shared ffmpeg conversion, Gemini PCM conversion, NeuTTS synth/conversion, Piper download/conversion и KittenTTS conversion получают explicit sanitized env; provider/model client credential construction не менялся. Checkbox остаётся открытым до Docker/browser/MCP/model-client audit scope.
 
 ## 5. Юлин Docker, browser, Wolfram и delegation
 

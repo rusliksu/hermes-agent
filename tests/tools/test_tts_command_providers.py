@@ -37,6 +37,7 @@ from tools.tts_tool import (
     _render_command_tts_template,
     _resolve_command_provider_config,
     _resolve_max_text_length,
+    _run_command_tts,
     _shell_quote_context,
     check_tts_requirements,
     text_to_speech_tool,
@@ -55,6 +56,25 @@ def _python_copy_command(output_placeholder: str = "{output_path}") -> str:
         f'shutil.copyfile(sys.argv[1], sys.argv[2])" '
         f'{{input_path}} {output_placeholder}'
     )
+
+
+_PATH_MARKER = "/tmp/hermes-tts-path-marker"
+_CONTROLLED_SECRET_ENV = {
+    "PATH": _PATH_MARKER,
+    "OPENAI_API_KEY": "provider-secret",
+    "FIRECRAWL_API_KEY": "tool-secret",
+    "TELEGRAM_BOT_TOKEN": "gateway-secret",
+    "GATEWAY_RELAY_SECRET": "relay-secret",
+    "AUXILIARY_TTS_API_KEY": "dynamic-secret",
+}
+_SECRET_ENV_NAMES = tuple(k for k in _CONTROLLED_SECRET_ENV if k != "PATH")
+
+
+def _assert_sanitized_tts_env(env: dict) -> None:
+    assert env is not None
+    for name in _SECRET_ENV_NAMES:
+        assert name not in env
+    assert _PATH_MARKER in env.get("PATH", "")
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +373,27 @@ class TestRenderCommandTtsTemplate:
 # ---------------------------------------------------------------------------
 
 class TestGenerateCommandTts:
+    def test_command_subprocess_gets_sanitized_explicit_env(self):
+        captured = {}
+
+        class FakeProc:
+            pid = 123
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        def fake_popen(_command, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return FakeProc()
+
+        with patch.dict(os.environ, _CONTROLLED_SECRET_ENV, clear=True):
+            with patch("tools.tts_tool.subprocess.Popen", side_effect=fake_popen):
+                result = _run_command_tts("tts --in input --out output", 5)
+
+        assert result.returncode == 0
+        _assert_sanitized_tts_env(captured["env"])
+
     def test_writes_output_file(self, tmp_path):
         out = tmp_path / "clip.mp3"
         config = {"command": _python_copy_command()}

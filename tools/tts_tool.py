@@ -56,6 +56,14 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _tts_subprocess_env() -> Dict[str, str]:
+    from tools.environments.local import hermes_subprocess_env
+
+    return hermes_subprocess_env(inherit_credentials=False)
+
+
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -734,6 +742,7 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 stdin=subprocess.DEVNULL,
+                env=_tts_subprocess_env(),
             )
         except Exception:
             proc.kill()
@@ -786,7 +795,12 @@ def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProces
     else:
         popen_kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(command, **popen_kwargs, stdin=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        command,
+        **popen_kwargs,
+        stdin=subprocess.DEVNULL,
+        env=_tts_subprocess_env(),
+    )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -925,6 +939,7 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
             capture_output=True, timeout=30,
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
+            env=_tts_subprocess_env(),
         )
         if result.returncode != 0:
             logger.warning("ffmpeg conversion failed with return code %d: %s", 
@@ -1929,7 +1944,14 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
                 ]
             else:
                 cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            result = subprocess.run(cmd, capture_output=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                env=_tts_subprocess_env(),
+            )
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
                 raise RuntimeError(f"ffmpeg conversion failed: {stderr}")
@@ -2012,7 +2034,14 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         "--device", device,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        stdin=subprocess.DEVNULL,
+        env=_tts_subprocess_env(),
+    )
     if result.returncode != 0:
         stderr = result.stderr.strip()
         # Filter out the "OK:" line from stderr
@@ -2024,7 +2053,14 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(
+                conv_cmd,
+                check=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                env=_tts_subprocess_env(),
+            )
             os.remove(wav_path)
         else:
             # No ffmpeg — just rename the WAV to the expected path
@@ -2096,6 +2132,7 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
              "--download-dir", str(download_dir)],
             capture_output=True, text=True, timeout=300,
             stdin=subprocess.DEVNULL,
+            env=_tts_subprocess_env(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -2203,7 +2240,14 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(
+                conv_cmd,
+                check=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                env=_tts_subprocess_env(),
+            )
             try:
                 os.remove(wav_path)
             except OSError:
@@ -2269,7 +2313,14 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(
+                conv_cmd,
+                check=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                env=_tts_subprocess_env(),
+            )
             os.remove(wav_path)
         else:
             # No ffmpeg — rename the WAV to the expected path
