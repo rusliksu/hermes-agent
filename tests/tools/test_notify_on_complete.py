@@ -18,6 +18,12 @@ from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
 )
+from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
+)
 
 
 @pytest.fixture()
@@ -46,6 +52,25 @@ def _make_session(
         notify_on_complete=notify_on_complete,
     )
     return s
+
+
+def _access_context_payload():
+    return serialize_resolved_access_context(
+        ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="123",
+                thread_id=None,
+            ),
+        )
+    )
 
 
 # =========================================================================
@@ -83,11 +108,13 @@ class TestCompletionQueue:
 
     def test_move_to_finished_with_notify(self, registry):
         """Processes with notify_on_complete push to queue."""
+        payload = _access_context_payload()
         s = _make_session(
             notify_on_complete=True,
             output="build succeeded",
             exit_code=0,
         )
+        s.resolved_access_context = payload
         s.exited = True
         s.exit_code = 0
         registry._running[s.id] = s
@@ -102,6 +129,7 @@ class TestCompletionQueue:
         assert completion["completion_reason"] == "exited"
         assert completion["termination_source"] == ""
         assert "build succeeded" in completion["output"]
+        assert completion[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
 
     def test_move_to_finished_nonzero_exit(self, registry):
         """Nonzero exit codes are captured correctly."""

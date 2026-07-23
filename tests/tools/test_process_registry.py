@@ -14,9 +14,16 @@ from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
+    ProcessNotificationSpec,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+)
+from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
 )
 
 
@@ -46,6 +53,25 @@ def _make_session(
         output_buffer=output,
     )
     return s
+
+
+def _access_context_payload():
+    return serialize_resolved_access_context(
+        ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="123",
+                thread_id=None,
+            ),
+        )
+    )
 
 
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
@@ -657,6 +683,102 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_spawn_local_registers_notification_spec_before_reader_can_finish(self, registry, tmp_path):
+        payload = _access_context_payload()
+
+        class FakeStdout:
+            def __init__(self):
+                self._chunks = iter(["READY\n", ""])
+
+            def read(self, _size):
+                return next(self._chunks)
+
+        proc = MagicMock()
+        proc.pid = 7777
+        proc.stdout = FakeStdout()
+        proc.returncode = 0
+
+        def instant_thread(target, args=(), **_kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        spec = ProcessNotificationSpec(
+            notify_on_complete=True,
+            watch_patterns=("READY",),
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="u123",
+            watcher_user_name="alice",
+            watcher_thread_id="42",
+            watcher_message_id="m1",
+            watcher_interval=5,
+            resolved_access_context=payload,
+        )
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.threading.Thread", side_effect=instant_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo READY", cwd=str(tmp_path), notification=spec)
+
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        assert [evt["type"] for evt in events] == ["watch_match", "completion"]
+        assert events[0]["platform"] == "telegram"
+        for evt in events:
+            assert evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
+
+    def test_spawn_via_env_registers_notification_spec_before_poller_can_finish(self, registry):
+        payload = _access_context_payload()
+
+        class FakeEnv:
+            def execute(self, command, **_kwargs):
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command.startswith("cat ") and command.endswith(".log 2>/dev/null"):
+                    return {"output": "READY\n"}
+                if command.startswith("kill -0"):
+                    return {"output": "1\n"}
+                if command.startswith("cat ") and command.endswith(".exit"):
+                    return {"output": "0\n"}
+                raise AssertionError(command)
+
+        def instant_thread(target, args=(), **_kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        spec = ProcessNotificationSpec(
+            notify_on_complete=True,
+            watch_patterns=("READY",),
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="u123",
+            watcher_user_name="alice",
+            watcher_thread_id="42",
+            watcher_message_id="m1",
+            watcher_interval=5,
+            resolved_access_context=payload,
+        )
+
+        with patch("tools.process_registry.threading.Thread", side_effect=instant_thread), \
+             patch("tools.process_registry.time.sleep", return_value=None), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(FakeEnv(), "echo READY", notification=spec)
+
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        assert [evt["type"] for evt in events] == ["watch_match", "completion"]
+        for evt in events:
+            assert evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
@@ -911,6 +1033,59 @@ class TestPopenLeakOnSetupFailure:
         assert session.pid == 7777
 
 
+class TestEnvLeakOnSetupFailure:
+    """Env-backed sandbox processes must not leak if post-launch setup fails."""
+
+    def test_env_pid_killed_when_poller_start_fails(self, registry, tmp_path):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append((command, kwargs))
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command == "kill 4321 2>/dev/null":
+                    return {"output": "", "returncode": 0}
+                raise AssertionError(command)
+
+        fake_thread = MagicMock()
+        fake_thread.start.side_effect = RuntimeError("poller start failed")
+        checkpoint = tmp_path / "procs.json"
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            with pytest.raises(RuntimeError, match="poller start failed"):
+                registry.spawn_via_env(FakeEnv(), "echo hello")
+
+        kill_calls = [(cmd, kwargs) for cmd, kwargs in commands if cmd.startswith("kill ")]
+        assert kill_calls == [("kill 4321 2>/dev/null", {"timeout": 5})]
+        assert registry._running == {}
+        assert json.loads(checkpoint.read_text()) == []
+
+    def test_env_cleanup_failure_preserves_poller_start_error(self, registry, tmp_path):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append((command, kwargs))
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command == "kill 4321 2>/dev/null":
+                    raise OSError("kill failed")
+                raise AssertionError(command)
+
+        fake_thread = MagicMock()
+        fake_thread.start.side_effect = RuntimeError("poller start failed")
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            with pytest.raises(RuntimeError, match="poller start failed"):
+                registry.spawn_via_env(FakeEnv(), "echo hello")
+
+        assert any(cmd == "kill 4321 2>/dev/null" for cmd, _kwargs in commands)
+        assert registry._running == {}
+
+
 # =========================================================================
 # Checkpoint
 # =========================================================================
@@ -945,12 +1120,14 @@ class TestCheckpoint:
     def test_write_checkpoint_includes_watcher_metadata(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
+            payload = _access_context_payload()
             s.watcher_platform = "telegram"
             s.watcher_chat_id = "999"
             s.watcher_user_id = "u123"
             s.watcher_user_name = "alice"
             s.watcher_thread_id = "42"
             s.watcher_interval = 60
+            s.resolved_access_context = payload
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -962,9 +1139,11 @@ class TestCheckpoint:
             assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
+            assert data[0]["resolved_access_context"] == payload
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
+        payload = _access_context_payload()
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
@@ -977,6 +1156,7 @@ class TestCheckpoint:
             "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
+            "resolved_access_context": payload,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
@@ -990,6 +1170,8 @@ class TestCheckpoint:
             assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
+            assert w["resolved_access_context"] == payload
+            assert registry.get("proc_live").resolved_access_context == payload
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"

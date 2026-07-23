@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import os
 import time
 import pytest
 from unittest.mock import patch
@@ -20,6 +21,12 @@ from tools.process_registry import (
     ProcessSession,
     WATCH_STRIKE_LIMIT,
     WATCH_GLOBAL_MAX_PER_WINDOW,
+)
+from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
 )
 
 
@@ -43,6 +50,25 @@ def _make_session(
         watch_patterns=watch_patterns or [],
     )
     return s
+
+
+def _access_context_payload():
+    return serialize_resolved_access_context(
+        ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="123",
+                thread_id=None,
+            ),
+        )
+    )
 
 
 # =========================================================================
@@ -91,6 +117,7 @@ class TestCheckWatchPatterns:
         assert evt["session_id"] == "proc_test_watch"
 
     def test_match_carries_session_key_and_watcher_routing_metadata(self, registry):
+        payload = _access_context_payload()
         session = _make_session(watch_patterns=["ERROR"])
         session.session_key = "agent:main:telegram:group:-100:42"
         session.watcher_platform = "telegram"
@@ -98,6 +125,7 @@ class TestCheckWatchPatterns:
         session.watcher_user_id = "u123"
         session.watcher_user_name = "alice"
         session.watcher_thread_id = "42"
+        session.resolved_access_context = payload
 
         registry._check_watch_patterns(session, "ERROR: disk full\n")
         evt = registry.completion_queue.get_nowait()
@@ -108,6 +136,7 @@ class TestCheckWatchPatterns:
         assert evt["user_id"] == "u123"
         assert evt["user_name"] == "alice"
         assert evt["thread_id"] == "42"
+        assert evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
 
     def test_multiple_patterns(self, registry):
         """First matching pattern is reported."""
@@ -189,7 +218,9 @@ class TestPerSessionRateLimit:
 
     def test_three_strikes_disables_watch_and_promotes_to_notify(self, registry):
         """Three consecutive strike windows → watch_disabled + notify_on_complete."""
+        payload = _access_context_payload()
         session = _make_session(watch_patterns=["E"])
+        session.resolved_access_context = payload
         session.notify_on_complete = False
 
         for strike in range(WATCH_STRIKE_LIMIT):
@@ -217,6 +248,7 @@ class TestPerSessionRateLimit:
                 matches += 1
         assert len(disabled_evts) == 1
         assert "notify_on_complete" in disabled_evts[0]["message"]
+        assert disabled_evts[0][ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
         # We should have had exactly WATCH_STRIKE_LIMIT emissions before disable.
         assert matches == WATCH_STRIKE_LIMIT
 
@@ -303,6 +335,58 @@ class TestCheckpointPersistence:
         count = registry.recover_from_checkpoint()
         # Won't recover since PID is fake, but verify the code path doesn't crash
         assert count == 0
+
+    def test_watch_disabled_checkpoint_recovery_does_not_reactivate_patterns(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """Disabled watch state survives restart and still emits one final completion."""
+        import tools.process_registry as pr_mod
+
+        payload = _access_context_payload()
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
+        session = _make_session(watch_patterns=["E"])
+        session.pid = os.getpid()
+        session.resolved_access_context = payload
+        registry._running[session.id] = session
+
+        for strike in range(WATCH_STRIKE_LIMIT):
+            registry._check_watch_patterns(session, f"E emit {strike}\n")
+            registry._check_watch_patterns(session, f"E drop {strike}\n")
+            session._watch_cooldown_until = time.time() - 0.01
+
+        entries = json.loads(checkpoint.read_text())
+        assert entries[0]["watch_disabled"] is True
+        assert entries[0]["notify_on_complete"] is True
+        assert entries[0]["watch_patterns"] == ["E"]
+        assert entries[0]["resolved_access_context"] == payload
+
+        disabled = []
+        while not registry.completion_queue.empty():
+            evt = registry.completion_queue.get_nowait()
+            if evt.get("type") == "watch_disabled":
+                disabled.append(evt)
+        assert len(disabled) == 1
+
+        recovered_registry = ProcessRegistry()
+        monkeypatch.setattr(recovered_registry, "_write_checkpoint", lambda: None)
+        assert recovered_registry.recover_from_checkpoint() == 1
+        recovered = recovered_registry.get(session.id)
+        assert recovered._watch_disabled is True
+        assert recovered.notify_on_complete is True
+
+        recovered_registry._check_watch_patterns(recovered, "E should not reactivate\n")
+        assert recovered_registry.completion_queue.empty()
+
+        recovered.exited = True
+        recovered.exit_code = 0
+        recovered.output_buffer = "done\n"
+        recovered_registry._move_to_finished(recovered)
+        events = []
+        while not recovered_registry.completion_queue.empty():
+            events.append(recovered_registry.completion_queue.get_nowait())
+        assert [evt["type"] for evt in events] == ["completion"]
+        assert events[0][ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
 
 
 # =========================================================================

@@ -21,6 +21,11 @@ import json
 
 import pytest
 
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
+)
 from gateway.session_context import (
     async_delivery_supported,
     clear_session_vars,
@@ -266,6 +271,22 @@ class TestTerminalNotifyGate:
             terminal_tool(command=command, background=True, notify_on_complete=True)
         )
 
+    def _access_context(self):
+        return ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="123",
+                thread_id=None,
+            ),
+        )
+
     def test_api_server_skips_watcher_and_notes(self):
         from tools.process_registry import process_registry
 
@@ -285,6 +306,7 @@ class TestTerminalNotifyGate:
     def test_gateway_registers_watcher(self):
         from tools.process_registry import process_registry
 
+        context = self._access_context()
         tokens = set_session_vars(
             platform="telegram",
             chat_id="123",
@@ -292,16 +314,20 @@ class TestTerminalNotifyGate:
             user_id="u1",
             session_key="telegram:private:123",
             async_delivery=True,
+            resolved_access_context=context,
         )
         try:
             d = self._run_bg("sleep 30 && echo DONE")
         finally:
             clear_session_vars(tokens)
 
+        payload = serialize_resolved_access_context(context)
         assert d.get("notify_on_complete") is True
         assert not d.get("notify_unsupported")
         assert len(process_registry.pending_watchers) == 1
         assert process_registry.pending_watchers[0]["platform"] == "telegram"
+        assert process_registry.pending_watchers[0]["resolved_access_context"] == payload
+        assert process_registry.get(d["session_id"]).resolved_access_context == payload
 
     def test_cli_stays_supported(self):
         """CLI delivers via the in-process completion_queue: notify stays on,
