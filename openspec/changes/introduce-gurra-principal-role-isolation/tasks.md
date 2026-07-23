@@ -60,6 +60,7 @@
   - 2026-07-22: локальный slice протащил текущий task-local `ResolvedAccessContext` через batch worker submit и inner `child.run_conversation` submit в `delegate_task` через отдельный `contextvars.copy_context()` на каждый concurrent submit; legacy path без context оставлен byte-compatible, checkbox остаётся открытым до полного callback/provider/completion/restart покрытия.
   - 2026-07-23: локальный slice протащил `source.resolved_access_context` в gateway agent cache signature как canonical six-field context fingerprint без raw IDs; malformed context fail-closed через `ValueError`, checkbox остаётся открытым до полного callback/background/cron/compaction/reset/restart/concurrency покрытия.
   - 2026-07-23: локальный ingress slice сделал `_allow_access_registry_ingress` idempotent для любого pre-bound `source.resolved_access_context`: второй gate валидирует existing context и exact delivery target/source match без повторного resolve; tests подтверждают resolve once и external mismatch deny.
+  - 2026-07-23: локальный delegation workspace-hint slice исключил process-global `TERMINAL_CWD`, parent cwd/subdirectory hints и child session-cwd seeding для typed non-owner contexts; typed owner и legacy `None` сохраняют прежний hint/cwd inheritance, checkbox остаётся открытым до полного provider/background/compaction/reset/restart/concurrency покрытия.
 
 ## 4. Role capability enforcement, self cron и scoped secrets
 
@@ -103,6 +104,7 @@
 - [ ] 5.6 Разрешить delegation только для `family_sandbox` и только внутри same `profile_id`, `conversation_scope`, `capabilities` и `delivery_target`.
   - 2026-07-22: локальный slice добавил pre-config/pre-credential/pre-child guard в `delegate_task`: при task-local typed `ResolvedAccessContext` delegation разрешён только для `owner`/`family_sandbox` с literal capability `delegation`; `family_standard`, `shared_room`, unknown и malformed получают categorical redacted tool_error, checkbox остаётся открытым до полного same-profile/sandbox/tool/provider enforcement.
   - 2026-07-22: локальный slice сузил gateway constructor surface: `delegation` появляется у `family_sandbox` только при literal capability `delegation` и configured `delegation`; `terminal`, `browser`, Wolfram и arbitrary MCP не добавляются до отдельных sandbox/backend tasks, same-profile runtime enforcement остаётся.
+  - 2026-07-23: локальный delegation workspace-hint slice не передаёт `WORKSPACE PATH` и не seed'ит child task cwd для typed `family_sandbox`, даже если legacy cwd carriers указывают на foreign host path; same-profile Docker/workspace provisioning и runtime sandbox enforcement остаются.
 
 ## 6. Dashboard Access/Users, lease и audit
 
@@ -145,6 +147,7 @@
   - 2026-07-22: добавлены focused session-store tests для restart compression-tip heal с exact persisted context, missing/malformed/mismatch denial before IO, no DB recovery без routing entry и reset/auto-reset context continuity; checkbox остаётся открытым до broader concurrent/background/callback/cron/delegation/compaction покрытия.
   - 2026-07-22: добавлены focused delegate tests для early deny без credential/child side effects, owner/family_sandbox+delegation allow, immutable six-field context visibility after inner executor hop, batch worker propagation и role=`orchestrator` как child-tree role без access-role изменения; checkbox остаётся открытым до broader background/callback/cron/compaction/restart покрытия.
   - 2026-07-23: добавлены focused agent-cache tests для canonical six-field context fingerprint: omitted==None legacy parity, stable typed context, bust по каждому authority field, malformed dict/object `ValueError` и call-site wiring `source.resolved_access_context` в `_agent_config_signature`; checkbox остаётся открытым до broader concurrent/background/callback/cron/compaction/restart покрытия.
+  - 2026-07-23: добавлены focused delegate tests для workspace/cwd isolation: `family_sandbox` child prompt не содержит foreign `WORKSPACE PATH`, non-owner path не читает `TERMINAL_CWD`/parent cwd candidates и не копирует parent session cwd в child task cwd, owner и legacy `None` сохраняют valid hint/cwd inheritance; broader background/callback/cron/compaction/restart покрытие остаётся.
 - [ ] 8.5 Добавить sandbox tests для symlink escape, host mount denial, network disabled, quotas и owner credential absence.
 - [ ] 8.6 Добавить dashboard lease tests для localhost/SSH tunnel, preview+confirm atomic apply, expiry, manual revoke, no restart resurrection и no content audit.
 - [ ] 8.7 Запустить focused tests for changed modules and specs without live effects.

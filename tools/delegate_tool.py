@@ -676,6 +676,17 @@ def _validate_delegation_access_context() -> Optional[str]:
     return None
 
 
+def _can_inherit_ambient_workspace_state() -> bool:
+    """Whether delegation may inherit parent/global cwd hints."""
+    access_context = get_resolved_access_context()
+    if access_context is None:
+        return True
+    return (
+        isinstance(access_context, ResolvedAccessContext)
+        and access_context.role_id == "owner"
+    )
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -761,6 +772,9 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    if not _can_inherit_ambient_workspace_state():
+        return None
+
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(
@@ -1974,12 +1988,13 @@ def _run_single_child(
         # starting directory while keeping the child's subsequent `cd`s
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
-        try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
+        if _can_inherit_ambient_workspace_state():
+            try:
+                from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
-        except Exception as e:
-            logger.debug("Child cwd seed failed: %s", e)
+                record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            except Exception as e:
+                logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
