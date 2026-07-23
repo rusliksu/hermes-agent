@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import importlib
 import sys
 import threading
@@ -88,7 +87,7 @@ def _context(role_id: str, capabilities=()):
     )
 
 
-def _shared_context(capabilities=()):
+def _shared_context(capabilities=(), *, thread_id=None):
     return ResolvedAccessContext(
         principal_id="room",
         role_id="shared_room",
@@ -100,6 +99,7 @@ def _shared_context(capabilities=()):
             account="bot-a",
             peer_kind="group",
             chat_id="-10001",
+            thread_id=thread_id,
         ),
     )
 
@@ -285,18 +285,36 @@ def test_shared_profile_memory_requires_room_memory_capability_and_config():
 
 def test_access_registry_shared_scope_is_opaque_without_legacy_policy():
     runner = _make_runner()
-    context = _shared_context({"room_memory"})
+    context = _shared_context({"room_memory"}, thread_id="topic-7")
     source = _source(context)
     source.thread_id = "topic-7"
 
     scope = runner._shared_scope_for_source(source)
 
-    expected_digest = hashlib.sha256(b"room-profile\0room").hexdigest()
-    assert scope.memory_namespace == f"access/{expected_digest}"
     assert scope.memory_namespace == shared_memory_namespace_for_access_context(context)
     assert scope.is_topic is True
     assert "room-profile" not in scope.memory_namespace
     assert "room" not in scope.memory_namespace
+    assert "topic-7" not in scope.memory_namespace
+
+
+def test_access_registry_shared_namespaces_split_root_and_topics():
+    root = _shared_context({"room_memory"})
+    topic_7 = _shared_context({"room_memory"}, thread_id="topic-7")
+    topic_8 = _shared_context({"room_memory"}, thread_id="topic-8")
+
+    namespaces = {
+        shared_memory_namespace_for_access_context(root),
+        shared_memory_namespace_for_access_context(topic_7),
+        shared_memory_namespace_for_access_context(topic_8),
+    }
+
+    assert len(namespaces) == 3
+    for namespace in namespaces:
+        assert namespace.startswith("access/")
+        assert "room-profile" not in namespace
+        assert "room" not in namespace
+        assert "topic-" not in namespace
 
 
 def test_access_context_fingerprint_is_opaque_and_six_field_stable():

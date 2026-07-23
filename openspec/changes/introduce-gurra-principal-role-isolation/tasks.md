@@ -12,6 +12,8 @@
 ## 2. Exact multiplex routing и request-path hardening
 
 - [x] 2.1 Подключить exact Telegram DM routing по `platform + account + peer_kind + user_id` с обязательным `user_id == chat_id`.
+  - 2026-07-23: локальный slice расширил shared-room resolver для Telegram topics: exact topic binding имеет приоритет, root binding с `thread_id=None` действует только как parent по exact `platform+account+peer_kind+chat_id`, без owner/default fallback.
+  - 2026-07-23: review-fix вынес единый shared-room selector для ingress и persisted-context validation: active exact выигрывает у stale disabled exact, disabled exact/root parent остаются categorical deny до fallback.
 - [ ] 2.2 Реализовать deny-before-model/session/tools для unknown, missing, malformed, disabled binding и mismatched DM identity.
   - 2026-07-22: добавлен optional runtime `AccessRegistry` gate в `GatewayRunner._handle_message` и focused ingress tests; checkbox остаётся открытым до config/schema loader и cutover без legacy fallback.
   - 2026-07-22: добавлен strict `access_registry` parser в `GatewayConfig.from_dict`, process-only `GatewayConfig.access_registry` и fallback wiring в `GatewayRunner.__init__`; checkbox остаётся открытым до downstream/cutover завершения.
@@ -22,6 +24,7 @@
 - [ ] 2.4 Укрепить request path так, чтобы `HERMES_HOME` и profile home брались из server-bound context, а не из module/import-time cache.
 - [ ] 2.5 Заменить request-path `os.getenv` authority/auth fallbacks на server-bound config/policy providers.
 - [ ] 2.6 Проверить outbound delivery routing только через resolved `delivery_target` без owner default delivery.
+  - 2026-07-23: локальный slice делает shared-room topic `delivery_target` server-derived из trusted incoming identity с точным `thread_id`; disabled exact topic binding deny до parent fallback, unknown room/non-member остаются deny.
 
 ## 3. Sessions, memory, prompt, attachments и context propagation
 
@@ -29,6 +32,7 @@
   - 2026-07-22: локальный slice добавил SQL-level scope для `session_search` browse/FTS/title и ownership-check до read/scroll/bookend I/O по `profile_name + delivery_target` origin; resume/reset/compaction/export/delete и полноценная migration остаются.
 - [ ] 3.2 Привязать memory namespaces, memory hydration, memory commit и memory tools к server-bound context.
   - 2026-07-22: локальный slice привязал built-in `MemoryStore` load/snapshot/tool writes к task-local `ResolvedAccessContext`, добавил fail-closed guard до memory mkdir/read/write и redacted `memory_access_denied`; external provider commit/full prompt layering/migration ещё остаются.
+  - 2026-07-23: локальный slice добавил delivery thread dimension в opaque shared memory namespace: root и разные topics одного room теперь получают разные `access/<sha256>` namespaces без raw IDs.
 - [ ] 3.3 Реализовать prompt layering: security layer -> read-only role layer -> scope layer -> private USER/memory layer.
 - [ ] 3.4 Исключить private USER/memory из shared room prompts и не импортировать private context между profiles.
 - [ ] 3.5 Привязать attachments, generated files и workspaces к resolved profile boundary и room scope.
@@ -93,6 +97,7 @@
 - [ ] 7.5 Перенести ambiguous legacy sessions только в closed read-only legacy archive с hashes/counts и без active search/memory/prompt/tool visibility.
 - [ ] 7.6 Исключить global `MEMORY.md`, global `USER.md` и personal context из family/shared imports.
 - [ ] 7.7 Сохранить room topics как separate namespace inside room profile и не склеивать DM history с room history.
+  - 2026-07-23: локальный slice разделил root/topic shared-room contexts через `delivery_target.thread_id` в namespace helper и registry validation; pending fingerprint уже включает полный context и разделяется тем же полем.
 - [ ] 7.8 Реализовать rollback, который восстанавливает saved profile mappings и migrated data from verified backup или отказывает с explicit error.
 
 ## 8. Focused и full tests
@@ -103,6 +108,7 @@
   - 2026-07-22: добавлены focused tests для typed role/capability/config toolset intersection, malformed/unknown role empty surface, no-tools as `[]`, typed shared memory/web/vision intersection и mocked `_run_agent` assertion, что shared override не открывает memory без `room_memory`; guessed IDs по attachments/filesystem/browser/sandbox/MCP остаются.
   - 2026-07-22: добавлены focused tests для guessed `session_id`, model-supplied profile, foreign profile, same-profile foreign DM/thread и malformed/shared/unknown/missing-db `session_search` denial before transcript I/O; memory namespaces/attachments/delivery broader coverage остаётся.
   - 2026-07-22: добавлены focused tests для guessed/mismatched memory namespace/profile/path: family/shared memory guard denies missing capability, malformed/unknown/mismatched context, stale snapshot, shared USER и `/memory --namespace` args до I/O; attachments/delivery/callback broader coverage остаётся.
+  - 2026-07-23: добавлены focused tests для topic-scoped shared-room routing: root topic allow, exact override, disabled exact deny, namespace separation root/two topics, context tamper deny, non-member и unknown room deny.
 - [ ] 8.4 Добавить concurrent/background/callback/cron/delegation/compaction/reset/restart tests с persisted context validation.
   - 2026-07-22: добавлены focused session-store tests для restart compression-tip heal с exact persisted context, missing/malformed/mismatch denial before IO, no DB recovery без routing entry и reset/auto-reset context continuity; checkbox остаётся открытым до broader concurrent/background/callback/cron/delegation/compaction покрытия.
   - 2026-07-22: добавлены focused delegate tests для early deny без credential/child side effects, owner/family_sandbox+delegation allow, immutable six-field context visibility after inner executor hop, batch worker propagation и role=`orchestrator` как child-tree role без access-role изменения; checkbox остаётся открытым до broader background/callback/cron/compaction/restart покрытия.

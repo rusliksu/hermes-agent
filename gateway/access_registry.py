@@ -223,7 +223,18 @@ def shared_memory_namespace_for_access_context(context: Any) -> str:
     )
     if resolved.role_id != "shared_room":
         raise ValueError("wrong_role")
-    canonical = f"{resolved.profile_id}\0{resolved.conversation_scope}".encode("utf-8")
+    target = resolved.delivery_target
+    canonical = "\0".join(
+        (
+            resolved.profile_id,
+            resolved.conversation_scope,
+            target.platform,
+            target.account,
+            target.peer_kind,
+            target.chat_id,
+            target.thread_id or "root",
+        )
+    ).encode("utf-8")
     return f"access/{hashlib.sha256(canonical).hexdigest()}"
 
 
@@ -614,7 +625,10 @@ class AccessRegistry:
         if not self.validate().valid:
             raise AccessDeniedError("registry_validation_failed", audit)
         if not matches:
-            raise AccessDeniedError("resolved_access_context_mismatch", audit)
+            shared_context = self._validate_derived_shared_context(context, audit)
+            if shared_context is None:
+                raise AccessDeniedError("resolved_access_context_mismatch", audit)
+            return shared_context
         return matches[0]
 
     def effective_capabilities(self, role_id: str, conversation_scope: str) -> frozenset[str]:
@@ -660,36 +674,115 @@ class AccessRegistry:
         identity: TransportIdentity,
         audit: RedactedAuditMetadata,
     ) -> ResolvedAccessContext:
-        disabled_matches = [
-            binding
-            for binding in self.shared_scope_bindings
-            if (
-                not binding.active
-                and _valid_room_identity(binding.room_identity)
-            )
-            and _room_key(binding.room_identity) == _room_key(identity)
-        ]
-        matches = [
+        binding, parent_match = self._select_shared_scope_binding(identity, audit)
+        member = ParticipantIdentity(identity.platform, identity.account, identity.user_id)
+        if member.key() not in {participant.key() for participant in binding.participant_identities}:
+            raise AccessDeniedError("participant_not_member", audit)
+        self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
+        return self._context_from_binding(
+            binding,
+            delivery_target=_delivery_target_from_room_identity(identity)
+            if parent_match
+            else None,
+        )
+
+    def _select_shared_scope_binding(
+        self,
+        identity: TransportIdentity,
+        audit: RedactedAuditMetadata,
+        *,
+        allow_missing: bool = False,
+    ) -> Optional[tuple[SharedScopeBinding, bool]]:
+        active_exact = [
             binding
             for binding in self.shared_scope_bindings
             if (
                 binding.active
                 and _valid_room_identity(binding.room_identity)
+                and _room_key(binding.room_identity) == _room_key(identity)
             )
-            and _room_key(binding.room_identity) == _room_key(identity)
         ]
-        if not matches and disabled_matches:
+        if active_exact:
+            return _single_match(active_exact, "shared_scope_binding", audit), False
+
+        disabled_exact = [
+            binding
+            for binding in self.shared_scope_bindings
+            if (
+                not binding.active
+                and _valid_room_identity(binding.room_identity)
+                and _room_key(binding.room_identity) == _room_key(identity)
+            )
+        ]
+        if disabled_exact:
             raise AccessDeniedError("disabled_shared_scope_binding", audit)
-        binding = _single_match(matches, "shared_scope_binding", audit)
-        member = ParticipantIdentity(identity.platform, identity.account, identity.user_id)
-        if member.key() not in {participant.key() for participant in binding.participant_identities}:
-            raise AccessDeniedError("participant_not_member", audit)
-        self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
-        return self._context_from_binding(binding)
+
+        if identity.thread_id is not None:
+            active_parent = [
+                binding
+                for binding in self.shared_scope_bindings
+                if (
+                    binding.active
+                    and _valid_room_identity(binding.room_identity)
+                    and binding.room_identity.thread_id is None
+                    and _room_parent_key(binding.room_identity) == _room_parent_key(identity)
+                )
+            ]
+            if active_parent:
+                return _single_match(active_parent, "shared_scope_binding", audit), True
+
+            disabled_parent = [
+                binding
+                for binding in self.shared_scope_bindings
+                if (
+                    not binding.active
+                    and _valid_room_identity(binding.room_identity)
+                    and binding.room_identity.thread_id is None
+                    and _room_parent_key(binding.room_identity) == _room_parent_key(identity)
+                )
+            ]
+            if disabled_parent:
+                raise AccessDeniedError("disabled_shared_scope_binding", audit)
+
+        if allow_missing:
+            return None
+        raise AccessDeniedError("missing_shared_scope_binding", audit)
+
+    def _validate_derived_shared_context(
+        self,
+        context: ResolvedAccessContext,
+        audit: RedactedAuditMetadata,
+    ) -> Optional[ResolvedAccessContext]:
+        target = context.delivery_target
+        if target.peer_kind == "dm" or target.thread_id is None:
+            return None
+        identity = TransportIdentity(
+            platform=target.platform,
+            account=target.account,
+            peer_kind=target.peer_kind,
+            user_id="validation-only",
+            chat_id=target.chat_id,
+            thread_id=target.thread_id,
+        )
+        if not _valid_room_identity(identity):
+            return None
+        selected = self._select_shared_scope_binding(identity, audit, allow_missing=True)
+        if selected is None:
+            return None
+        binding, parent_match = selected
+        expected = self._context_from_binding(
+            binding,
+            delivery_target=_delivery_target_from_room_identity(identity)
+            if parent_match
+            else None,
+        )
+        return expected if expected == context else None
 
     def _context_from_binding(
         self,
         binding: PrincipalBinding | SharedScopeBinding,
+        *,
+        delivery_target: Optional[DeliveryTarget] = None,
     ) -> ResolvedAccessContext:
         return ResolvedAccessContext(
             principal_id=binding.principal_id,
@@ -697,7 +790,7 @@ class AccessRegistry:
             profile_id=binding.profile_id,
             conversation_scope=binding.conversation_scope,
             capabilities=self.effective_capabilities(binding.role_id, binding.conversation_scope),
-            delivery_target=binding.delivery_target,
+            delivery_target=delivery_target or binding.delivery_target,
         )
 
     def _active_resolved_contexts(self) -> tuple[ResolvedAccessContext, ...]:
@@ -795,6 +888,25 @@ def _room_key(identity: TransportIdentity) -> tuple[str, str, str, str, Optional
         identity.peer_kind,
         identity.chat_id,
         identity.thread_id,
+    )
+
+
+def _room_parent_key(identity: TransportIdentity) -> tuple[str, str, str, str]:
+    return (
+        identity.platform,
+        identity.account,
+        identity.peer_kind,
+        identity.chat_id,
+    )
+
+
+def _delivery_target_from_room_identity(identity: TransportIdentity) -> DeliveryTarget:
+    return DeliveryTarget(
+        platform=identity.platform,
+        account=identity.account,
+        peer_kind=identity.peer_kind,
+        chat_id=identity.chat_id,
+        thread_id=identity.thread_id,
     )
 
 

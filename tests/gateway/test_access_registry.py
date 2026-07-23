@@ -20,6 +20,7 @@ from gateway.access_registry import (
     compare_legacy_access_resolution,
     deserialize_resolved_access_context,
     serialize_resolved_access_context,
+    shared_memory_namespace_for_access_context,
 )
 
 
@@ -190,6 +191,32 @@ def _shared_bindings() -> tuple[SharedScopeBinding, ...]:
                 ParticipantIdentity("telegram", ACCOUNT, "opaque-family-1"),
             ),
         ),
+    )
+
+
+def _topic_binding(
+    *,
+    principal_id: str = "principal-room-topic",
+    profile_id: str = "room-profile-1",
+    conversation_scope: str = "room-1",
+    active: bool = True,
+) -> SharedScopeBinding:
+    identity = _group_identity(
+        "opaque-room-0",
+        "ignored-member",
+        thread_id="topic-7",
+    )
+    return SharedScopeBinding(
+        principal_id=principal_id,
+        role_id="shared_room",
+        profile_id=profile_id,
+        room_identity=identity,
+        conversation_scope=conversation_scope,
+        delivery_target=_target(identity),
+        participant_identities=(
+            ParticipantIdentity("telegram", ACCOUNT, "opaque-family-0"),
+        ),
+        active=active,
     )
 
 
@@ -635,6 +662,158 @@ def test_shared_room_requires_exact_binding_and_membership_without_role_elevatio
 
     with pytest.raises(AccessDeniedError) as exc:
         registry.resolve(_group_identity("unknown-room", "opaque-family-0"))
+    assert exc.value.reason == "missing_shared_scope_binding"
+
+
+def test_root_shared_room_binding_resolves_member_topics_with_derived_delivery():
+    registry = _registry()
+
+    context = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+    )
+
+    assert context.principal_id == "principal-room-0"
+    assert context.role_id == "shared_room"
+    assert context.profile_id == "room-profile-0"
+    assert context.conversation_scope == "room-0"
+    assert context.capabilities == ROOM_CAPS
+    assert context.delivery_target == DeliveryTarget(
+        platform="telegram",
+        account=ACCOUNT,
+        peer_kind="group",
+        chat_id="opaque-room-0",
+        thread_id="topic-7",
+    )
+    assert registry.validate_resolved_context(context) == context
+
+
+def test_exact_topic_shared_binding_overrides_root_binding():
+    root = _shared_bindings()[0]
+    exact = _topic_binding()
+    registry = _registry(shared_bindings=(root, exact))
+
+    context = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+    )
+
+    assert context.principal_id == "principal-room-topic"
+    assert context.profile_id == "room-profile-1"
+    assert context.conversation_scope == "room-1"
+    assert context.delivery_target.thread_id == "topic-7"
+    assert registry.validate_resolved_context(context) == context
+
+
+def test_active_exact_topic_binding_wins_over_stale_disabled_exact_binding():
+    root = _shared_bindings()[0]
+    exact = _topic_binding()
+    stale_disabled_exact = _topic_binding(
+        principal_id="principal-stale-disabled-topic",
+        active=False,
+    )
+    registry = _registry(shared_bindings=(root, stale_disabled_exact, exact))
+
+    context = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+    )
+
+    assert context.principal_id == "principal-room-topic"
+    assert context.profile_id == "room-profile-1"
+    assert context.conversation_scope == "room-1"
+    assert registry.validate_resolved_context(context) == context
+
+
+def test_disabled_exact_topic_binding_denies_without_parent_fallback():
+    root = _shared_bindings()[0]
+    disabled_exact = _topic_binding(
+        principal_id="principal-disabled-topic",
+        active=False,
+    )
+    registry = _registry(shared_bindings=(root, disabled_exact))
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.resolve(
+            _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+        )
+
+    assert exc.value.reason == "disabled_shared_scope_binding"
+
+
+def test_disabled_root_shared_binding_denies_topic_without_missing_fallback():
+    disabled_root = replace(_shared_bindings()[0], active=False)
+    registry = _registry(shared_bindings=(disabled_root,))
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.resolve(
+            _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+        )
+
+    assert exc.value.reason == "disabled_shared_scope_binding"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda context: replace(
+            context,
+            delivery_target=replace(context.delivery_target, thread_id="topic-8"),
+        ),
+        lambda context: replace(context, profile_id="room-profile-0"),
+        lambda context: replace(context, conversation_scope="room-0"),
+        lambda context: replace(context, capabilities=frozenset({"public_web"})),
+    ],
+)
+def test_validate_resolved_context_rejects_tampered_topic_context(mutate):
+    root = _shared_bindings()[0]
+    exact = _topic_binding()
+    registry = _registry(shared_bindings=(root, exact))
+    context = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+    )
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.validate_resolved_context(mutate(context))
+
+    assert exc.value.reason == "resolved_access_context_mismatch"
+
+
+def test_topic_shared_namespaces_include_delivery_thread_dimension_without_raw_ids():
+    registry = _registry()
+    root = registry.resolve(_group_identity("opaque-room-0", "opaque-family-0"))
+    topic_7 = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-7")
+    )
+    topic_8 = registry.resolve(
+        _group_identity("opaque-room-0", "opaque-family-0", thread_id="topic-8")
+    )
+
+    namespaces = {
+        shared_memory_namespace_for_access_context(root),
+        shared_memory_namespace_for_access_context(topic_7),
+        shared_memory_namespace_for_access_context(topic_8),
+    }
+
+    assert len(namespaces) == 3
+    for namespace in namespaces:
+        assert namespace.startswith("access/")
+        assert "opaque-room-0" not in namespace
+        assert "topic-" not in namespace
+        assert "room-profile" not in namespace
+        assert "room-0" not in namespace
+
+
+def test_topic_shared_room_non_member_and_unknown_room_stay_denied():
+    registry = _registry()
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.resolve(
+            _group_identity("opaque-room-0", "opaque-family-1", thread_id="topic-7")
+        )
+    assert exc.value.reason == "participant_not_member"
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.resolve(
+            _group_identity("unknown-room", "opaque-family-0", thread_id="topic-7")
+        )
     assert exc.value.reason == "missing_shared_scope_binding"
 
 
