@@ -37,6 +37,7 @@ from gateway.session_context import (
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    bind_resolved_access_context,
     get_resolved_access_context,
     reset_session_vars,
     set_session_vars,
@@ -217,6 +218,16 @@ def test_reset_session_vars_restores_resolved_access_context_unset():
     set_session_vars(**MINE, resolved_access_context={"principal_id": "mine"})
     reset_session_vars()
     assert _RESOLVED_ACCESS_CONTEXT.get() is _UNSET
+    assert get_resolved_access_context() is None
+
+
+def test_bind_resolved_access_context_is_nest_safe_and_restores_token():
+    reset_session_vars()
+    with bind_resolved_access_context({"principal_id": "outer"}):
+        assert get_resolved_access_context() == {"principal_id": "outer"}
+        with bind_resolved_access_context({"principal_id": "inner"}):
+            assert get_resolved_access_context() == {"principal_id": "inner"}
+        assert get_resolved_access_context() == {"principal_id": "outer"}
     assert get_resolved_access_context() is None
 
 

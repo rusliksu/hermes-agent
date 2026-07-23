@@ -111,8 +111,14 @@ def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
-def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
+def stage_write(
+    subsystem: str,
+    payload: Dict[str, Any],
+    *,
+    summary: str,
+    origin: str,
+    scope_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
 
     Args:
@@ -139,6 +145,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    if scope_key is not None:
+        record["scope_key"] = scope_key
     try:
         d = _pending_dir(subsystem)
         d.mkdir(parents=True, exist_ok=True)
@@ -151,7 +159,11 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     return record
 
 
-def list_pending(subsystem: str) -> List[Dict[str, Any]]:
+def _record_matches_scope(record: Dict[str, Any], scope_key: Optional[str]) -> bool:
+    return scope_key is None or record.get("scope_key") == scope_key
+
+
+def list_pending(subsystem: str, *, scope_key: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
     d = _pending_dir(subsystem)
     if not d.exists():
@@ -159,29 +171,46 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for p in d.glob("*.json"):
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            record = json.loads(p.read_text(encoding="utf-8"))
+            if _record_matches_scope(record, scope_key):
+                records.append(record)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
     return records
 
 
-def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
+def get_pending(
+    subsystem: str,
+    pending_id: str,
+    *,
+    scope_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        return record if _record_matches_scope(record, scope_key) else None
     except Exception:
         return None
 
 
-def discard_pending(subsystem: str, pending_id: str) -> bool:
+def discard_pending(
+    subsystem: str,
+    pending_id: str,
+    *,
+    scope_key: Optional[str] = None,
+) -> bool:
     """Delete a pending record. Returns True if it existed."""
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
         if path.exists():
+            if scope_key is not None:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if not _record_matches_scope(record, scope_key):
+                    return False
             path.unlink()
             return True
     except Exception as e:  # pragma: no cover
@@ -189,8 +218,10 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
     return False
 
 
-def pending_count(subsystem: str) -> int:
+def pending_count(subsystem: str, *, scope_key: Optional[str] = None) -> int:
     """Cheap count of pending records (for notification badges)."""
+    if scope_key is not None:
+        return len(list_pending(subsystem, scope_key=scope_key))
     d = _pending_dir(subsystem)
     if not d.exists():
         return 0

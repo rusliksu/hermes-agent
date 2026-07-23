@@ -30,8 +30,8 @@ def _fmt_state(subsystem: str) -> str:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_pending_list(subsystem: str) -> str:
-    records = wa.list_pending(subsystem)
+def _fmt_pending_list(subsystem: str, *, pending_scope_key: Optional[str] = None) -> str:
+    records = wa.list_pending(subsystem, scope_key=pending_scope_key)
     if not records:
         return f"No pending {subsystem} writes."
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
@@ -57,6 +57,7 @@ def handle_pending_subcommand(
     *,
     memory_store=None,
     set_mode_fn=None,
+    pending_scope_key: Optional[str] = None,
 ) -> Optional[str]:
     """Dispatch a /memory or /skills subcommand.
 
@@ -76,22 +77,25 @@ def handle_pending_subcommand(
     """
     if not args:
         # Bare /memory or /skills with no sub → show pending + gate state.
-        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
+        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(
+            subsystem,
+            pending_scope_key=pending_scope_key,
+        )
 
     sub = args[0].lower()
     rest = args[1:]
 
     if sub == "pending":
-        return _fmt_pending_list(subsystem)
+        return _fmt_pending_list(subsystem, pending_scope_key=pending_scope_key)
 
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(subsystem, rest, memory_store, pending_scope_key=pending_scope_key)
 
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, pending_scope_key=pending_scope_key)
 
     if sub == "diff" and subsystem == wa.SKILLS:
-        return _diff(rest)
+        return _diff(rest, pending_scope_key=pending_scope_key)
 
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
@@ -105,19 +109,25 @@ def _resolve_one(subsystem: str, rest: List[str]):
     return rest[0], None
 
 
-def _approve(subsystem: str, rest: List[str], memory_store) -> str:
+def _approve(
+    subsystem: str,
+    rest: List[str],
+    memory_store,
+    *,
+    pending_scope_key: Optional[str] = None,
+) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
 
-    records = wa.list_pending(subsystem)
+    records = wa.list_pending(subsystem, scope_key=pending_scope_key)
     if not records:
         return f"No pending {subsystem} writes."
 
     if target.lower() == "all":
         targets = list(records)
     else:
-        rec = wa.get_pending(subsystem, target)
+        rec = wa.get_pending(subsystem, target, scope_key=pending_scope_key)
         if not rec:
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
@@ -126,7 +136,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     for rec in targets:
         ok, msg = _apply_one(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
+            wa.discard_pending(subsystem, rec["id"], scope_key=pending_scope_key)
             applied += 1
         else:
             failed.append(f"{rec['id']}: {msg}")
@@ -155,25 +165,30 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e)
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(
+    subsystem: str,
+    rest: List[str],
+    *,
+    pending_scope_key: Optional[str] = None,
+) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
         n = 0
-        for rec in wa.list_pending(subsystem):
-            if wa.discard_pending(subsystem, rec["id"]):
+        for rec in wa.list_pending(subsystem, scope_key=pending_scope_key):
+            if wa.discard_pending(subsystem, rec["id"], scope_key=pending_scope_key):
                 n += 1
         return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
+    if wa.discard_pending(subsystem, target, scope_key=pending_scope_key):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."
 
 
-def _diff(rest: List[str]) -> str:
+def _diff(rest: List[str], *, pending_scope_key: Optional[str] = None) -> str:
     if not rest:
         return "Usage: /skills diff <id>"
-    rec = wa.get_pending(wa.SKILLS, rest[0])
+    rec = wa.get_pending(wa.SKILLS, rest[0], scope_key=pending_scope_key)
     if not rec:
         return f"No pending skill write with id '{rest[0]}'."
     diff = wa.skill_pending_diff(rec)

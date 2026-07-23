@@ -63,6 +63,7 @@ from gateway.access_registry import (
     AccessDeniedError,
     RedactedAuditMetadata,
     ResolvedAccessContext,
+    shared_memory_namespace_for_access_context,
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -3769,6 +3770,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _shared_scope_for_source(self, source: SessionSource):
+        context = getattr(source, "resolved_access_context", None)
+        if context is not None:
+            try:
+                namespace = shared_memory_namespace_for_access_context(context)
+            except ValueError:
+                return None
+            from gateway.single_principal import SharedTelegramScope
+
+            return SharedTelegramScope(
+                memory_namespace=namespace,
+                is_topic=bool(getattr(source, "thread_id", None)),
+            )
         policy = getattr(self, "_single_principal_policy", None)
         if policy is None:
             return None
@@ -3792,6 +3805,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         role_capability_toolsets = {
             "family_standard": {
+                "memory_search": "memory",
                 "public_web": "web",
                 "vision": "vision",
                 "image_generation": "image_gen",
@@ -3800,6 +3814,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "self_reminder": "cronjob",
             },
             "family_sandbox": {
+                "memory_search": "memory",
                 "public_web": "web",
                 "vision": "vision",
                 "image_generation": "image_gen",
@@ -3865,6 +3880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expected_tool_names: frozenset[str] = frozenset({"memory"}),
     ) -> None:
         from tools.memory_tool import MemoryStore
+        from gateway.session_context import get_resolved_access_context
 
         if set(getattr(agent, "valid_tool_names", set())) != set(expected_tool_names):
             raise RuntimeError("shared capability profile validation failed")
@@ -3874,6 +3890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_char_limit=memory_config.get("user_char_limit", 1375),
             memory_dir=memory_dir,
             allow_user_profile=False,
+            access_context=get_resolved_access_context(None),
         )
         store.load_from_disk()
         agent._memory_store = store

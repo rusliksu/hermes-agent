@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
@@ -350,6 +351,16 @@ def get_resolved_access_context(default: Any = None) -> Any:
     if value is _UNSET:
         return default
     return value
+
+
+@contextmanager
+def bind_resolved_access_context(resolved_access_context: Any):
+    """Temporarily bind only the task-local server-owned access context."""
+    token = _RESOLVED_ACCESS_CONTEXT.set(resolved_access_context)
+    try:
+        yield
+    finally:
+        _RESOLVED_ACCESS_CONTEXT.reset(token)
 
 
 def declare_stateless_channel() -> None:

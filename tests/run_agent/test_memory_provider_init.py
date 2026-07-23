@@ -3,6 +3,9 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context, reset_session_vars
+
 
 class RecordingMemoryProvider:
     name = "recording"
@@ -23,6 +26,22 @@ class RecordingMemoryProvider:
 
     def shutdown(self):
         pass
+
+
+def _access_context(role_id="family_standard") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal",
+        role_id=role_id,
+        profile_id="profile",
+        conversation_scope="private",
+        capabilities=frozenset({"memory_search"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="10001",
+        ),
+    )
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():
@@ -92,6 +111,80 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+def test_typed_non_owner_context_does_not_initialize_external_memory_provider():
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    reset_session_vars()
+
+    with (
+        bind_resolved_access_context(_access_context("family_standard")),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider) as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-family",
+            platform="telegram",
+        )
+
+    reset_session_vars()
+    assert agent._memory_manager is None
+    assert provider.init_kwargs is None
+    load_memory_provider.assert_not_called()
+
+
+def test_builtin_memory_hydration_failure_clears_store_and_flags():
+    cfg = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "provider": "",
+        },
+        "agent": {},
+    }
+
+    class FailingMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def load_from_disk(self):
+            raise RuntimeError("memory_access_denied")
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("tools.memory_tool.MemoryStore", FailingMemoryStore),
+        patch("plugins.memory.load_memory_provider") as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_store is None
+    assert agent._memory_enabled is False
+    assert agent._user_profile_enabled is False
+    load_memory_provider.assert_not_called()
 
 
 class CoreShadowProvider:

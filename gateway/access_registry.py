@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
@@ -197,6 +199,32 @@ def deserialize_resolved_access_context(data: Any) -> ResolvedAccessContext:
         capabilities=_deserialize_capabilities(context["capabilities"]),
         delivery_target=_deserialize_delivery_target(context["delivery_target"]),
     )
+
+
+def canonical_access_context_fingerprint(context: Any) -> str:
+    """Return an opaque stable fingerprint for a strict six-field context."""
+    canonical = json.dumps(
+        serialize_resolved_access_context(
+            deserialize_resolved_access_context(
+                serialize_resolved_access_context(context)
+            )
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def shared_memory_namespace_for_access_context(context: Any) -> str:
+    """Return the opaque shared-memory namespace for a shared_room context."""
+    resolved = deserialize_resolved_access_context(
+        serialize_resolved_access_context(context)
+    )
+    if resolved.role_id != "shared_room":
+        raise ValueError("wrong_role")
+    canonical = f"{resolved.profile_id}\0{resolved.conversation_scope}".encode("utf-8")
+    return f"access/{hashlib.sha256(canonical).hexdigest()}"
 
 
 @dataclass(frozen=True)

@@ -3013,39 +3013,109 @@ class GatewaySlashCommandsMixin:
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
         """
-        from gateway.run import _hermes_home
+        from contextlib import nullcontext
+
+        from hermes_constants import get_hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
-        session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        source = event.source
+        registry = getattr(self, "access_registry", None)
+        access_context = None
+        shared_scope = None
+        profile_home = None
+        pending_scope_key = None
+        if registry is not None:
+            try:
+                from gateway.access_registry import canonical_access_context_fingerprint
 
-        def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
-            atomic_config_write(config_path, user_config)
-            # New setting must take effect next message → drop cached agent.
-            self._evict_cached_agent(session_key)
+                access_context = registry.validate_resolved_context(
+                    getattr(source, "resolved_access_context", None)
+                )
+                role_id = getattr(access_context, "role_id", None)
+                capabilities = getattr(access_context, "capabilities", frozenset())
+                if role_id == "owner":
+                    pass
+                elif role_id in {"family_standard", "family_sandbox"}:
+                    if "memory_search" not in capabilities:
+                        return "Memory access denied."
+                elif role_id == "shared_room":
+                    if "room_memory" not in capabilities:
+                        return "Memory access denied."
+                    shared_scope = self._shared_scope_for_source(source)
+                    if shared_scope is None:
+                        return "Memory access denied."
+                else:
+                    return "Memory access denied."
+                pending_scope_key = canonical_access_context_fingerprint(access_context)
+                profile_home = self._resolve_profile_home_for_source(source)
+            except Exception:
+                return "Memory access denied."
 
-        # Apply approved writes against a fresh on-disk store (the gateway has
-        # no long-lived agent; the store persists to the same MEMORY/USER.md).
-        # load_on_disk_store() honors the user's configured char limits.
-        store = load_on_disk_store()
+        runtime_scope = nullcontext()
+        context_scope = nullcontext()
+        if registry is not None:
+            from gateway.run import _profile_runtime_scope
+            from gateway.session_context import bind_resolved_access_context
 
-        out = handle_pending_subcommand(
-            wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
-        )
-        if out is None:
-            out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
-                   "reject <id>, approval <on|off>.")
-        return out
+            runtime_scope = _profile_runtime_scope(profile_home)
+            context_scope = bind_resolved_access_context(access_context)
+
+        with runtime_scope:
+            with context_scope:
+                session_key = self._session_key_for_source(source)
+                config_path = get_hermes_home() / "config.yaml"
+
+                def _set_approval(enabled: bool):
+                    import yaml
+                    user_config = {}
+                    if config_path.exists():
+                        with open(config_path, encoding="utf-8") as f:
+                            user_config = yaml.safe_load(f) or {}
+                    user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
+                    atomic_config_write(config_path, user_config)
+                    # New setting must take effect next message → drop cached agent.
+                    self._evict_cached_agent(session_key)
+
+                memory_dir = None
+                allow_user_profile = True
+                if shared_scope is not None:
+                    memory_dir = (
+                        get_hermes_home()
+                        / "memories"
+                        / "shared"
+                        / shared_scope.memory_namespace
+                    )
+                    allow_user_profile = False
+
+                # Apply approved writes against a fresh on-disk store (the gateway has
+                # no long-lived agent; the store persists to the same MEMORY/USER.md).
+                # load_on_disk_store() honors the user's configured char limits.
+                try:
+                    store = load_on_disk_store(
+                        memory_dir=memory_dir,
+                        allow_user_profile=allow_user_profile,
+                        access_context=access_context,
+                    )
+
+                    out = handle_pending_subcommand(
+                        wa.MEMORY,
+                        args,
+                        memory_store=store,
+                        set_mode_fn=_set_approval,
+                        pending_scope_key=pending_scope_key,
+                    )
+                except Exception:
+                    if registry is None:
+                        raise
+                    return "Memory access denied."
+                if out is None:
+                    out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
+                           "reject <id>, approval <on|off>.")
+                return out
 
     async def _handle_skills_command(self, event: MessageEvent) -> str:
         """Handle /skills on the gateway — pending skill-write review only.
