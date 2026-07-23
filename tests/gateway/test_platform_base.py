@@ -21,6 +21,24 @@ from gateway.platforms.base import (
 )
 
 
+def _resolved_context(profile_id: str):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+    return ResolvedAccessContext(
+        principal_id=f"principal-{profile_id or 'blank'}",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope=f"dm:{profile_id or 'blank'}",
+        capabilities=frozenset({"attachments"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="acct",
+            peer_kind="dm",
+            chat_id="chat",
+        ),
+    )
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 
@@ -1504,6 +1522,76 @@ class TestMediaDeliveryDefaultMode:
         assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
 
 
+class TestScopedMediaDelivery:
+    def _use_home(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", ())
+        return hermes_home
+
+    def _file(self, path, data=b"x"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_legacy_none_keeps_profile_cache_and_default_mode(self, tmp_path, monkeypatch):
+        from gateway.session_context import bind_resolved_access_context
+
+        hermes_home = self._use_home(monkeypatch, tmp_path)
+        profile_cache = self._file(hermes_home / "profiles" / "a" / "cache" / "images" / "a.png")
+        host_file = self._file(tmp_path / "fresh.pdf", b"%PDF")
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_home)
+
+        with bind_resolved_access_context(None):
+            assert BasePlatformAdapter.validate_media_delivery_path(str(profile_cache)) == str(profile_cache.resolve())
+            assert BasePlatformAdapter.validate_media_delivery_path(str(host_file)) == str(host_file.resolve())
+
+    def test_typed_profile_allows_only_current_profile_cache(self, tmp_path, monkeypatch):
+        from gateway.session_context import bind_resolved_access_context
+
+        hermes_home = self._use_home(monkeypatch, tmp_path)
+        a = self._file(hermes_home / "profiles" / "a" / "cache" / "images" / "a.png")
+        b = self._file(hermes_home / "profiles" / "b" / "cache" / "images" / "b.png")
+        fresh = self._file(tmp_path / "fresh.pdf", b"%PDF")
+
+        with bind_resolved_access_context(_resolved_context("a")):
+            assert BasePlatformAdapter.validate_media_delivery_path(str(a)) == str(a.resolve())
+            assert BasePlatformAdapter.validate_media_delivery_path(str(b)) is None
+            assert BasePlatformAdapter.validate_media_delivery_path(str(fresh)) is None
+
+    def test_typed_default_profile_uses_default_cache_only(self, tmp_path, monkeypatch):
+        from gateway.session_context import bind_resolved_access_context
+
+        hermes_home = self._use_home(monkeypatch, tmp_path)
+        default_doc = self._file(hermes_home / "cache" / "documents" / "report.pdf", b"%PDF")
+        named_doc = self._file(hermes_home / "profiles" / "a" / "cache" / "documents" / "report.pdf", b"%PDF")
+
+        with bind_resolved_access_context(_resolved_context("default")):
+            assert BasePlatformAdapter.validate_media_delivery_path(str(default_doc)) == str(default_doc.resolve())
+            assert BasePlatformAdapter.validate_media_delivery_path(str(named_doc)) is None
+
+    def test_malformed_context_rejects_otherwise_allowed_file(self, tmp_path, monkeypatch):
+        from gateway.session_context import bind_resolved_access_context
+
+        allowed = self._file(tmp_path / "allowed" / "report.pdf", b"%PDF")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (allowed.parent,))
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+
+        with bind_resolved_access_context({"profile_id": "a"}):
+            assert BasePlatformAdapter.validate_media_delivery_path(str(allowed)) is None
+
+    def test_blank_and_unknown_profile_have_no_roots(self, tmp_path, monkeypatch):
+        from gateway.session_context import bind_resolved_access_context
+
+        hermes_home = self._use_home(monkeypatch, tmp_path)
+        default_doc = self._file(hermes_home / "cache" / "documents" / "report.pdf", b"%PDF")
+
+        for context in (_resolved_context(""), _resolved_context("missing")):
+            with bind_resolved_access_context(context):
+                assert BasePlatformAdapter.validate_media_delivery_path(str(default_doc)) is None
+
+
 # ---------------------------------------------------------------------------
 # should_send_media_as_audio
 # ---------------------------------------------------------------------------
@@ -2031,6 +2119,68 @@ class _CapturingAdapter(BasePlatformAdapter):
             "metadata": metadata,
         })
         return SendResult(success=True, message_id="m1")
+
+
+class _DocumentCapturingAdapter(_CapturingAdapter):
+    def __init__(self):
+        from gateway.config import Platform, PlatformConfig
+        BasePlatformAdapter.__init__(
+            self,
+            PlatformConfig(enabled=True, typing_indicator=False),
+            Platform.TELEGRAM,
+        )
+        self.sent: list[dict] = []
+        self.documents: list[str] = []
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None):
+        from gateway.platforms.base import SendResult
+        self.documents.append(file_path)
+        return SendResult(success=True, message_id=f"doc-{len(self.documents)}")
+
+
+class TestHandleMessageScopedMediaDelivery:
+    @pytest.mark.asyncio
+    async def test_handle_message_binds_event_context_for_normal_attachment_filter(self, tmp_path, monkeypatch):
+        import asyncio
+        from gateway.session import SessionSource
+        from gateway.session_context import get_resolved_access_context
+
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", ())
+
+        async def inline_to_thread(fn, /, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.platforms.base.asyncio.to_thread", inline_to_thread)
+        a = hermes_home / "profiles" / "a" / "cache" / "documents" / "a.pdf"
+        b = hermes_home / "profiles" / "b" / "cache" / "documents" / "b.pdf"
+        a.parent.mkdir(parents=True)
+        b.parent.mkdir(parents=True)
+        a.write_bytes(b"%PDF")
+        b.write_bytes(b"%PDF")
+
+        adapter = _DocumentCapturingAdapter()
+        release = asyncio.Event()
+
+        async def handler(_event):
+            await release.wait()
+            return f"MEDIA:{a}\nMEDIA:{b}"
+
+        adapter.set_message_handler(handler)
+        source = SessionSource(platform=adapter.platform, chat_id="chat", user_id="user")
+        source.resolved_access_context = _resolved_context("a")
+        event = MessageEvent(text="go", source=source)
+
+        await adapter.handle_message(event)
+        task = next(iter(adapter._background_tasks))
+        release.set()
+        await task
+        await asyncio.sleep(0)
+
+        assert adapter.documents == [str(a.resolve())]
+        assert get_resolved_access_context() is None
 
 
 class TestMediaFallbackDoesNotLeakHostPath:
