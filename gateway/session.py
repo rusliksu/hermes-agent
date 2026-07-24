@@ -520,9 +520,13 @@ def build_session_context_prompt(
         lines.append("")
         lines.append(
             "**Shared-scope boundary:** This session can reply in the current "
-            "Telegram scope and use only its scoped memory. Other platforms, "
-            "home channels, local files, scheduled delivery, and private "
-            "destinations are unavailable."
+            "Telegram scope and use its scoped memory plus public web tools when "
+            "they are available. For URL-based requests, use a web tool before "
+            "discussing page contents. If web tools are absent, say the web "
+            "backend is unavailable and ask for text or screenshots; never infer "
+            "page contents from the URL alone. Other platforms, home channels, "
+            "local files, scheduled delivery, and private destinations are "
+            "unavailable."
         )
         return "\n".join(lines)
 
