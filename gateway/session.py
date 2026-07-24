@@ -581,10 +581,11 @@ def build_session_context_prompt(
     if context.restricted_shared_scope:
         lines.append("")
         lines.append(
-            "**Shared-scope boundary:** This session can reply in the current "
-            "Telegram scope and use only its scoped memory. Other platforms, "
-            "home channels, local files, scheduled delivery, and private "
-            "destinations are unavailable."
+            "**Shared-scope boundary:** This session can use the configured "
+            "Telegram tool profile. Memory is scoped to this room; the owner's "
+            "private conversation context, direct-message history, identity "
+            "context, and private memory are not injected. Existing tool safety "
+            "and approval rules still apply."
         )
         return "\n".join(lines)
 

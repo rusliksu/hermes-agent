@@ -4732,6 +4732,9 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_key = self._session_key_for_source(source)
 
+        if not self._is_elevated_user_authorized(source):
+            return "⛔ You are not authorized to approve commands."
+
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
         )
@@ -4780,6 +4783,9 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        if not self._is_elevated_user_authorized(source):
+            return "⛔ You are not authorized to deny commands."
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,

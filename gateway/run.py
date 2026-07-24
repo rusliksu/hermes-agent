@@ -3823,6 +3823,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         if role_id == "owner":
             return list(configured_toolsets)
+        if role_id == "shared_room":
+            return list(configured_toolsets)
 
         role_capability_toolsets = {
             "family_standard": {
@@ -3844,10 +3846,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "self_reminder": "cronjob",
                 "delegation": "delegation",
             },
-            "shared_room": {
-                "public_web": "web",
-                "vision": "vision",
-            },
         }
         capability_toolsets = role_capability_toolsets.get(role_id)
         if capability_toolsets is None:
@@ -3865,32 +3863,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _shared_tool_profile_for_source(
         source: SessionSource,
         configured_toolsets: list[str] | None = None,
+        disabled_toolsets: list[str] | None = None,
     ) -> tuple[list[str], frozenset[str]]:
         context = getattr(source, "resolved_access_context", None)
-        if context is None:
-            toolsets = ["memory"]
-            expected_tools = {"memory"}
-            return toolsets, frozenset(expected_tools)
         if (
-            not isinstance(context, ResolvedAccessContext)
-            or context.role_id != "shared_room"
-            or not isinstance(context.capabilities, frozenset)
+            context is not None
+            and (
+                not isinstance(context, ResolvedAccessContext)
+                or context.role_id != "shared_room"
+                or not isinstance(context.capabilities, frozenset)
+            )
         ):
             return [], frozenset()
 
-        configured = {str(toolset) for toolset in (configured_toolsets or [])}
-        toolsets = ["memory"]
-        expected_tools = {"memory"}
-        if "room_memory" not in context.capabilities or "memory" not in configured:
-            toolsets = []
-            expected_tools = set()
-        if "public_web" in context.capabilities and "web" in configured:
-            toolsets.append("web")
-            expected_tools.update({"web_search", "web_extract"})
-        if "vision" in context.capabilities and "vision" in configured:
-            toolsets.append("vision")
-            expected_tools.add("vision_analyze")
-        return sorted(toolsets), frozenset(expected_tools)
+        toolsets = sorted(str(toolset) for toolset in (configured_toolsets or []))
+        try:
+            from model_tools import get_tool_definitions
+
+            expected_tools = frozenset(
+                definition["function"]["name"]
+                for definition in get_tool_definitions(
+                    enabled_toolsets=toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                )
+            )
+        except Exception:
+            return toolsets, frozenset()
+        return toolsets, expected_tools
 
     @staticmethod
     def _bind_shared_memory(
@@ -3898,12 +3898,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scope: Any,
         memory_config: dict,
         *,
-        expected_tool_names: frozenset[str] = frozenset({"memory"}),
+        expected_tool_names: frozenset[str] | None = None,
     ) -> None:
         from tools.memory_tool import MemoryStore
         from gateway.session_context import get_resolved_access_context
 
-        if set(getattr(agent, "valid_tool_names", set())) != set(expected_tool_names):
+        valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        if expected_tool_names is not None:
+            valid = valid_tool_names == set(expected_tool_names)
+        else:
+            valid = "memory" in valid_tool_names
+        if not valid:
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -10126,6 +10131,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif _norm_reply in {"cancel", "nevermind", "no"}:
                 _confirm_choice = "cancel"
             if _confirm_choice is not None:
+                if not self._is_elevated_user_authorized(source):
+                    return "⛔ You are not authorized to answer this confirmation."
                 _resolved = await _slash_confirm_mod.resolve(
                     _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
                 )
@@ -13583,12 +13590,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._shared_scope_for_source(source) is not None:
             if canonical_cmd in {"help", "whoami"}:
                 return None
+            if canonical_cmd in {"approve", "deny"} and (
+                self._is_elevated_user_authorized(source)
+            ):
+                return None
             logger.info("Shared-scope slash command denied")
             return (
                 f"⛔ /{canonical_cmd} is unavailable in shared chats. "
                 "Use /help to see the shared-chat controls."
             )
         policy = _policy_for_source(self.config, source)
+        single_principal = getattr(self, "_single_principal_policy", None)
+        if (
+            getattr(single_principal, "enabled", False)
+            and source.platform == Platform.TELEGRAM
+            and single_principal.is_telegram_family_ordinary_dm(source)
+        ):
+            if policy.enabled and policy.can_run(source.user_id, canonical_cmd):
+                return None
+            if canonical_cmd in {"help", "whoami"}:
+                return None
+            logger.info("Single-principal family slash command denied")
+            return (
+                f"⛔ /{canonical_cmd} is admin-only here. "
+                "Use /whoami for the commands available to you."
+            )
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -18588,15 +18614,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
-        shared_expected_tool_names = frozenset()
-        if shared_scope is not None:
-            enabled_toolsets, shared_expected_tool_names = (
-                self._shared_tool_profile_for_source(
-                    source,
-                    configured_toolsets=configured_toolsets,
-                )
-            )
-            disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -19576,11 +19593,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     combined_ephemeral = (combined_ephemeral + "\n\n" + profile_prompt).strip()
             if shared_scope is not None:
                 shared_prompt = (
-                    "This is a shared multi-user Telegram scope. Use only this "
-                    "scope's MEMORY.md. Never infer or claim access to the owner's "
-                    "private profile, direct messages, files, credentials, tasks, "
-                    "or other chats/topics. Treat sender-prefixed messages as "
-                    "separate participants in the same shared room."
+                    "This is a shared multi-user Telegram scope. The configured "
+                    "Telegram tools are available, and memory is limited to this "
+                    "scope's MEMORY.md. The owner's private profile, direct-message "
+                    "history, identity context, and private memory are not injected. "
+                    "Do not treat host-tool availability as permission to access "
+                    "credentials or private destinations. Treat sender-prefixed "
+                    "messages as separate participants in the same shared room."
                 )
                 combined_ephemeral = (
                     combined_ephemeral + "\n\n" + shared_prompt
@@ -19994,7 +20013,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         agent,
                         shared_scope,
                         memory_config,
-                        expected_tool_names=shared_expected_tool_names,
                     )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
