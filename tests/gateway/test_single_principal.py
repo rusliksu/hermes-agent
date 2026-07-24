@@ -59,6 +59,17 @@ def _runner(policy=None):
     return runner
 
 
+def _force_web_tools_available(monkeypatch):
+    import tools.web_tools  # noqa: F401
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    for name in ("web_search", "web_extract"):
+        monkeypatch.setattr(registry._tools[name], "check_fn", lambda: True)
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+
 def test_policy_parser_and_redacted_validation():
     policy = _policy()
     assert policy.enabled is True
@@ -163,6 +174,9 @@ def test_shared_policy_session_keys_are_per_chat_and_topic_not_sender(tmp_path):
     prompt = build_session_context_prompt(context)
     assert context.restricted_shared_scope is True
     assert "Shared-scope boundary" in prompt
+    assert "use a web tool before discussing page contents" in prompt
+    assert "web backend is unavailable" in prompt
+    assert "never infer page contents from the URL alone" in prompt
     assert "Connected Platforms" not in prompt
     assert "Home Channels" not in prompt
     assert "Delivery options" not in prompt
@@ -198,15 +212,34 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
         tmp_path / "memories" / "shared" / "telegram"
     )
 
-    from model_tools import get_tool_definitions
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
 
-    tool_names = {
-        definition["function"]["name"]
-        for definition in get_tool_definitions(
-            enabled_toolsets=["memory"], disabled_toolsets=["kanban"]
+    try:
+        _force_web_tools_available(monkeypatch)
+        tool_names = {
+            definition["function"]["name"]
+            for definition in get_tool_definitions(
+                enabled_toolsets=["memory", "web"],
+                disabled_toolsets=["kanban"],
+            )
+        }
+        assert tool_names == {"memory", "web_search", "web_extract"}
+        runner._bind_shared_memory(
+            SimpleNamespace(valid_tool_names=tool_names),
+            scope,
+            {},
         )
-    }
-    assert tool_names == {"memory"}
+    finally:
+        _clear_tool_defs_cache()
+        invalidate_check_fn_cache()
+
+    with pytest.raises(RuntimeError, match="shared capability profile"):
+        runner._bind_shared_memory(
+            SimpleNamespace(valid_tool_names={"memory", "web_search"}),
+            scope,
+            {},
+        )
 
     with pytest.raises(RuntimeError, match="shared capability profile"):
         runner._bind_shared_memory(

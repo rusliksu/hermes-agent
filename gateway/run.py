@@ -3760,7 +3760,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
         from tools.memory_tool import MemoryStore
 
-        if set(getattr(agent, "valid_tool_names", set())) != {"memory"}:
+        valid_tool_names = frozenset(getattr(agent, "valid_tool_names", set()))
+        if valid_tool_names not in {
+            frozenset({"memory"}),
+            frozenset({"memory", "web_search", "web_extract"}),
+        }:
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -17928,7 +17932,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
         if shared_scope is not None:
-            enabled_toolsets = ["memory"]
+            enabled_toolsets = ["memory", "web"]
             disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
