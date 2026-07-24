@@ -17,9 +17,13 @@
 
 ## 3. Artifact и rollout
 
-- [ ] 3.1 Собрать immutable candidate и зафиксировать exact base/head/hash
-- [ ] 3.2 Проверить browser, safe terminal/file и negative canaries
-- [ ] 3.3 Зафиксировать previous symlink target и rollback command
-- [ ] 3.4 Атомарно переключить symlink и restart только user gateway
+- [x] 3.1 Собрать immutable candidate и зафиксировать exact base/head/hash
+- [x] 3.2 Проверить browser, safe terminal/file и negative canaries
+- [x] 3.3 Зафиксировать previous symlink target и rollback command
+- [x] 3.4 Атомарно переключить symlink и restart только user gateway
 - [ ] 3.5 Проверить service health, masked logs и Telegram canaries
-- [ ] 3.6 Обновить evidence и delivery state
+- [x] 3.6 Обновить evidence и delivery state
+
+Service health и masked logs прошли; 3.5 остаётся открытым только до ручного
+multi-participant Telegram canary, потому что credential-safe helper на HOSTKEY
+недоступен.
