@@ -14,11 +14,19 @@ Gurra/Hermes сейчас не имеет достаточно жесткой с
 - Запретить model args выбирать foreign namespace, profile, session, memory, delivery target или role.
 - Ввести server-side `RolePolicy`, `PrincipalBinding`, `SharedScopeBinding`; effective permissions вычисляются как пересечение role/scope/backend, unknown tools всегда deny.
 - Реализовать RBAC и room ACL без OPA/OpenFGA.
-- Поддержать роли `owner`, `family_standard`, `family_sandbox` для Юли и `shared_room` с границами из пользовательского плана.
+- Поддержать ровно четыре идентификатора ролей: `owner`, `family_standard`, `family_sandbox`, `shared_room`; отдельные роли под людей не вводятся.
+- Подтвержденная дельта 2026-07-24: typed `shared_room` получает полный серверно настроенный Telegram tool profile для этой комнаты, включая configured MCP и cron; это не означает web/vision/room-memory-only профиль и не дает права придумывать tools/MCP/profile/scope/delivery target из model, command или callback args.
+- Для любого tool/backend/background/cron execution доступность остается server-side решением по validated room `ResolvedAccessContext`, configured tool profile и backend policy; unknown или unconfigured tool/MCP всегда deny.
+- Каждый shared-room tool/backend/background/cron execution остается связан с тем же room `profile_id`, `conversation_scope` и delivery target: private DM memory/session/attachments, foreign profile/room access, owner/default fallback и private/cross-room delivery запрещены.
+- Shared-room cron может доставлять только в тот же server-bound room/topic `delivery_target`; private, cross-room и owner delivery остаются deny.
+- Подтвержденная дельта 2026-07-24: `family_standard` по умолчанию остается без Wolfram/arbitrary MCP; private roster вручную подтверждает ровно три private family `PrincipalBinding` с literal capability `wolfram`, без создания пятой роли, отдельной роли под человека или special-case principal.
+- Human labels для этих трех grants никогда не попадают в artifacts; username/display-name не являются authority, proof или источником назначения.
+- Literal capability `wolfram` разрешает только точный настроенный allowlist Wolfram MCP в собственном family profile/context каждой подтвержденной binding; terminal, host filesystem, browser, delegation, arbitrary MCP, cross-profile search/data, private/cross-profile delivery и foreign delivery остаются deny.
+- Существующие `family_sandbox` Wolfram allowlist и `shared_room` configured MCP/cron policy не меняются этой дельтой.
 - Подготовить отдельные профили для 9 family `principal` и 2 shared rooms.
 - Зафиксировать minor baseline clarification по credential-safe live audit: Руслан является `owner` и сохраняет текущий полный owner profile; current live registry доказанно содержит 1 owner, 9 unique family transport identities и 2 unique shared rooms без дублей, но family entries не имеют безопасных human labels.
-- До provisioning/cutover требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family identities; оператор вручную подтверждает, какая binding принадлежит Юле, только ей назначается `family_sandbox`, остальные восемь получают `family_standard`.
-- Считать display name/username только redacted admin labels: они никогда не являются authority, не используются для auto-link нескольких аккаунтов и не заменяют manual roster confirmation.
+- До provisioning/cutover требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family identities; оператор вручную подтверждает одну sandbox binding с `family_sandbox`, остальные восемь получают `family_standard`, а ровно три private family `PrincipalBinding` дополнительно получают literal capability `wolfram`.
+- Считать username/display-name только redacted admin labels: они никогда не являются authority, не используются для auto-link нескольких аккаунтов, не заменяют manual roster confirmation и не попадают в artifacts как human labels для Wolfram grants.
 - Блокировать provisioning и live cutover при missing, duplicate или ambiguous roster mapping; не угадывать family identity, роль или profile.
 - Сделать scoped model secrets так, чтобы они не попадали в tool env.
 - Добавить Dashboard Access/Users для redacted status, role preview/confirm/audit и break-glass read-only доступа на 15 минут с reason, reconfirm, manual revoke, без bulk search/export, без model/tools exposure и без content в audit.
@@ -32,7 +40,7 @@ Gurra/Hermes сейчас не имеет достаточно жесткой с
 
 - `principal-role-routing`: разрешение trusted transport principal/shared room в профиль, exact Telegram DM routing, deny-before-model/session/tools, фиксированный `ResolvedAccessContext` и отсутствие owner/default fallback.
 - `profile-data-isolation`: изоляция `HERMES_HOME`, memory, SQLite sessions, prompt/context, skills, workspace, attachments, scoped model secrets и tool env по каждому principal/profile/shared room.
-- `role-capability-policy`: server-side роли, bindings, RBAC, room ACL и effective permissions как пересечение role/scope/backend с deny для unknown tools.
+- `role-capability-policy`: server-side роли, bindings, RBAC, room ACL и effective permissions как пересечение role/scope/backend с deny для unknown/unconfigured tools; typed `shared_room` использует полный configured Telegram tool profile своей комнаты, включая configured MCP/cron, без private/cross-room/owner fallback.
 - `access-dashboard`: Dashboard Access/Users, redacted status, role preview/confirm/audit и ограниченный break-glass read-only процесс.
 - `principal-migration-rollout`: deterministic migration, legacy archive для ambiguous sessions, backup/dry-run/rollback, тесты и explicit gates для live rollout.
 
@@ -43,7 +51,7 @@ Gurra/Hermes сейчас не имеет достаточно жесткой с
 ## Влияние
 
 - Gateway/Telegram ingress: principal resolution, DM identity checks, malformed/unknown denial, shared room ACL и delivery routing.
-- Profile/session/memory/prompt/tool boundaries: profile-aware `HERMES_HOME`, SQLite sessions, memory stores, prompt/context assembly, skills, workspace, attachments, tool environment и propagation of `ResolvedAccessContext` через callbacks, background, delegation, cron, compaction, reset и restart.
+- Profile/session/memory/prompt/tool boundaries: profile-aware `HERMES_HOME`, SQLite sessions, memory stores, prompt/context assembly, skills, workspace, attachments, configured room tool profile, tool environment и propagation of `ResolvedAccessContext` через callbacks, background, delegation, cron, compaction, reset и restart.
 - Policy layer: новые серверные контракты `RolePolicy`, `PrincipalBinding`, `SharedScopeBinding` и проверка effective permissions перед backend/tool доступом.
 - Dashboard: Access/Users UI/API для безопасного управления ролями, аудита и break-glass read-only flow только через localhost/SSH tunnel.
 - Migration/rollout: owned DM session migration с preservation guarantees, closed read-only legacy archive, backup/dry-run/rollback, preflight, restart-loop guard, Telegram canaries, privacy warnings и rollback criteria.

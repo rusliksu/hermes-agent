@@ -20,14 +20,18 @@
 
 #### Scenario: Shared room разрешена
 - **WHEN** сообщение приходит из configured shared room или topic с active `SharedScopeBinding`
-- **THEN** система SHALL использовать shared room profile и room `conversation_scope`, сохранив sender identity только как redacted audit metadata
+- **THEN** система SHALL использовать shared room profile, room `conversation_scope`, room `delivery_target` и полный серверно настроенный Telegram tool profile, сохранив sender identity только как redacted audit metadata
 
 #### Scenario: Room membership не выдает role
 - **WHEN** family principal пишет в shared room
 - **THEN** система MUST не повышать role этого principal и MUST вычислить permissions только через пересечение role/scope/backend
 
+#### Scenario: Shared room tool profile не выбирается моделью
+- **WHEN** model args, command args или callback payload include tool name, MCP server, capability, profile, scope или delivery target для shared room turn
+- **THEN** система MUST authorize только exact configured room tools из validated room `ResolvedAccessContext`, configured Telegram tool profile и backend policy
+
 ### Requirement: Проверенный семейный roster до provisioning и cutover
-Система MUST требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family transport identities до provisioning, migration preflight или live cutover.
+Система MUST требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family transport identities до provisioning, migration preflight или live cutover; тот же private roster MUST содержать ровно одну `family_sandbox` binding и ровно три private family `PrincipalBinding` с literal capability `wolfram`.
 
 #### Scenario: Owner baseline сохраняется
 - **WHEN** baseline registry preflight выполняется
@@ -41,17 +45,21 @@
 - **WHEN** provisioning или migration preflight запускается для family profiles
 - **THEN** система MUST require private manually confirmed roster entry для каждой из 9 family transport identities with opaque `principal_id`, `role_id` и `profile_id`
 
-#### Scenario: Юлина binding назначается вручную
+#### Scenario: Sandbox binding назначается вручную
 - **WHEN** оператор подтверждает roster
-- **THEN** оператор MUST manually mark exactly one binding as Юлина и система MUST assign `family_sandbox` only to that binding, while assigning `family_standard` to the other eight family bindings
+- **THEN** оператор MUST manually mark exactly one binding as sandbox binding и система MUST assign `family_sandbox` only to that binding, while assigning `family_standard` to the other eight family bindings
+
+#### Scenario: Wolfram capability grants назначаются вручную
+- **WHEN** оператор подтверждает private roster
+- **THEN** оператор MUST manually mark exactly three private family `PrincipalBinding` with literal capability `wolfram`, а система MUST NOT create a fifth role, create a person-specific role, make any binding special, or derive the capability assignment from username, display-name, message text, model args или room membership
 
 #### Scenario: Display labels не являются authority
-- **WHEN** display name или username доступны из transport metadata, dashboard или audit
-- **THEN** система MUST treat them only as redacted admin labels and MUST NOT use them as authority, roster proof или auto-link evidence across multiple accounts
+- **WHEN** username/display-name доступны из transport metadata, dashboard или audit
+- **THEN** система MUST treat username/display-name only as non-authoritative redacted admin labels, MUST NOT use them as roster proof, exact identity source или auto-link evidence across multiple accounts, and MUST NOT include human labels for the three `wolfram` grants in artifacts
 
 #### Scenario: Неоднозначный roster блокирует cutover
-- **WHEN** roster has missing, duplicate или ambiguous mapping for any family transport identity, role или profile
-- **THEN** система MUST block provisioning, migration preflight and live cutover and MUST NOT guess the intended person, role или profile
+- **WHEN** roster has missing, duplicate или ambiguous mapping for any family transport identity, role, profile или `wolfram` capability assignment
+- **THEN** система MUST block provisioning, migration preflight and live cutover and MUST NOT guess the intended exact identity, role, profile или capability assignment
 
 ### Requirement: Unknown и malformed ingress fail-closed
 Система MUST отказывать unknown, missing или malformed transport identity без owner/default fallback.
@@ -81,7 +89,7 @@
 
 #### Scenario: Context reaches background and cron русифицирован
 - **WHEN** background command или cron job продолжает работу после исходного turn
-- **THEN** job MUST использовать persisted server-bound `ResolvedAccessContext` с шестью authority-полями, а не current process env или guessed transport IDs
+- **THEN** job MUST использовать persisted server-bound `ResolvedAccessContext` с шестью authority-полями, а не current process env, guessed transport IDs или model-selected tool/delivery scope
 
 #### Scenario: Context reaches delegation русифицирован
 - **WHEN** agent delegates work to subagent или worker
@@ -124,3 +132,7 @@
 #### Scenario: Shared room delivery русифицирован
 - **WHEN** shared room turn завершается
 - **THEN** response delivery MUST target only configured shared room/topic `delivery_target` и MUST NOT leak to principal private DM
+
+#### Scenario: Shared room cron delivery русифицирован
+- **WHEN** shared room cron или background delivery fires after original turn
+- **THEN** delivery MUST target only тот же configured shared room/topic `delivery_target` и MUST deny private, cross-room и owner default delivery
