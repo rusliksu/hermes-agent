@@ -21,9 +21,9 @@
 - [x] 3.2 Проверить browser, safe terminal/file и negative canaries
 - [x] 3.3 Зафиксировать previous symlink target и rollback command
 - [x] 3.4 Атомарно переключить symlink и restart только user gateway
-- [ ] 3.5 Проверить service health, masked logs и Telegram canaries
+- [x] 3.5 Проверить service health, masked logs и Telegram canaries
 - [x] 3.6 Обновить evidence и delivery state
 
-Service health и masked logs прошли; 3.5 остаётся открытым только до ручного
-multi-participant Telegram canary, потому что credential-safe helper на HOSTKEY
-недоступен.
+Service health и masked logs прошли. Ручной participant canary в реальной
+shared Telegram теме вызвал `browser_navigate` и `browser_snapshot`, после чего
+Gurra корректно пересказала `https://example.com`.
