@@ -635,6 +635,25 @@ class GatewayAuthorizationMixin:
 
         return bool(check_ids & allowed_ids)
 
+    def _is_elevated_user_authorized(self, source: SessionSource) -> bool:
+        """Return whether source may approve owner-only/elevated actions."""
+        single_principal = getattr(self, "_single_principal_policy", None)
+        if single_principal is not None and single_principal.enabled:
+            upstream_authenticated = (
+                source.delivered_via_upstream_relay is True
+                or self._adapter_authorization_is_upstream(
+                    source.platform,
+                    profile=source.profile,
+                )
+            )
+            return bool(
+                single_principal.authorize_elevated(
+                    source,
+                    upstream_authenticated=upstream_authenticated,
+                )
+            )
+        return self._is_user_authorized(source)
+
     def _get_unauthorized_dm_behavior(
         self,
         platform: Optional[Platform],

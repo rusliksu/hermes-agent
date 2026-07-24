@@ -48,6 +48,11 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.config import Platform, PlatformConfig
+from gateway.single_principal import SinglePrincipalPolicy
+
+
+OWNER = "10001"
+FAMILY = "30003"
 
 
 def _make_adapter(extra=None):
@@ -72,6 +77,29 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.last_source = source
         return self.authorized
+
+
+class _SinglePrincipalRunner:
+    def __init__(self):
+        self._single_principal_policy = SinglePrincipalPolicy.from_dict(
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [FAMILY],
+            }
+        )
+        self.last_source = None
+
+    async def _handle_message(self, event):
+        return None
+
+    def _is_user_authorized(self, source):
+        self.last_source = source
+        return bool(self._single_principal_policy.authorize(source))
+
+    def _is_elevated_user_authorized(self, source):
+        self.last_source = source
+        return bool(self._single_principal_policy.authorize_elevated(source))
 
 
 # ===========================================================================
@@ -463,6 +491,66 @@ class TestTelegramApprovalCallback:
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
         assert runner.last_source.chat_id == "12345"
+
+    @pytest.mark.asyncio
+    async def test_family_approval_callback_is_owner_only(self):
+        adapter = _make_adapter()
+        adapter._approval_state[8] = "agent:main:telegram:dm:30003"
+        runner = _SinglePrincipalRunner()
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "ea:once:8"
+        query.message = MagicMock()
+        query.message.chat_id = int(FAMILY)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = f"0{FAMILY}"
+        query.from_user.first_name = "Family"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        assert adapter._approval_state[8] == "agent:main:telegram:dm:30003"
+
+    @pytest.mark.asyncio
+    async def test_owner_approval_callback_still_resolves(self):
+        adapter = _make_adapter()
+        adapter._approval_state[9] = "agent:main:telegram:dm:10001"
+        runner = _SinglePrincipalRunner()
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "ea:once:9"
+        query.message = MagicMock()
+        query.message.chat_id = int(OWNER)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = f"0{OWNER}"
+        query.from_user.first_name = "Owner"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_called_once_with("agent:main:telegram:dm:10001", "once")
+        query.edit_message_text.assert_called_once()
+        assert 9 not in adapter._approval_state
 
     @pytest.mark.asyncio
     async def test_already_resolved(self):

@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +17,7 @@ from gateway.single_principal import (
 
 
 OWNER = "10001"
+FAMILY = "30003"
 OUTSIDER = "20002"
 
 
@@ -59,23 +61,14 @@ def _runner(policy=None):
     return runner
 
 
-def _force_web_tools_available(monkeypatch):
-    import tools.web_tools  # noqa: F401
-    from model_tools import _clear_tool_defs_cache
-    from tools.registry import invalidate_check_fn_cache, registry
-
-    for name in ("web_search", "web_extract"):
-        monkeypatch.setattr(registry._tools[name], "check_fn", lambda: True)
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-
-
 def test_policy_parser_and_redacted_validation():
-    policy = _policy()
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
     assert policy.enabled is True
     assert policy.authorize(_source()) is True
+    assert policy.authorize(_source(FAMILY, chat_id=FAMILY)) is True
     assert policy.authorize(_source(thread_id="77")) is True
     assert policy.authorize(_source(OUTSIDER)) is False
+    assert policy.authorize(_source(None)) is False
     assert policy.authorize(_source(chat_type="group")) is False
 
     report = validate_single_principal_policy(
@@ -88,13 +81,17 @@ def test_policy_parser_and_redacted_validation():
     )
     rendered = json.dumps(report.as_dict())
     assert report.verdict == "fail"
+    assert report.family_user_count == 1
     assert {category for category, _ in report.conflicts} == {
         "allow_all",
         "group_grant",
         "non_owner_allowlist",
         "wildcard_grant",
     }
+    assert "family_user_count" in rendered
+    assert "categories" in rendered
     assert OWNER not in rendered
+    assert FAMILY not in rendered
     assert OUTSIDER not in rendered
     assert "-123" not in rendered
 
@@ -132,6 +129,27 @@ def test_shared_policy_authorizes_exact_group_and_hashes_scope_identity():
     assert root_scope.memory_namespace != topic_scope.memory_namespace
     assert "-10001" not in root_scope.memory_namespace
     assert "31" not in topic_scope.memory_namespace
+
+
+def test_family_list_does_not_expand_shared_group_access():
+    policy = _policy(
+        telegram_allowed_user_ids=[FAMILY],
+        telegram_shared_chat_ids=["-10001", "-20002"],
+    )
+
+    assert policy.authorize(_source(FAMILY, chat_id=FAMILY)) is True
+    assert policy.authorize(
+        _source(FAMILY, chat_id="-10001", chat_type="group")
+    ) is True
+    assert policy.authorize(
+        _source(OUTSIDER, chat_id="-20002", chat_type="forum")
+    ) is True
+    assert policy.authorize(
+        _source(FAMILY, chat_id="-30003", chat_type="group")
+    ) is False
+    assert _policy(telegram_allowed_user_ids=[FAMILY]).authorize(
+        _source(FAMILY, chat_id="-10001", chat_type="group")
+    ) is False
 
 
 def test_shared_policy_session_keys_are_per_chat_and_topic_not_sender(tmp_path):
@@ -174,15 +192,16 @@ def test_shared_policy_session_keys_are_per_chat_and_topic_not_sender(tmp_path):
     prompt = build_session_context_prompt(context)
     assert context.restricted_shared_scope is True
     assert "Shared-scope boundary" in prompt
-    assert "use a web tool before discussing page contents" in prompt
-    assert "web backend is unavailable" in prompt
-    assert "never infer page contents from the URL alone" in prompt
+    assert "configured Telegram tool profile" in prompt
+    assert "Memory is scoped to this room" in prompt
+    assert "private conversation context" in prompt
+    assert "only its scoped memory" not in prompt
     assert "Connected Platforms" not in prompt
     assert "Home Channels" not in prompt
     assert "Delivery options" not in prompt
 
 
-def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
+def test_shared_scope_binds_scoped_memory_with_full_tools_and_denies_admin_commands(
     tmp_path, monkeypatch
 ):
     policy = _policy(telegram_shared_chat_ids=["-10001"])
@@ -196,11 +215,26 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
     assert "unavailable in shared chats" in runner._check_slash_access(
         source, "restart"
     )
+    assert runner._is_elevated_user_authorized(source) is False
+    owner_source = _source(OWNER, chat_id="-10001", chat_type="group")
+    assert runner._is_elevated_user_authorized(owner_source) is True
+    assert runner._check_slash_access(owner_source, "approve") is None
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        source, "approve"
+    )
 
     import gateway.run as run_module
 
     monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
-    agent = SimpleNamespace(valid_tool_names={"memory"})
+    agent = SimpleNamespace(
+        valid_tool_names={
+            "memory",
+            "browser_navigate",
+            "terminal",
+            "read_file",
+            "execute_code",
+        }
+    )
     runner._bind_shared_memory(agent, scope, {})
 
     assert agent._memory_enabled is True
@@ -212,41 +246,148 @@ def test_shared_scope_binds_only_scoped_memory_and_denies_admin_commands(
         tmp_path / "memories" / "shared" / "telegram"
     )
 
-    from model_tools import _clear_tool_defs_cache, get_tool_definitions
-    from tools.registry import invalidate_check_fn_cache
-
-    try:
-        _force_web_tools_available(monkeypatch)
-        tool_names = {
-            definition["function"]["name"]
-            for definition in get_tool_definitions(
-                enabled_toolsets=["memory", "web"],
-                disabled_toolsets=["kanban"],
-            )
-        }
-        assert tool_names == {"memory", "web_search", "web_extract"}
-        runner._bind_shared_memory(
-            SimpleNamespace(valid_tool_names=tool_names),
-            scope,
-            {},
-        )
-    finally:
-        _clear_tool_defs_cache()
-        invalidate_check_fn_cache()
-
     with pytest.raises(RuntimeError, match="shared capability profile"):
         runner._bind_shared_memory(
-            SimpleNamespace(valid_tool_names={"memory", "web_search"}),
+            SimpleNamespace(valid_tool_names={"terminal", "read_file"}),
             scope,
             {},
         )
 
-    with pytest.raises(RuntimeError, match="shared capability profile"):
-        runner._bind_shared_memory(
-            SimpleNamespace(valid_tool_names={"memory", "terminal"}),
-            scope,
-            {},
-        )
+
+@pytest.mark.asyncio
+async def test_shared_turn_uses_configured_telegram_tool_profile(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+    import hermes_cli.tools_config as tools_config
+    import run_agent
+
+    configured_toolsets = {"memory", "browser", "terminal", "file", "code"}
+    captured = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.tools = []
+            self.valid_tool_names = {
+                "memory",
+                "browser_navigate",
+                "terminal",
+                "read_file",
+                "execute_code",
+            }
+
+        def run_conversation(self, *args, **kwargs):
+            return {
+                "final_response": "ok",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    runner = _runner(policy)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    runner._pending_model_notes = {}
+    runner._session_db = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(streaming=None, single_principal=policy)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        load_transcript=lambda session_id: [],
+    )
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(run_module, "_hermes_home", tmp_path)
+    monkeypatch.setattr(run_module, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(run_module, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_module,
+        "_load_gateway_config",
+        lambda: {"agent": {"disabled_toolsets": ["spotify"]}},
+    )
+    monkeypatch.setattr(run_module, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(
+        run_module, "_resolve_gateway_model", lambda config=None: "test-model"
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test",
+        },
+    )
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: configured_toolsets,
+    )
+    monkeypatch.setattr(run_agent, "AIAgent", CapturingAgent)
+
+    source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+    result = await runner._run_agent(
+        message="open the link",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:telegram:group:shared",
+    )
+
+    assert result["final_response"] == "ok"
+    assert captured["enabled_toolsets"] == sorted(configured_toolsets)
+    assert captured["disabled_toolsets"] == ["spotify"]
+    assert captured["skip_context_files"] is True
+    assert captured["skip_memory"] is True
+    assert captured["user_id"] is None
+    assert "configured Telegram tools are available" in captured[
+        "ephemeral_system_prompt"
+    ]
+    assert "private memory are not injected" in captured["ephemeral_system_prompt"]
+    shared_signature = runner._agent_config_signature(
+        "test-model",
+        {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test",
+        },
+        captured["enabled_toolsets"],
+        captured["ephemeral_system_prompt"],
+    )
+    private_signature = runner._agent_config_signature(
+        "test-model",
+        {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test",
+        },
+        captured["enabled_toolsets"],
+        "",
+        user_id=OUTSIDER,
+    )
+    assert shared_signature != private_signature
 
 
 def test_shared_memory_canary_matrix_survives_reload_without_cross_scope_leakage(
@@ -398,6 +539,14 @@ def test_owner_session_keys_remain_byte_compatible():
     )
 
 
+def test_family_session_keys_remain_isolated_from_owner():
+    owner_key = build_session_key(_source())
+    family_key = build_session_key(_source(FAMILY, chat_id=FAMILY))
+
+    assert family_key == "agent:main:telegram:dm:30003"
+    assert family_key != owner_key
+
+
 def test_pairing_rejects_non_owner_without_writing(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway.pairing import PairingStore
@@ -409,6 +558,20 @@ def test_pairing_rejects_non_owner_without_writing(monkeypatch, tmp_path):
     assert store.list_approved("telegram") == []
     store._approve_user("telegram", OWNER)
     assert len(store.list_approved("telegram")) == 1
+
+
+def test_family_user_is_not_pairing_owner(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.pairing import PairingStore
+
+    store = PairingStore(
+        profile="test",
+        single_principal_policy=_policy(telegram_allowed_user_ids=[FAMILY]),
+    )
+    with pytest.raises(SinglePrincipalPolicyError):
+        store._approve_user("telegram", FAMILY)
+
+    assert store.list_approved("telegram") == []
 
 
 def test_pairing_approve_rejects_preexisting_non_owner_request(monkeypatch, tmp_path):
@@ -450,12 +613,142 @@ async def test_non_owner_stops_before_pre_dispatch_hook(monkeypatch, caplog):
     assert "private input" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_family_dm_authorizes_but_unknown_and_missing_sender_stop_early(
+    monkeypatch, caplog
+):
+    runner = _runner(_policy(telegram_allowed_user_ids=[FAMILY]))
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner.session_store = MagicMock()
+    runner._handle_message_with_agent = AsyncMock(return_value="ok")
+    hook = MagicMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+
+    assert runner._is_user_authorized(_source(FAMILY, chat_id=FAMILY)) is True
+    unknown_result = await runner._handle_message(
+        MessageEvent(text="unknown input", source=_source(OUTSIDER))
+    )
+    missing_result = await runner._handle_message(
+        MessageEvent(text="missing input", source=_source(None))
+    )
+
+    assert unknown_result is None
+    assert missing_result is None
+    hook.assert_not_called()
+    runner.session_store.assert_not_called()
+    runner._handle_message_with_agent.assert_not_called()
+    assert "unknown input" not in caplog.text
+    assert "missing input" not in caplog.text
+
+
+def test_family_user_is_not_single_principal_slash_admin():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={},
+            )
+        },
+        single_principal=policy,
+    )
+
+    assert runner._check_slash_access(_source(), "restart") is None
+    denial = runner._check_slash_access(
+        _source(FAMILY, chat_id=FAMILY),
+        "restart",
+    )
+    assert denial is not None
+    assert "/restart is admin-only here" in denial
+    assert runner._check_slash_access(_source(FAMILY, chat_id=FAMILY), "whoami") is None
+
+
+def test_normalized_family_user_is_not_single_principal_slash_admin():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={},
+            )
+        },
+        single_principal=policy,
+    )
+
+    denial = runner._check_slash_access(
+        _source(f"0{FAMILY}", chat_id=f"0{FAMILY}"),
+        "restart",
+    )
+    assert denial is not None
+    assert "/restart is admin-only here" in denial
+
+
+def test_single_principal_normalized_owner_family_and_elevated_helpers():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+
+    owner = _source(f"0{OWNER}", chat_id=f"0{OWNER}")
+    family = _source(f"0{FAMILY}", chat_id=f"0{FAMILY}")
+    outsider = _source(OUTSIDER, chat_id=OUTSIDER)
+
+    assert policy.is_telegram_owner(owner) is True
+    assert policy.is_telegram_family_ordinary_dm(family) is True
+    assert policy.authorizes_telegram_ordinary_dm(owner) is True
+    assert policy.authorizes_telegram_ordinary_dm(family) is True
+    assert policy.authorizes_telegram_ordinary_dm(outsider) is False
+    assert policy.authorize_elevated(owner) is True
+    assert policy.authorize_elevated(family) is False
+    shared_policy = _policy(telegram_shared_chat_ids=["-10001"])
+    assert shared_policy.authorize_elevated(
+        _source(OWNER, chat_id="-10001", chat_type="group")
+    ) is True
+    assert shared_policy.authorize_elevated(
+        _source(OWNER, chat_id="-20002", chat_type="group")
+    ) is False
+
+
+def test_family_user_can_run_explicit_user_command_but_not_admin_command():
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    runner = _runner(policy)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test",
+                extra={
+                    "allow_admin_from": [OWNER],
+                    "user_allowed_commands": ["status"],
+                },
+            )
+        },
+        single_principal=policy,
+    )
+    family = _source(FAMILY, chat_id=FAMILY)
+
+    assert runner._check_slash_access(family, "status") is None
+    assert "/restart is admin-only here" in runner._check_slash_access(
+        family,
+        "restart",
+    )
+
+
 def test_gateway_config_parses_single_principal_policy():
     config = GatewayConfig.from_dict(
-        {"single_principal": {"enabled": True, "telegram_owner_id": OWNER}}
+        {
+            "single_principal": {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [FAMILY],
+            }
+        }
     )
-    assert config.single_principal == _policy()
-    assert GatewayConfig.from_dict(config.to_dict()).single_principal == _policy()
+    policy = _policy(telegram_allowed_user_ids=[FAMILY])
+    assert config.single_principal == policy
+    assert GatewayConfig.from_dict(config.to_dict()).single_principal == policy
 
 
 def test_validator_rejects_pairing_drift_and_unsupported_ingress():
@@ -478,6 +771,66 @@ def test_validator_rejects_pairing_drift_and_unsupported_ingress():
         "non_owner_pairing": 1,
         "unsupported_external_platform": 1,
     }
+
+
+@pytest.mark.parametrize(
+    "raw,category",
+    [
+        (
+            {"enabled": True, "telegram_owner_id": "not-numeric"},
+            "malformed_owner",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["*"],
+            },
+            "wildcard_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["", "not-numeric"],
+            },
+            "malformed_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": ["030003", FAMILY],
+            },
+            "duplicate_family_user",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_allowed_user_ids": [OWNER],
+            },
+            "owner_in_family_users",
+        ),
+        (
+            {
+                "enabled": True,
+                "telegram_owner_id": OWNER,
+                "telegram_shared_chat_ids": ["-010001", "-10001"],
+            },
+            "duplicate_shared_scope",
+        ),
+    ],
+)
+def test_numeric_policy_validation_is_redacted(raw, category):
+    policy = SinglePrincipalPolicy.from_dict(raw)
+    report = validate_single_principal_policy(policy, environ={})
+    rendered = json.dumps(report.as_dict())
+    assert report.verdict == "fail"
+    assert category in dict(report.conflicts)
+    assert OWNER not in rendered
+    assert FAMILY not in rendered
+    assert "not-numeric" not in rendered
 
 
 def test_validator_fails_closed_when_pairing_store_is_unreadable():
@@ -579,13 +932,16 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     class Runner:
-        _single_principal_policy = _policy()
+        _single_principal_policy = _policy(telegram_allowed_user_ids=[FAMILY])
 
         async def handle(self, _event):
             return None
 
         def _is_user_authorized(self, source):
             return bool(self._single_principal_policy.authorize(source))
+
+        def _is_elevated_user_authorized(self, source):
+            return bool(self._single_principal_policy.authorize_elevated(source))
 
     adapter = object.__new__(TelegramAdapter)
     adapter.config = PlatformConfig(enabled=True, token="test", extra={})
@@ -601,6 +957,16 @@ def test_telegram_prefilter_and_callback_use_runner_policy():
         )
 
     assert adapter._is_user_authorized_from_message(message(OWNER)) is True
+    assert adapter._is_user_authorized_from_message(message(FAMILY)) is True
     assert adapter._is_user_authorized_from_message(message(OUTSIDER)) is False
     assert adapter._is_callback_user_authorized(OWNER) is True
+    assert adapter._is_callback_user_authorized(FAMILY) is True
     assert adapter._is_callback_user_authorized(OUTSIDER) is False
+    assert adapter._is_callback_user_authorized(
+        OWNER,
+        require_elevated=True,
+    ) is True
+    assert adapter._is_callback_user_authorized(
+        FAMILY,
+        require_elevated=True,
+    ) is False

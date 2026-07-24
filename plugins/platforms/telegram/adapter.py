@@ -858,6 +858,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        require_elevated: bool = False,
     ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -900,6 +901,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Participants invoke the constrained agent via message
                     # mention/reply/addressed command only.
                     return False
+                if require_elevated:
+                    elevated_auth_fn = getattr(runner, "_is_elevated_user_authorized", None)
+                    if callable(elevated_auth_fn):
+                        return bool(elevated_auth_fn(source))
+                    if single_principal_enabled:
+                        return False
                 return bool(auth_fn(source))
             except Exception:
                 if single_principal_enabled:
@@ -5894,6 +5901,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_type=str(query_chat_type) if query_chat_type is not None else None,
                     thread_id=str(query_thread_id) if query_thread_id is not None else None,
                     user_name=query_user_name,
+                    require_elevated=True,
                 ):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
@@ -5960,6 +5968,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_type=str(query_chat_type) if query_chat_type is not None else None,
                     thread_id=str(query_thread_id) if query_thread_id is not None else None,
                     user_name=query_user_name,
+                    require_elevated=True,
                 ):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return

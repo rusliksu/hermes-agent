@@ -3760,11 +3760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
         from tools.memory_tool import MemoryStore
 
-        valid_tool_names = frozenset(getattr(agent, "valid_tool_names", set()))
-        if valid_tool_names not in {
-            frozenset({"memory"}),
-            frozenset({"memory", "web_search", "web_extract"}),
-        }:
+        if "memory" not in set(getattr(agent, "valid_tool_names", set())):
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -9643,6 +9639,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif _norm_reply in {"cancel", "nevermind", "no"}:
                 _confirm_choice = "cancel"
             if _confirm_choice is not None:
+                if not self._is_elevated_user_authorized(source):
+                    return "⛔ You are not authorized to answer this confirmation."
                 _resolved = await _slash_confirm_mod.resolve(
                     _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
                 )
@@ -13100,12 +13098,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._shared_scope_for_source(source) is not None:
             if canonical_cmd in {"help", "whoami"}:
                 return None
+            if canonical_cmd in {"approve", "deny"} and (
+                self._is_elevated_user_authorized(source)
+            ):
+                return None
             logger.info("Shared-scope slash command denied")
             return (
                 f"⛔ /{canonical_cmd} is unavailable in shared chats. "
                 "Use /help to see the shared-chat controls."
             )
         policy = _policy_for_source(self.config, source)
+        single_principal = getattr(self, "_single_principal_policy", None)
+        if (
+            getattr(single_principal, "enabled", False)
+            and source.platform == Platform.TELEGRAM
+            and single_principal.is_telegram_family_ordinary_dm(source)
+        ):
+            if policy.enabled and policy.can_run(source.user_id, canonical_cmd):
+                return None
+            if canonical_cmd in {"help", "whoami"}:
+                return None
+            logger.info("Single-principal family slash command denied")
+            return (
+                f"⛔ /{canonical_cmd} is admin-only here. "
+                "Use /whoami for the commands available to you."
+            )
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -17931,9 +17948,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
-        if shared_scope is not None:
-            enabled_toolsets = ["memory", "web"]
-            disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -18900,11 +18914,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
             if shared_scope is not None:
                 shared_prompt = (
-                    "This is a shared multi-user Telegram scope. Use only this "
-                    "scope's MEMORY.md. Never infer or claim access to the owner's "
-                    "private profile, direct messages, files, credentials, tasks, "
-                    "or other chats/topics. Treat sender-prefixed messages as "
-                    "separate participants in the same shared room."
+                    "This is a shared multi-user Telegram scope. The configured "
+                    "Telegram tools are available, and memory is limited to this "
+                    "scope's MEMORY.md. The owner's private profile, direct-message "
+                    "history, identity context, and private memory are not injected. "
+                    "Do not treat host-tool availability as permission to access "
+                    "credentials or private destinations. Treat sender-prefixed "
+                    "messages as separate participants in the same shared room."
                 )
                 combined_ephemeral = (
                     combined_ephemeral + "\n\n" + shared_prompt
