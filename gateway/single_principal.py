@@ -260,6 +260,14 @@ class SinglePrincipalPolicy:
             return None
         if upstream_authenticated:
             return self.allow_owner_bound_relay
+        if self.shared_scope(source) is not None:
+            normalized_user_id = _normalize_positive_telegram_id(
+                getattr(source, "user_id", None)
+            )
+            return bool(
+                normalized_user_id is not None
+                and normalized_user_id == self.telegram_owner_id
+            )
         return self.is_telegram_owner(source)
 
     def authorize(self, source: Any, *, upstream_authenticated: bool = False) -> Optional[bool]:
