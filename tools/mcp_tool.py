@@ -5152,6 +5152,40 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _mcp_registration_context_allowed() -> bool:
+    """Fail closed for multiplex MCP registration without strict task context."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception:
+        return True
+
+    if not is_multiplex_active():
+        return True
+
+    try:
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+        from gateway.session_context import get_resolved_access_context
+
+        serialized = serialize_resolved_access_context(
+            get_resolved_access_context(None)
+        )
+        return (
+            serialize_resolved_access_context(
+                deserialize_resolved_access_context(serialized)
+            )
+            == serialized
+        )
+    except Exception as exc:
+        logger.debug(
+            "MCP registration denied without strict resolved access context: %s",
+            type(exc).__name__,
+        )
+        return False
+
+
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
@@ -5166,6 +5200,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
+        return []
+    if not _mcp_registration_context_allowed():
         return []
 
     servers = _filter_suspicious_mcp_servers(servers)
@@ -5286,6 +5322,8 @@ def discover_mcp_tools() -> List[str]:
     """
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
+        return []
+    if not _mcp_registration_context_allowed():
         return []
 
     servers = _load_mcp_config()
