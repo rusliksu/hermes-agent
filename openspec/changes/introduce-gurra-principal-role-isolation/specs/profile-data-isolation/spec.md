@@ -93,6 +93,29 @@
 - **WHEN** model request is authorized for role сервером
 - **THEN** model credentials MUST be available only to model client construction и MUST NOT be exported to terminal, Docker, browser или MCP tool env
 
+#### Scenario: Модельные секреты исключены из окружения MCP
+- **WHEN** процесс MCP server запускается для типизированного owner, family или shared profile
+- **THEN** окружение MCP MUST исключать учетные данные модели/провайдера, учетные данные owner и пути несвязанных профилей независимо от имени инструмента, роли или настроенного профиля инструментов
+
+### Requirement: Изоляция MCP-процессов с привязкой к профилю
+Система MUST привязывать процесс MCP server, соединение, снимок конфигурации, поверхность схемы инструмента, маршрутизацию обработчика и ссылки на учетные данные конкретного инструмента к разрешенным `profile_id` и `conversation_scope`.
+
+#### Scenario: Обнаружение запуска MCP без scope запрещено
+- **WHEN** запуск gateway multiplex пытается выполнить обнаружение запуска MCP-процесса без разрешенного `ResolvedAccessContext`
+- **THEN** система MUST deny до подстановки, spawn, соединения, регистрации схемы или захвата обработчика
+
+#### Scenario: Отсутствующий MCP-пул запрещен до spawn
+- **WHEN** типизированный контекст запрашивает MCP tool, но текущие `profile_id` и `conversation_scope` не имеют соответствующего привязанного к профилю MCP-пула или снимка конфигурации
+- **THEN** система MUST deny до spawn процесса, сетевого соединения или поиска учетных данных
+
+#### Scenario: Отсутствующая ссылка на учетные данные MCP запрещена до spawn
+- **WHEN** настроенный MCP server/tool требует ссылку на учетные данные конкретного инструмента, а текущая profile-local server-side ссылка отсутствует
+- **THEN** система MUST deny до spawn процесса и MUST NOT использовать модельные учетные данные, env vars, owner refs или refs другого профиля как запасной источник
+
+#### Scenario: Одинаковое имя сервера с разными учетными данными профилей изолировано
+- **WHEN** два типизированных профиля настраивают одинаковое имя MCP server с разными profile-local credential refs
+- **THEN** каждый процесс, соединение, снимок конфигурации и маршрутизация обработчика MUST использовать только ref этого профиля и MUST NOT вызывать или переиспользовать пул другого профиля
+
 ### Requirement: Browser and public web state isolation по ролям
 Система SHALL isolate public web, browser state and search state by role/profile.
 

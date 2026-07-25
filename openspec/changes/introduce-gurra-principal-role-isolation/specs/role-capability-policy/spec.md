@@ -34,6 +34,25 @@
 - **WHEN** model, command или plugin asks for unknown capability or tool name
 - **THEN** система MUST deny before execution and log redacted audit
 
+### Requirement: Маршрутизация MCP использует текущий разрешенный контекст
+Система MUST сохранять видимые для backend/model имена MCP tool как имена server/tool, но MUST разрешать маршрутизацию только через привязанный к профилю MCP-пул текущего разрешенного контекста и политику role/scope/backend.
+
+#### Scenario: Видимое для модели имя MCP не является глобальным полномочием
+- **WHEN** модель вызывает MCP tool по видимому имени `server/tool`
+- **THEN** обработчик MUST разрешить текущий task-local или восстановленный `ResolvedAccessContext`, выбрать только привязанный к профилю пул этого контекста и MUST NOT использовать глобальный handle сервера, захваченный при регистрации
+
+#### Scenario: Два профиля с одинаковым именем MCP server не дают перекрестный вызов
+- **WHEN** profile A и profile B предоставляют одинаковое видимое для модели имя MCP `server/tool` с разными refs учетных данных конкретного инструмента
+- **THEN** вызов из profile A MUST выполняться только в пуле profile A и MUST NOT достигать конфигурации, процесса, соединения, учетных данных или результатов инструмента из profile B
+
+#### Scenario: Отсутствующие MCP-пул, конфигурация или секрет запрещены
+- **WHEN** в текущем контексте отсутствует настроенный MCP-пул, снимок конфигурации, точный allowlist инструментов или обязательный profile-local credential ref
+- **THEN** система MUST deny до spawn, соединения или маршрутизации инструмента
+
+#### Scenario: Фоновый MCP не может открыть чужой профиль заново
+- **WHEN** фоновая задача, cron, callback или восстановленная задача вызывает MCP после перезапуска
+- **THEN** система MUST восстановить исходный контекст из шести полей и MUST NOT открывать, переиспользовать или создавать MCP-пул другого профиля
+
 ### Requirement: Owner capability boundary для Руслана
 Система SHALL allow owner access only inside current full owner profile and explicit admin surfaces.
 
@@ -104,7 +123,11 @@
 
 #### Scenario: Shared room configured MCP allowed комнаты
 - **WHEN** shared_room turn requests configured MCP tool из room Telegram tool profile
-- **THEN** система SHALL разрешить его только после того, как validated room `ResolvedAccessContext`, configured tool profile и backend policy разрешили exact tool; `shared_room` MUST NOT получать Wolfram автоматически и MUST NOT получать Wolfram MCP, пока отдельная room policy не будет явно одобрена отдельной дельтой
+- **THEN** система SHALL разрешить его только через привязанный к профилю пул этой комнаты после того, как validated room `ResolvedAccessContext`, configured tool profile и backend policy разрешили exact tool; `shared_room` MUST NOT получать Wolfram автоматически и MUST NOT получать Wolfram MCP, пока отдельная room policy не будет явно одобрена отдельной дельтой
+
+#### Scenario: Shared rooms используют только настроенный MCP комнаты
+- **WHEN** две shared rooms настраивают разные наборы MCP или у одной комнаты отсутствует настройка MCP
+- **THEN** каждая комната MUST предоставлять и маршрутизировать только собственный настроенный MCP для своих room `profile_id` и `conversation_scope`; отсутствующий room MCP MUST deny до spawn и MUST NOT использовать owner, family, default или MCP другой комнаты как запасной источник
 
 #### Scenario: Shared room unknown tool denied запрет
 - **WHEN** model, command или callback asks for tool name, MCP server, capability, profile, scope или delivery target, отсутствующий в configured room profile

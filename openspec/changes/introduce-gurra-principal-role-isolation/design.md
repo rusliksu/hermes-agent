@@ -16,6 +16,8 @@ Minor baseline clarification по credential-safe live audit: Руслан яв�
 
 Подтвержденная дельта 2026-07-25: идентификаторы ролей остаются ровно `owner`, `family_standard`, `family_sandbox`, `shared_room`. Wolfram больше не назначается индивидуальными roster-записями: все personal family profiles получают Wolfram через role policy. Восемь `family_standard` profiles получают точный настроенный Wolfram MCP allowlist по умолчанию, а единственный `family_sandbox` сохраняет свой Wolfram MCP allowlist. Это не создает пятую роль, отдельную роль под человека или special-case principal. Username/display-name не являются authority, proof или источником назначения. Wolfram role policy действует только для точного настроенного allowlist Wolfram MCP в собственном family profile/context и не дает terminal, host filesystem, browser, delegation, arbitrary MCP, cross-profile search/data, private/cross-profile delivery или foreign delivery. `shared_room` не получает Wolfram автоматически и не получает Wolfram MCP, пока отдельная room policy не будет явно одобрена отдельной дельтой; shared-room configured MCP/cron policy остается отдельной.
 
+Подтвержденная архитектурная дельта 2026-07-25 после static audit: текущий MCP discovery/startup path запускается один раз при старте gateway до `_profile_runtime_scope`, а `_servers` является global registry по server name. В multiplex это небезопасно для profile secrets: scoped interpolation fail-closes unscoped startup, а literal secrets в MCP config могли бы создать global subprocess, доступный не тому profile. Поэтому MCP startup, schema discovery и dispatch должны стать profile-bound и context-bound; unscoped process-start discovery в multiplex запрещается.
+
 ## Цели / Не-цели
 
 **Цели:**
@@ -27,6 +29,7 @@ Minor baseline clarification по credential-safe live audit: Руслан яв�
 - Реализовать server-side `RolePolicy`, `PrincipalBinding`, `SharedScopeBinding` и positive intersection role/scope/backend; unknown capability/tool всегда deny.
 - Задать prompt layering: security layer -> read-only role layer -> scope layer -> private USER/memory layer; prompt может сужать поведение, но не выдает права.
 - Устранить на request path module/import-time `HERMES_HOME` и `os.getenv` auth fallbacks; `session_search` и memory namespace становятся server-bound.
+- Привязать MCP server process, connection, config snapshot, tool schema surface, handler routing и tool-specific credential refs к resolved `profile_id` и `conversation_scope`; запретить global MCP server capture при registration.
 - Зафиксировать roster/preflight baseline: provisioning 9 family profiles, одна manually confirmed `family_sandbox` binding и восемь `family_standard` bindings возможны только после private manually confirmed roster для всех девяти family transport identities.
 - Зафиксировать capability границы для `owner`, `family_standard`, `family_sandbox`, `shared_room`, включая Docker sandbox для `family_sandbox` без host mounts/owner credentials, Wolfram role policy для всех personal family profiles и полный серверно настроенный Telegram tool profile для typed shared rooms без автоматического Wolfram, private/cross-room/owner fallback.
 - Добавить Dashboard Access/Users только для localhost/SSH tunnel, role preview/confirm/audit и break-glass 15m read-only с reason, reconfirm и manual revoke.
@@ -95,7 +98,19 @@ Shared room разрешается через `SharedScopeBinding`, а не че
 
 Альтернатива: сохранять env bridge как совместимость. Отклонено для request path, потому что env является process-global и ломает concurrent multi-profile isolation.
 
-### 6. Family sandbox и browser/network границы фиксируются явно
+### 6. MCP процессы и dispatch являются profile-bound
+
+Решение: для typed personal/shared profiles MCP server process, connection, config snapshot, tool schema surface, handler routing и любые tool-specific credential references создаются и выбираются только после resolved `ResolvedAccessContext`, с binding к `profile_id` и `conversation_scope`. Startup discovery без resolved context в multiplex должен fail-closed до spawn/interpolation/schema registration. Это запрещает общий `_servers[server_name]` как authority и запрещает global subprocess, созданный до `_profile_runtime_scope`.
+
+Model/provider credentials не являются MCP credentials и никогда не попадают в MCP env. Если MCP tool требует секрет, policy/config хранит только distinct profile-local server-side credential ref для конкретного server/tool profile; отсутствующий ref, missing config snapshot, missing profile pool или failed interpolation дают deny before spawn. Literal MCP config secrets не должны превращаться в process-global env для другого profile.
+
+Backend/model-visible MCP tool names остаются стабильными `server/tool`, чтобы не ломать prompt/tool naming и provider contracts. Но registration хранит только schema descriptor без live global server handle: runtime dispatch обязан заново резолвить текущий task-local/persisted `ResolvedAccessContext`, выбрать profile-bound pool и проверить role/scope/backend intersection. Два profile могут иметь одинаковый server name и разные credential refs/config snapshots; cross-call в чужой pool невозможен даже при совпадающем model-visible tool name.
+
+Background jobs, cron, callbacks и restored tasks используют persisted six-field context и не могут открыть или создать MCP pool другого profile. Shared rooms видят только MCP, явно configured для этой комнаты и разрешенный backend policy; room Wolfram не появляется автоматически и требует отдельной явно одобренной room policy.
+
+Альтернатива: оставить global MCP discovery at gateway startup и фильтровать tool calls по enabled tools. Отклонено, потому что глобальный subprocess уже мог получить чужие literal secrets и global handler мог удержать server handle до request-scoped policy check.
+
+### 7. Family sandbox и browser/network границы фиксируются явно
 
 Решение: `family_standard` не получает browser capability. Для этой роли доступен только public web как server-mediated fetch/search без persistent/logged-in browser state, без localhost/private network и без owner cookies. Wolfram MCP для `family_standard` разрешается role policy по умолчанию только как точный настроенный allowlist Wolfram MCP в собственном family profile/context. Terminal, host filesystem, browser, delegation, arbitrary MCP, cross-profile search/data и private/cross-profile delivery остаются deny. `family_sandbox` terminal запускается только в Docker sandbox: без host mounts, без owner credentials, `HOME` внутри profile, terminal network disabled, лимиты 2 vCPU, 2 GiB memory, 256 PID и 5 GiB writable disk.
 
@@ -103,7 +118,7 @@ Shared room разрешается через `SharedScopeBinding`, а не че
 
 Альтернатива: общий terminal с profile cwd. Отклонено, потому что cwd не защищает owner files, credentials, browser state и ambient network.
 
-### 7. Dashboard Access/Users локален и не раскрывает секреты
+### 8. Dashboard Access/Users локален и не раскрывает секреты
 
 Решение: dashboard Access/Users доступен только через localhost/SSH tunnel. UI/API показывают redacted status, role preview, explicit confirm и audit. Role/binding change применяется атомарно только после preview, confirm и audit persistence. Break-glass lease scoped на один target profile/session set, длится максимум 15 минут, read-only history only, требует reason, reconfirm, показывает privacy warning, может быть manually revoked и не переживает restart.
 
@@ -111,7 +126,7 @@ Break-glass не разрешает bulk search/export, передачу сод�
 
 Альтернатива: full admin dashboard для всех roles. Отклонено из-за высокого риска случайного раскрытия model, memory и sessions.
 
-### 8. Migration/rollout детерминированны и поставляются slices
+### 9. Migration/rollout детерминированны и поставляются slices
 
 Решение: migration переносит все однозначные owned DM sessions в profile DBs с сохранением IDs, timestamps, message counts и content hashes. Ambiguous legacy rows уходят в closed read-only archive. Global `MEMORY.md`/`USER.md` и personal context не импортируются. Room/topic mapping строит deterministic shared scopes; topics живут отдельным namespace внутри room profile и не склеиваются с DM history.
 
@@ -124,6 +139,7 @@ Rollout делится на additive slices с compare mode, backup, dry-run, st
 - [Риск] Legacy rows без достаточной identity нельзя безопасно классифицировать. -> Митигация: переносить их только в closed read-only legacy archive с hashes/counts, без импорта в active profiles.
 - [Риск] Cached agents могут удерживать старый profile home или memory manager. -> Митигация: cache key включает `ResolvedAccessContext` profile/session scope, reset/restart очищают cross-profile cached state, tests покрывают concurrent turns.
 - [Риск] Существующие tools могут читать `HERMES_HOME` или auth из env на import/request path. -> Митигация: audit request path, заменить на context-bound providers, unknown или non-migrated tool deny для family/shared roles.
+- [Риск] MCP startup discovery может создать global subprocess с literal secrets до profile scope. -> Митигация: запретить unscoped process-start discovery в multiplex, создать profile-bound pools/config snapshots после resolved context, deny before spawn при missing pool/config/ref.
 - [Риск] Dashboard break-glass может стать обходом private boundary. -> Митигация: localhost/SSH tunnel only, one target profile/session set, 15m read-only history lease, reason/reconfirm/manual revoke, audit без content, no bulk/model/tools exposure.
 - [Риск] Telegram IDs могут быть malformed или не соответствовать DM semantics. -> Митигация: exact DM rule `user_id == chat_id`, strict type validation, fail-closed denial before model/session/tools.
 - [Риск] Docker sandbox limits могут ломать полезные family tasks. -> Митигация: v1 принимает constrained sandbox, расширение требует material OpenSpec delta и отдельного approval.
@@ -132,8 +148,8 @@ Rollout делится на additive slices с compare mode, backup, dry-run, st
 ## План миграции
 
 1. Реализовать additive server contracts: `ResolvedAccessContext`, bindings, role policies, deny-before-model/session/tools gates и tests.
-2. Подключить profile-bound sessions, memory, prompt layers, attachments, tools, callbacks, background, cron, delegation, compaction, reset/restart и concurrent turn propagation в compare mode.
-3. Добавить family/shared role capability enforcement, self reminders, shared-room same-room cron delivery, scoped secrets, Docker sandbox для `family_sandbox`, isolated public browser, Wolfram role policy для всех personal family profiles и same-profile delegation.
+2. Подключить profile-bound sessions, memory, prompt layers, attachments, tools, MCP pools, callbacks, background, cron, delegation, compaction, reset/restart и concurrent turn propagation в compare mode.
+3. Добавить family/shared role capability enforcement, self reminders, shared-room same-room cron delivery, scoped secrets, MCP credential-ref denial before spawn, Docker sandbox для `family_sandbox`, isolated public browser, Wolfram role policy для всех personal family profiles и same-profile delegation.
 4. Добавить dashboard Access/Users с role preview/confirm/audit и break-glass lease invariants.
 5. Реализовать migration tooling с backup, dry-run, deterministic hashes/counts, ambiguous legacy archive, room topic namespaces и rollback.
 6. Выполнить private roster/preflight validation: 9 family transport identities mapped to opaque `principal_id -> role_id -> profile_id`, одна binding manually confirmed as only `family_sandbox`, остальные восемь `family_standard`, no missing/duplicate/ambiguous mappings, username/display-name redacted and non-authoritative.
