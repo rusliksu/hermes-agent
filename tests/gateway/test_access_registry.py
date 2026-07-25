@@ -52,11 +52,10 @@ FAMILY_CAPS = frozenset({
     "voice_generation",
     "wolfram",
 })
-SANDBOX_CAPS = (FAMILY_CAPS - {"wolfram"}) | frozenset({
+SANDBOX_CAPS = FAMILY_CAPS | frozenset({
     "delegation",
     "docker_terminal",
     "isolated_browser",
-    "wolfram_mcp",
 })
 ROOM_CAPS = frozenset({
     "attachments",
@@ -269,34 +268,32 @@ def test_all_family_standard_bindings_get_role_policy_wolfram():
 
 
 @pytest.mark.parametrize(
-    "roles,scope_capabilities,backend_capabilities",
+    "role_id,role_caps",
     [
-        (
-            {"family_standard": RolePolicy("family_standard", FAMILY_CAPS - {"wolfram"})},
-            {"private": FAMILY_CAPS},
-            BACKEND_CAPS,
-        ),
-        (
-            {"family_standard": RolePolicy("family_standard", FAMILY_CAPS)},
-            {"private": FAMILY_CAPS - {"wolfram"}},
-            BACKEND_CAPS,
-        ),
-        (
-            {"family_standard": RolePolicy("family_standard", FAMILY_CAPS)},
-            {"private": FAMILY_CAPS},
-            BACKEND_CAPS - {"wolfram"},
-        ),
+        ("family_standard", FAMILY_CAPS),
+        ("family_sandbox", SANDBOX_CAPS),
     ],
 )
-def test_family_standard_wolfram_requires_role_scope_and_backend(
-    roles,
-    scope_capabilities,
-    backend_capabilities,
+@pytest.mark.parametrize("missing_from", ["role", "scope", "backend"])
+def test_family_wolfram_requires_role_scope_and_backend(
+    role_id,
+    role_caps,
+    missing_from,
 ):
     binding = replace(
         _principal_bindings()[1],
-        role_id="family_standard",
+        role_id=role_id,
     )
+    roles = {
+        role_id: RolePolicy(
+            role_id,
+            role_caps - {"wolfram"} if missing_from == "role" else role_caps,
+        )
+    }
+    scope_capabilities = {
+        "private": role_caps - {"wolfram"} if missing_from == "scope" else role_caps
+    }
+    backend_capabilities = BACKEND_CAPS - {"wolfram"} if missing_from == "backend" else BACKEND_CAPS
     registry = _registry(
         principal_bindings=(binding,),
         roles=roles,
@@ -308,7 +305,7 @@ def test_family_standard_wolfram_requires_role_scope_and_backend(
 
     context = registry.resolve(_dm_identity("opaque-family-0"))
 
-    assert context.role_id == "family_standard"
+    assert context.role_id == role_id
     assert "public_web" in context.capabilities
     assert "wolfram" not in context.capabilities
 
@@ -335,14 +332,13 @@ def test_shared_room_does_not_inherit_family_wolfram_policy():
     assert "wolfram" not in context.capabilities
 
 
-def test_non_family_standard_role_policy_still_requires_role_capability():
+def test_family_sandbox_uses_literal_wolfram_capability():
     binding = replace(
         _principal_bindings()[1],
         role_id="family_sandbox",
     )
     registry = _registry(
         principal_bindings=(binding,),
-        scope_capabilities={"private": SANDBOX_CAPS | {"wolfram"}},
         profiles=frozenset({"family-profile-0"}),
         shared_bindings=(),
     )
@@ -350,7 +346,7 @@ def test_non_family_standard_role_policy_still_requires_role_capability():
     context = registry.resolve(_dm_identity("opaque-family-0"))
 
     assert "delegation" in context.capabilities
-    assert "wolfram" not in context.capabilities
+    assert "wolfram" in context.capabilities
 
 
 def test_validate_resolved_context_accepts_current_active_context():

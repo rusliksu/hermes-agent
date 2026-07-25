@@ -222,21 +222,29 @@ def test_family_standard_capability_cannot_enable_disabled_platform_toolset():
     ) == ["web"]
 
 
-def test_family_standard_wolfram_requires_resolved_capability_and_configured_toolset():
+@pytest.mark.parametrize("role_id", ["family_standard", "family_sandbox"])
+@pytest.mark.parametrize("wolfram_toolset", ["wolfram", "mcp-wolfram"])
+def test_family_roles_wolfram_requires_literal_capability_and_exact_configured_toolset(
+    role_id,
+    wolfram_toolset,
+):
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
-        CONFIGURED_TOOLSETS,
-        _context("family_standard", {"wolfram", "public_web"}),
+        ["web", wolfram_toolset, "mcp-arbitrary", "wolfram-extra"],
+        _context(
+            role_id,
+            {"wolfram", "public_web", "wolfram_mcp", "arbitrary_mcp"},
+        ),
     )
     missing_capability = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
-        CONFIGURED_TOOLSETS,
-        _context("family_standard", {"public_web"}),
+        ["web", wolfram_toolset],
+        _context(role_id, {"public_web", "wolfram_mcp"}),
     )
     missing_config = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         ["web"],
-        _context("family_standard", {"wolfram", "public_web"}),
+        _context(role_id, {"wolfram", "public_web"}),
     )
 
-    assert allowed == ["web", "wolfram"]
+    assert allowed == sorted(["web", wolfram_toolset])
     assert missing_capability == ["web"]
     assert missing_config == ["web"]
     assert not {
@@ -244,7 +252,8 @@ def test_family_standard_wolfram_requires_resolved_capability_and_configured_too
         "file",
         "browser",
         "delegation",
-        "custom_mcp_server",
+        "mcp-arbitrary",
+        "wolfram-extra",
     } & set(allowed)
 
 

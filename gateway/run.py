@@ -3835,7 +3835,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "voice_generation": "tts",
                 "session_search": "session_search",
                 "self_reminder": "cronjob",
-                "wolfram": "wolfram",
             },
             "family_sandbox": {
                 "memory_search": "memory",
@@ -3858,6 +3857,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for capability, toolset in capability_toolsets.items()
             if capability in capabilities and toolset in configured
         }
+        if "wolfram" in capabilities:
+            allowed.update(configured & {"wolfram", "mcp-wolfram"})
         return sorted(allowed)
 
     @staticmethod
