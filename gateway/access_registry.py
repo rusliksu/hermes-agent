@@ -290,11 +290,7 @@ class PrincipalBinding:
     transport_identity: TransportIdentity
     conversation_scope: str
     delivery_target: DeliveryTarget
-    capabilities: frozenset[str] = field(default_factory=frozenset)
     active: bool = True
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
 
 
 @dataclass(frozen=True)
@@ -639,19 +635,12 @@ class AccessRegistry:
         self,
         role_id: str,
         conversation_scope: str,
-        binding_capabilities: Any = None,
     ) -> frozenset[str]:
         role = self.roles.get(role_id)
         if not isinstance(role, RolePolicy) or not role.active:
             return frozenset()
         scope_caps = self.scope_capabilities.get(conversation_scope, frozenset())
-        allowed = role.capabilities
-        if role_id == "family_standard":
-            binding_caps = _immutable_capabilities(binding_capabilities)
-            allowed = role.capabilities - {"wolfram"}
-            if "wolfram" in binding_caps:
-                allowed = allowed | {"wolfram"}
-        return allowed & scope_caps & self.backend_capabilities
+        return role.capabilities & scope_caps & self.backend_capabilities
 
     def _resolve_dm(
         self,
@@ -807,7 +796,6 @@ class AccessRegistry:
             capabilities=self.effective_capabilities(
                 binding.role_id,
                 binding.conversation_scope,
-                binding.capabilities if isinstance(binding, PrincipalBinding) else None,
             ),
             delivery_target=delivery_target or binding.delivery_target,
         )

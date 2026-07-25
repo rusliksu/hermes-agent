@@ -149,11 +149,11 @@ def test_minimal_dm_access_registry_parses_to_immutable_types_and_runner_uses_co
     assert explicit_runner.access_registry is explicit
 
 
-def test_family_standard_wolfram_binding_capability_parses_and_intersects_scope_backend():
+def test_family_standard_wolfram_role_policy_parses_and_intersects_scope_backend():
     raw = _minimal_dm_registry()
     raw["roles"] = {
         "family_standard": {
-            "capabilities": ["public_web"],
+            "capabilities": ["public_web", "wolfram"],
         },
     }
     raw["principal_bindings"][0]["role_id"] = "family_standard"
@@ -163,11 +163,6 @@ def test_family_standard_wolfram_binding_capability_parses_and_intersects_scope_
         "not_backend",
     ]
     raw["backend_capabilities"] = ["public_web", "wolfram", "backend_only"]
-    raw["principal_bindings"][0]["capabilities"] = [
-        "wolfram",
-        "not_backend",
-        "scope_unknown",
-    ]
 
     registry = GatewayConfig.from_dict({"access_registry": raw}).access_registry
     context = registry.resolve(
@@ -180,10 +175,15 @@ def test_family_standard_wolfram_binding_capability_parses_and_intersects_scope_
         )
     )
 
-    assert registry.principal_bindings[0].capabilities == frozenset(
-        {"wolfram", "not_backend", "scope_unknown"}
-    )
     assert context.capabilities == frozenset({"public_web", "wolfram"})
+
+
+def test_principal_binding_config_rejects_obsolete_capabilities_field():
+    raw = _minimal_dm_registry()
+    raw["principal_bindings"][0]["capabilities"] = ["wolfram"]
+
+    with pytest.raises(AccessRegistryConfigError):
+        GatewayConfig.from_dict({"access_registry": raw})
 
 
 def test_shared_room_public_web_registry_resolves_to_configured_telegram_profile():

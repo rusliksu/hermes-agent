@@ -46,23 +46,23 @@
 - **THEN** система MUST apply shared room scope for that room turn and MUST NOT automatically inject owner private USER/memory into shared prompt
 
 ### Requirement: Family standard capability boundary для семьи
-Система SHALL давать `family_standard` только personal memory/session search, documents, attachments, vision, public web, image/voice generation и self reminders по умолчанию, без Wolfram или arbitrary MCP, кроме случая ровно трех private manually confirmed family `PrincipalBinding` с literal capability `wolfram`; эти bindings остаются role `family_standard` и не создают пятую роль.
+Система SHALL давать `family_standard` только personal memory/session search, documents, attachments, vision, public web, image/voice generation, self reminders и точный настроенный Wolfram MCP allowlist по умолчанию; arbitrary MCP остается deny. Восемь `family_standard` profiles получают Wolfram через role policy, без индивидуальных roster-записей для Wolfram и без пятой роли.
 
 #### Scenario: Family standard personal capability личная
 - **WHEN** family_standard requests personal memory/session search, documents, attachments, vision, public web, image generation, voice generation или reminder to self
 - **THEN** система SHALL allow it only inside family profile, configured `conversation_scope` и server-bound `delivery_target`
 
-#### Scenario: Family standard browser and MCP denied запрет
-- **WHEN** family_standard requests host shell, host filesystem, logged-in browser, persistent browser, arbitrary MCP, Wolfram MCP without literal `wolfram` capability, delegation, localhost access, owner credentials или service controls
+#### Scenario: Family standard browser and arbitrary MCP denied запрет
+- **WHEN** family_standard requests host shell, host filesystem, logged-in browser, persistent browser, arbitrary MCP, delegation, localhost access, owner credentials или service controls
 - **THEN** система MUST deny
 
-#### Scenario: Family standard Wolfram capability ограничен
-- **WHEN** `PrincipalBinding` с ролью `family_standard` входит в ровно три вручную подтверждённые private bindings с literal capability `wolfram` и запрашивает вычисление через Wolfram MCP
-- **THEN** система SHALL allow only точный настроенный allowlist Wolfram MCP inside that binding's own family profile/context and MUST deny terminal, host filesystem, browser, delegation, arbitrary MCP, cross-profile search/data, private/cross-profile delivery and foreign delivery
+#### Scenario: Family standard Wolfram role policy ограничен
+- **WHEN** `family_standard` запрашивает вычисление через Wolfram MCP
+- **THEN** система SHALL разрешать только точный настроенный allowlist Wolfram MCP внутри собственного family profile/context и MUST deny terminal, host filesystem, browser, delegation, arbitrary MCP, cross-profile search/data, private/cross-profile delivery и foreign delivery
 
-#### Scenario: Family standard Wolfram labels не являются authority
-- **WHEN** username/display-name или human label доступны для одной из трех private family `PrincipalBinding` с literal capability `wolfram`
-- **THEN** система MUST NOT use that label as authority or grant source and MUST NOT include human labels for those grants in artifacts
+#### Scenario: Family standard Wolfram не выводится из labels
+- **WHEN** username/display-name, human label, message text, command args, callback payload или user-supplied capability field пытаются указать Wolfram availability для `family_standard`
+- **THEN** система MUST игнорировать их как authority и MUST использовать только server-side role policy, configured toolset и backend intersection
 
 #### Scenario: Family standard cross profile denied запрет
 - **WHEN** family_standard requests owner sessions, owner memory, another family profile, shared room private data или cross-principal/profile search
@@ -81,7 +81,7 @@
 
 #### Scenario: Sandbox Wolfram allowlist для MCP
 - **WHEN** family_sandbox requests Wolfram MCP computation через allowlist
-- **THEN** система SHALL allow only configured Wolfram MCP allowlist inside own `family_sandbox` profile/context and MUST deny arbitrary MCP tools; this existing sandbox policy is unchanged by the three `family_standard` `wolfram` grants
+- **THEN** система SHALL allow only configured Wolfram MCP allowlist inside own `family_sandbox` profile/context and MUST deny arbitrary MCP tools; this sandbox policy is retained as part of all personal family role policy
 
 #### Scenario: Sandbox same-profile delegation только same-profile
 - **WHEN** family_sandbox delegates work to subagent или worker
@@ -104,7 +104,7 @@
 
 #### Scenario: Shared room configured MCP allowed комнаты
 - **WHEN** shared_room turn requests configured MCP tool из room Telegram tool profile
-- **THEN** система SHALL разрешить его только после того, как validated room `ResolvedAccessContext`, configured tool profile и backend policy разрешили exact tool; this existing shared-room MCP/cron policy is unchanged by private family `wolfram` grants
+- **THEN** система SHALL разрешить его только после того, как validated room `ResolvedAccessContext`, configured tool profile и backend policy разрешили exact tool; `shared_room` MUST NOT получать Wolfram автоматически и MUST NOT получать Wolfram MCP, пока отдельная room policy не будет явно одобрена отдельной дельтой
 
 #### Scenario: Shared room unknown tool denied запрет
 - **WHEN** model, command или callback asks for tool name, MCP server, capability, profile, scope или delivery target, отсутствующий в configured room profile

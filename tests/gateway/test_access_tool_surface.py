@@ -222,7 +222,7 @@ def test_family_standard_capability_cannot_enable_disabled_platform_toolset():
     ) == ["web"]
 
 
-def test_family_standard_wolfram_requires_literal_capability_and_configured_toolset():
+def test_family_standard_wolfram_requires_resolved_capability_and_configured_toolset():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _context("family_standard", {"wolfram", "public_web"}),
@@ -246,6 +246,16 @@ def test_family_standard_wolfram_requires_literal_capability_and_configured_tool
         "delegation",
         "custom_mcp_server",
     } & set(allowed)
+
+
+def test_shared_room_does_not_auto_inherit_family_wolfram_toolset():
+    toolsets = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        ["web"],
+        _shared_context({"room_memory", "public_web", "wolfram"}),
+    )
+
+    assert toolsets == ["web"]
+    assert "wolfram" not in toolsets
 
 
 def test_family_memory_surface_requires_memory_search_capability_and_config():

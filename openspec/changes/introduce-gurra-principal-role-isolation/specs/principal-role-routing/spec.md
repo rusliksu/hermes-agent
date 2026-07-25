@@ -31,7 +31,7 @@
 - **THEN** система MUST authorize только exact configured room tools из validated room `ResolvedAccessContext`, configured Telegram tool profile и backend policy
 
 ### Requirement: Проверенный семейный roster до provisioning и cutover
-Система MUST требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family transport identities до provisioning, migration preflight или live cutover; тот же private roster MUST содержать ровно одну `family_sandbox` binding и ровно три private family `PrincipalBinding` с literal capability `wolfram`.
+Система MUST требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family transport identities до provisioning, migration preflight или live cutover; тот же private roster MUST содержать ровно одну `family_sandbox` binding и восемь `family_standard` bindings. Wolfram MUST назначаться через role policy для всех personal family profiles, а не через roster.
 
 #### Scenario: Owner baseline сохраняется
 - **WHEN** baseline registry preflight выполняется
@@ -49,17 +49,17 @@
 - **WHEN** оператор подтверждает roster
 - **THEN** оператор MUST manually mark exactly one binding as sandbox binding и система MUST assign `family_sandbox` only to that binding, while assigning `family_standard` to the other eight family bindings
 
-#### Scenario: Wolfram capability grants назначаются вручную
+#### Scenario: Wolfram назначается role policy
 - **WHEN** оператор подтверждает private roster
-- **THEN** оператор MUST manually mark exactly three private family `PrincipalBinding` with literal capability `wolfram`, а система MUST NOT create a fifth role, create a person-specific role, make any binding special, or derive the capability assignment from username, display-name, message text, model args или room membership
+- **THEN** система MUST NOT требовать или принимать Wolfram assignments в roster; восемь `family_standard` profiles SHALL получать exact configured Wolfram MCP allowlist по role policy по умолчанию, один `family_sandbox` SHALL сохранять свой Wolfram MCP allowlist, и система MUST NOT создавать пятую роль, роль под человека, special-case principal или выводить Wolfram availability из username, display-name, message text, model args или room membership
 
 #### Scenario: Display labels не являются authority
 - **WHEN** username/display-name доступны из transport metadata, dashboard или audit
-- **THEN** система MUST treat username/display-name only as non-authoritative redacted admin labels, MUST NOT use them as roster proof, exact identity source или auto-link evidence across multiple accounts, and MUST NOT include human labels for the three `wolfram` grants in artifacts
+- **THEN** система MUST treat username/display-name only as non-authoritative redacted admin labels, MUST NOT use them as roster proof, exact identity source, role/profile assignment source, Wolfram source или auto-link evidence across multiple accounts
 
 #### Scenario: Неоднозначный roster блокирует cutover
-- **WHEN** roster has missing, duplicate или ambiguous mapping for any family transport identity, role, profile или `wolfram` capability assignment
-- **THEN** система MUST block provisioning, migration preflight and live cutover and MUST NOT guess the intended exact identity, role, profile или capability assignment
+- **WHEN** roster has missing, duplicate или ambiguous mapping for any family transport identity, role или profile
+- **THEN** система MUST block provisioning, migration preflight and live cutover and MUST NOT guess the intended exact identity, role или profile
 
 ### Requirement: Unknown и malformed ingress fail-closed
 Система MUST отказывать unknown, missing или malformed transport identity без owner/default fallback.

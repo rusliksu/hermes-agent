@@ -231,9 +231,31 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
-    async def test_successful_task_sends_result(self):
+    async def test_successful_task_sends_result(self, monkeypatch):
         """When the agent completes successfully, the result is sent."""
+        from gateway import run as gateway_run
+
         runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._refresh_fallback_model = MagicMock(return_value=None)
+
+        async def run_inline(func):
+            return func()
+
+        runner._run_in_executor_with_context = run_inline
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -249,8 +271,7 @@ class TestRunBackgroundTask:
 
         mock_result = {"final_response": "Hello from background!", "messages": []}
 
-        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
-             patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
             mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
