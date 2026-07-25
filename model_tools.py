@@ -1037,6 +1037,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    allow_unlisted_tool_search_call: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1058,6 +1059,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        allow_unlisted_tool_search_call: Internal bridge-only escape hatch set
+                       after tool_call has passed its scoped catalog check.
 
     Returns:
         Function result as a JSON string.
@@ -1067,6 +1070,15 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+
+    if (
+        enabled_tools is not None
+        and function_name not in set(enabled_tools)
+        and not allow_unlisted_tool_search_call
+    ):
+        return json.dumps({
+            "error": f"Tool '{function_name}' is not available in this session."
+        }, ensure_ascii=False)
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1141,6 +1153,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                allow_unlisted_tool_search_call=True,
             )
 
     _tool_original_args = dict(function_args)
