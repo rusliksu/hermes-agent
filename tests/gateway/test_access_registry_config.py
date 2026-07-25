@@ -149,7 +149,44 @@ def test_minimal_dm_access_registry_parses_to_immutable_types_and_runner_uses_co
     assert explicit_runner.access_registry is explicit
 
 
-def test_shared_room_public_web_registry_resolves_to_memory_and_web_profile():
+def test_family_standard_wolfram_binding_capability_parses_and_intersects_scope_backend():
+    raw = _minimal_dm_registry()
+    raw["roles"] = {
+        "family_standard": {
+            "capabilities": ["public_web"],
+        },
+    }
+    raw["principal_bindings"][0]["role_id"] = "family_standard"
+    raw["scope_capabilities"]["private"] = [
+        "public_web",
+        "wolfram",
+        "not_backend",
+    ]
+    raw["backend_capabilities"] = ["public_web", "wolfram", "backend_only"]
+    raw["principal_bindings"][0]["capabilities"] = [
+        "wolfram",
+        "not_backend",
+        "scope_unknown",
+    ]
+
+    registry = GatewayConfig.from_dict({"access_registry": raw}).access_registry
+    context = registry.resolve(
+        TransportIdentity(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            user_id=SENTINEL_USER,
+            chat_id=SENTINEL_USER,
+        )
+    )
+
+    assert registry.principal_bindings[0].capabilities == frozenset(
+        {"wolfram", "not_backend", "scope_unknown"}
+    )
+    assert context.capabilities == frozenset({"public_web", "wolfram"})
+
+
+def test_shared_room_public_web_registry_resolves_to_configured_telegram_profile():
     registry = GatewayConfig.from_dict(
         {"access_registry": _shared_room_registry()}
     ).access_registry
@@ -170,14 +207,25 @@ def test_shared_room_public_web_registry_resolves_to_memory_and_web_profile():
     )
     source.resolved_access_context = context
 
+    configured_toolsets = ["memory", "web", "vision", "terminal", "delegation"]
     toolsets, expected_tools = GatewayRunner._shared_tool_profile_for_source(
         source,
-        configured_toolsets=["memory", "web"],
+        configured_toolsets=configured_toolsets,
+    )
+    from model_tools import get_tool_definitions
+
+    runtime_tool_names = frozenset(
+        definition["function"]["name"]
+        for definition in get_tool_definitions(
+            enabled_toolsets=toolsets,
+            quiet_mode=True,
+        )
     )
 
     assert isinstance(registry.shared_scope_bindings[0], SharedScopeBinding)
-    assert toolsets == ["memory", "web"]
-    assert expected_tools == frozenset({"memory", "web_search", "web_extract"})
+    assert toolsets == sorted(configured_toolsets)
+    assert expected_tools == runtime_tool_names
+    assert "memory" in expected_tools
 
 
 @pytest.mark.parametrize(
@@ -192,6 +240,12 @@ def test_shared_room_public_web_registry_resolves_to_memory_and_web_profile():
         ),
         (
             lambda raw: raw["principal_bindings"][0].update({"active": ["true"]}),
+            AccessRegistryConfigError,
+        ),
+        (
+            lambda raw: raw["principal_bindings"][0].update(
+                {"capabilities": "wolfram"}
+            ),
             AccessRegistryConfigError,
         ),
         (

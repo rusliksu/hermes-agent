@@ -324,7 +324,7 @@ def _parse_access_registry(raw: Any) -> "AccessRegistry":
                 "conversation_scope",
                 "delivery_target",
             },
-            {"active"},
+            {"active", "capabilities"},
         )
         principal_bindings.append(
             PrincipalBinding(
@@ -346,6 +346,12 @@ def _parse_access_registry(raw: Any) -> "AccessRegistry":
                 delivery_target=delivery_target(
                     binding["delivery_target"],
                     f"{path}.delivery_target",
+                ),
+                capabilities=frozenset(
+                    _require_str_list(
+                        binding.get("capabilities", []),
+                        f"{path}.capabilities",
+                    )
                 ),
                 active=_require_bool(binding.get("active", True), f"{path}.active"),
             )

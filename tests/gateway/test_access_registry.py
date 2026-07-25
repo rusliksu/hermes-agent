@@ -69,7 +69,7 @@ BACKEND_CAPS = (
     OWNER_CAPS
     | SANDBOX_CAPS
     | ROOM_CAPS
-    | frozenset({"backend_only", "scope_unknown"})
+    | frozenset({"backend_only", "scope_unknown", "wolfram"})
 )
 
 
@@ -252,6 +252,98 @@ def test_exact_telegram_dm_success_and_capability_intersection():
     assert "not_backend" not in context.capabilities
     assert "backend_only" not in context.capabilities
     assert context.delivery_target.chat_id == "opaque-family-0"
+
+
+def test_family_standard_wolfram_binding_grant_extends_role_only_through_scope_and_backend():
+    binding = replace(
+        _principal_bindings()[1],
+        role_id="family_standard",
+        capabilities=frozenset({"wolfram", "scope_unknown", "not_backend"}),
+    )
+    registry = _registry(
+        principal_bindings=(binding,),
+        scope_capabilities={
+            "private": FAMILY_CAPS | {"wolfram", "not_backend"},
+        },
+        profiles=frozenset({"family-profile-0"}),
+        shared_bindings=(),
+    )
+
+    context = registry.resolve(_dm_identity("opaque-family-0"))
+
+    assert context.role_id == "family_standard"
+    assert "public_web" in context.capabilities
+    assert "wolfram" in context.capabilities
+    assert "scope_unknown" not in context.capabilities
+    assert "not_backend" not in context.capabilities
+
+
+def test_family_standard_role_default_wolfram_does_not_grant_sibling_binding():
+    granted = replace(
+        _principal_bindings()[1],
+        role_id="family_standard",
+        capabilities=frozenset({"wolfram"}),
+    )
+    sibling = replace(_principal_bindings()[2], role_id="family_standard")
+    registry = _registry(
+        principal_bindings=(granted, sibling),
+        roles={
+            "family_standard": RolePolicy(
+                "family_standard",
+                FAMILY_CAPS | {"wolfram"},
+            ),
+        },
+        scope_capabilities={"private": FAMILY_CAPS | {"wolfram"}},
+        profiles=frozenset({"family-profile-0", "family-profile-1"}),
+        shared_bindings=(),
+    )
+
+    assert "wolfram" in registry.resolve(_dm_identity("opaque-family-0")).capabilities
+    sibling_context = registry.resolve(_dm_identity("opaque-family-1"))
+    assert "public_web" in sibling_context.capabilities
+    assert "wolfram" not in sibling_context.capabilities
+
+
+def test_family_standard_unapproved_or_malformed_binding_override_fails_closed():
+    binding = replace(
+        _principal_bindings()[1],
+        role_id="family_standard",
+        capabilities=("delegation", "wolfram_mcp", "", object()),
+    )
+    registry = _registry(
+        principal_bindings=(binding,),
+        scope_capabilities={
+            "private": FAMILY_CAPS | {"delegation", "wolfram_mcp", "wolfram"},
+        },
+        profiles=frozenset({"family-profile-0"}),
+        shared_bindings=(),
+    )
+
+    context = registry.resolve(_dm_identity("opaque-family-0"))
+
+    assert "public_web" in context.capabilities
+    assert "delegation" not in context.capabilities
+    assert "wolfram_mcp" not in context.capabilities
+    assert "wolfram" not in context.capabilities
+
+
+def test_non_family_standard_binding_capability_override_fails_closed():
+    binding = replace(
+        _principal_bindings()[1],
+        role_id="family_sandbox",
+        capabilities=frozenset({"wolfram"}),
+    )
+    registry = _registry(
+        principal_bindings=(binding,),
+        scope_capabilities={"private": SANDBOX_CAPS | {"wolfram"}},
+        profiles=frozenset({"family-profile-0"}),
+        shared_bindings=(),
+    )
+
+    context = registry.resolve(_dm_identity("opaque-family-0"))
+
+    assert "delegation" in context.capabilities
+    assert "wolfram" not in context.capabilities
 
 
 def test_validate_resolved_context_accepts_current_active_context():

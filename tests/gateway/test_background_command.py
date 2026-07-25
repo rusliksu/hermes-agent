@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -266,6 +267,96 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_typed_background_task_passes_filtered_toolsets_to_agent(self, monkeypatch):
+        """Typed background agents must not reopen raw platform toolsets."""
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._refresh_fallback_model = MagicMock(return_value=None)
+
+        async def run_inline(func):
+            return func()
+
+        runner._run_in_executor_with_context = run_inline
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "platform_toolsets": {
+                    "telegram": [
+                        "web",
+                        "wolfram",
+                        "terminal",
+                        "file",
+                        "browser",
+                        "delegation",
+                        "custom_mcp_server",
+                    ],
+                },
+            },
+        )
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="12345",
+            chat_type="dm",
+        )
+        source.resolved_access_context = ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web", "wolfram"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="12345",
+            ),
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {
+                "final_response": "done",
+                "messages": [],
+            }
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        enabled = MockAgent.call_args.kwargs["enabled_toolsets"]
+        assert enabled == ["web", "wolfram"]
+        assert not {
+            "terminal",
+            "file",
+            "browser",
+            "delegation",
+            "custom_mcp_server",
+        } & set(enabled)
 
     @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):

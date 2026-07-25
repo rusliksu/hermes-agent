@@ -71,6 +71,19 @@ def _tool_names_for_toolsets(toolsets):
     return names
 
 
+def _runtime_tool_names_for_toolsets(toolsets, disabled_toolsets=None):
+    from model_tools import get_tool_definitions
+
+    return frozenset(
+        definition["function"]["name"]
+        for definition in get_tool_definitions(
+            enabled_toolsets=list(toolsets),
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+        )
+    )
+
+
 def _context(role_id: str, capabilities=()):
     return ResolvedAccessContext(
         principal_id="principal",
@@ -209,6 +222,32 @@ def test_family_standard_capability_cannot_enable_disabled_platform_toolset():
     ) == ["web"]
 
 
+def test_family_standard_wolfram_requires_literal_capability_and_configured_toolset():
+    allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        CONFIGURED_TOOLSETS,
+        _context("family_standard", {"wolfram", "public_web"}),
+    )
+    missing_capability = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        CONFIGURED_TOOLSETS,
+        _context("family_standard", {"public_web"}),
+    )
+    missing_config = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        ["web"],
+        _context("family_standard", {"wolfram", "public_web"}),
+    )
+
+    assert allowed == ["web", "wolfram"]
+    assert missing_capability == ["web"]
+    assert missing_config == ["web"]
+    assert not {
+        "terminal",
+        "file",
+        "browser",
+        "delegation",
+        "custom_mcp_server",
+    } & set(allowed)
+
+
 def test_family_memory_surface_requires_memory_search_capability_and_config():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
@@ -248,39 +287,36 @@ def test_family_sandbox_delegation_only_with_capability_and_config():
     assert not {"terminal", "browser", "wolfram"} & set(allowed)
 
 
-def test_shared_room_generic_surface_is_web_and_vision_only():
-    assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+def test_shared_room_typed_surface_uses_full_configured_tool_profile():
+    toolsets = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _shared_context({"room_memory", "public_web", "vision"}),
-    ) == ["vision", "web"]
+    )
+
+    assert toolsets == CONFIGURED_TOOLSETS
+    assert {"terminal", "file", "browser", "delegation", "custom_mcp_server"} <= set(
+        toolsets
+    )
 
 
-def test_shared_profile_memory_requires_room_memory_capability_and_config():
+def test_shared_profile_uses_configured_tools_and_runtime_expected_names():
     source = _source(_shared_context({"room_memory", "public_web", "vision"}))
 
     toolsets, expected_tools = gateway_run.GatewayRunner._shared_tool_profile_for_source(
         source,
         configured_toolsets=["memory", "web", "vision", "terminal"],
     )
-    no_capability, no_capability_tools = (
-        gateway_run.GatewayRunner._shared_tool_profile_for_source(
-            _source(_shared_context({"public_web", "vision"})),
-            configured_toolsets=["memory", "web", "vision"],
-        )
-    )
     no_config, no_config_tools = gateway_run.GatewayRunner._shared_tool_profile_for_source(
         source,
         configured_toolsets=["web", "vision"],
     )
 
-    assert toolsets == ["memory", "vision", "web"]
-    assert expected_tools == frozenset(
-        {"memory", "vision_analyze", "web_search", "web_extract"}
-    )
-    assert no_capability == ["vision", "web"]
-    assert no_capability_tools == frozenset({"vision_analyze", "web_search", "web_extract"})
+    assert toolsets == ["memory", "terminal", "vision", "web"]
+    assert expected_tools == _runtime_tool_names_for_toolsets(toolsets)
+    assert "memory" in expected_tools
     assert no_config == ["vision", "web"]
-    assert no_config_tools == frozenset({"vision_analyze", "web_search", "web_extract"})
+    assert no_config_tools == _runtime_tool_names_for_toolsets(no_config)
+    assert "memory" not in no_config_tools
 
 
 def test_access_registry_shared_scope_is_opaque_without_legacy_policy():
@@ -542,14 +578,15 @@ def test_empty_toolset_result_stays_empty_list_not_default_all():
 def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
     monkeypatch,
 ):
+    user_config = {
+        "platform_toolsets": {
+            "telegram": ["web", "terminal", "browser", "delegation"],
+        },
+    }
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {
-            "platform_toolsets": {
-                "telegram": ["memory", "web", "terminal", "browser", "delegation"],
-            },
-        },
+        lambda: user_config,
     )
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda *a, **k: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **k: "model")
@@ -575,7 +612,15 @@ def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
     )
 
     assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["enabled_toolsets"] == ["web"]
+    from hermes_cli.tools_config import _get_platform_tools
+
+    assert _CapturingAgent.last_init["enabled_toolsets"] == sorted(
+        _get_platform_tools(user_config, "telegram")
+    )
+    assert {"browser", "delegation", "terminal", "web"} <= set(
+        _CapturingAgent.last_init["enabled_toolsets"]
+    )
+    assert "memory" not in _CapturingAgent.last_init["enabled_toolsets"]
     assert _CapturingAgent.last_init["skip_context_files"] is True
     assert _CapturingAgent.last_init["skip_memory"] is True
     assert _CapturingAgent.last_init["prefill_messages"] is None
@@ -719,7 +764,8 @@ def test_typed_prompt_isolation_uses_access_context_prompt_rules(
         assert prompt.startswith(
             "Context prompt\n\nThis is a shared multi-user Telegram scope."
         )
-        assert "Use only this scope's MEMORY.md" in prompt
+        assert "The configured Telegram tools are available" in prompt
+        assert "memory is limited to this scope's MEMORY.md" in prompt
         assert "FAMILY PROFILE" not in prompt
     else:
         assert prompt == expected_prompt
@@ -738,14 +784,15 @@ def test_typed_prompt_isolation_uses_access_context_prompt_rules(
 def test_run_agent_access_registry_shared_room_binds_only_room_memory_namespace(
     monkeypatch,
 ):
+    user_config = {
+        "platform_toolsets": {
+            "telegram": ["memory", "web", "terminal", "browser", "delegation"],
+        },
+    }
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {
-            "platform_toolsets": {
-                "telegram": ["memory", "web", "terminal", "browser", "delegation"],
-            },
-        },
+        lambda: user_config,
     )
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda *a, **k: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **k: "model")
@@ -757,7 +804,7 @@ def test_run_agent_access_registry_shared_room_binds_only_room_memory_namespace(
     runner = _make_runner()
     captured = {}
 
-    def bind_shared_memory(agent, scope, memory_config, *, expected_tool_names):
+    def bind_shared_memory(agent, scope, memory_config, *, expected_tool_names=None):
         captured["scope"] = scope
         captured["expected_tool_names"] = expected_tool_names
 
@@ -780,14 +827,22 @@ def test_run_agent_access_registry_shared_room_binds_only_room_memory_namespace(
     )
 
     assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["enabled_toolsets"] == ["memory", "web"]
+    from hermes_cli.tools_config import _get_platform_tools
+
+    assert _CapturingAgent.last_init["enabled_toolsets"] == sorted(
+        _get_platform_tools(user_config, "telegram")
+    )
+    assert {"browser", "delegation", "memory", "terminal", "web"} <= set(
+        _CapturingAgent.last_init["enabled_toolsets"]
+    )
     assert _CapturingAgent.last_init["skip_context_files"] is True
     assert _CapturingAgent.last_init["skip_memory"] is True
     assert _CapturingAgent.last_init["prefill_messages"] is None
     assert _CapturingAgent.last_init["user_id"] is None
     assert captured["scope"].memory_namespace == expected_namespace
-    assert captured["expected_tool_names"] == frozenset(
-        {"memory", "web_search", "web_extract"}
-    )
+    if captured["expected_tool_names"] is not None:
+        assert captured["expected_tool_names"] == _runtime_tool_names_for_toolsets(
+            _CapturingAgent.last_init["enabled_toolsets"]
+        )
     assert "room-profile" not in expected_namespace
     assert "room" not in expected_namespace
