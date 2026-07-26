@@ -11400,7 +11400,7 @@ _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
 _MAX_PENDING_MCP_OAUTH_FLOWS = 8
 _mcp_oauth_flows: dict[str, "DashboardOAuthFlow"] = {}
 _mcp_oauth_flows_lock = threading.Lock()
-_mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
+_mcp_oauth_transactions: dict[tuple[str, str, Any], threading.Lock] = {}
 _mcp_oauth_transactions_lock = threading.Lock()
 
 
@@ -11440,9 +11440,44 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
 
 
 def _mcp_oauth_transaction(flow) -> threading.Lock:
-    key = (flow.hermes_home, flow.server_name)
+    key = (flow.hermes_home, flow.server_name, getattr(flow, "pool_key", None))
     with _mcp_oauth_transactions_lock:
         return _mcp_oauth_transactions.setdefault(key, threading.Lock())
+
+
+def _mcp_dashboard_oauth_context_for_profile(profile: Optional[str]):
+    try:
+        from agent.secret_scope import is_multiplex_active
+        multiplex_active = is_multiplex_active()
+    except Exception:
+        raise HTTPException(
+            status_code=403,
+            detail="MCP OAuth multiplex state unavailable",
+        )
+    if not multiplex_active:
+        return None, None
+
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        raise HTTPException(
+            status_code=403,
+            detail="MCP OAuth requires an exact profile in multiplex mode",
+        )
+    profile_dir = _resolve_profile_dir(requested)
+    from gateway.access_registry import AccessDeniedError
+    from gateway.config import load_gateway_config
+
+    registry = getattr(load_gateway_config(), "access_registry", None)
+    if registry is None:
+        raise HTTPException(
+            status_code=403,
+            detail="MCP OAuth requires an access registry in multiplex mode",
+        )
+    try:
+        context = registry.resolve_exact_profile_context(requested)
+    except AccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=exc.reason) from exc
+    return context, str(profile_dir.expanduser().resolve(strict=False))
 
 
 def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
@@ -11466,23 +11501,63 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         home_token = set_hermes_home_override(flow.hermes_home)
         secret_token = set_secret_scope(build_profile_secret_scope(Path(flow.hermes_home)))
         try:
+            pool = None
+            runtime_cfg = cfg
+            if flow.access_context is not None:
+                from gateway.session_context import bind_resolved_access_context
+                from tools import mcp_tool
+
+                with bind_resolved_access_context(flow.access_context):
+                    pool = mcp_tool._current_mcp_pool()
+                    if pool is None or pool.key != flow.pool_key:
+                        raise RuntimeError("profile-bound-mcp-pool-mismatch")
+                    prepared = mcp_tool._prepare_typed_mcp_servers_for_pool(
+                        {flow.server_name: cfg},
+                        pool,
+                    )
+                    runtime_cfg = prepared.get(flow.server_name)
+                    if runtime_cfg is None:
+                        raise RuntimeError(
+                            pool.connect_errors.get(
+                                flow.server_name,
+                                "profile-bound-mcp-config-invalid",
+                            )
+                        )
             transaction = _mcp_oauth_transaction(flow)
             with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):
                 manager = get_manager()
-                storage = HermesTokenStorage(flow.server_name)
+                storage = HermesTokenStorage(
+                    flow.server_name,
+                    hermes_home=flow.hermes_home,
+                    typed_pool_key=flow.pool_key,
+                )
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
                     previous_entry = manager.remove(
                         flow.server_name,
                         hermes_home=flow.hermes_home,
+                        pool_key=flow.pool_key,
                     )
-                    tools = _probe_single_server(
+                    if flow.access_context is not None:
+                        with bind_resolved_access_context(flow.access_context):
+                            tools = _probe_single_server(
+                                flow.server_name,
+                                runtime_cfg,
+                                connect_timeout=max(float(runtime_cfg.get("connect_timeout", 0) or 0), 315),
+                                pool=pool,
+                            )
+                    else:
+                        tools = _probe_single_server(
+                            flow.server_name,
+                            runtime_cfg,
+                            connect_timeout=max(float(runtime_cfg.get("connect_timeout", 0) or 0), 315),
+                        )
+                    if not _oauth_tokens_present(
                         flow.server_name,
-                        cfg,
-                        connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
-                    )
-                    if not _oauth_tokens_present(flow.server_name):
+                        hermes_home=flow.hermes_home,
+                        typed_pool_key=flow.pool_key,
+                    ):
                         raise RuntimeError(
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."
@@ -11493,13 +11568,18 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                     if flow.reconnect_live:
                         from tools.mcp_tool import reconnect_mcp_server
 
-                        reconnect_mcp_server(flow.server_name)
+                        if flow.access_context is not None:
+                            with bind_resolved_access_context(flow.access_context):
+                                reconnect_mcp_server(flow.server_name)
+                        else:
+                            reconnect_mcp_server(flow.server_name)
                 except Exception:
                     storage.restore(backup, only_if_absent=True)
                     manager.restore_entry(
                         flow.server_name,
                         previous_entry,
                         hermes_home=flow.hermes_home,
+                        pool_key=flow.pool_key,
                     )
                     raise
         finally:
@@ -11513,13 +11593,20 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         # instead of a bare "403 Forbidden".
         lowered = msg.lower()
         if "403" in msg and ("regist" in lowered or "forbidden" in lowered):
-            msg = (
-                f"'{flow.server_name}' only allows pre-approved OAuth clients — it rejected "
-                "client registration (403), so no browser flow can start. "
-                "Options: add a pre-registered client to this server's entry "
-                "(oauth: {client_id: ..., client_secret: ...}), or use the "
-                "provider's stdio / API-key server instead."
-            )
+            if flow.pool_key is not None:
+                msg = (
+                    f"'{flow.server_name}' provider rejected dynamic client registration "
+                    "(403), so no browser flow can start for this typed profile. "
+                    "Use a supported stdio or API-key MCP server for typed profiles."
+                )
+            else:
+                msg = (
+                    f"'{flow.server_name}' only allows pre-approved OAuth clients — it rejected "
+                    "client registration (403), so no browser flow can start. "
+                    "Options: add a pre-registered client to this server's entry "
+                    "(oauth: {client_id: ..., client_secret: ...}), or use the "
+                    "provider's stdio / API-key server instead."
+                )
         flow.mark_error(msg)
     finally:
         flow.mark_worker_done()
@@ -11534,11 +11621,13 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     _require_token(request)
     _gc_mcp_oauth_flows()
     from hermes_constants import get_hermes_home
+    from tools.mcp_tool import MCPPoolKey
 
     process_home = str(get_hermes_home().expanduser().resolve(strict=False))
+    access_context, exact_flow_home = _mcp_dashboard_oauth_context_for_profile(profile)
     with _profile_scope(profile):
         servers = _get_mcp_servers()
-        flow_home = str(get_hermes_home().expanduser().resolve(strict=False))
+        flow_home = exact_flow_home or str(get_hermes_home().expanduser().resolve(strict=False))
     if name not in servers:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
     cfg = dict(servers[name])
@@ -11549,6 +11638,14 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     cfg["auth"] = "oauth"
 
     flow_id = secrets.token_urlsafe(24)
+    pool_key = (
+        MCPPoolKey(
+            profile_id=access_context.profile_id,
+            conversation_scope=access_context.conversation_scope,
+        )
+        if access_context is not None
+        else None
+    )
     flow = DashboardOAuthFlow(
         flow_id=flow_id,
         server_name=name,
@@ -11556,6 +11653,8 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         hermes_home=flow_home,
         redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri")
         or _mcp_oauth_callback_url(request, name),
+        access_context=access_context,
+        pool_key=pool_key,
         reconnect_live=flow_home == process_home,
     )
     with _mcp_oauth_flows_lock:
@@ -11571,6 +11670,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         if any(
             flow.server_name == name
             and flow.hermes_home == flow_home
+            and flow.pool_key == pool_key
             and not flow.worker_done
             for flow in _mcp_oauth_flows.values()
         ):

@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -143,6 +144,26 @@ def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
     except ImportError:
         base = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     return base / "mcp-tokens"
+
+
+def _typed_token_namespace(server_name: str, typed_pool_key: Any) -> str:
+    profile_id = getattr(typed_pool_key, "profile_id", None)
+    conversation_scope = getattr(typed_pool_key, "conversation_scope", None)
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        raise ValueError("profile-bound-oauth-key-invalid")
+    if not isinstance(conversation_scope, str) or not conversation_scope.strip():
+        raise ValueError("profile-bound-oauth-key-invalid")
+    canonical = "\0".join((profile_id, conversation_scope, server_name)).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _require_typed_hermes_home(hermes_home: str | Path | None) -> Path:
+    if hermes_home is None:
+        raise ValueError("profile-bound-oauth-home-missing")
+    raw_home = str(hermes_home).strip()
+    if not raw_home:
+        raise ValueError("profile-bound-oauth-home-missing")
+    return Path(raw_home)
 
 
 def _safe_filename(name: str) -> str:
@@ -388,18 +409,46 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        typed_pool_key: Any = None,
+    ):
+        self._raw_server_name = str(server_name)
         self._server_name = _safe_filename(server_name)
-        self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._hermes_home = (
+            _require_typed_hermes_home(hermes_home)
+            if typed_pool_key is not None
+            else (Path(hermes_home) if hermes_home is not None else None)
+        )
+        self._typed_namespace = (
+            _typed_token_namespace(self._raw_server_name, typed_pool_key)
+            if typed_pool_key is not None
+            else None
+        )
+
+    def _state_dir(self) -> Path:
+        base = _get_token_dir(self._hermes_home)
+        if self._typed_namespace is None:
+            return base
+        return base / self._typed_namespace
 
     def _tokens_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
+        if self._typed_namespace is not None:
+            return self._state_dir() / "tokens.json"
+        return self._state_dir() / f"{self._server_name}.json"
 
     def _client_info_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.client.json"
+        if self._typed_namespace is not None:
+            return self._state_dir() / "client.json"
+        return self._state_dir() / f"{self._server_name}.client.json"
 
     def _meta_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+        if self._typed_namespace is not None:
+            return self._state_dir() / "meta.json"
+        return self._state_dir() / f"{self._server_name}.meta.json"
 
     # -- tokens ------------------------------------------------------------
 
@@ -536,7 +585,7 @@ class HermesTokenStorage:
         self.remove()
         if not snapshot:
             return
-        token_dir = _get_token_dir(self._hermes_home)
+        token_dir = self._state_dir()
         token_dir.mkdir(parents=True, exist_ok=True)
         for fname, data in snapshot.items():
             path = token_dir / fname
@@ -979,9 +1028,14 @@ def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
+    typed_pool_key: Any = None,
 ) -> None:
     """Delete stored OAuth tokens and client info for a server."""
-    storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    storage = HermesTokenStorage(
+        server_name,
+        hermes_home=hermes_home,
+        typed_pool_key=typed_pool_key,
+    )
     storage.remove()
     logger.info("OAuth tokens removed for '%s'", server_name)
 

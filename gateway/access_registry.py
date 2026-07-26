@@ -631,6 +631,30 @@ class AccessRegistry:
             return shared_context
         return matches[0]
 
+    def resolve_exact_profile_context(self, profile_id: str) -> ResolvedAccessContext:
+        audit = RedactedAuditMetadata(event="resolve_profile_context")
+        if not _is_nonempty_str(profile_id):
+            raise AccessDeniedError("missing_profile", audit)
+        active_contexts = [
+            context
+            for context in self._active_resolved_contexts()
+            if context.profile_id == profile_id
+        ]
+        if len(active_contexts) > 1:
+            raise AccessDeniedError("ambiguous_profile_binding", audit)
+        if not self.validate().valid:
+            raise AccessDeniedError("registry_validation_failed", audit)
+        if not active_contexts:
+            disabled_match = any(
+                isinstance(binding, (PrincipalBinding, SharedScopeBinding))
+                and not binding.active
+                and binding.profile_id == profile_id
+                for binding in self.principal_bindings + self.shared_scope_bindings
+            )
+            reason = "disabled_profile_binding" if disabled_match else "missing_profile_binding"
+            raise AccessDeniedError(reason, audit)
+        return self.validate_resolved_context(active_contexts[0])
+
     def effective_capabilities(
         self,
         role_id: str,

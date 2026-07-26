@@ -442,14 +442,10 @@ def _build_safe_env(user_env: Optional[dict], *, pool: Optional[Any] = None) -> 
     credentials to MCP server subprocesses.
     """
     if pool is not None and pool.key is not None:
-        try:
-            from hermes_cli.profiles import get_profile_dir
+        if not pool.profile_home:
+            raise ValueError("profile-bound-mcp-runtime-home-missing")
 
-            profile_home = get_profile_dir(pool.key.profile_id).resolve()
-        except Exception as exc:
-            raise ValueError("profile-bound-mcp-runtime-home-missing") from exc
-
-        return build_typed_child_env(user_env, profile_home=profile_home)
+        return build_typed_child_env(user_env, profile_home=pool.profile_home)
 
     env = {}
     for key, value in os.environ.items():
@@ -2602,10 +2598,32 @@ class MCPServerTask:
         _oauth_auth = None
         if self._auth_type == "oauth":
             try:
+                pool = _server_pool(self)
+                if _is_mcp_multiplex_active_strict():
+                    if pool is None or pool.key is None:
+                        raise ValueError("profile-bound-mcp-runtime-pool-missing")
+                    if not pool.profile_home:
+                        raise ValueError("profile-bound-mcp-runtime-home-missing")
+                pool_key = pool.key if pool is not None else None
+                pool_home = pool.profile_home if pool is not None else None
+                if pool_key is not None and not pool_home:
+                    raise ValueError("profile-bound-mcp-runtime-home-missing")
                 from tools.mcp_oauth_manager import get_manager
-                _oauth_auth = get_manager().get_or_build_provider(
-                    self.name, url, config.get("oauth"),
-                )
+                manager = get_manager()
+                if pool_key is None and pool_home is None:
+                    _oauth_auth = manager.get_or_build_provider(
+                        self.name,
+                        url,
+                        config.get("oauth"),
+                    )
+                else:
+                    _oauth_auth = manager.get_or_build_provider(
+                        self.name,
+                        url,
+                        config.get("oauth"),
+                        hermes_home=pool_home,
+                        pool_key=pool_key,
+                    )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
@@ -3214,6 +3232,7 @@ class MCPPoolKey:
 @dataclass
 class MCPServerPool:
     key: Optional[MCPPoolKey] = None
+    profile_home: Optional[str] = None
     servers: Dict[str, MCPServerTask] = field(default_factory=dict)
     connecting: set[str] = field(default_factory=set)
     connect_errors: Dict[str, str] = field(default_factory=dict)
@@ -3304,6 +3323,32 @@ def _strict_current_mcp_pool_key() -> Optional[MCPPoolKey]:
         return None
 
 
+def _profile_home_for_mcp_pool_key(key: MCPPoolKey) -> Optional[str]:
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        return str(get_profile_dir(key.profile_id).expanduser().resolve(strict=False))
+    except Exception as exc:
+        logger.debug(
+            "MCP pool denied because exact profile home could not be resolved: %s",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _validate_mcp_pool_home(pool: MCPServerPool, key: MCPPoolKey) -> bool:
+    home = _profile_home_for_mcp_pool_key(key)
+    if home is None:
+        return False
+    if pool.profile_home is None:
+        pool.profile_home = home
+        return True
+    if pool.profile_home != home:
+        logger.warning("MCP pool denied because captured profile home changed")
+        return False
+    return True
+
+
 def _current_mcp_pool(*, create: bool = True) -> Optional[MCPServerPool]:
     """Return the current MCP runtime pool, failing closed under multiplex."""
     try:
@@ -3333,6 +3378,8 @@ def _current_mcp_pool(*, create: bool = True) -> Optional[MCPServerPool]:
         if pool is None and create:
             pool = MCPServerPool(key=key)
             _profile_pools[key] = pool
+        if pool is not None and not _validate_mcp_pool_home(pool, key):
+            return None
         return pool
 
 
@@ -3735,6 +3782,8 @@ def _handle_auth_error_and_retry(
     exc: BaseException,
     retry_call,
     op_description: str,
+    *,
+    pool: Optional[MCPServerPool] = None,
 ):
     """Attempt auth recovery and one retry; return None to fall through.
 
@@ -3767,11 +3816,44 @@ def _handle_auth_error_and_retry(
     if not _is_auth_error(exc):
         return None
 
+    try:
+        multiplex_active = _is_mcp_multiplex_active_strict()
+    except Exception:
+        multiplex_active = True
+    if multiplex_active:
+        if pool is None or pool.key is None:
+            return json.dumps(
+                {"error": "profile-bound-mcp-runtime-pool-missing"},
+                ensure_ascii=False,
+            )
+        profile_id = getattr(pool.key, "profile_id", None)
+        conversation_scope = getattr(pool.key, "conversation_scope", None)
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            return json.dumps(
+                {"error": "profile-bound-oauth-key-invalid"},
+                ensure_ascii=False,
+            )
+        if not isinstance(conversation_scope, str) or not conversation_scope.strip():
+            return json.dumps(
+                {"error": "profile-bound-oauth-key-invalid"},
+                ensure_ascii=False,
+            )
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
+    pool_key = pool.key if pool is not None else None
+    pool_home = pool.profile_home if pool is not None else None
+    if pool_key is not None and not pool_home:
+        return json.dumps({"error": "profile-bound-mcp-runtime-home-missing"}, ensure_ascii=False)
 
     async def _recover():
-        return await manager.handle_401(server_name, None)
+        if pool_key is None and pool_home is None:
+            return await manager.handle_401(server_name, None)
+        return await manager.handle_401(
+            server_name,
+            None,
+            hermes_home=pool_home,
+            pool_key=pool_key,
+        )
 
     try:
         recovered = _run_on_mcp_loop(_recover, timeout=10)
@@ -3783,9 +3865,9 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        pool = _current_mcp_pool(create=False)
+        reconnect_pool = pool if pool is not None else _current_mcp_pool(create=False)
         with _lock:
-            srv = pool.servers.get(server_name) if pool is not None else None
+            srv = reconnect_pool.servers.get(server_name) if reconnect_pool is not None else None
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -3803,17 +3885,17 @@ def _handle_auth_error_and_retry(
         # _bump_server_error on failure, so a genuinely broken server will
         # re-trip the breaker as normal.
         if reconnected:
-            _reset_server_error(server_name, pool)
+            _reset_server_error(server_name, reconnect_pool)
 
         try:
             result = retry_call()
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
-                    _reset_server_error(server_name, pool)
+                    _reset_server_error(server_name, reconnect_pool)
                     return result
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name, pool)
+                _reset_server_error(server_name, reconnect_pool)
                 return result
         except Exception as retry_exc:
             logger.warning(
@@ -3824,7 +3906,7 @@ def _handle_auth_error_and_retry(
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops
     # retrying the tool.
-    _bump_server_error(server_name)
+    _bump_server_error(server_name, pool)
     return json.dumps({
         "error": (
             f"MCP server '{server_name}' requires re-authentication. "
@@ -4489,11 +4571,15 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
         return False
 
 
-def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
+def _get_connected_server_for_call(
+    server_name: str,
+    pool: Optional[MCPServerPool] = None,
+) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state."""
-    pool = _current_mcp_pool(create=False)
     if pool is None:
-        return None
+        pool = _current_mcp_pool(create=False)
+        if pool is None:
+            return None
     with _lock:
         server = pool.servers.get(server_name)
     if server is not None and server.session is None and server._is_recycled_stdio():
@@ -4553,7 +4639,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
 
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, pool)
         if not server:
             _bump_server_error(server_name, pool)
             return json.dumps({
@@ -4712,6 +4798,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
+                pool=pool,
             )
             if recovered is not None:
                 return recovered
@@ -4749,7 +4836,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             return json.dumps({
                 "error": "profile-bound-mcp-snapshot-missing"
             }, ensure_ascii=False)
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, pool)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -4784,7 +4871,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "resources/list",
+                server_name, exc, _call_once, "resources/list", pool=pool,
             )
             if recovered is not None:
                 return recovered
@@ -4816,7 +4903,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             return json.dumps({
                 "error": "profile-bound-mcp-snapshot-missing"
             }, ensure_ascii=False)
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, pool)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -4856,7 +4943,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "resources/read",
+                server_name, exc, _call_once, "resources/read", pool=pool,
             )
             if recovered is not None:
                 return recovered
@@ -4886,7 +4973,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             return json.dumps({
                 "error": "profile-bound-mcp-snapshot-missing"
             }, ensure_ascii=False)
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, pool)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -4926,7 +5013,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "prompts/list",
+                server_name, exc, _call_once, "prompts/list", pool=pool,
             )
             if recovered is not None:
                 return recovered
@@ -4958,7 +5045,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return json.dumps({
                 "error": "profile-bound-mcp-snapshot-missing"
             }, ensure_ascii=False)
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_name, pool)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -5002,7 +5089,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "prompts/get",
+                server_name, exc, _call_once, "prompts/get", pool=pool,
             )
             if recovered is not None:
                 return recovered

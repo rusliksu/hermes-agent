@@ -13,13 +13,17 @@ from tools.mcp_profile_policy import typed_mcp_config_fingerprint
 
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_profile_pool_state():
+def _reset_mcp_profile_pool_state(monkeypatch, tmp_path):
     from agent.secret_scope import set_multiplex_active
     from gateway.session_context import reset_session_vars
     import model_tools
     from tools import mcp_tool
     from tools.registry import registry
 
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda profile_id: tmp_path / "profiles" / str(profile_id),
+    )
     set_multiplex_active(False)
     reset_session_vars()
     model_tools._tool_defs_cache.clear()
@@ -496,9 +500,14 @@ def test_typed_same_server_tool_uses_profile_local_refs_only_env_header_and_hash
             "profile-bound-mcp-tools-include-invalid",
         ),
         (
-            {**_typed_raw_server(), "auth": "oauth"},
+            {**_typed_raw_server(), "auth": "oauth", "oauth": {"client_secret": "literal"}},
             {"MCP_DEMO_TOKEN": "secret"},
-            "profile-bound-oauth-not-implemented",
+            "profile-bound-oauth-client-secret-denied",
+        ),
+        (
+            {**_typed_raw_server(), "auth": "oauth", "oauth": {"scope": "${credential:token}"}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-credential-ref-location-denied",
         ),
     ],
 )
@@ -526,6 +535,156 @@ def test_typed_config_denies_before_spawn_or_interpolation(monkeypatch, cfg, sco
 
     assert pool.connect_errors["demo"] == reason
     assert "demo" not in pool.config_snapshots
+
+
+def test_typed_oauth_without_secret_uses_exact_include_and_hash_snapshot(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    captured = {}
+
+    async def fake_discover(name, cfg, pool=None):
+        captured["cfg"] = cfg
+        captured["pool"] = pool
+        return []
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run_coro_inline)
+    monkeypatch.setattr(mcp_tool, "_discover_and_register_server", fake_discover)
+
+    token = set_secret_scope({})
+    try:
+        with bind_resolved_access_context(_ctx("profile-a", "dm:a")):
+            assert mcp_tool.register_mcp_servers({
+                "demo": {
+                    "url": "https://mcp.example/mcp",
+                    "auth": "oauth",
+                    "oauth": {"scope": "read"},
+                    "tools": {"include": ["echo"], "resources": False, "prompts": False},
+                }
+            }) == []
+            pool = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token)
+
+    assert captured["pool"] is pool
+    assert captured["cfg"]["auth"] == "oauth"
+    assert captured["cfg"]["oauth"] == {"scope": "read"}
+    assert pool.allowed_tool_names["demo"] == frozenset({"echo"})
+    assert pool.config_snapshots["demo"] == typed_mcp_config_fingerprint(captured["cfg"])
+
+
+@pytest.mark.asyncio
+async def test_http_oauth_provider_uses_captured_pool_home_despite_ambient_context(monkeypatch, tmp_path):
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    with bind_resolved_access_context(ctx_a):
+        pool_a = mcp_tool._current_mcp_pool()
+    with bind_resolved_access_context(ctx_b):
+        pool_b = mcp_tool._current_mcp_pool()
+    assert pool_a.profile_home != pool_b.profile_home
+
+    observed = {}
+
+    class StopAfterProvider(RuntimeError):
+        pass
+
+    class FakeManager:
+        def get_or_build_provider(self, server_name, server_url, oauth_config, **kwargs):
+            observed.update(
+                server_name=server_name,
+                server_url=server_url,
+                oauth_config=oauth_config,
+                kwargs=kwargs,
+            )
+            raise StopAfterProvider()
+
+    server = mcp_tool.MCPServerTask("demo")
+    server._pool = pool_a
+    server._auth_type = "oauth"
+
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_validate_remote_mcp_url", lambda *_a, **_k: None)
+    monkeypatch.setattr("tools.mcp_oauth_manager.get_manager", lambda: FakeManager())
+
+    with bind_resolved_access_context(ctx_b), pytest.raises(StopAfterProvider):
+        await server._run_http({"url": "https://mcp.example/mcp", "auth": "oauth"})
+
+    assert observed["kwargs"] == {
+        "hermes_home": pool_a.profile_home,
+        "pool_key": pool_a.key,
+    }
+
+
+def test_auth_recovery_uses_captured_pool_despite_ambient_context(monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context, reset_session_vars
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    with bind_resolved_access_context(ctx_a):
+        pool_a = mcp_tool._current_mcp_pool()
+    with bind_resolved_access_context(ctx_b):
+        pool_b = mcp_tool._current_mcp_pool()
+    assert pool_a.profile_home != pool_b.profile_home
+
+    observed = []
+
+    class FakeManager:
+        async def handle_401(self, server_name, failed_access_token=None, **kwargs):
+            observed.append((server_name, failed_access_token, kwargs))
+            return False
+
+    monkeypatch.setattr(mcp_tool, "_is_auth_error", lambda exc: True)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run_coro_inline)
+    monkeypatch.setattr("tools.mcp_oauth_manager.get_manager", lambda: FakeManager())
+
+    with bind_resolved_access_context(ctx_b):
+        result_b = json.loads(
+            mcp_tool._handle_auth_error_and_retry(
+                "demo",
+                RuntimeError("401"),
+                lambda: '{"result":"retry"}',
+                "tools/call echo",
+                pool=pool_a,
+            )
+        )
+    reset_session_vars()
+    result_missing = json.loads(
+        mcp_tool._handle_auth_error_and_retry(
+            "demo",
+            RuntimeError("401"),
+            lambda: '{"result":"retry"}',
+            "tools/call echo",
+            pool=pool_a,
+        )
+    )
+
+    assert result_b["needs_reauth"] is True
+    assert result_missing["needs_reauth"] is True
+    assert observed == [
+        (
+            "demo",
+            None,
+            {"hermes_home": pool_a.profile_home, "pool_key": pool_a.key},
+        ),
+        (
+            "demo",
+            None,
+            {"hermes_home": pool_a.profile_home, "pool_key": pool_a.key},
+        ),
+    ]
+    assert pool_a.error_counts["demo"] == 2
+    assert "demo" not in pool_b.error_counts
 
 
 def test_typed_process_env_provider_key_cannot_satisfy_missing_ref(monkeypatch):
@@ -647,7 +806,8 @@ def test_typed_build_safe_env_uses_profile_home_xdg_without_ambient_provider_env
     )
 
     pool = mcp_tool.MCPServerPool(
-        key=mcp_tool.MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+        key=mcp_tool.MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a"),
+        profile_home=str(profile_home.resolve(strict=False)),
     )
     env = mcp_tool._build_safe_env({"DEMO_TOKEN": "resolved"}, pool=pool)
 

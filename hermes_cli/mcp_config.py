@@ -276,7 +276,12 @@ def _resolve_mcp_server_config(config: dict) -> dict:
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = None,
+    *,
+    details: Optional[dict] = None,
+    pool: Any = None,
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -299,7 +304,8 @@ def _probe_single_server(
         _parse_boolish,
     )
 
-    config = _resolve_mcp_server_config(config)
+    if pool is None or getattr(pool, "key", None) is None:
+        config = _resolve_mcp_server_config(config)
     if connect_timeout is None:
         raw_timeout = config.get("connect_timeout", 30)
         try:
@@ -311,8 +317,9 @@ def _probe_single_server(
     tools_found: List[Tuple[str, str]] = []
 
     async def _probe():
+        connect_args = (name, config, pool) if pool is not None else (name, config)
         server = await asyncio.wait_for(
-            _connect_server(name, config), timeout=connect_timeout
+            _connect_server(*connect_args), timeout=connect_timeout
         )
         try:
             for t in server._tools:
@@ -378,7 +385,12 @@ def _probe_single_server(
     return tools_found
 
 
-def _oauth_tokens_present(name: str) -> bool:
+def _oauth_tokens_present(
+    name: str,
+    *,
+    hermes_home=None,
+    typed_pool_key=None,
+) -> bool:
     """Return True if an OAuth token file exists on disk for ``name``.
 
     Used after ``hermes mcp login`` to distinguish a genuine authentication
@@ -387,8 +399,19 @@ def _oauth_tokens_present(name: str) -> bool:
     """
     try:
         from tools.mcp_oauth import HermesTokenStorage
-        return HermesTokenStorage(name).has_cached_tokens()
+        return HermesTokenStorage(
+            name,
+            hermes_home=hermes_home,
+            typed_pool_key=typed_pool_key,
+        ).has_cached_tokens()
     except Exception as exc:  # pragma: no cover — defensive
+        if typed_pool_key is not None:
+            logger.debug(
+                "Could not check typed OAuth tokens for '%s': %s: token storage check failed",
+                name,
+                type(exc).__name__,
+            )
+            return False
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
         # Be permissive on unexpected errors: don't block a real success.
         return True

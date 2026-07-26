@@ -193,6 +193,18 @@ def _credential_ref_mapping(cfg: Mapping[str, Any]) -> dict[str, str]:
     return mapping
 
 
+def _validate_oauth_section(cfg: Mapping[str, Any]) -> None:
+    if str(cfg.get("auth") or "").strip().lower() != "oauth":
+        return
+    oauth = cfg.get("oauth") or {}
+    if not isinstance(oauth, Mapping):
+        raise _error("profile-bound-oauth-config-invalid")
+    if oauth.get("client_id"):
+        raise _error("profile-bound-oauth-preregistered-client-denied")
+    if oauth.get("client_secret"):
+        raise _error("profile-bound-oauth-client-secret-denied")
+
+
 def _substitute_allowed_refs(
     cfg: Mapping[str, Any],
     resolved_refs: Mapping[str, str],
@@ -252,9 +264,8 @@ def prepare_typed_mcp_server_config(
 
     if not isinstance(cfg, Mapping):
         raise _error("profile-bound-mcp-config-invalid")
-    if str(cfg.get("auth") or "").strip().lower() == "oauth":
-        raise _error("profile-bound-oauth-not-implemented")
 
+    _validate_oauth_section(cfg)
     allowed_tools, resources_enabled, prompts_enabled = _require_tools_include(cfg)
     _validate_env_section(cfg)
     _validate_headers_section(cfg)

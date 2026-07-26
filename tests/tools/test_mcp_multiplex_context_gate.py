@@ -6,10 +6,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_multiplex_context():
+def _reset_multiplex_context(monkeypatch, tmp_path):
     from agent.secret_scope import set_multiplex_active
     from gateway.session_context import reset_session_vars
 
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda profile_id: tmp_path / "profiles" / str(profile_id),
+    )
     set_multiplex_active(False)
     reset_session_vars()
     yield
@@ -120,6 +124,57 @@ def test_strict_bound_context_reaches_registration_filtering(monkeypatch):
     with bind_resolved_access_context(_strict_access_context()):
         assert mcp_tool.register_mcp_servers({"demo": {"command": "demo-mcp"}}) == []
     assert calls["filter"] == 1
+
+
+@pytest.mark.asyncio
+async def test_http_oauth_multiplex_missing_captured_pool_denies_before_manager(monkeypatch):
+    from tools import mcp_tool
+
+    _enable_multiplex()
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    called = {"manager": 0}
+
+    def _manager():
+        called["manager"] += 1
+        raise AssertionError("oauth manager must not be touched")
+
+    monkeypatch.setattr("tools.mcp_oauth_manager.get_manager", _manager)
+    server = mcp_tool.MCPServerTask("demo")
+    server._auth_type = "oauth"
+
+    with pytest.raises(ValueError, match="profile-bound-mcp-runtime-pool-missing"):
+        await server._run_http({"url": "https://mcp.example/mcp", "auth": "oauth"})
+
+    assert called["manager"] == 0
+
+
+def test_auth_recovery_multiplex_missing_pool_denies_before_manager(monkeypatch):
+    import json
+
+    from tools import mcp_tool
+
+    _enable_multiplex()
+    called = {"manager": 0}
+
+    def _manager():
+        called["manager"] += 1
+        raise AssertionError("oauth manager must not be touched")
+
+    monkeypatch.setattr(mcp_tool, "_is_auth_error", lambda exc: True)
+    monkeypatch.setattr("tools.mcp_oauth_manager.get_manager", _manager)
+
+    result = json.loads(
+        mcp_tool._handle_auth_error_and_retry(
+            "demo",
+            RuntimeError("401"),
+            lambda: '{"result":"retry"}',
+            "tools/call echo",
+            pool=None,
+        )
+    )
+
+    assert result == {"error": "profile-bound-mcp-runtime-pool-missing"}
+    assert called["manager"] == 0
 
 
 def test_legacy_non_multiplex_discover_still_reaches_config_load(monkeypatch):
