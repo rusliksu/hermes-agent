@@ -186,7 +186,8 @@
   - [ ] Добавить startup tests, что gateway multiplex denies unscoped MCP discovery before spawn, while typed restored/current context can discover only its own configured MCP pool.
 - [ ] 8.5 Добавить sandbox tests для symlink escape, host mount denial, network disabled, quotas и owner credential absence.
 - [ ] 8.6 Добавить dashboard lease tests для localhost/SSH tunnel, preview+confirm atomic apply, expiry, manual revoke, no restart resurrection и no content audit.
-- [ ] 8.7 Запустить focused tests for changed modules and specs without live effects.
+- [x] 8.7 Запустить focused tests for changed modules and specs without live effects.
+  - 2026-07-26: focused verification на HEAD `8002a4b0447298697482f4203b07fa08cae86ef2`, no-live-effects: `tests/gateway/test_access_registry.py` 73 passed, `tests/tools/test_mcp_oauth_manager.py` 27 passed, `tests/tools/test_mcp_profile_pool.py` 33 passed, `tests/tools/test_mcp_multiplex_context_gate.py` 7 passed, `tests/tools/test_mcp_dashboard_oauth.py` 13 passed, `tests/hermes_cli/test_mcp_dashboard_oauth.py` 20 passed; test-quality audit passed for exact profile/scope/storage/callback behavior and mutation guards. Unrelated whole circuit-breaker file remains a sandbox event-loop validation gap, not a production workaround.
 - [ ] 8.8 Запустить full relevant test suite, включая gateway, Telegram routing, sessions, memory, tools, cron, dashboard и migration paths.
 
 ## 9. Review, strict validation, preflight и PR readiness
