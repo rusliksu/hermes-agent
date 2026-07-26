@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -1730,7 +1731,7 @@ class MCPServerTask:
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
-        "_reconnect_retries",
+        "_reconnect_retries", "_pool",
     )
 
     def __init__(self, name: str):
@@ -1791,6 +1792,7 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+        self._pool = None
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -2294,7 +2296,15 @@ class MCPServerTask:
         # available for scoped call sites.  Run in a worker thread: the
         # reaper blocks up to 2s (SIGTERM → wait → SIGKILL) when orphans
         # exist, which would otherwise stall the shared MCP event loop.
-        await asyncio.to_thread(_kill_orphaned_mcp_children)
+        pool_key = _server_pool_key(self)
+        if pool_key is None:
+            await asyncio.to_thread(_kill_orphaned_mcp_children)
+        else:
+            await asyncio.to_thread(
+                _kill_orphaned_mcp_children,
+                server_name=self.name,
+                pool_key=pool_key,
+            )
 
         # Snapshot child PIDs before spawning so we can track the new one.
         pids_before = _snapshot_child_pids()
@@ -2336,6 +2346,8 @@ class MCPServerTask:
                     with _lock:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
+                            if pool_key is not None:
+                                _stdio_pid_pool_keys[_pid] = pool_key
                         _stdio_pgids.update(new_pgids)
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
@@ -2364,7 +2376,7 @@ class MCPServerTask:
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
+                    _reset_server_error(self.name, _server_pool(self))
                     # This session is live: reset the reconnect retry counter
                     # so transient prior failures do not accumulate toward
                     # permanent parking (#57604).
@@ -2385,6 +2397,7 @@ class MCPServerTask:
                 with _lock:
                     for _pid in new_pids:
                         _stdio_pids.pop(_pid, None)
+                        _stdio_pid_pool_keys.pop(_pid, None)
                     for pid in new_pids:
                         # ``os.kill(pid, 0)`` is NOT a no-op on Windows
                         # (bpo-14484). Use the cross-platform check.
@@ -2404,10 +2417,13 @@ class MCPServerTask:
                         if pid_alive or pgroup_alive:
                             _orphan_stdio_pids.add(pid)
                             _orphan_stdio_pid_servers[pid] = self.name
+                            if pool_key is not None:
+                                _orphan_stdio_pid_pool_keys[pid] = pool_key
                         else:
                             # Nothing left to reap — drop the pgid entry so
                             # PID-reuse can't surface stale pgroup state later.
                             _stdio_pgids.pop(pid, None)
+                            _orphan_stdio_pid_pool_keys.pop(pid, None)
 
     # Content types a real MCP Streamable-HTTP endpoint may return on the
     # initial POST/GET. Anything else on a 2xx response means the URL is not
@@ -2659,7 +2675,7 @@ class MCPServerTask:
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
+                    _reset_server_error(self.name, _server_pool(self))
                     self._reconnect_retries = 0
                     reason = await self._wait_for_lifecycle_event()
                     if reason == "reconnect":
@@ -2716,7 +2732,7 @@ class MCPServerTask:
                         # Session is live again: clear any breaker state from
                         # a prior outage so the first call after recovery
                         # isn't gated on a stale failure count (#16788).
-                        _reset_server_error(self.name)
+                        _reset_server_error(self.name, _server_pool(self))
                         self._reconnect_retries = 0
                         reason = await self._wait_for_lifecycle_event()
                         if reason == "reconnect":
@@ -2748,7 +2764,7 @@ class MCPServerTask:
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
+                    _reset_server_error(self.name, _server_pool(self))
                     self._reconnect_retries = 0
                     reason = await self._wait_for_lifecycle_event()
                     if reason == "reconnect":
@@ -3166,9 +3182,29 @@ class MCPServerTask:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_servers: Dict[str, MCPServerTask] = {}
-_server_connecting: set[str] = set()
-_server_connect_errors: Dict[str, str] = {}
+@dataclass(frozen=True)
+class MCPPoolKey:
+    profile_id: str
+    conversation_scope: str
+
+
+@dataclass
+class MCPServerPool:
+    key: Optional[MCPPoolKey] = None
+    servers: Dict[str, MCPServerTask] = field(default_factory=dict)
+    connecting: set[str] = field(default_factory=set)
+    connect_errors: Dict[str, str] = field(default_factory=dict)
+    error_counts: Dict[str, int] = field(default_factory=dict)
+    breaker_opened_at: Dict[str, float] = field(default_factory=dict)
+    parallel_safe_servers: set[str] = field(default_factory=set)
+
+
+_legacy_pool = MCPServerPool()
+_profile_pools: Dict[MCPPoolKey, MCPServerPool] = {}
+
+_servers = _legacy_pool.servers
+_server_connecting = _legacy_pool.connecting
+_server_connect_errors = _legacy_pool.connect_errors
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -3187,34 +3223,146 @@ _server_connect_errors: Dict[str, str] = {}
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+_server_error_counts = _legacy_pool.error_counts
+_server_breaker_opened_at = _legacy_pool.breaker_opened_at
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
 
-def _bump_server_error(server_name: str) -> None:
+def _sync_legacy_pool_aliases() -> MCPServerPool:
+    """Keep legacy monkeypatchable globals bound to the legacy pool."""
+    _legacy_pool.servers = _servers
+    _legacy_pool.connecting = _server_connecting
+    _legacy_pool.connect_errors = _server_connect_errors
+    _legacy_pool.error_counts = _server_error_counts
+    _legacy_pool.breaker_opened_at = _server_breaker_opened_at
+    _legacy_pool.parallel_safe_servers = _parallel_safe_servers
+    return _legacy_pool
+
+
+def _strict_current_mcp_pool_key() -> Optional[MCPPoolKey]:
+    """Return the strict multiplex MCP pool key, or None to fail closed."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception:
+        return None
+    if not is_multiplex_active():
+        return None
+    try:
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+        from gateway.session_context import get_resolved_access_context
+
+        serialized = serialize_resolved_access_context(
+            get_resolved_access_context(None)
+        )
+        resolved = deserialize_resolved_access_context(serialized)
+        if serialize_resolved_access_context(resolved) != serialized:
+            raise ValueError("noncanonical_resolved_access_context")
+        return MCPPoolKey(
+            profile_id=resolved.profile_id,
+            conversation_scope=resolved.conversation_scope,
+        )
+    except Exception as exc:
+        logger.debug(
+            "MCP pool denied without strict resolved access context: %s",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _current_mcp_pool(*, create: bool = True) -> Optional[MCPServerPool]:
+    """Return the current MCP runtime pool, failing closed under multiplex."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception as exc:
+        logger.debug(
+            "MCP pool unavailable because multiplex state import failed: %s",
+            type(exc).__name__,
+        )
+        return None
+    try:
+        is_active = is_multiplex_active()
+    except Exception as exc:
+        logger.debug(
+            "MCP pool unavailable because multiplex state check failed: %s",
+            type(exc).__name__,
+        )
+        return None
+    if not is_active:
+        return _sync_legacy_pool_aliases()
+
+    key = _strict_current_mcp_pool_key()
+    if key is None:
+        return None
+    with _lock:
+        pool = _profile_pools.get(key)
+        if pool is None and create:
+            pool = MCPServerPool(key=key)
+            _profile_pools[key] = pool
+        return pool
+
+
+def _server_pool(server: Any) -> Optional[MCPServerPool]:
+    pool = getattr(server, "_pool", None)
+    if isinstance(pool, MCPServerPool):
+        return pool
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception as exc:
+        logger.debug(
+            "MCP server pool unavailable because multiplex state import failed: %s",
+            type(exc).__name__,
+        )
+        return None
+    try:
+        is_active = is_multiplex_active()
+    except Exception as exc:
+        logger.debug(
+            "MCP server pool unavailable because multiplex state check failed: %s",
+            type(exc).__name__,
+        )
+        return None
+    if is_active:
+        return None
+    return _sync_legacy_pool_aliases()
+
+
+def _server_pool_key(server: Any) -> Optional[MCPPoolKey]:
+    pool = _server_pool(server)
+    return pool.key if pool is not None else None
+
+
+def _bump_server_error(server_name: str, pool: Optional[MCPServerPool] = None) -> None:
     """Increment the consecutive-failure count for ``server_name``.
 
     When the count crosses :data:`_CIRCUIT_BREAKER_THRESHOLD`, stamp the
     breaker-open timestamp so the cooldown clock starts (or re-starts,
     for probe failures in the half-open state).
     """
-    n = _server_error_counts.get(server_name, 0) + 1
-    _server_error_counts[server_name] = n
+    pool = pool or _current_mcp_pool(create=False)
+    if pool is None:
+        return
+    n = pool.error_counts.get(server_name, 0) + 1
+    pool.error_counts[server_name] = n
     if n >= _CIRCUIT_BREAKER_THRESHOLD:
-        _server_breaker_opened_at[server_name] = time.monotonic()
+        pool.breaker_opened_at[server_name] = time.monotonic()
 
 
-def _reset_server_error(server_name: str) -> None:
+def _reset_server_error(server_name: str, pool: Optional[MCPServerPool] = None) -> None:
     """Fully close the breaker for ``server_name``.
 
     Clears both the failure count and the breaker-open timestamp. Call
     this on any unambiguous success signal (successful tool call,
     successful reconnect, manual /mcp refresh).
     """
-    _server_error_counts[server_name] = 0
-    _server_breaker_opened_at.pop(server_name, None)
+    pool = pool or _current_mcp_pool(create=False)
+    if pool is None:
+        return
+    pool.error_counts[server_name] = 0
+    pool.breaker_opened_at.pop(server_name, None)
 
 
 def _signal_reconnect(server: Any) -> bool:
@@ -3243,8 +3391,11 @@ def _signal_reconnect(server: Any) -> bool:
 
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return False
     with _lock:
-        server = _servers.get(server_name)
+        server = pool.servers.get(server_name)
     if server is None:
         return False
     return _signal_reconnect(server)
@@ -3456,8 +3607,9 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
+        pool = _current_mcp_pool(create=False)
         with _lock:
-            srv = _servers.get(server_name)
+            srv = pool.servers.get(server_name) if pool is not None else None
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -3475,17 +3627,17 @@ def _handle_auth_error_and_retry(
         # _bump_server_error on failure, so a genuinely broken server will
         # re-trip the breaker as normal.
         if reconnected:
-            _reset_server_error(server_name)
+            _reset_server_error(server_name, pool)
 
         try:
             result = retry_call()
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
-                    _reset_server_error(server_name)
+                    _reset_server_error(server_name, pool)
                     return result
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
+                _reset_server_error(server_name, pool)
                 return result
         except Exception as retry_exc:
             logger.warning(
@@ -3587,8 +3739,9 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
+    pool = _current_mcp_pool(create=False)
     with _lock:
-        srv = _servers.get(server_name)
+        srv = pool.servers.get(server_name) if pool is not None else None
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -3622,10 +3775,10 @@ def _handle_session_expired_and_retry(
         try:
             parsed = json.loads(result)
             if "error" not in parsed:
-                _server_error_counts[server_name] = 0
+                _reset_server_error(server_name, pool)
                 return result
         except (json.JSONDecodeError, TypeError):
-            _server_error_counts[server_name] = 0
+            _reset_server_error(server_name, pool)
             return result
     except Exception as retry_exc:
         logger.warning(
@@ -3638,7 +3791,7 @@ def _handle_session_expired_and_retry(
 # Sanitized server names whose ``supports_parallel_tool_calls`` config is True.
 # Populated during ``register_mcp_servers()`` and queried by
 # ``is_mcp_tool_parallel_safe()`` for the parallel-execution check in run_agent.
-_parallel_safe_servers: set = set()
+_parallel_safe_servers = _legacy_pool.parallel_safe_servers
 
 # Exact MCP tool-name provenance. MCP tool names are formatted as
 # ``mcp_{sanitized_server}_{sanitized_tool}``, which is ambiguous when server
@@ -3661,6 +3814,7 @@ _lock = threading.Lock()
 # fails or times out.  PIDs are added after connection and removed on
 # normal server shutdown.
 _stdio_pids: Dict[int, str] = {}  # pid -> server_name
+_stdio_pid_pool_keys: Dict[int, MCPPoolKey] = {}
 
 # PIDs that survived their session context exit (SDK teardown failed to
 # terminate them).  These are detected in _run_stdio's finally block and
@@ -3669,6 +3823,7 @@ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 # sessions (e.g. concurrent cron jobs or live user chats).
 _orphan_stdio_pids: set = set()
 _orphan_stdio_pid_servers: Dict[int, str] = {}
+_orphan_stdio_pid_pool_keys: Dict[int, MCPPoolKey] = {}
 
 # Process-group IDs of stdio MCP subprocesses, captured at spawn time.
 # The MCP SDK spawns stdio children with ``start_new_session=True`` so each
@@ -4017,7 +4172,11 @@ def _load_mcp_config() -> Dict[str, dict]:
 # Server connection helper
 # ---------------------------------------------------------------------------
 
-async def _connect_server(name: str, config: dict) -> MCPServerTask:
+async def _connect_server(
+    name: str,
+    config: dict,
+    pool: Optional[MCPServerPool] = None,
+) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.
 
     The server Task keeps the connection alive in the background.
@@ -4029,6 +4188,8 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
+    if pool is not None:
+        server._pool = pool
     await server.start(config)
     return server
 
@@ -4073,12 +4234,15 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
 
 def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state."""
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return None
     with _lock:
-        server = _servers.get(server_name)
+        server = pool.servers.get(server_name)
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
-            server = _servers.get(server_name)
+            server = pool.servers.get(server_name)
     return server
 
 
@@ -4097,6 +4261,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        pool = _current_mcp_pool(create=False)
+        if pool is None:
+            return json.dumps({
+                "error": f"MCP server '{server_name}' is not connected"
+            }, ensure_ascii=False)
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4107,15 +4276,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+        if pool.error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = pool.breaker_opened_at.get(server_name, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
                 return json.dumps({
                     "error": (
                         f"MCP server '{server_name}' is unreachable after "
-                        f"{_server_error_counts[server_name]} consecutive "
+                        f"{pool.error_counts[server_name]} consecutive "
                         f"failures. Auto-retry available in ~{remaining}s. "
                         f"Do NOT retry this tool yet — use alternative "
                         f"approaches or ask the user to check the MCP server."
@@ -4125,7 +4294,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         server = _get_connected_server_for_call(server_name)
         if not server:
-            _bump_server_error(server_name)
+            _bump_server_error(server_name, pool)
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -4151,7 +4320,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # without burning iterations. The breaker resets once the
                 # fresh session initializes (_run_stdio/_run_http call
                 # _reset_server_error).
-                _bump_server_error(server_name)
+                _bump_server_error(server_name, pool)
                 if _signal_reconnect(server):
                     return json.dumps({
                         "error": (
@@ -4267,11 +4436,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    _bump_server_error(server_name, pool)
                 else:
-                    _reset_server_error(server_name)  # success — reset
+                    _reset_server_error(server_name, pool)  # success — reset
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+                _reset_server_error(server_name, pool)  # non-JSON = success
             return result
         except InterruptedError:
             return _interrupted_call_result()
@@ -4296,7 +4465,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            _bump_server_error(server_name, pool)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
@@ -4577,8 +4746,11 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
+        pool = _current_mcp_pool(create=False)
+        if pool is None:
+            return False
         with _lock:
-            server = _servers.get(server_name)
+            server = pool.servers.get(server_name)
         return (
             server is not None
             and (server.session is not None or server._is_recycled_stdio())
@@ -5000,8 +5172,16 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 
 def _existing_tool_names() -> List[str]:
     """Return tool names for all currently connected servers."""
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return []
+    return _existing_tool_names_for_pool(pool)
+
+
+def _existing_tool_names_for_pool(pool: MCPServerPool) -> List[str]:
+    """Return tool names for all servers in *pool*."""
     names: List[str] = []
-    for _sname, server in _servers.items():
+    for _sname, server in pool.servers.items():
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
@@ -5121,20 +5301,30 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     return registered_names
 
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(
+    name: str,
+    config: dict,
+    pool: Optional[MCPServerPool] = None,
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
     """
+    pool = pool or _current_mcp_pool()
+    if pool is None:
+        return []
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
+    connect_coro = (
+        _connect_server(name, config, pool)
+        if pool.key is not None
+        else _connect_server(name, config)
     )
+    server = await asyncio.wait_for(connect_coro, timeout=connect_timeout)
+    server._pool = pool
     with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
-        _servers[name] = server
+        pool.connecting.discard(name)
+        pool.connect_errors.pop(name, None)
+        pool.servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -5152,40 +5342,6 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def _mcp_registration_context_allowed() -> bool:
-    """Fail closed for multiplex MCP registration without strict task context."""
-    try:
-        from agent.secret_scope import is_multiplex_active
-    except Exception:
-        return True
-
-    if not is_multiplex_active():
-        return True
-
-    try:
-        from gateway.access_registry import (
-            deserialize_resolved_access_context,
-            serialize_resolved_access_context,
-        )
-        from gateway.session_context import get_resolved_access_context
-
-        serialized = serialize_resolved_access_context(
-            get_resolved_access_context(None)
-        )
-        return (
-            serialize_resolved_access_context(
-                deserialize_resolved_access_context(serialized)
-            )
-            == serialized
-        )
-    except Exception as exc:
-        logger.debug(
-            "MCP registration denied without strict resolved access context: %s",
-            type(exc).__name__,
-        )
-        return False
-
-
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
@@ -5201,7 +5357,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
-    if not _mcp_registration_context_allowed():
+    pool = _current_mcp_pool()
+    if pool is None:
         return []
 
     servers = _filter_suspicious_mcp_servers(servers)
@@ -5215,7 +5372,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in pool.servers and _parse_boolish(v.get("enabled", True), default=True)
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
@@ -5223,31 +5380,33 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
         # (#50170). Wake them now so their tools come back promptly.
         stale_cached = [
-            _servers[k]
+            pool.servers[k]
             for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
+            if k in pool.servers and getattr(pool.servers[k], "session", None) is None
         ]
-        _server_connecting.update(new_servers)
+        pool.connecting.update(new_servers)
         for srv_name in new_servers:
-            _server_connect_errors.pop(srv_name, None)
+            pool.connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
-                _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
+                pool.parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
-                _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+                pool.parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
 
     for srv in stale_cached:
         _signal_reconnect(srv)
 
     if not new_servers:
-        return _existing_tool_names()
+        return _existing_tool_names_for_pool(pool) if pool.key is not None else _existing_tool_names()
 
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
+        if pool.key is not None:
+            return await _discover_and_register_server(name, cfg, pool)
         return await _discover_and_register_server(name, cfg)
 
     async def _discover_all():
@@ -5262,8 +5421,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 command = new_servers.get(name, {}).get("command")
                 message = _format_connect_error(result)
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors[name] = message
+                    pool.connecting.discard(name)
+                    pool.connect_errors[name] = message
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
@@ -5272,8 +5431,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 )
             else:
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors.pop(name, None)
+                    pool.connecting.discard(name)
+                    pool.connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -5293,9 +5452,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Log a summary so ACP callers get visibility into what was registered.
     with _lock:
-        connected = [n for n in new_servers if n in _servers]
+        connected = [n for n in new_servers if n in pool.servers]
         new_tool_count = sum(
-            len(getattr(_servers[n], "_registered_tool_names", []))
+            len(getattr(pool.servers[n], "_registered_tool_names", []))
             for n in connected
         )
     failed = len(new_servers) - len(connected)
@@ -5305,7 +5464,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             summary += f" ({failed} failed)"
         logger.info(summary)
 
-    return _existing_tool_names()
+    return _existing_tool_names_for_pool(pool) if pool.key is not None else _existing_tool_names()
 
 
 def discover_mcp_tools() -> List[str]:
@@ -5323,7 +5482,8 @@ def discover_mcp_tools() -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
-    if not _mcp_registration_context_allowed():
+    pool = _current_mcp_pool()
+    if pool is None:
         return []
 
     servers = _load_mcp_config()
@@ -5335,7 +5495,7 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if name not in pool.servers and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
     tool_names = register_mcp_servers(servers)
@@ -5343,9 +5503,9 @@ def discover_mcp_tools() -> List[str]:
         return tool_names
 
     with _lock:
-        connected_server_names = [name for name in new_server_names if name in _servers]
+        connected_server_names = [name for name in new_server_names if name in pool.servers]
         new_tool_count = sum(
-            len(getattr(_servers[name], "_registered_tool_names", []))
+            len(getattr(pool.servers[name], "_registered_tool_names", []))
             for name in connected_server_names
         )
 
@@ -5372,9 +5532,12 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """
     if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return False
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
-        return bool(server_name and server_name in _parallel_safe_servers)
+        return bool(server_name and server_name in pool.parallel_safe_servers)
 
 
 def get_mcp_status() -> List[dict]:
@@ -5386,6 +5549,9 @@ def get_mcp_status() -> List[dict]:
     configured but have not been started in this process yet.
     """
     result: List[dict] = []
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return result
 
     # Get configured servers from config
     configured = _load_mcp_config()
@@ -5393,9 +5559,9 @@ def get_mcp_status() -> List[dict]:
         return result
 
     with _lock:
-        active_servers = dict(_servers)
-        connecting = set(_server_connecting)
-        connect_errors = dict(_server_connect_errors)
+        active_servers = dict(pool.servers)
+        connecting = set(pool.connecting)
+        connect_errors = dict(pool.connect_errors)
 
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
@@ -5732,6 +5898,29 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
+def snapshot_current_mcp_server_names() -> set[str]:
+    """Return connected server names for the current MCP runtime pool."""
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return set()
+    with _lock:
+        return set(pool.servers)
+
+
+def _all_server_pools() -> list[MCPServerPool]:
+    _sync_legacy_pool_aliases()
+    with _lock:
+        return [_legacy_pool, *_profile_pools.values()]
+
+
+def shutdown_current_mcp_servers():
+    """Close MCP server connections in the current pool only."""
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return
+    _shutdown_mcp_pool(pool, stop_loop=False)
+
+
 def shutdown_mcp_servers():
     """Close all MCP server connections and stop the background loop.
 
@@ -5739,12 +5928,20 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    for pool in _all_server_pools():
+        _shutdown_mcp_pool(pool, stop_loop=False)
+    _stop_mcp_loop()
+
+
+def _shutdown_mcp_pool(pool: MCPServerPool, *, stop_loop: bool) -> None:
+    """Close server connections in one pool."""
     with _lock:
-        servers_snapshot = list(_servers.values())
+        servers_snapshot = list(pool.servers.values())
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
-        _stop_mcp_loop()
+        if stop_loop:
+            _stop_mcp_loop()
         return
 
     async def _shutdown():
@@ -5758,7 +5955,12 @@ def shutdown_mcp_servers():
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
         with _lock:
-            _servers.clear()
+            pool.servers.clear()
+            pool.connecting.clear()
+            pool.connect_errors.clear()
+            pool.error_counts.clear()
+            pool.breaker_opened_at.clear()
+            pool.parallel_safe_servers.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -5775,12 +5977,14 @@ def shutdown_mcp_servers():
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
-    _stop_mcp_loop()
+    if stop_loop:
+        _stop_mcp_loop()
 
 
 def _kill_orphaned_mcp_children(
     include_active: bool = False,
     server_name: Optional[str] = None,
+    pool_key: Optional[MCPPoolKey] = None,
 ) -> None:
     """Best-effort graceful shutdown of stdio MCP subprocesses to reap orphans.
 
@@ -5804,6 +6008,9 @@ def _kill_orphaned_mcp_children(
     MCP server are reaped. This lets stdio reconnects clean up their previous
     transport without touching unrelated servers.
 
+    When ``pool_key`` is set, only PIDs owned by that profile-bound MCP pool
+    are reaped. Same-name servers in other profile pools are left alone.
+
     With ``include_active=True`` also kills every PID in ``_stdio_pids`` —
     used only at final shutdown, after the MCP event loop has stopped and no
     sessions can still be in flight.
@@ -5816,10 +6023,13 @@ def _kill_orphaned_mcp_children(
             owner = _orphan_stdio_pid_servers.get(opid, "orphan")
             if server_name is not None and owner != server_name:
                 continue
+            if pool_key is not None and _orphan_stdio_pid_pool_keys.get(opid) != pool_key:
+                continue
             pids[opid] = owner
         for opid in pids:
             _orphan_stdio_pids.discard(opid)
             _orphan_stdio_pid_servers.pop(opid, None)
+            _orphan_stdio_pid_pool_keys.pop(opid, None)
         if include_active:
             active = dict(_stdio_pids)
             if server_name is not None:
@@ -5828,9 +6038,16 @@ def _kill_orphaned_mcp_children(
                     for pid, owner in active.items()
                     if owner == server_name
                 }
+            if pool_key is not None:
+                active = {
+                    pid: owner
+                    for pid, owner in active.items()
+                    if _stdio_pid_pool_keys.get(pid) == pool_key
+                }
             pids.update(active)
             for pid in active:
                 _stdio_pids.pop(pid, None)
+                _stdio_pid_pool_keys.pop(pid, None)
         # Snapshot pgids for the pids we're about to kill, then drop the
         # entries so a future spawn can't collide with stale state.
         pgids: Dict[int, int] = {pid: _stdio_pgids[pid] for pid in pids if pid in _stdio_pgids}
@@ -5922,7 +6139,11 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
-        if only_if_idle and (_servers or _server_connecting):
+        active = any(
+            pool.servers or pool.connecting
+            for pool in (_legacy_pool, *_profile_pools.values())
+        )
+        if only_if_idle and active:
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
             return False
         loop = _mcp_loop

@@ -38,6 +38,24 @@ def _make_event() -> MessageEvent:
     return MessageEvent(text="/reload-mcp", source=_make_source(), message_id="m1")
 
 
+def _resolved_context(profile_id: str = "profile-a"):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+    return ResolvedAccessContext(
+        principal_id=f"principal-{profile_id}",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope=f"dm:{profile_id}",
+        capabilities=frozenset({"mcp"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-main",
+            peer_kind="dm",
+            chat_id=f"chat-{profile_id}",
+        ),
+    )
+
+
 def _make_runner_with_cached_agents(num_agents: int = 2):
     """Build a bare GatewayRunner with `num_agents` fake cached agents."""
     import threading
@@ -82,6 +100,13 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
     return runner
 
 
+async def _execute_reload_and_close_executor(runner):
+    try:
+        return await runner._execute_mcp_reload(_make_event())
+    finally:
+        runner._shutdown_executor()
+
+
 @pytest.mark.asyncio
 async def test_reload_mcp_refreshes_cached_agent_tools():
     """After /reload-mcp succeeds, every cached agent gets its tool list
@@ -106,12 +131,15 @@ async def test_reload_mcp_refreshes_cached_agent_tools():
     ]
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_current_mcp_servers"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=["HassTurnOn", "HassTurnOff"]),
-        patch.dict("tools.mcp_tool._servers", {"homeassistant": object()}, clear=True),
+        patch(
+            "tools.mcp_tool.snapshot_current_mcp_server_names",
+            side_effect=[{"homeassistant"}, {"homeassistant"}],
+        ),
         patch("model_tools.get_tool_definitions", return_value=fresh_tool_defs),
     ):
-        result = await runner._execute_mcp_reload(_make_event())
+        result = await _execute_reload_and_close_executor(runner)
 
     # The reload itself returned a status string (not an exception).
     assert isinstance(result, str)
@@ -136,12 +164,12 @@ async def test_reload_mcp_handles_empty_agent_cache():
     assert len(runner._agent_cache) == 0
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_current_mcp_servers"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
-        patch.dict("tools.mcp_tool._servers", {}, clear=True),
+        patch("tools.mcp_tool.snapshot_current_mcp_server_names", return_value=set()),
         patch("model_tools.get_tool_definitions", return_value=[]),
     ):
-        result = await runner._execute_mcp_reload(_make_event())
+        result = await _execute_reload_and_close_executor(runner)
 
     assert isinstance(result, str)
 
@@ -164,13 +192,58 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
         return [{"type": "function", "function": {"name": "refreshed"}}]
 
     with (
-        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.shutdown_current_mcp_servers"),
         patch("tools.mcp_tool.discover_mcp_tools", return_value=["refreshed"]),
-        patch.dict("tools.mcp_tool._servers", {"homeassistant": object()}, clear=True),
+        patch(
+            "tools.mcp_tool.snapshot_current_mcp_server_names",
+            side_effect=[{"homeassistant"}, {"homeassistant"}],
+        ),
         patch("model_tools.get_tool_definitions", side_effect=_capture_get_tool_definitions),
     ):
-        await runner._execute_mcp_reload(_make_event())
+        await _execute_reload_and_close_executor(runner)
 
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_uses_context_preserving_current_pool_helpers():
+    from gateway.session_context import bind_resolved_access_context, get_resolved_access_context
+
+    runner = _make_runner_with_cached_agents(num_agents=0)
+    context = _resolved_context("profile-a")
+    seen: list[tuple[str, str]] = []
+
+    def _profile_id():
+        return get_resolved_access_context().profile_id
+
+    def _snapshot():
+        seen.append(("snapshot", _profile_id()))
+        return {"current-profile-server"}
+
+    def _shutdown():
+        seen.append(("shutdown", _profile_id()))
+
+    def _discover():
+        seen.append(("discover", _profile_id()))
+        return ["mcp__current_profile_server__echo"]
+
+    with (
+        bind_resolved_access_context(context),
+        patch("tools.mcp_tool.shutdown_current_mcp_servers", side_effect=_shutdown),
+        patch("tools.mcp_tool.discover_mcp_tools", side_effect=_discover),
+        patch("tools.mcp_tool.snapshot_current_mcp_server_names", side_effect=_snapshot),
+        patch.dict("tools.mcp_tool._servers", {"foreign-server": object()}, clear=True),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+    ):
+        result = await _execute_reload_and_close_executor(runner)
+
+    assert seen == [
+        ("snapshot", "profile-a"),
+        ("shutdown", "profile-a"),
+        ("discover", "profile-a"),
+        ("snapshot", "profile-a"),
+    ]
+    assert "current-profile-server" in result
+    assert "foreign-server" not in result

@@ -15255,24 +15255,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
-        loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                discover_mcp_tools,
+                shutdown_current_mcp_servers,
+                snapshot_current_mcp_server_names,
+            )
 
             # Capture old server names before shutdown
-            with _lock:
-                old_servers = set(_servers.keys())
+            old_servers = await self._run_in_executor_with_context(
+                snapshot_current_mcp_server_names
+            )
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await self._run_in_executor_with_context(shutdown_current_mcp_servers)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             # Compute what changed
-            with _lock:
-                connected_servers = set(_servers.keys())
+            connected_servers = await self._run_in_executor_with_context(
+                snapshot_current_mcp_server_names
+            )
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
