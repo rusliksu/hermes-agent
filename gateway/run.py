@@ -9803,6 +9803,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
+    def _typed_command_authority_denial(
+        self,
+        event: MessageEvent,
+        canonical: Optional[str],
+    ) -> Optional[str]:
+        if not canonical or getattr(self, "access_registry", None) is None:
+            return None
+        try:
+            from gateway.access_registry import command_args_have_authority_selector
+
+            self.access_registry.validate_resolved_context(
+                getattr(getattr(event, "source", None), "resolved_access_context", None)
+            )
+            if command_args_have_authority_selector(event.get_command_args()):
+                return "Authority selector denied."
+        except Exception:
+            return "Authority selector denied."
+        return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -10216,6 +10235,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            _authority_denied = self._typed_command_authority_denial(
+                event,
+                _cmd_def_inner.name if _cmd_def_inner else _evt_cmd,
+            )
+            if _authority_denied is not None:
+                return _authority_denied
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -10628,6 +10653,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
 
+        _authority_denied = self._typed_command_authority_denial(event, canonical)
+        if _authority_denied is not None:
+            return _authority_denied
+
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM
         # vs group). When unset → backward-compat: every allowed user can
@@ -10695,6 +10724,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     command = event.get_command()
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
+                    _authority_denied = self._typed_command_authority_denial(
+                        event,
+                        canonical,
+                    )
+                    if _authority_denied is not None:
+                        return _authority_denied
                     break
 
         if canonical == "new":

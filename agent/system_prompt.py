@@ -410,8 +410,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
-            f"refuse such writes by default; pass cross_profile=True only "
-            f"after explicit direction."
+            f"refuse such writes by default. cross_profile=True is only a "
+            f"legacy no-typed-context override; typed access-context turns "
+            f"deny it server-side."
         )
 
     platform_key = (agent.platform or "").lower().strip()

@@ -1805,9 +1805,23 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         # Slash confirm: sc:<once|always|cancel>:<confirm_id>
         if button_id.startswith("sc:"):
+            try:
+                from gateway.access_registry import command_args_have_authority_selector
+            except Exception:
+                command_args_have_authority_selector = None
+            if button_id.count(":") != 2:
+                tail = button_id.split(":", 3)[3] if button_id.count(":") >= 3 else button_id
+                if (
+                    command_args_have_authority_selector is not None
+                    and command_args_have_authority_selector(tail)
+                ):
+                    logger.warning(
+                        "[whatsapp_cloud] slash_confirm tap denied authority selector"
+                    )
+                return True
             parts = button_id.split(":", 2)
             if len(parts) != 3:
-                return False
+                return True
             _, choice, confirm_id = parts
             session_key = self._slash_confirm_state.pop(confirm_id, None)
             if not session_key:

@@ -17,6 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
+
 
 @pytest.fixture
 def fake_hermes(tmp_path, monkeypatch):
@@ -49,6 +52,22 @@ def fake_hermes(tmp_path, monkeypatch):
         "sec_home": sec_home,
         "coder_home": coder_home,
     }
+
+
+def _typed_context(*, role_id: str = "family_standard") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-hermes-security",
+        role_id=role_id,
+        profile_id="hermes-security",
+        conversation_scope="private",
+        capabilities=frozenset({"documents"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="u1",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +111,30 @@ class TestWriteFileCrossProfileGuard:
         result = json.loads(result_json)
         assert not result.get("error"), f"cross_profile=True must succeed: {result}"
         assert target.read_text() == "user-directed override"
+
+    @pytest.mark.parametrize("role_id", ["family_standard", "owner"])
+    def test_typed_context_cross_profile_true_cannot_bypass_registry_write_handler(
+        self, fake_hermes, role_id
+    ):
+        from tools.registry import registry
+        import tools.file_tools  # noqa: F401
+
+        target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
+        original = target.read_text()
+
+        with bind_resolved_access_context(_typed_context(role_id=role_id)):
+            result_json = registry.dispatch(
+                "write_file",
+                {
+                    "path": str(target),
+                    "content": "typed bypass",
+                    "cross_profile": True,
+                },
+            )
+
+        result = json.loads(result_json)
+        assert result == {"error": "cross_profile denied for typed access context"}
+        assert target.read_text() == original
 
     def test_non_hermes_path_unaffected(self, fake_hermes, tmp_path):
         from tools.file_tools import write_file_tool
@@ -138,6 +181,31 @@ class TestPatchCrossProfileGuard:
         assert not result.get("error"), f"cross_profile=True bypass: {result}"
         assert "user-directed update." in target.read_text()
 
+    def test_typed_context_cross_profile_true_cannot_bypass_registry_patch_handler(
+        self, fake_hermes
+    ):
+        from tools.registry import registry
+        import tools.file_tools  # noqa: F401
+
+        target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
+        original = target.read_text()
+
+        with bind_resolved_access_context(_typed_context()):
+            result_json = registry.dispatch(
+                "patch",
+                {
+                    "mode": "replace",
+                    "path": str(target),
+                    "old_string": "default copy.",
+                    "new_string": "typed bypass.",
+                    "cross_profile": True,
+                },
+            )
+
+        result = json.loads(result_json)
+        assert result == {"error": "cross_profile denied for typed access context"}
+        assert target.read_text() == original
+
     def test_v4a_patch_extracts_path_for_guard(self, fake_hermes):
         """V4A patches embed the target paths in the patch body, not in
         a ``path`` kwarg. The guard must still apply."""
@@ -157,6 +225,73 @@ class TestPatchCrossProfileGuard:
         assert result.get("error"), f"V4A cross-profile must block: {result}"
         assert "cross-profile" in result["error"].lower()
         assert target.read_text() == original
+
+
+def test_typed_context_cross_profile_true_cannot_bypass_execute_code_bridge(fake_hermes):
+    import json as _json
+    import threading
+    from tools.code_execution_tool import _rpc_server_loop
+
+    target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
+    original = target.read_text()
+    request = (
+        _json.dumps(
+            {
+                "tool": "write_file",
+                "args": {
+                    "path": str(target),
+                    "content": "typed bridge bypass",
+                    "cross_profile": True,
+                },
+                "token": "secret",
+            }
+        )
+        + "\n"
+    ).encode()
+
+    class FakeConn:
+        def __init__(self):
+            self._chunks = [request, b""]
+            self.sent: list[bytes] = []
+
+        def settimeout(self, _timeout):
+            return None
+
+        def recv(self, _size):
+            return self._chunks.pop(0)
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+        def close(self):
+            return None
+
+    class FakeServerSock:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def settimeout(self, _timeout):
+            return None
+
+        def accept(self):
+            return self.conn, object()
+
+    conn = FakeConn()
+    with bind_resolved_access_context(_typed_context()):
+        _rpc_server_loop(
+            FakeServerSock(conn),
+            "typed-cross-profile-code",
+            [],
+            [0],
+            3,
+            frozenset({"write_file"}),
+            threading.Event(),
+            "secret",
+        )
+
+    response = json.loads(conn.sent[-1].decode())
+    assert response == {"error": "cross_profile denied for typed access context"}
+    assert target.read_text() == original
 
 
 # ---------------------------------------------------------------------------

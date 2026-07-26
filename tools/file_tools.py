@@ -676,10 +676,10 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
       the agent sees a plain ``/root/.hermes/…`` path.
 
     Returns ``None`` when the write is in-scope or outside Hermes scope.
-    All detectors are soft guards — the agent can override any by
-    passing ``cross_profile=True`` to its write tool after explicit user
-    direction. Defense-in-depth, NOT a security boundary — the terminal
-    tool runs as the same OS user and can write any of these paths
+    All detectors are legacy soft guards. ``cross_profile=True`` can override
+    them only when no typed access context is bound; typed turns deny the flag
+    before this path. Defense-in-depth, NOT a standalone security boundary —
+    the terminal tool runs as the same OS user and can write any of these paths
     directly. See ``agent/file_safety.classify_cross_profile_target``,
     ``classify_sandbox_mirror_target`` and ``classify_container_mirror_target``
     for the detection rules.
@@ -715,6 +715,21 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
         resolved,
         mirror_prefix=_get_container_mirror_prefix_for_task(task_id),
     )
+
+
+def _typed_cross_profile_override_error(cross_profile: bool) -> str | None:
+    if not cross_profile:
+        return None
+    try:
+        from gateway.access_registry import ResolvedAccessContext
+        from gateway.session_context import get_resolved_access_context
+
+        context = get_resolved_access_context(None)
+    except Exception:
+        return "cross_profile denied for typed access context"
+    if isinstance(context, ResolvedAccessContext):
+        return "cross_profile denied for typed access context"
+    return None
 
 
 def _is_expected_write_exception(exc: Exception) -> bool:
@@ -1574,12 +1589,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     session_id: str | None = None) -> str:
     """Write content to a file.
 
-    ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
-    guard fires only on writes that land in another profile's
-    skills/plugins/cron/memories directory; everything else is unaffected.
-    Pass ``True`` after explicit user direction — same shape as ``force``
-    on the terminal tool.
+    ``cross_profile`` opts out of the legacy soft cross-Hermes-profile guard
+    only when no typed access context is bound. In typed
+    ``ResolvedAccessContext`` turns, model args cannot grant this authority.
     """
+    typed_override_err = _typed_cross_profile_override_error(cross_profile)
+    if typed_override_err:
+        return tool_error(typed_override_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1658,10 +1674,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                session_id: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
-    ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
-    targets under another profile's skills/plugins/cron/memories
-    directory. Same shape as ``write_file``'s flag.
+    ``cross_profile`` opts out of the legacy soft cross-Hermes-profile guard
+    only when no typed access context is bound. In typed
+    ``ResolvedAccessContext`` turns, model args cannot grant this authority.
     """
+    typed_override_err = _typed_cross_profile_override_error(cross_profile)
+    if typed_override_err:
+        return tool_error(typed_override_err)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -1968,7 +1987,7 @@ WRITE_FILE_SCHEMA = {
             "content": {"type": "string", "description": "Complete content to write to the file"},
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
+                "description": "Legacy no-typed-context opt-out for the cross-profile soft guard. In typed ResolvedAccessContext turns this is denied because model args cannot grant cross-profile authority.",
                 "default": False,
             },
         },
@@ -2019,7 +2038,7 @@ PATCH_SCHEMA = {
             },
             "cross_profile": {
                 "type": "boolean",
-                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
+                "description": "Legacy no-typed-context opt-out for the cross-profile soft guard. In typed ResolvedAccessContext turns this is denied because model args cannot grant cross-profile authority.",
                 "default": False,
             },
         },

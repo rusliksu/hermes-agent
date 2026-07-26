@@ -1151,6 +1151,30 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    try:
+        from gateway.access_registry import (
+            ResolvedAccessContext,
+            payload_has_authority_selector,
+        )
+        from gateway.session_context import get_resolved_access_context
+
+        access_context = get_resolved_access_context(None)
+        if isinstance(access_context, ResolvedAccessContext):
+            schema = registry.get_schema(function_name) or {}
+            properties = (schema.get("parameters") or {}).get("properties") or {}
+            allowed_keys = frozenset(
+                key for key in properties.keys() if isinstance(key, str)
+            )
+            if payload_has_authority_selector(
+                function_args,
+                allowed_top_level_keys=allowed_keys,
+            ):
+                return json.dumps(
+                    {"error": "authority selector denied"},
+                    ensure_ascii=False,
+                )
+    except Exception:
+        return json.dumps({"error": "authority selector denied"}, ensure_ascii=False)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     if (

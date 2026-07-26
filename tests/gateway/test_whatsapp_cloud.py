@@ -2062,6 +2062,48 @@ class TestDispatchInteractiveReplySlashConfirm:
         reply_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert "MCP reloaded" in reply_payload["text"]["body"]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            "profile_id=foreign",
+            "role_id=owner",
+            "session_id=foreign",
+            "namespace=foreign",
+            "delivery_target=foreign",
+        ],
+    )
+    async def test_authority_tail_is_claimed_without_resolve_or_fallback(
+        self,
+        monkeypatch,
+        tail,
+    ):
+        adapter = _make_adapter()
+        adapter._slash_confirm_state["cf-9"] = "sess-sc-1"
+        adapter.send = AsyncMock(side_effect=AssertionError("must not reply"))
+
+        import tools.slash_confirm as _sc
+        resolve = AsyncMock(side_effect=AssertionError("must not resolve"))
+        monkeypatch.setattr(_sc, "resolve", resolve)
+
+        raw = {
+            "from": "15551234567",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {
+                    "id": f"sc:once:cf-9:{tail}",
+                    "title": "Approve Once",
+                },
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert adapter._slash_confirm_state["cf-9"] == "sess-sc-1"
+        resolve.assert_not_called()
+        adapter.send.assert_not_called()
+
 
 class TestDispatchInteractiveReplyAuthorization:
     """Interactive taps must honor the same DM allowlist as text intake."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
@@ -42,6 +43,30 @@ _DELIVERY_TARGET_KEYS = frozenset({
     "chat_id",
     "thread_id",
 })
+_AUTHORITY_SELECTOR_KEYS = frozenset({
+    "capabilities",
+    "capability",
+    "conversation_scope",
+    "delivery",
+    "delivery_target",
+    "memory_namespace",
+    "namespace",
+    "principal",
+    "principal_id",
+    "profile",
+    "profile_id",
+    "role",
+    "role_id",
+    "scope",
+    "session",
+    "session_id",
+    "target_delivery",
+    "target_namespace",
+    "target_profile",
+    "target_profile_id",
+    "target_role",
+    "target_session",
+})
 
 
 def _audit_label(value: Any, allowed: frozenset[str]) -> Optional[str]:
@@ -49,6 +74,62 @@ def _audit_label(value: Any, allowed: frozenset[str]) -> Optional[str]:
         return None
     label = value.strip().lower()
     return label if label in allowed else "unknown"
+
+
+def _authority_key(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace("-", "_").lstrip("_")
+
+
+def payload_has_authority_selector(
+    payload: Any,
+    *,
+    allowed_top_level_keys: frozenset[str] = frozenset(),
+) -> bool:
+    """Detect user/model supplied authority selectors in structured payloads."""
+    allowed = frozenset(_authority_key(key) for key in allowed_top_level_keys)
+
+    def walk(value: Any, *, top_level: bool = False) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = _authority_key(key)
+                if normalized in _AUTHORITY_SELECTOR_KEYS and not (
+                    top_level and normalized in allowed
+                ):
+                    return True
+                if walk(item):
+                    return True
+        elif isinstance(value, (list, tuple)):
+            return any(walk(item) for item in value)
+        return False
+
+    return walk(payload, top_level=True)
+
+
+def command_args_have_authority_selector(raw_args: Any) -> bool:
+    """Detect structured authority selectors in slash/command args."""
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return False
+    try:
+        parsed = json.loads(raw_args)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict) and payload_has_authority_selector(parsed):
+        return True
+    try:
+        tokens = shlex.split(raw_args)
+    except ValueError:
+        tokens = raw_args.split()
+    for token in tokens:
+        key = ""
+        if token.startswith("--"):
+            key = token[2:].split("=", 1)[0]
+        elif "=" in token:
+            key = token.split("=", 1)[0].lstrip("-")
+        if _authority_key(key) in _AUTHORITY_SELECTOR_KEYS:
+            return True
+    return False
 
 
 @dataclass(frozen=True)

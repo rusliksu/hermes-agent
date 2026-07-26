@@ -5957,6 +5957,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---
         if data.startswith("sc:"):
+            try:
+                from gateway.access_registry import command_args_have_authority_selector
+            except Exception:
+                command_args_have_authority_selector = None
+            if data.count(":") != 2:
+                tail = data.split(":", 3)[3] if data.count(":") >= 3 else data
+                if (
+                    command_args_have_authority_selector is not None
+                    and command_args_have_authority_selector(tail)
+                ):
+                    await query.answer(text="authority selector denied")
+                    return
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, always, cancel
