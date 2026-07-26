@@ -109,6 +109,12 @@ from typing import Callable
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
+from tools.mcp_profile_policy import (
+    TypedMCPConfigError,
+    build_typed_child_env,
+    prepare_typed_mcp_server_config,
+    typed_mcp_config_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -425,7 +431,7 @@ def _env_ref_name(ref: str) -> str:
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(user_env: Optional[dict], *, pool: Optional[Any] = None) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -435,6 +441,16 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     This prevents accidentally leaking secrets like API keys, tokens, or
     credentials to MCP server subprocesses.
     """
+    if pool is not None and pool.key is not None:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+
+            profile_home = get_profile_dir(pool.key.profile_id).resolve()
+        except Exception as exc:
+            raise ValueError("profile-bound-mcp-runtime-home-missing") from exc
+
+        return build_typed_child_env(user_env, profile_home=profile_home)
+
     env = {}
     for key, value in os.environ.items():
         if (
@@ -2235,7 +2251,7 @@ class MCPServerTask:
                 f"MCP server '{self.name}' has no 'command' in config"
             )
 
-        safe_env = _build_safe_env(user_env)
+        safe_env = _build_safe_env(user_env, pool=_server_pool(self))
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
         # Check package against OSV malware database before spawning.
@@ -3208,6 +3224,9 @@ class MCPServerPool:
     tool_toolsets: Dict[str, str] = field(default_factory=dict)
     toolset_aliases: Dict[str, str] = field(default_factory=dict)
     tool_server_names: Dict[str, str] = field(default_factory=dict)
+    config_snapshots: Dict[str, str] = field(default_factory=dict)
+    credential_ref_metadata: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    allowed_tool_names: Dict[str, frozenset[str]] = field(default_factory=dict)
     generation: int = 0
 
 
@@ -4260,6 +4279,73 @@ def _interpolate_env_vars(value):
     return value
 
 
+def _prepare_typed_mcp_servers_for_pool(
+    servers: Dict[str, dict],
+    pool: MCPServerPool,
+) -> Dict[str, dict]:
+    prepared_servers: Dict[str, dict] = {}
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            with _lock:
+                pool.connect_errors[name] = "profile-bound-mcp-config-invalid"
+            continue
+        if not _parse_boolish(cfg.get("enabled", True), default=True):
+            with _lock:
+                pool.config_snapshots.pop(name, None)
+                pool.credential_ref_metadata.pop(name, None)
+                pool.allowed_tool_names.pop(name, None)
+                pool.connect_errors.pop(name, None)
+            prepared_servers[name] = deepcopy(cfg)
+            continue
+        try:
+            from agent.secret_scope import current_secret_scope
+
+            prepared = prepare_typed_mcp_server_config(
+                name,
+                cfg,
+                current_secret_scope(),
+            )
+        except TypedMCPConfigError as exc:
+            with _lock:
+                pool.connect_errors[name] = str(exc)
+                pool.config_snapshots.pop(name, None)
+                pool.credential_ref_metadata.pop(name, None)
+                pool.allowed_tool_names.pop(name, None)
+            continue
+        with _lock:
+            pool.config_snapshots[name] = prepared.fingerprint
+            pool.credential_ref_metadata[name] = dict(prepared.credential_ref_metadata)
+            pool.allowed_tool_names[name] = prepared.allowed_operation_names
+            pool.connect_errors.pop(name, None)
+        prepared_servers[name] = prepared.prepared_config
+    return prepared_servers
+
+
+def _typed_mcp_snapshot_matches(pool: MCPServerPool, name: str, config: dict) -> bool:
+    if pool.key is None:
+        return True
+    fingerprint = typed_mcp_config_fingerprint(config)
+    with _lock:
+        snapshot = pool.config_snapshots.get(name)
+    return isinstance(snapshot, str) and snapshot == fingerprint
+
+
+def _typed_mcp_call_allowed(pool: MCPServerPool, server_name: str, tool_name: str) -> bool:
+    if pool.key is None:
+        return True
+    with _lock:
+        server = pool.servers.get(server_name)
+        snapshot = pool.config_snapshots.get(server_name)
+        allowed = pool.allowed_tool_names.get(server_name)
+    config = getattr(server, "_config", None) or {}
+    return (
+        isinstance(snapshot, str)
+        and snapshot == typed_mcp_config_fingerprint(config)
+        and isinstance(allowed, frozenset)
+        and tool_name in allowed
+    )
+
+
 def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
     try:
@@ -4299,11 +4385,25 @@ def _load_mcp_config() -> Dict[str, dict]:
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
-        from hermes_cli.config import load_config
         from utils import env_var_enabled as _env_enabled
 
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
+        if _is_mcp_multiplex_active():
+            from hermes_cli.config import read_raw_config
+
+            config = read_raw_config()
+            servers = config.get("mcp_servers")
+            if not servers or not isinstance(servers, dict):
+                return {}
+            return {
+                name: deepcopy(cfg)
+                for name, cfg in _filter_suspicious_mcp_servers(servers).items()
+                if isinstance(cfg, dict)
+            }
+
+        from hermes_cli.config import load_config
+
         config = load_config()
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
@@ -4422,6 +4522,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if pool is None:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
+            }, ensure_ascii=False)
+        if not _typed_mcp_call_allowed(pool, server_name, tool_name):
+            return json.dumps({
+                "error": "profile-bound-mcp-snapshot-missing"
             }, ensure_ascii=False)
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -4640,6 +4744,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        pool = _current_mcp_pool(create=False)
+        if pool is None or not _typed_mcp_call_allowed(pool, server_name, "list_resources"):
+            return json.dumps({
+                "error": "profile-bound-mcp-snapshot-missing"
+            }, ensure_ascii=False)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -4702,6 +4811,11 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
+        pool = _current_mcp_pool(create=False)
+        if pool is None or not _typed_mcp_call_allowed(pool, server_name, "read_resource"):
+            return json.dumps({
+                "error": "profile-bound-mcp-snapshot-missing"
+            }, ensure_ascii=False)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -4767,6 +4881,11 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        pool = _current_mcp_pool(create=False)
+        if pool is None or not _typed_mcp_call_allowed(pool, server_name, "list_prompts"):
+            return json.dumps({
+                "error": "profile-bound-mcp-snapshot-missing"
+            }, ensure_ascii=False)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -4834,6 +4953,11 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
+        pool = _current_mcp_pool(create=False)
+        if pool is None or not _typed_mcp_call_allowed(pool, server_name, "get_prompt"):
+            return json.dumps({
+                "error": "profile-bound-mcp-snapshot-missing"
+            }, ensure_ascii=False)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -5287,8 +5411,10 @@ def _mcp_tool_defined_in_other_pool(
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}
-    resources_enabled = _parse_boolish(tools_filter.get("resources"), default=True)
-    prompts_enabled = _parse_boolish(tools_filter.get("prompts"), default=True)
+    pool = _server_pool(server)
+    utility_default = not (pool is not None and pool.key is not None)
+    resources_enabled = _parse_boolish(tools_filter.get("resources"), default=utility_default)
+    prompts_enabled = _parse_boolish(tools_filter.get("prompts"), default=utility_default)
 
     # ``initialize_result.capabilities`` is the source of truth: its sub-objects
     # (``resources``, ``prompts``) are non-None iff the server advertises that
@@ -5491,6 +5617,10 @@ async def _discover_and_register_server(
     pool = pool or _current_mcp_pool()
     if pool is None:
         return []
+    if not _typed_mcp_snapshot_matches(pool, name, config):
+        with _lock:
+            pool.connect_errors[name] = "profile-bound-mcp-snapshot-missing"
+        return []
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
     connect_coro = (
         _connect_server(name, config, pool)
@@ -5540,6 +5670,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         return []
 
     servers = _filter_suspicious_mcp_servers(servers)
+    if pool.key is not None:
+        servers = _prepare_typed_mcp_servers_for_pool(servers, pool)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
@@ -5596,8 +5728,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         )
         for name, result in zip(server_names, results):
             if isinstance(result, BaseException):
-                command = new_servers.get(name, {}).get("command")
-                message = _format_connect_error(result)
+                command = None if pool.key is not None else new_servers.get(name, {}).get("command")
+                message = (
+                    "profile-bound-mcp-connect-failed"
+                    if pool.key is not None
+                    else _format_connect_error(result)
+                )
                 with _lock:
                     pool.connecting.discard(name)
                     pool.connect_errors[name] = message
@@ -5610,7 +5746,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             else:
                 with _lock:
                     pool.connecting.discard(name)
-                    pool.connect_errors.pop(name, None)
+                    if name in pool.servers:
+                        pool.connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -6138,6 +6275,22 @@ def _shutdown_mcp_pool(pool: MCPServerPool, *, stop_loop: bool) -> None:
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
+        if pool.key is not None:
+            with _lock:
+                had_typed_state = any((
+                    pool.connecting,
+                    pool.connect_errors,
+                    pool.config_snapshots,
+                    pool.credential_ref_metadata,
+                    pool.allowed_tool_names,
+                ))
+                pool.connecting.clear()
+                pool.connect_errors.clear()
+                pool.config_snapshots.clear()
+                pool.credential_ref_metadata.clear()
+                pool.allowed_tool_names.clear()
+                if had_typed_state:
+                    pool.generation += 1
         if stop_loop:
             _stop_mcp_loop()
         return
@@ -6164,6 +6317,9 @@ def _shutdown_mcp_pool(pool: MCPServerPool, *, stop_loop: bool) -> None:
                 pool.tool_toolsets.clear()
                 pool.toolset_aliases.clear()
                 pool.tool_server_names.clear()
+                pool.config_snapshots.clear()
+                pool.credential_ref_metadata.clear()
+                pool.allowed_tool_names.clear()
                 pool.generation += 1
 
     with _lock:

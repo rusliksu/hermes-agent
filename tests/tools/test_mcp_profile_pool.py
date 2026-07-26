@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tools.mcp_profile_policy import typed_mcp_config_fingerprint
+
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_profile_pool_state():
@@ -29,6 +31,9 @@ def _reset_mcp_profile_pool_state():
     mcp_tool._server_breaker_opened_at.clear()
     mcp_tool._parallel_safe_servers.clear()
     mcp_tool._mcp_tool_server_names.clear()
+    mcp_tool._legacy_pool.config_snapshots.clear()
+    mcp_tool._legacy_pool.credential_ref_metadata.clear()
+    mcp_tool._legacy_pool.allowed_tool_names.clear()
     mcp_tool._profile_pools.clear()
     yield
     set_multiplex_active(False)
@@ -42,6 +47,9 @@ def _reset_mcp_profile_pool_state():
     mcp_tool._server_breaker_opened_at.clear()
     mcp_tool._parallel_safe_servers.clear()
     mcp_tool._mcp_tool_server_names.clear()
+    mcp_tool._legacy_pool.config_snapshots.clear()
+    mcp_tool._legacy_pool.credential_ref_metadata.clear()
+    mcp_tool._legacy_pool.allowed_tool_names.clear()
     mcp_tool._profile_pools.clear()
 
 
@@ -83,6 +91,7 @@ def _server(label: str):
         name="demo",
         session=session,
         _tools=[],
+        _config={"tools": {"include": ["echo"], "resources": False, "prompts": False}},
         tool_timeout=120,
         _rpc_lock=asyncio.Lock(),
         _is_recycled_stdio=lambda: False,
@@ -113,6 +122,8 @@ def _install_server(context, server):
         pool = mcp_tool._current_mcp_pool()
         assert pool is not None
         server._pool = pool
+        pool.config_snapshots["demo"] = typed_mcp_config_fingerprint(server._config)
+        pool.allowed_tool_names["demo"] = frozenset({"echo"})
         pool.servers["demo"] = server
         return pool
 
@@ -123,12 +134,19 @@ def _register_demo_server(context, tools):
 
     server = _server(f"from-{context.profile_id}")
     server._tools = list(tools)
+    server._config = {
+        "tools": {
+            "include": [tool.name for tool in tools],
+            "resources": False,
+            "prompts": False,
+        }
+    }
     with bind_resolved_access_context(context):
         pool = _install_server(context, server)
         server._registered_tool_names = mcp_tool._register_server_tools(
             "demo",
             server,
-            {"tools": {"resources": False, "prompts": False}},
+            server._config,
         )
         return pool, server
 
@@ -229,6 +247,7 @@ async def test_bound_multiplex_discovery_passes_and_stores_exact_pool(monkeypatc
     with bind_resolved_access_context(context):
         pool = mcp_tool._current_mcp_pool()
         assert pool is not None
+        pool.config_snapshots["demo"] = typed_mcp_config_fingerprint(config)
         registered = await mcp_tool._discover_and_register_server("demo", config, pool)
 
     server = observed["server"]
@@ -370,3 +389,394 @@ def test_legacy_single_profile_mcp_definitions_still_use_registry():
     defs = _mcp_defs(_ctx("ignored", "ignored"), enabled_toolsets=["demo"])
 
     assert defs["mcp__demo__echo"]["description"] == "Legacy echo"
+
+
+def _typed_raw_server(secret_key: str = "MCP_DEMO_TOKEN") -> dict:
+    return {
+        "command": "demo-mcp",
+        "args": ["--mode", "safe"],
+        "env": {"DEMO_TOKEN": "${credential:token}"},
+        "headers": {"Authorization": "Bearer ${credential:token}"},
+        "credential_refs": {"token": secret_key},
+        "tools": {"include": ["echo"], "resources": False, "prompts": False},
+    }
+
+
+def test_typed_same_server_tool_uses_profile_local_refs_only_env_header_and_hash_snapshots(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    captured: dict[str, dict] = {}
+
+    async def fake_discover(name, cfg, pool=None):
+        captured[pool.key.profile_id] = cfg
+        return []
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run_coro_inline)
+    monkeypatch.setattr(mcp_tool, "_discover_and_register_server", fake_discover)
+
+    token_a = set_secret_scope({"MCP_DEMO_TOKEN": "profile-a-secret"})
+    try:
+        with bind_resolved_access_context(ctx_a):
+            assert mcp_tool.register_mcp_servers({"demo": _typed_raw_server()}) == []
+            pool_a = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token_a)
+
+    token_b = set_secret_scope({"MCP_DEMO_TOKEN": "profile-b-secret"})
+    try:
+        with bind_resolved_access_context(ctx_b):
+            assert mcp_tool.register_mcp_servers({"demo": _typed_raw_server()}) == []
+            pool_b = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token_b)
+
+    assert captured["profile-a"]["args"] == ["--mode", "safe"]
+    assert captured["profile-b"]["args"] == ["--mode", "safe"]
+    assert captured["profile-a"]["env"] == {"DEMO_TOKEN": "profile-a-secret"}
+    assert captured["profile-b"]["env"] == {"DEMO_TOKEN": "profile-b-secret"}
+    assert captured["profile-a"]["headers"] == {"Authorization": "Bearer profile-a-secret"}
+    assert captured["profile-b"]["headers"] == {"Authorization": "Bearer profile-b-secret"}
+    assert len(pool_a.config_snapshots["demo"]) == 64
+    assert len(pool_b.config_snapshots["demo"]) == 64
+    assert all(ch in "0123456789abcdef" for ch in pool_a.config_snapshots["demo"])
+    assert all(ch in "0123456789abcdef" for ch in pool_b.config_snapshots["demo"])
+    assert "profile-a-secret" not in pool_a.config_snapshots["demo"]
+    assert "profile-b-secret" not in pool_b.config_snapshots["demo"]
+    assert pool_a.config_snapshots["demo"] == typed_mcp_config_fingerprint(captured["profile-a"])
+    assert pool_b.config_snapshots["demo"] == typed_mcp_config_fingerprint(captured["profile-b"])
+    assert pool_a.credential_ref_metadata["demo"] == {"token": "MCP_DEMO_TOKEN"}
+    assert pool_b.credential_ref_metadata["demo"] == {"token": "MCP_DEMO_TOKEN"}
+    assert pool_a.allowed_tool_names["demo"] == frozenset({"echo"})
+    assert pool_b.allowed_tool_names["demo"] == frozenset({"echo"})
+
+
+@pytest.mark.parametrize(
+    ("cfg", "scope", "reason"),
+    [
+        (_typed_raw_server(), {}, "profile-bound-mcp-credential-ref-missing"),
+        (
+            {**_typed_raw_server(), "args": ["${credential:token}"]},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-credential-ref-location-denied",
+        ),
+        (
+            {**_typed_raw_server(), "args": ["${env:MCP_DEMO_TOKEN}"]},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-legacy-placeholder-denied",
+        ),
+        (
+            {**_typed_raw_server(), "env": {"HOME": "${credential:token}"}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-env-key-denied",
+        ),
+        (
+            {**_typed_raw_server(), "env": {"XDG_CONFIG_HOME": "${credential:token}"}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-env-key-denied",
+        ),
+        (
+            {**_typed_raw_server(), "env": {"TMPDIR": "${credential:token}"}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-env-key-denied",
+        ),
+        (
+            {**_typed_raw_server(), "tools": {"resources": False, "prompts": False}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-tools-include-missing",
+        ),
+        (
+            {**_typed_raw_server(), "tools": {"include": ["*"], "resources": False, "prompts": False}},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-mcp-tools-include-invalid",
+        ),
+        (
+            {**_typed_raw_server(), "auth": "oauth"},
+            {"MCP_DEMO_TOKEN": "secret"},
+            "profile-bound-oauth-not-implemented",
+        ),
+    ],
+)
+def test_typed_config_denies_before_spawn_or_interpolation(monkeypatch, cfg, scope, reason):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    monkeypatch.setenv("MCP_DEMO_TOKEN", "ambient-must-not-satisfy-ref")
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(
+        mcp_tool,
+        "_discover_and_register_server",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawn/connect must not run")),
+    )
+
+    token = set_secret_scope(scope)
+    try:
+        with bind_resolved_access_context(_ctx("profile-a", "dm:a")):
+            assert mcp_tool.register_mcp_servers({"demo": cfg}) == []
+            pool = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token)
+
+    assert pool.connect_errors["demo"] == reason
+    assert "demo" not in pool.config_snapshots
+
+
+def test_typed_process_env_provider_key_cannot_satisfy_missing_ref(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    monkeypatch.setenv("MCP_OPENAI_API_KEY", "ambient-provider-secret")
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    token = set_secret_scope({})
+    try:
+        with bind_resolved_access_context(_ctx("profile-a", "dm:a")):
+            assert mcp_tool.register_mcp_servers({
+                "demo": _typed_raw_server("MCP_OPENAI_API_KEY")
+            }) == []
+            pool = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token)
+
+    assert pool.connect_errors["demo"] == "profile-bound-mcp-credential-ref-missing"
+    assert pool.config_snapshots == {}
+
+
+def test_typed_child_env_empty_ambient_env_does_not_fallback_to_process_env(monkeypatch, tmp_path):
+    from tools.mcp_profile_policy import build_typed_child_env
+
+    profile_home = tmp_path / "profiles" / "profile-a"
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-provider-secret")
+
+    env = build_typed_child_env({}, profile_home=profile_home, ambient_env={})
+
+    assert "PATH" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert env["HOME"] == str(profile_home.resolve())
+    assert env["HERMES_HOME"] == str(profile_home.resolve())
+    assert env["TMPDIR"] == str(profile_home.resolve() / "tmp")
+    assert env["TEMP"] == str(profile_home.resolve() / "tmp")
+    assert env["TMP"] == str(profile_home.resolve() / "tmp")
+
+
+def test_typed_handler_denies_missing_snapshot_before_server_call(monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    context = _ctx("profile-a", "dm:a")
+    server = _server("from-a")
+    with bind_resolved_access_context(context):
+        pool = mcp_tool._current_mcp_pool()
+        server._pool = pool
+        pool.servers["demo"] = server
+        handler = mcp_tool._make_tool_handler("demo", "echo", 120)
+        assert json.loads(handler({})) == {"error": "profile-bound-mcp-snapshot-missing"}
+
+    assert server.session.calls == []
+
+
+def test_typed_handler_denies_tool_missing_from_exact_raw_allowlist(monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    context = _ctx("profile-a", "dm:a")
+    server = _server("from-a")
+    server._config = {"tools": {"include": ["other"], "resources": False, "prompts": False}}
+    with bind_resolved_access_context(context):
+        pool = _install_server(context, server)
+        pool.config_snapshots["demo"] = typed_mcp_config_fingerprint(server._config)
+        pool.allowed_tool_names["demo"] = frozenset({"other"})
+        handler = mcp_tool._make_tool_handler("demo", "echo", 120)
+        assert json.loads(handler({})) == {"error": "profile-bound-mcp-snapshot-missing"}
+
+    assert server.session.calls == []
+
+
+def test_typed_disabled_config_clears_stale_snapshot_and_denies_handler(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    context = _ctx("profile-a", "dm:a")
+    server = _server("from-a")
+    token = set_secret_scope({"MCP_DEMO_TOKEN": "secret"})
+    try:
+        with bind_resolved_access_context(context):
+            pool = _install_server(context, server)
+            pool.credential_ref_metadata["demo"] = {"token": "MCP_DEMO_TOKEN"}
+            assert "demo" in pool.config_snapshots
+
+            mcp_tool._prepare_typed_mcp_servers_for_pool(
+                {"demo": {**_typed_raw_server(), "enabled": False}},
+                pool,
+            )
+            handler = mcp_tool._make_tool_handler("demo", "echo", 120)
+            assert json.loads(handler({})) == {"error": "profile-bound-mcp-snapshot-missing"}
+    finally:
+        reset_secret_scope(token)
+
+    assert server.session.calls == []
+
+
+def test_typed_build_safe_env_uses_profile_home_xdg_without_ambient_provider_env(monkeypatch, tmp_path):
+    from tools import mcp_tool
+
+    profile_home = tmp_path / "profiles" / "profile-a"
+    monkeypatch.setenv("HOME", "/owner/home")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/owner/.config")
+    monkeypatch.setenv("TMPDIR", "/owner/tmp")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda profile_id: profile_home,
+    )
+
+    pool = mcp_tool.MCPServerPool(
+        key=mcp_tool.MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    )
+    env = mcp_tool._build_safe_env({"DEMO_TOKEN": "resolved"}, pool=pool)
+
+    assert env["HOME"] == str(profile_home.resolve())
+    assert env["HERMES_HOME"] == str(profile_home.resolve())
+    assert env["TMPDIR"] == str(profile_home.resolve() / "tmp")
+    assert env["TEMP"] == str(profile_home.resolve() / "tmp")
+    assert env["TMP"] == str(profile_home.resolve() / "tmp")
+    assert env["XDG_CONFIG_HOME"].startswith(str(profile_home.resolve()))
+    assert env["XDG_CACHE_HOME"].startswith(str(profile_home.resolve()))
+    assert env["XDG_DATA_HOME"].startswith(str(profile_home.resolve()))
+    assert env["XDG_STATE_HOME"].startswith(str(profile_home.resolve()))
+    assert env["DEMO_TOKEN"] == "resolved"
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_typed_register_rechecks_snapshot_after_preparation_before_discovery(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+
+    async def forbidden_connect_server(*_args, **_kwargs):
+        raise AssertionError("_connect_server must not run when typed snapshot changed")
+
+    def race_then_run(coro_or_factory, timeout=120):
+        pool = mcp_tool._current_mcp_pool(create=False)
+        assert pool is not None
+        pool.config_snapshots["demo"] = "f" * 64
+        return _run_coro_inline(coro_or_factory, timeout=timeout)
+
+    monkeypatch.setattr(mcp_tool, "_connect_server", forbidden_connect_server)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", race_then_run)
+
+    token = set_secret_scope({"MCP_DEMO_TOKEN": "secret"})
+    try:
+        with bind_resolved_access_context(_ctx("profile-a", "dm:a")):
+            assert mcp_tool.register_mcp_servers({"demo": _typed_raw_server()}) == []
+            pool = mcp_tool._current_mcp_pool(create=False)
+    finally:
+        reset_secret_scope(token)
+
+    assert pool.connect_errors["demo"] == "profile-bound-mcp-snapshot-missing"
+    assert "demo" not in pool.servers
+
+
+def test_typed_utility_operations_allowed_only_when_explicit_flags_true(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    context = _ctx("profile-a", "dm:a")
+    token = set_secret_scope({"MCP_DEMO_TOKEN": "secret"})
+    try:
+        with bind_resolved_access_context(context):
+            pool = mcp_tool._current_mcp_pool()
+            assert pool is not None
+            prepared = mcp_tool._prepare_typed_mcp_servers_for_pool(
+                {
+                    "demo": {
+                        **_typed_raw_server(),
+                        "tools": {"include": ["echo"], "resources": True, "prompts": False},
+                    }
+                },
+                pool,
+            )
+            server = _server("from-a")
+            server._config = prepared["demo"]
+            server._pool = pool
+            pool.servers["demo"] = server
+
+            assert mcp_tool._typed_mcp_call_allowed(pool, "demo", "echo") is True
+            assert mcp_tool._typed_mcp_call_allowed(pool, "demo", "list_resources") is True
+            assert mcp_tool._typed_mcp_call_allowed(pool, "demo", "read_resource") is True
+            assert mcp_tool._typed_mcp_call_allowed(pool, "demo", "list_prompts") is False
+            assert mcp_tool._typed_mcp_call_allowed(pool, "demo", "get_prompt") is False
+    finally:
+        reset_secret_scope(token)
+
+
+def test_typed_guessed_disabled_utility_handler_denied(monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    context = _ctx("profile-a", "dm:a")
+    server = _server("from-a")
+    with bind_resolved_access_context(context):
+        pool = _install_server(context, server)
+        pool.allowed_tool_names["demo"] = frozenset({"echo"})
+        handler = mcp_tool._make_list_resources_handler("demo", 120)
+        assert json.loads(handler({})) == {"error": "profile-bound-mcp-snapshot-missing"}
+
+    assert server.session.calls == []
+
+
+def test_typed_shutdown_without_server_clears_prepared_state_and_bumps_generation():
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    token = set_secret_scope({"MCP_DEMO_TOKEN": "secret"})
+    try:
+        with bind_resolved_access_context(_ctx("profile-a", "dm:a")):
+            pool = mcp_tool._current_mcp_pool()
+            assert pool is not None
+            mcp_tool._prepare_typed_mcp_servers_for_pool({"demo": _typed_raw_server()}, pool)
+            pool.connect_errors["demo"] = "profile-bound-mcp-connect-failed"
+            before_generation = pool.generation
+
+            assert pool.servers == {}
+            assert pool.config_snapshots
+            assert pool.credential_ref_metadata == {"demo": {"token": "MCP_DEMO_TOKEN"}}
+            assert pool.allowed_tool_names == {"demo": frozenset({"echo"})}
+            assert pool.connect_errors == {"demo": "profile-bound-mcp-connect-failed"}
+
+            mcp_tool.shutdown_current_mcp_servers()
+    finally:
+        reset_secret_scope(token)
+
+    assert pool.config_snapshots == {}
+    assert pool.credential_ref_metadata == {}
+    assert pool.allowed_tool_names == {}
+    assert pool.connect_errors == {}
+    assert pool.connecting == set()
+    assert pool.generation == before_generation + 1

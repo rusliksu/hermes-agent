@@ -121,6 +121,54 @@ class TestLoadMCPConfig:
             result = _load_mcp_config()
             assert result == {}
 
+    def test_legacy_env_placeholders_still_expand(self, monkeypatch):
+        """Non-multiplex MCP config keeps legacy ${VAR}/${env:VAR} behavior."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import _load_mcp_config
+
+        set_multiplex_active(False)
+        monkeypatch.setenv("MCP_LEGACY_A", "legacy-a")
+        monkeypatch.setenv("MCP_LEGACY_B", "legacy-b")
+        servers = {
+            "demo": {
+                "command": "demo",
+                "args": ["${MCP_LEGACY_A}", "${env:MCP_LEGACY_B}"],
+                "env": {"TOKEN": "${MCP_LEGACY_A}"},
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv", return_value=None):
+            result = _load_mcp_config()
+
+        assert result["demo"]["args"] == ["legacy-a", "legacy-b"]
+        assert result["demo"]["env"] == {"TOKEN": "legacy-a"}
+
+    def test_multiplex_load_mcp_config_reads_raw_without_dotenv_or_env_expansion(self, monkeypatch):
+        """Typed multiplex load returns raw placeholders and avoids process env expansion."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import _load_mcp_config
+
+        set_multiplex_active(True)
+        monkeypatch.setenv("MCP_RAW_TOKEN", "ambient-secret")
+        raw_servers = {
+            "demo": {
+                "command": "demo",
+                "args": ["${credential:token}", "${MCP_RAW_TOKEN}"],
+                "credential_refs": {"token": "MCP_RAW_TOKEN"},
+                "tools": {"include": ["echo"], "resources": False, "prompts": False},
+            }
+        }
+
+        try:
+            with patch("hermes_cli.config.read_raw_config", return_value={"mcp_servers": raw_servers}), \
+                 patch("hermes_cli.config.load_config", side_effect=AssertionError("load_config denied")), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv", side_effect=AssertionError("dotenv denied")):
+                result = _load_mcp_config()
+
+            assert result["demo"]["args"] == ["${credential:token}", "${MCP_RAW_TOKEN}"]
+        finally:
+            set_multiplex_active(False)
+
 
 class TestMCPStatus:
     def test_status_distinguishes_configured_connecting_failed_and_disabled(
