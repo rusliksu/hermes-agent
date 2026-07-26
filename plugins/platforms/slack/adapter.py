@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
@@ -73,6 +74,9 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id",
     default=None,
 )
+
+_SLACK_CALLBACK_PENDING_MAX = 1000
+_SLACK_CALLBACK_PENDING_TTL_SECONDS = 3600
 
 
 @dataclass
@@ -453,9 +457,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
-        # Track pending approval message_ts → resolved flag to prevent
-        # double-clicks on approval buttons.
-        self._approval_resolved: Dict[str, bool] = {}
+        # Opaque callback id → server-side authority and delivery context.
+        self._pending_approval_callbacks: Dict[str, Dict[str, Any]] = {}
+        self._pending_slash_confirm_callbacks: Dict[str, Dict[str, Any]] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -499,6 +503,75 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+
+    @staticmethod
+    def _new_callback_id() -> str:
+        return secrets.token_urlsafe(16)
+
+    def _prune_callback_store(self, store: Dict[str, Dict[str, Any]]) -> None:
+        now = time.monotonic()
+        for key, state in list(store.items()):
+            created_at = float(state.get("created_at") or now)
+            if now - created_at > _SLACK_CALLBACK_PENDING_TTL_SECONDS:
+                store.pop(key, None)
+        if len(store) > _SLACK_CALLBACK_PENDING_MAX:
+            excess = len(store) - (_SLACK_CALLBACK_PENDING_MAX // 2)
+            for key in list(store)[:excess]:
+                store.pop(key, None)
+
+    def _remember_callback_state(
+        self,
+        store: Dict[str, Dict[str, Any]],
+        callback_id: str,
+        state: Dict[str, Any],
+    ) -> None:
+        self._prune_callback_store(store)
+        state["created_at"] = time.monotonic()
+        store[callback_id] = state
+
+    @staticmethod
+    def _callback_context_matches(
+        state: Dict[str, Any],
+        *,
+        channel_id: str,
+        team_id: str,
+        message_ts: str,
+    ) -> bool:
+        expected_channel = str(state.get("channel_id") or "")
+        expected_team = str(state.get("team_id") or "")
+        expected_ts = str(state.get("message_ts") or "")
+        if not expected_channel or expected_channel != str(channel_id or ""):
+            return False
+        if not expected_ts or expected_ts != str(message_ts or ""):
+            return False
+        if expected_team and expected_team != str(team_id or ""):
+            return False
+        return True
+
+    def _consume_callback_state(
+        self,
+        store: Dict[str, Dict[str, Any]],
+        callback_id: str,
+        *,
+        channel_id: str,
+        team_id: str,
+        message_ts: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not callback_id:
+            return None
+        self._prune_callback_store(store)
+        state = store.get(callback_id)
+        if not state:
+            return None
+        if not self._callback_context_matches(
+            state,
+            channel_id=channel_id,
+            team_id=team_id,
+            message_ts=message_ts,
+        ):
+            logger.warning("[Slack] Ignoring callback with mismatched delivery context")
+            return None
+        return store.pop(callback_id, None)
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -3802,9 +3875,14 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not self._app:
             return SendResult(success=False, error="Not connected")
+        approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+        if not approval_request_id:
+            return SendResult(success=False, error="approval request id missing")
 
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
+            team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id, "")
+            callback_id = self._new_callback_id()
 
             # Slack hard-caps a section block's text at 3000 chars; an
             # oversized block fails the whole send with ``invalid_blocks``
@@ -3820,35 +3898,39 @@ class SlackAdapter(BasePlatformAdapter):
             budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
             cmd_preview = command[:budget] + "..." if len(command) > budget else command
 
+            allowed_choices = ["once"]
             actions = [
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Once"},
                     "style": "primary",
                     "action_id": "hermes_approve_once",
-                    "value": session_key,
+                    "value": callback_id,
                 },
             ]
             if not smart_denied:
+                allowed_choices.append("session")
                 actions.append({
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Session"},
                     "action_id": "hermes_approve_session",
-                    "value": session_key,
+                    "value": callback_id,
                 })
                 if allow_permanent:
+                    allowed_choices.append("always")
                     actions.append({
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Always Allow"},
                         "action_id": "hermes_approve_always",
-                        "value": session_key,
+                        "value": callback_id,
                     })
+            allowed_choices.append("deny")
             actions.append({
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Deny"},
                 "style": "danger",
                 "action_id": "hermes_deny",
-                "value": session_key,
+                "value": callback_id,
             })
             blocks = [
                 {
@@ -3870,11 +3952,22 @@ class SlackAdapter(BasePlatformAdapter):
                 kwargs["thread_ts"] = thread_ts
 
             result = await self._get_client(
-                chat_id, team_id=self._metadata_team_id(metadata)
+                chat_id, team_id=team_id or None
             ).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                self._approval_resolved[msg_ts] = False
+                self._remember_callback_state(
+                    self._pending_approval_callbacks,
+                    callback_id,
+                    {
+                        "session_key": session_key,
+                        "approval_request_id": approval_request_id,
+                        "allowed_choices": allowed_choices,
+                        "channel_id": chat_id,
+                        "team_id": team_id,
+                        "message_ts": msg_ts,
+                    },
+                )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
@@ -3896,16 +3989,14 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
+            team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id, "")
+            callback_id = self._new_callback_id()
             # Same 3000-char section-block cap as send_exec_approval: budget
             # the body against the rendered title so the wrapper never pushes
             # the block over the limit (overflow → invalid_blocks → no buttons).
             _title = (title or "Confirm")[:150]
             budget = 3000 - len(f"*{_title}*\n\n") - len("...")
             body = message[:budget] + "..." if len(message) > budget else message
-            # Encode session_key and confirm_id into the button value so the
-            # callback handler can resolve without extra bookkeeping.
-            value = f"{session_key}|{confirm_id}"
-
             blocks = [
                 {
                     "type": "section",
@@ -3922,20 +4013,20 @@ class SlackAdapter(BasePlatformAdapter):
                             "text": {"type": "plain_text", "text": "Approve Once"},
                             "style": "primary",
                             "action_id": "hermes_confirm_once",
-                            "value": value,
+                            "value": callback_id,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Always Approve"},
                             "action_id": "hermes_confirm_always",
-                            "value": value,
+                            "value": callback_id,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Cancel"},
                             "style": "danger",
                             "action_id": "hermes_confirm_cancel",
-                            "value": value,
+                            "value": callback_id,
                         },
                     ],
                 },
@@ -3950,10 +4041,23 @@ class SlackAdapter(BasePlatformAdapter):
                 kwargs["thread_ts"] = thread_ts
 
             result = await self._get_client(
-                chat_id, team_id=self._metadata_team_id(metadata)
+                chat_id, team_id=team_id or None
             ).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+            if msg_ts:
+                self._remember_callback_state(
+                    self._pending_slash_confirm_callbacks,
+                    callback_id,
+                    {
+                        "session_key": session_key,
+                        "confirm_id": confirm_id,
+                        "channel_id": chat_id,
+                        "team_id": team_id,
+                        "message_ts": msg_ts,
+                    },
+                )
             return SendResult(
-                success=True, message_id=result.get("ts", ""), raw_response=result
+                success=True, message_id=msg_ts, raw_response=result
             )
         except Exception as e:
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
@@ -4030,7 +4134,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
-        value = action.get("value", "")
+        callback_id = str(action.get("value") or "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -4060,11 +4164,21 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-        # Parse session_key|confirm_id back out
-        if "|" not in value:
-            logger.warning("[Slack] Malformed slash-confirm value: %s", value)
+        pending = self._consume_callback_state(
+            self._pending_slash_confirm_callbacks,
+            callback_id,
+            channel_id=channel_id,
+            team_id=team_id,
+            message_ts=msg_ts,
+        )
+        if not pending:
+            logger.warning("[Slack] Ignoring unknown or stale slash-confirm callback")
             return
-        session_key, confirm_id = value.split("|", 1)
+        session_key = str(pending.get("session_key") or "")
+        confirm_id = str(pending.get("confirm_id") or "")
+        if not session_key or not confirm_id:
+            logger.warning("[Slack] Ignoring malformed slash-confirm callback state")
+            return
 
         choice_map = {
             "hermes_confirm_once": "once",
@@ -4134,8 +4248,7 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id, team_id=team_id or None
                 ).chat_postMessage(**post_kwargs)
             logger.info(
-                "Slack button resolved slash-confirm for session %s (choice=%s, user=%s)",
-                session_key,
+                "Slack button resolved slash-confirm (choice=%s, user=%s)",
                 choice,
                 user_name,
             )
@@ -4168,7 +4281,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
-        session_key = action.get("value", "")
+        callback_id = str(action.get("value") or "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -4208,10 +4321,61 @@ class SlackAdapter(BasePlatformAdapter):
             "hermes_approve_always": "always",
             "hermes_deny": "deny",
         }
-        choice = choice_map.get(action_id, "deny")
+        choice = choice_map.get(action_id)
+        if not choice:
+            logger.warning("[Slack] Ignoring malformed approval callback action")
+            return
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
-        if self._approval_resolved.pop(msg_ts, True):
+        self._prune_callback_store(self._pending_approval_callbacks)
+        pending = self._pending_approval_callbacks.get(callback_id)
+        if not pending:
+            logger.warning("[Slack] Ignoring unknown or stale approval callback")
+            return
+        if not self._callback_context_matches(
+            pending,
+            channel_id=channel_id,
+            team_id=team_id,
+            message_ts=msg_ts,
+        ):
+            logger.warning("[Slack] Ignoring callback with mismatched delivery context")
+            return
+        session_key = str(pending.get("session_key") or "")
+        approval_request_id = str(pending.get("approval_request_id") or "")
+        allowed_choices = {str(item) for item in pending.get("allowed_choices") or []}
+        if choice not in allowed_choices:
+            logger.warning("[Slack] Ignoring hidden approval callback choice")
+            return
+        if not session_key or not approval_request_id:
+            logger.warning("[Slack] Ignoring malformed approval callback state")
+            self._pending_approval_callbacks.pop(callback_id, None)
+            return
+        pending = self._pending_approval_callbacks.pop(callback_id, None)
+        if not pending:
+            logger.warning("[Slack] Ignoring consumed approval callback")
+            return
+
+        # Resolve the exact approval entry before updating the message.
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                expected_request_id=approval_request_id,
+            )
+            if count == 0:
+                logger.warning("[Slack] Approval callback did not match pending request")
+                return
+            logger.info(
+                "Slack button resolved %d approval(s) (choice=%s, user=%s)",
+                count,
+                choice,
+                user_name,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to resolve gateway approval from Slack button: %s", exc
+            )
             return
 
         # Update the message to show the decision and remove buttons
@@ -4255,26 +4419,6 @@ class SlackAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
-
-        # Resolve the approval — this unblocks the agent thread
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info(
-                "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count,
-                session_key,
-                choice,
-                user_name,
-            )
-        except Exception as exc:
-            logger.error(
-                "Failed to resolve gateway approval from Slack button: %s", exc
-            )
-
-        # (approval state already consumed by atomic pop above)
-
     # ----- Thread context fetching -----
 
     async def _fetch_thread_context(

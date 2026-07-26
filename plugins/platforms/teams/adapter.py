@@ -27,6 +27,8 @@ import html
 import json
 import logging
 import os
+import secrets
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -106,6 +108,8 @@ _DEFAULT_PORT = 3978
 # aiohttp client_max_size keeps oversized/chunked request bodies bounded.
 _MAX_BODY_BYTES = 1_048_576
 _WEBHOOK_PATH = "/api/messages"
+_TEAMS_PENDING_APPROVAL_MAX = 1000
+_TEAMS_PENDING_APPROVAL_TTL_SECONDS = 3600
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -711,6 +715,34 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        self._pending_approval_callbacks: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _new_approval_id() -> str:
+        return secrets.token_urlsafe(16)
+
+    def _prune_pending_approvals(self) -> None:
+        now = time.monotonic()
+        for key, state in list(self._pending_approval_callbacks.items()):
+            created_at = float(state.get("created_at") or now)
+            if now - created_at > _TEAMS_PENDING_APPROVAL_TTL_SECONDS:
+                self._pending_approval_callbacks.pop(key, None)
+        if len(self._pending_approval_callbacks) > _TEAMS_PENDING_APPROVAL_MAX:
+            excess = len(self._pending_approval_callbacks) - (
+                _TEAMS_PENDING_APPROVAL_MAX // 2
+            )
+            for key in list(self._pending_approval_callbacks)[:excess]:
+                self._pending_approval_callbacks.pop(key, None)
+
+    def _remember_pending_approval(self, approval_id: str, state: Dict[str, Any]) -> None:
+        self._prune_pending_approvals()
+        state["created_at"] = time.monotonic()
+        self._pending_approval_callbacks[approval_id] = state
+
+    @staticmethod
+    def _activity_conversation_id(activity: Any) -> str:
+        conversation = getattr(activity, "conversation", None)
+        return str(getattr(conversation, "id", "") or "")
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Lazy-install the Teams SDK on demand (parity with Slack/Discord/etc.),
@@ -1005,9 +1037,9 @@ class TeamsAdapter(BasePlatformAdapter):
         action = ctx.activity.value.action
         data = action.data or {}
         hermes_action = data.get("hermes_action", "")
-        session_key = data.get("session_key", "")
+        approval_id = str(data.get("approval_id") or "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action or not approval_id:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
@@ -1037,7 +1069,7 @@ class TeamsAdapter(BasePlatformAdapter):
             clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
             if "*" not in allowed_ids and clicker_id not in allowed_ids:
-                logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
+                logger.warning("[teams] Unauthorized card action ignored")
                 return InvokeResponse(
                     status=200,
                     body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
@@ -1056,7 +1088,46 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
+        self._prune_pending_approvals()
+        state = self._pending_approval_callbacks.get(approval_id)
+        if not state:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+        callback_chat_id = self._activity_conversation_id(ctx.activity)
+        expected_chat_id = str(state.get("chat_id") or "")
+        if not callback_chat_id or not expected_chat_id or callback_chat_id != expected_chat_id:
+            logger.warning("[teams] Approval callback conversation mismatch")
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+        session_key = str(state.get("session_key") or "")
+        if not session_key:
+            logger.warning("[teams] Approval callback state malformed")
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+        approval_request_id = str(state.get("approval_request_id") or "")
+        allowed_choices = {str(item) for item in state.get("allowed_choices") or []}
+        if choice not in allowed_choices:
+            logger.warning("[teams] Hidden approval callback choice ignored")
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+        if not approval_request_id:
+            logger.warning("[teams] Approval callback state missing request id")
+            self._pending_approval_callbacks.pop(approval_id, None)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+
         if not has_blocking_approval(session_key):
+            self._pending_approval_callbacks.pop(approval_id, None)
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(
@@ -1066,7 +1137,26 @@ class TeamsAdapter(BasePlatformAdapter):
                 ),
             )
 
-        resolve_gateway_approval(session_key, choice)
+        state = self._pending_approval_callbacks.pop(approval_id, None)
+        if not state:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+        resolved = resolve_gateway_approval(
+            session_key,
+            choice,
+            expected_request_id=approval_request_id,
+        )
+        if resolved == 0:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
+                ),
+            )
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1074,8 +1164,8 @@ class TeamsAdapter(BasePlatformAdapter):
             "always": "✅ Always allowed",
             "deny": "❌ Denied",
         }
-        cmd = data.get("cmd", "")
-        desc = data.get("desc", "")
+        cmd = state.get("cmd", "")
+        desc = state.get("desc", "")
         body = []
         if cmd:
             body.append(TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"))
@@ -1104,29 +1194,32 @@ class TeamsAdapter(BasePlatformAdapter):
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
+        approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+        if not approval_request_id:
+            return SendResult(success=False, error="approval request id missing")
 
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        # Truncated for button data payload — just enough to reconstruct the card body.
-        btn_data_base = {
-            "session_key": session_key,
-            "cmd": command[:200] + "..." if len(command) > 200 else command,
-            "desc": description,
-        }
+        approval_id = self._new_approval_id()
+        btn_data_base = {"approval_id": approval_id}
 
+        allowed_choices = ["once"]
         actions = [ExecuteAction(
             title="Allow Once", verb="hermes_approve",
             data={**btn_data_base, "hermes_action": "approve_once"}, style="positive",
         )]
         if not smart_denied:
+            allowed_choices.append("session")
             actions.append(ExecuteAction(
                 title="Allow Session", verb="hermes_approve",
                 data={**btn_data_base, "hermes_action": "approve_session"},
             ))
             if allow_permanent:
+                allowed_choices.append("always")
                 actions.append(ExecuteAction(
                     title="Always Allow", verb="hermes_approve",
                     data={**btn_data_base, "hermes_action": "approve_always"},
                 ))
+        allowed_choices.append("deny")
         actions.append(ExecuteAction(
             title="Deny", verb="hermes_approve",
             data={**btn_data_base, "hermes_action": "deny"}, style="destructive",
@@ -1145,6 +1238,18 @@ class TeamsAdapter(BasePlatformAdapter):
         try:
             result = await self._send_card(chat_id, card)
             message_id = getattr(result, "id", None) if result else None
+            self._remember_pending_approval(
+                approval_id,
+                {
+                    "session_key": session_key,
+                    "approval_request_id": approval_request_id,
+                    "allowed_choices": allowed_choices,
+                    "chat_id": chat_id,
+                    "message_id": str(message_id or ""),
+                    "cmd": command[:200] + "..." if len(command) > 200 else command,
+                    "desc": description,
+                },
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)

@@ -194,6 +194,72 @@ def _make_config(**extra):
     return PlatformConfig(enabled=True, extra=extra)
 
 
+class _FakeTeamsCard:
+    def __init__(self):
+        self.version = ""
+        self.body = []
+        self.actions = []
+
+    def with_version(self, version):
+        self.version = version
+        return self
+
+    def with_body(self, body):
+        self.body = body
+        return self
+
+    def with_actions(self, actions):
+        self.actions = actions
+        return self
+
+
+def _teams_action(title="", verb="", data=None, style=None):
+    return {"title": title, "verb": verb, "data": data or {}, "style": style}
+
+
+def _teams_text_block(**kwargs):
+    return {"text_block": kwargs}
+
+
+def _make_card_action_ctx(
+    data,
+    *,
+    conversation_id="19:abc@thread.v2",
+    clicker_id="aad-owner",
+):
+    return SimpleNamespace(
+        activity=SimpleNamespace(
+            value=SimpleNamespace(action=SimpleNamespace(data=data)),
+            from_=SimpleNamespace(aad_object_id=clicker_id, id=clicker_id),
+            conversation=SimpleNamespace(id=conversation_id),
+        )
+    )
+
+
+def _seed_teams_approval(
+    adapter,
+    token,
+    session_key,
+    *,
+    chat_id="19:abc@thread.v2",
+    message_id="msg-1",
+    approval_request_id="request-1",
+    allowed_choices=("once", "session", "always", "deny"),
+):
+    if not hasattr(adapter, "_pending_approval_callbacks"):
+        adapter._pending_approval_callbacks = {}
+    adapter._pending_approval_callbacks[token] = {
+        "session_key": session_key,
+        "approval_request_id": approval_request_id,
+        "allowed_choices": list(allowed_choices),
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "cmd": "rm -rf /tmp/demo",
+        "desc": "dangerous command",
+        "created_at": 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests: Requirements
 # ---------------------------------------------------------------------------
@@ -497,6 +563,285 @@ class TestTeamsSend:
         mock_app.send.assert_awaited_once()
         call_args = mock_app.send.call_args
         assert call_args[0][0] == "conv-id"
+
+
+class TestTeamsApprovalCallbacks:
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        return adapter
+
+    @pytest.mark.anyio
+    async def test_send_exec_approval_payload_omits_session_key(self, monkeypatch):
+        adapter = self._make_adapter()
+        sent = {}
+
+        async def fake_send_card(chat_id, card):
+            sent["chat_id"] = chat_id
+            sent["card"] = card
+            return SimpleNamespace(id="msg-1")
+
+        adapter._send_card = fake_send_card  # type: ignore[assignment]
+        monkeypatch.setattr(_teams_mod, "AdaptiveCard", _FakeTeamsCard)
+        monkeypatch.setattr(_teams_mod, "ExecuteAction", _teams_action)
+        monkeypatch.setattr(_teams_mod, "TextBlock", _teams_text_block)
+
+        result = await adapter.send_exec_approval(
+            chat_id="19:abc@thread.v2",
+            command="rm -rf /tmp/demo",
+            session_key="agent:main:teams:dm:19:abc@thread.v2",
+            description="dangerous command",
+            metadata={"approval_request_id": "request-1"},
+        )
+
+        assert result.success
+        actions = sent["card"].actions
+        assert actions
+        payload = json.dumps(actions, sort_keys=True)
+        assert "session_key" not in payload
+        assert "agent:main:teams:dm:19:abc@thread.v2" not in payload
+        assert "request-1" not in payload
+        tokens = {action["data"]["approval_id"] for action in actions}
+        assert len(tokens) == 1
+        token = tokens.pop()
+        assert adapter._pending_approval_callbacks[token]["session_key"] == "agent:main:teams:dm:19:abc@thread.v2"
+        assert adapter._pending_approval_callbacks[token]["approval_request_id"] == "request-1"
+        assert adapter._pending_approval_callbacks[token]["allowed_choices"] == [
+            "once", "session", "always", "deny",
+        ]
+
+    @pytest.mark.anyio
+    async def test_send_exec_approval_missing_request_id_fails_closed_without_send(self):
+        adapter = self._make_adapter()
+        send_card = AsyncMock()
+        adapter._send_card = send_card  # type: ignore[assignment]
+
+        result = await adapter.send_exec_approval(
+            chat_id="19:abc@thread.v2",
+            command="rm -rf /tmp/demo",
+            session_key="agent:main:teams:dm:19:abc@thread.v2",
+        )
+
+        assert result.success is False
+        assert result.error == "approval request id missing"
+        send_card.assert_not_called()
+        assert adapter._pending_approval_callbacks == {}
+
+    @pytest.mark.anyio
+    async def test_normal_callback_resolves_intended_session(self, monkeypatch):
+        adapter = self._make_adapter()
+        _seed_teams_approval(
+            adapter,
+            "approval-token",
+            "agent:main:teams:dm:19:abc@thread.v2",
+        )
+        resolve_calls = []
+        has_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(_teams_mod, "AdaptiveCard", _FakeTeamsCard)
+        monkeypatch.setattr(_teams_mod, "TextBlock", _teams_text_block)
+        monkeypatch.setattr(
+            "tools.approval.has_blocking_approval",
+            lambda session_key: has_calls.append(session_key) or True,
+        )
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        await adapter._on_card_action(
+            _make_card_action_ctx({
+                "approval_id": "approval-token",
+                "hermes_action": "approve_once",
+            })
+        )
+
+        assert has_calls == ["agent:main:teams:dm:19:abc@thread.v2"]
+        assert resolve_calls == [
+            (
+                "agent:main:teams:dm:19:abc@thread.v2",
+                "once",
+                {"expected_request_id": "request-1"},
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_hostile_callback_cannot_choose_foreign_session(self, monkeypatch):
+        adapter = self._make_adapter()
+        _seed_teams_approval(
+            adapter,
+            "approval-token",
+            "agent:main:teams:dm:19:abc@thread.v2",
+        )
+        resolve_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(_teams_mod, "AdaptiveCard", _FakeTeamsCard)
+        monkeypatch.setattr(_teams_mod, "TextBlock", _teams_text_block)
+        monkeypatch.setattr("tools.approval.has_blocking_approval", lambda _session_key: True)
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        await adapter._on_card_action(
+            _make_card_action_ctx({
+                "approval_id": "approval-token",
+                "hermes_action": "approve_once",
+                "session_key": "agent:main:teams:dm:foreign",
+            })
+        )
+
+        assert resolve_calls == [
+            (
+                "agent:main:teams:dm:19:abc@thread.v2",
+                "once",
+                {"expected_request_id": "request-1"},
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_unknown_callback_id_does_not_call_resolver_or_approval_state(self, monkeypatch):
+        adapter = self._make_adapter()
+        has_calls = []
+        resolve_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(
+            "tools.approval.has_blocking_approval",
+            lambda session_key: has_calls.append(session_key) or True,
+        )
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        await adapter._on_card_action(
+            _make_card_action_ctx({
+                "approval_id": "missing-token",
+                "hermes_action": "approve_once",
+                "session_key": "agent:main:teams:dm:foreign",
+            })
+        )
+
+        assert has_calls == []
+        assert resolve_calls == []
+
+    @pytest.mark.anyio
+    async def test_hidden_choice_does_not_call_resolver_or_consume_callback(self, monkeypatch):
+        adapter = self._make_adapter()
+        _seed_teams_approval(
+            adapter,
+            "approval-token",
+            "agent:main:teams:dm:19:abc@thread.v2",
+            allowed_choices=("once", "deny"),
+        )
+        has_calls = []
+        resolve_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(
+            "tools.approval.has_blocking_approval",
+            lambda session_key: has_calls.append(session_key) or True,
+        )
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        await adapter._on_card_action(
+            _make_card_action_ctx({
+                "approval_id": "approval-token",
+                "hermes_action": "approve_always",
+            })
+        )
+
+        assert has_calls == []
+        assert resolve_calls == []
+        assert "approval-token" in adapter._pending_approval_callbacks
+
+    @pytest.mark.anyio
+    async def test_allowed_always_resolves_exact_request(self, monkeypatch):
+        adapter = self._make_adapter()
+        _seed_teams_approval(
+            adapter,
+            "approval-token",
+            "agent:main:teams:dm:19:abc@thread.v2",
+        )
+        resolve_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(_teams_mod, "AdaptiveCard", _FakeTeamsCard)
+        monkeypatch.setattr(_teams_mod, "TextBlock", _teams_text_block)
+        monkeypatch.setattr("tools.approval.has_blocking_approval", lambda _session_key: True)
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        await adapter._on_card_action(
+            _make_card_action_ctx({
+                "approval_id": "approval-token",
+                "hermes_action": "approve_always",
+            })
+        )
+
+        assert resolve_calls == [
+            (
+                "agent:main:teams:dm:19:abc@thread.v2",
+                "always",
+                {"expected_request_id": "request-1"},
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_double_click_consumes_callback_once(self, monkeypatch):
+        adapter = self._make_adapter()
+        _seed_teams_approval(
+            adapter,
+            "approval-token",
+            "agent:main:teams:dm:19:abc@thread.v2",
+        )
+        resolve_calls = []
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        monkeypatch.setattr(_teams_mod, "AdaptiveCard", _FakeTeamsCard)
+        monkeypatch.setattr(_teams_mod, "TextBlock", _teams_text_block)
+        monkeypatch.setattr("tools.approval.has_blocking_approval", lambda _session_key: True)
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, **kwargs: resolve_calls.append(
+                (session_key, choice, kwargs)
+            ),
+        )
+
+        ctx = _make_card_action_ctx({
+            "approval_id": "approval-token",
+            "hermes_action": "approve_once",
+        })
+        await adapter._on_card_action(ctx)
+        await adapter._on_card_action(ctx)
+
+        assert resolve_calls == [
+            (
+                "agent:main:teams:dm:19:abc@thread.v2",
+                "once",
+                {"expected_request_id": "request-1"},
+            )
+        ]
 
 
 def _make_summary_payload():

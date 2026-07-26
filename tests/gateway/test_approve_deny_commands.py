@@ -197,6 +197,115 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_expected_request_id_mismatch_does_not_resolve_current_head(self):
+        """A stale button for request A must not approve later FIFO head B."""
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-stale-callback"
+        live_entry = _ApprovalEntry({
+            "command": "command B",
+            "approval_request_id": "request-B",
+        })
+        _gateway_queues[session_key] = [live_entry]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            expected_request_id="request-A",
+        )
+
+        assert count == 0
+        assert _gateway_queues[session_key] == [live_entry]
+        assert not live_entry.event.is_set()
+        assert live_entry.result is None
+
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            expected_request_id="request-B",
+        )
+        assert count == 1
+        assert session_key not in _gateway_queues
+        assert live_entry.event.is_set()
+        assert live_entry.result == "deny"
+
+    def test_expected_request_id_resolves_exact_entry_without_consuming_fifo_head(self):
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-exact-callback"
+        first = _ApprovalEntry({
+            "command": "command A",
+            "approval_request_id": "request-A",
+        })
+        second = _ApprovalEntry({
+            "command": "command B",
+            "approval_request_id": "request-B",
+        })
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            expected_request_id="request-stale",
+        )
+        assert count == 0
+        assert _gateway_queues[session_key] == [first, second]
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            expected_request_id="request-B",
+        )
+        assert count == 1
+        assert _gateway_queues[session_key] == [first]
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert second.result == "deny"
+
+        count = resolve_gateway_approval(session_key, "once")
+        assert count == 1
+        assert session_key not in _gateway_queues
+        assert first.event.is_set()
+        assert first.result == "once"
+
+    def test_await_gateway_decision_assigns_request_id_before_notify(self):
+        from tools.approval import _await_gateway_decision, resolve_gateway_approval
+
+        session_key = "test-request-id-notify"
+        notified = []
+
+        def notify(data):
+            notified.append(dict(data))
+            resolve_gateway_approval(
+                session_key,
+                "once",
+                expected_request_id=data.get("approval_request_id"),
+            )
+
+        decision = _await_gateway_decision(
+            session_key,
+            notify,
+            {
+                "command": "rm -rf /tmp/demo",
+                "description": "dangerous command",
+                "pattern_key": "danger",
+                "pattern_keys": ["danger"],
+            },
+        )
+
+        assert decision == {"resolved": True, "choice": "once", "reason": None}
+        assert len(notified) == 1
+        request_id = notified[0]["approval_request_id"]
+        assert isinstance(request_id, str)
+        assert len(request_id) >= 16
+        assert request_id not in {"test-request-id-notify", "rm -rf /tmp/demo"}
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

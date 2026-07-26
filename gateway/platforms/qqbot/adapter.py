@@ -37,6 +37,7 @@ import json
 import logging
 import mimetypes
 import os
+import secrets
 import time
 import uuid
 from datetime import datetime, timezone
@@ -260,6 +261,7 @@ class QQAdapter(BasePlatformAdapter):
         # box; callers can override with set_interaction_callback(None) or
         # register a custom handler.
         self._interaction_callback = self._default_interaction_dispatch
+        self._approval_state: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -1005,21 +1007,21 @@ class QQAdapter(BasePlatformAdapter):
             await self._acknowledge_interaction(event.id)
         except Exception as exc:
             logger.warning(
-                "[%s] Failed to ACK interaction %s: %s",
-                self._log_tag, event.id, exc,
+                "[%s] Failed to ACK interaction: %s",
+                self._log_tag, exc,
             )
 
         logger.info(
-            "[%s] Interaction: scene=%s button_data=%r operator=%s",
-            self._log_tag, event.scene, event.button_data, event.operator_openid,
+            "[%s] Interaction received for scene=%s",
+            self._log_tag, event.scene,
         )
 
         callback = self._interaction_callback
         if callback is None:
             logger.debug(
                 "[%s] No interaction callback registered; dropping button "
-                "click %r",
-                self._log_tag, event.button_data,
+                "click",
+                self._log_tag,
             )
             return
         try:
@@ -1071,6 +1073,28 @@ class QQAdapter(BasePlatformAdapter):
         "allow-always": "always",
         "deny": "deny",
     }
+    _APPROVAL_STATE_MAX = 1000
+    _APPROVAL_STATE_TTL_SECONDS = 3600
+
+    @staticmethod
+    def _new_approval_id() -> str:
+        return secrets.token_urlsafe(16)
+
+    def _prune_approval_state(self) -> None:
+        now = time.monotonic()
+        for key, state in list(self._approval_state.items()):
+            created_at = float(state.get("created_at") or now)
+            if now - created_at > self._APPROVAL_STATE_TTL_SECONDS:
+                self._approval_state.pop(key, None)
+        if len(self._approval_state) > self._APPROVAL_STATE_MAX:
+            excess = len(self._approval_state) - (self._APPROVAL_STATE_MAX // 2)
+            for key in list(self._approval_state)[:excess]:
+                self._approval_state.pop(key, None)
+
+    def _remember_approval_state(self, approval_id: str, state: Dict[str, Any]) -> None:
+        self._prune_approval_state()
+        state["created_at"] = time.monotonic()
+        self._approval_state[approval_id] = state
 
     @staticmethod
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
@@ -1112,15 +1136,64 @@ class QQAdapter(BasePlatformAdapter):
 
         return False
 
+    @staticmethod
+    def _approval_state_matches_event(
+        event: InteractionEvent,
+        state: Dict[str, Any],
+    ) -> bool:
+        """Match a button click to the chat/operator captured when sent."""
+        chat_type = str(state.get("chat_type") or "")
+        chat_id = str(state.get("chat_id") or "")
+        operator = str(state.get("operator_openid") or "")
+        event_operator = str(event.operator_openid or "").strip()
+        if not chat_type or not chat_id or not operator or not event_operator:
+            return False
+        if chat_type == "c2c":
+            return (
+                event.scene == "c2c"
+                and event.user_openid == chat_id
+                and event_operator == operator
+            )
+        if chat_type == "group":
+            return (
+                event.scene == "group"
+                and event.group_openid == chat_id
+                and event_operator == operator
+            )
+        if chat_type == "guild":
+            event_chat = str(event.channel_id or event.guild_id or "")
+            return (
+                event.scene == "guild"
+                and event_chat == chat_id
+                and event_operator == operator
+            )
+        return False
+
+    @classmethod
+    def _approval_operator_from_session(
+        cls,
+        *,
+        session_key: str,
+        chat_type: str,
+        chat_id: str,
+    ) -> str:
+        parsed = cls._parse_gateway_session_key(session_key) or {}
+        if chat_type == "c2c":
+            return str(parsed.get("chat_id") or chat_id or "")
+        if chat_type in {"group", "guild"}:
+            return str(parsed.get("user_id") or "")
+        return ""
+
     async def _default_interaction_dispatch(
             self,
             event: InteractionEvent,
     ) -> None:
         """Route ``INTERACTION_CREATE`` button clicks to the right subsystem.
 
-        - ``approve:<session_key>:<decision>`` →
+        - ``approve:<approval_id>:<decision>`` →
           :func:`tools.approval.resolve_gateway_approval`
-          (unblocks the agent thread waiting on a dangerous-command approval).
+          after server-side pending-state lookup (unblocks the agent thread
+          waiting on a dangerous-command approval).
         - ``update_prompt:<answer>`` →
           writes the answer to ``~/.hermes/.update_response`` for the
           detached ``hermes update --gateway`` process to consume.
@@ -1137,36 +1210,62 @@ class QQAdapter(BasePlatformAdapter):
 
         approval = parse_approval_button_data(button_data)
         if approval is not None:
-            session_key, decision = approval
+            approval_id, decision = approval
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
-                    "[%s] Unknown approval decision %r (session=%s)",
-                    self._log_tag, decision, session_key,
+                    "[%s] Unknown approval decision",
+                    self._log_tag,
                 )
                 return
-            if not self._is_authorized_interaction_for_session(event, session_key):
+            self._prune_approval_state()
+            state = self._approval_state.get(approval_id)
+            if not state:
+                logger.warning("[%s] Ignoring unknown or stale approval callback", self._log_tag)
+                return
+            if not self._approval_state_matches_event(event, state):
                 logger.warning(
-                    "[%s] Rejected unauthorized approval click for session %s "
-                    "(operator=%s)",
-                    self._log_tag, session_key, event.operator_openid,
+                    "[%s] Rejected approval callback with mismatched context",
+                    self._log_tag,
                 )
+                return
+            allowed_choices = {str(item) for item in state.get("allowed_choices") or []}
+            if choice not in allowed_choices:
+                logger.warning("[%s] Hidden approval callback choice ignored", self._log_tag)
+                return
+            approval_request_id = str(state.get("approval_request_id") or "")
+            if not approval_request_id:
+                logger.warning("[%s] Approval callback state missing request id", self._log_tag)
+                self._approval_state.pop(approval_id, None)
+                return
+            state = self._approval_state.pop(approval_id, None)
+            if not state:
+                logger.warning("[%s] Ignoring consumed approval callback", self._log_tag)
+                return
+            session_key = str(state.get("session_key") or "")
+            if not session_key:
+                logger.warning("[%s] Approval callback state malformed", self._log_tag)
                 return
             try:
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    expected_request_id=approval_request_id,
+                )
+                if count == 0:
+                    logger.warning("[%s] Approval callback did not match pending request", self._log_tag)
+                    return
                 logger.info(
-                    "[%s] Button resolved %d approval(s) for session %s "
-                    "(choice=%s, operator=%s)",
-                    self._log_tag, count, session_key, choice,
-                    event.operator_openid,
+                    "[%s] Button resolved %d approval(s) (choice=%s)",
+                    self._log_tag, count, choice,
                 )
             except Exception as exc:
                 logger.error(
-                    "[%s] resolve_gateway_approval failed for session %s: %s",
-                    self._log_tag, session_key, exc,
+                    "[%s] resolve_gateway_approval failed: %s",
+                    self._log_tag, exc,
                 )
             return
 
@@ -1175,16 +1274,16 @@ class QQAdapter(BasePlatformAdapter):
             update_session_key = f"agent:main:qqbot:{event.scene}:{event.group_openid or event.guild_id or event.user_openid}"
             if not self._is_authorized_interaction_for_session(event, update_session_key):
                 logger.warning(
-                    "[%s] Rejected unauthorized update prompt click (operator=%s)",
-                    self._log_tag, event.operator_openid,
+                    "[%s] Rejected unauthorized update prompt click",
+                    self._log_tag,
                 )
                 return
             self._write_update_response(update_answer, event.operator_openid)
             return
 
         logger.debug(
-            "[%s] Unrecognised button_data %r from interaction %s",
-            self._log_tag, button_data, event.id,
+            "[%s] Unrecognised interaction button data",
+            self._log_tag,
         )
 
     @staticmethod
@@ -2641,15 +2740,17 @@ class QQAdapter(BasePlatformAdapter):
         override by passing a custom :class:`ApprovalRequest`.
 
         Users click the button → ``INTERACTION_CREATE`` fires → the adapter's
-        registered :meth:`set_interaction_callback` handler decodes
-        ``button_data`` via :func:`parse_approval_button_data`.
+        registered :meth:`set_interaction_callback` handler decodes the opaque
+        approval id via :func:`parse_approval_button_data`.
         """
         from gateway.platforms.qqbot.keyboards import build_approval_text
+        if not req.approval_id:
+            return SendResult(success=False, error="approval callback id missing")
         return await self.send_with_keyboard(
             chat_id,
             build_approval_text(req),
             build_approval_keyboard(
-                req.session_key,
+                req.approval_id,
                 allow_permanent=getattr(req, "allow_permanent", True),
             ),
             reply_to=reply_to,
@@ -2681,9 +2782,23 @@ class QQAdapter(BasePlatformAdapter):
         :func:`tools.approval.resolve_gateway_approval` — dispatched by the
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
-        del metadata  # QQ doesn't have thread_id / DM targeting overrides.
+        approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+        if not approval_request_id:
+            return SendResult(success=False, error="approval request id missing")
         if smart_denied:
             description += " Owner override applies to this one operation only."
+        approval_id = self._new_approval_id()
+        allow_always = allow_permanent and not smart_denied
+        allowed_choices = ["once"]
+        if allow_always:
+            allowed_choices.append("always")
+        allowed_choices.append("deny")
+        chat_type = self._guess_chat_type(chat_id)
+        operator_openid = self._approval_operator_from_session(
+            session_key=session_key,
+            chat_type=chat_type,
+            chat_id=chat_id,
+        )
 
         # Use the reply-to message for passive-message context when we have one.
         # QQ requires a msg_id on outbound messages to a user we've never
@@ -2696,11 +2811,26 @@ class QQAdapter(BasePlatformAdapter):
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
-            allow_permanent=allow_permanent and not smart_denied,
+            allow_permanent=allow_always,
+            approval_id=approval_id,
         )
-        return await self.send_approval_request(
+        result = await self.send_approval_request(
             chat_id, req, reply_to=msg_id,
         )
+        if result.success:
+            self._remember_approval_state(
+                approval_id,
+                {
+                    "session_key": session_key,
+                    "approval_request_id": approval_request_id,
+                    "allowed_choices": allowed_choices,
+                    "chat_type": chat_type,
+                    "chat_id": chat_id,
+                    "operator_openid": operator_openid,
+                    "message_id": result.message_id or "",
+                },
+            )
+        return result
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
 
