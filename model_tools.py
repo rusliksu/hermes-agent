@@ -27,6 +27,7 @@ import asyncio
 import logging
 import threading
 import time
+from copy import deepcopy
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
@@ -276,6 +277,60 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+_MCP_MULTIPLEX_UNAVAILABLE_FINGERPRINT = ("multiplex-unavailable",)
+
+
+def _is_mcp_multiplex_runtime_active_strict() -> bool:
+    from agent.secret_scope import is_multiplex_active
+    return bool(is_multiplex_active())
+
+
+def _mcp_toolset_fail_closed_value(toolset_name: str) -> Optional[set[str]]:
+    if toolset_name.startswith("mcp-"):
+        return set()
+    try:
+        alias_target = registry.get_toolset_alias_target(toolset_name)
+    except Exception:
+        alias_target = None
+    if isinstance(alias_target, str) and alias_target.startswith("mcp-"):
+        return set()
+    return None
+
+
+def _mcp_pool_cache_fingerprint() -> Optional[tuple]:
+    try:
+        from tools.mcp_tool import current_mcp_pool_cache_fingerprint
+        return current_mcp_pool_cache_fingerprint()
+    except Exception:
+        try:
+            active = _is_mcp_multiplex_runtime_active_strict()
+        except Exception:
+            return _MCP_MULTIPLEX_UNAVAILABLE_FINGERPRINT
+        if active:
+            return _MCP_MULTIPLEX_UNAVAILABLE_FINGERPRINT
+        return None
+
+
+def _resolve_current_mcp_toolset(toolset_name: str) -> Optional[set[str]]:
+    try:
+        from tools.mcp_tool import resolve_current_mcp_toolset
+        return resolve_current_mcp_toolset(toolset_name)
+    except Exception:
+        try:
+            _is_mcp_multiplex_runtime_active_strict()
+        except Exception:
+            return _mcp_toolset_fail_closed_value(toolset_name)
+        return _mcp_toolset_fail_closed_value(toolset_name)
+
+
+def _current_mcp_tool_definitions(tool_names: set[str]) -> List[Dict[str, Any]]:
+    try:
+        from tools.mcp_tool import current_mcp_tool_definitions
+        return current_mcp_tool_definitions(tool_names)
+    except Exception:
+        return []
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -320,6 +375,7 @@ def get_tool_definitions(
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
+            _mcp_pool_cache_fingerprint(),
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
@@ -330,14 +386,12 @@ def get_tool_definitions(
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
-            # Return a shallow copy of the list but share the dict references —
-            # schemas are treated as read-only by all known callers.
-            return list(cached)
+            return deepcopy(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode:
-        # Cache the freshly-computed list, but hand callers a shallow copy so
+        # Cache the freshly-computed list, but hand callers a deep copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
         # long-lived Gateway process accumulates duplicate tool names across
@@ -349,8 +403,8 @@ def get_tool_definitions(
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
-        return list(result)
+        _tool_defs_cache[cache_key] = deepcopy(result)
+        return deepcopy(result)
     return result
 
 
@@ -374,7 +428,12 @@ def _compute_tool_definitions(
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
-            if validate_toolset(toolset_name):
+            mcp_tools = _resolve_current_mcp_toolset(toolset_name)
+            if mcp_tools is not None:
+                tools_to_include.update(mcp_tools)
+                if not quiet_mode:
+                    print(f"✅ Enabled MCP toolset '{toolset_name}': {', '.join(sorted(mcp_tools)) if mcp_tools else 'no tools'}")
+            elif validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.update(resolved)
                 if not quiet_mode:
@@ -390,7 +449,11 @@ def _compute_tool_definitions(
         # Default: start with everything
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
-            tools_to_include.update(resolve_toolset(ts_name))
+            mcp_tools = _resolve_current_mcp_toolset(ts_name)
+            if mcp_tools is not None:
+                tools_to_include.update(mcp_tools)
+            else:
+                tools_to_include.update(resolve_toolset(ts_name))
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
@@ -398,7 +461,13 @@ def _compute_tool_definitions(
     # stripped out. See issue #17309.
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
-            if validate_toolset(toolset_name):
+            mcp_tools = _resolve_current_mcp_toolset(toolset_name)
+            if mcp_tools is not None:
+                tools_to_include.difference_update(mcp_tools)
+                resolved = sorted(mcp_tools)
+                if not quiet_mode:
+                    print(f"🚫 Disabled MCP toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
+            elif validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset
                 if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
                     # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, and
@@ -441,8 +510,21 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    mcp_definitions = _current_mcp_tool_definitions(tools_to_include)
+    if mcp_definitions:
+        tools_to_include = {
+            name for name in tools_to_include
+            if not name.startswith("mcp__")
+        }
+    elif _mcp_pool_cache_fingerprint() is not None:
+        tools_to_include = {
+            name for name in tools_to_include
+            if not name.startswith("mcp__")
+        }
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    filtered_tools.extend(mcp_definitions)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

@@ -89,6 +89,16 @@ def _should_run_preflight_estimate(
     return estimate_messages_tokens_rough(messages) >= threshold_tokens
 
 
+def _agent_advertises_mcp_tools(agent) -> bool:
+    for tool in getattr(agent, "tools", None) or []:
+        try:
+            if str(tool.get("function", {}).get("name", "")).startswith("mcp__"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -196,9 +206,10 @@ def build_turn_context(
             # This keeps the no-MCP first turn off the heavy import path
             # without changing behavior for MCP users.
             import sys as _sys
-            if "tools.mcp_tool" in _sys.modules:
+            agent_has_mcp_tools = _agent_advertises_mcp_tools(agent)
+            if "tools.mcp_tool" in _sys.modules or agent_has_mcp_tools:
                 from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
+                if has_registered_mcp_tools() or agent_has_mcp_tools:
                     refresh_agent_mcp_tools(agent, quiet_mode=True)
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)

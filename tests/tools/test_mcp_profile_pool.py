@@ -14,10 +14,16 @@ import pytest
 def _reset_mcp_profile_pool_state():
     from agent.secret_scope import set_multiplex_active
     from gateway.session_context import reset_session_vars
+    import model_tools
     from tools import mcp_tool
+    from tools.registry import registry
 
     set_multiplex_active(False)
     reset_session_vars()
+    model_tools._tool_defs_cache.clear()
+    for tool_name in list(registry.get_all_tool_names()):
+        if tool_name.startswith("mcp__"):
+            registry.deregister(tool_name)
     mcp_tool._servers.clear()
     mcp_tool._server_error_counts.clear()
     mcp_tool._server_breaker_opened_at.clear()
@@ -27,6 +33,10 @@ def _reset_mcp_profile_pool_state():
     yield
     set_multiplex_active(False)
     reset_session_vars()
+    model_tools._tool_defs_cache.clear()
+    for tool_name in list(registry.get_all_tool_names()):
+        if tool_name.startswith("mcp__"):
+            registry.deregister(tool_name)
     mcp_tool._servers.clear()
     mcp_tool._server_error_counts.clear()
     mcp_tool._server_breaker_opened_at.clear()
@@ -72,8 +82,21 @@ def _server(label: str):
     return SimpleNamespace(
         name="demo",
         session=session,
+        _tools=[],
+        tool_timeout=120,
         _rpc_lock=asyncio.Lock(),
         _is_recycled_stdio=lambda: False,
+    )
+
+
+def _tool(name: str, description: str, properties: dict | None = None):
+    return SimpleNamespace(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": properties or {},
+        },
     )
 
 
@@ -92,6 +115,39 @@ def _install_server(context, server):
         server._pool = pool
         pool.servers["demo"] = server
         return pool
+
+
+def _register_demo_server(context, tools):
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    server = _server(f"from-{context.profile_id}")
+    server._tools = list(tools)
+    with bind_resolved_access_context(context):
+        pool = _install_server(context, server)
+        server._registered_tool_names = mcp_tool._register_server_tools(
+            "demo",
+            server,
+            {"tools": {"resources": False, "prompts": False}},
+        )
+        return pool, server
+
+
+def _mcp_defs(context, enabled_toolsets=None):
+    from gateway.session_context import bind_resolved_access_context
+    from model_tools import get_tool_definitions
+
+    with bind_resolved_access_context(context):
+        definitions = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    return {
+        d["function"]["name"]: d["function"]
+        for d in definitions
+        if d["function"]["name"].startswith("mcp__")
+    }
 
 
 def test_same_server_name_dispatches_to_current_profile_pool(monkeypatch):
@@ -213,3 +269,104 @@ def test_breaker_and_parallel_safe_state_are_profile_pool_local(monkeypatch):
 
     assert server_a.session.calls == []
     assert server_b.session.calls == [("echo", {})]
+
+
+def test_model_definitions_same_name_use_current_profile_schema_snapshot():
+    from agent.secret_scope import set_multiplex_active
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    _register_demo_server(
+        ctx_a,
+        [_tool("echo", "Echo from A", {"a_only": {"type": "string"}})],
+    )
+    _register_demo_server(
+        ctx_b,
+        [_tool("echo", "Echo from B", {"b_only": {"type": "integer"}})],
+    )
+
+    defs_a = _mcp_defs(ctx_a, enabled_toolsets=["demo"])
+    defs_b = _mcp_defs(ctx_b, enabled_toolsets=["demo"])
+
+    assert defs_a["mcp__demo__echo"]["description"] == "Echo from A"
+    assert set(defs_a["mcp__demo__echo"]["parameters"]["properties"]) == {"a_only"}
+    assert defs_b["mcp__demo__echo"]["description"] == "Echo from B"
+    assert set(defs_b["mcp__demo__echo"]["parameters"]["properties"]) == {"b_only"}
+
+
+def test_model_definitions_do_not_leak_a_only_tool_to_profile_b():
+    from agent.secret_scope import set_multiplex_active
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    _register_demo_server(ctx_a, [_tool("echo", "Shared"), _tool("a_only", "A only")])
+    _register_demo_server(ctx_b, [_tool("echo", "Shared")])
+
+    assert set(_mcp_defs(ctx_a, enabled_toolsets=["demo"])) == {
+        "mcp__demo__a_only",
+        "mcp__demo__echo",
+    }
+    assert set(_mcp_defs(ctx_b, enabled_toolsets=["demo"])) == {"mcp__demo__echo"}
+
+
+def test_model_definitions_missing_multiplex_context_see_no_mcp_tools():
+    from agent.secret_scope import set_multiplex_active
+    from model_tools import get_tool_definitions
+
+    set_multiplex_active(True)
+    _register_demo_server(_ctx("profile-a", "dm:a"), [_tool("echo", "Echo")])
+
+    definitions = get_tool_definitions(
+        enabled_toolsets=["demo"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+
+    assert [
+        d["function"]["name"]
+        for d in definitions
+        if d["function"]["name"].startswith("mcp__")
+    ] == []
+
+
+def test_deregistering_profile_a_snapshot_preserves_profile_b_definitions():
+    from agent.secret_scope import set_multiplex_active
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    _pool_a, server_a = _register_demo_server(
+        ctx_a,
+        [_tool("echo", "Echo from A", {"a_only": {"type": "string"}})],
+    )
+    _register_demo_server(
+        ctx_b,
+        [_tool("echo", "Echo from B", {"b_only": {"type": "integer"}})],
+    )
+
+    mcp_tool.MCPServerTask._deregister_tools(server_a)
+
+    assert _mcp_defs(ctx_a, enabled_toolsets=["demo"]) == {}
+    defs_b = _mcp_defs(ctx_b, enabled_toolsets=["demo"])
+    assert defs_b["mcp__demo__echo"]["description"] == "Echo from B"
+    assert set(defs_b["mcp__demo__echo"]["parameters"]["properties"]) == {"b_only"}
+
+
+def test_legacy_single_profile_mcp_definitions_still_use_registry():
+    from tools import mcp_tool
+
+    server = _server("legacy")
+    server._tools = [_tool("echo", "Legacy echo")]
+    mcp_tool._servers["demo"] = server
+    server._registered_tool_names = mcp_tool._register_server_tools(
+        "demo",
+        server,
+        {"tools": {"resources": False, "prompts": False}},
+    )
+
+    defs = _mcp_defs(_ctx("ignored", "ignored"), enabled_toolsets=["demo"])
+
+    assert defs["mcp__demo__echo"]["description"] == "Legacy echo"

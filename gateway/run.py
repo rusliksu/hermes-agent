@@ -66,6 +66,7 @@ from gateway.access_registry import (
     ResolvedAccessContext,
     canonical_access_context_fingerprint,
     deserialize_resolved_access_context,
+    serialize_resolved_access_context,
     shared_memory_namespace_for_access_context,
 )
 from gateway.handoff import categorize_handoff_failure, resolve_handoff_access_context
@@ -15303,6 +15304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # gate in _handle_reload_mcp_command before we reach this point.
             try:
                 from tools.mcp_tool import refresh_agent_mcp_tools
+                from gateway.session_context import bind_resolved_access_context
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
@@ -15314,6 +15316,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 continue
                             if _agent is None:
                                 continue
+                            try:
+                                _stored_context = deserialize_resolved_access_context(
+                                    serialize_resolved_access_context(
+                                        getattr(_agent, "_gateway_resolved_access_context", None)
+                                    )
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Skipping cached agent MCP refresh for %s: "
+                                    "missing exact resolved access context",
+                                    _sess_key,
+                                )
+                                continue
                             # Preserve each cached agent's build-time toolset
                             # selection EXACTLY: a gateway session built with a
                             # restricted enabled_toolsets (e.g. ["safe"]) must
@@ -15323,7 +15338,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # edit; gateway agents are per-session and may be
                             # deliberately locked down. (Contract is asserted by
                             # test_reload_mcp_preserves_per_agent_toolset_overrides.)
-                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
+                            with bind_resolved_access_context(_stored_context):
+                                refresh_agent_mcp_tools(_agent, quiet_mode=True)
             except Exception as _exc:
                 logger.debug(
                     "Failed to update cached agent tools after MCP reload: %s",
@@ -20025,6 +20041,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         shared_scope,
                         memory_config,
                     )
+                try:
+                    agent._gateway_resolved_access_context = deserialize_resolved_access_context(
+                        serialize_resolved_access_context(
+                            getattr(source, "resolved_access_context", None)
+                        )
+                    )
+                except Exception:
+                    pass
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for

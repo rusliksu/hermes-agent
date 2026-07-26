@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable
@@ -1997,9 +1998,12 @@ class MCPServerTask:
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
             }
+            pool = _server_pool(self)
             for tool_name in stale_tool_names:
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+                _forget_mcp_tool_definition(tool_name, pool)
+                if not _mcp_tool_defined_in_other_pool(tool_name, pool):
+                    registry.deregister(tool_name)
+                    _forget_mcp_tool_server(tool_name)
 
             # 3. Re-register with fresh tool list
             self._tools = new_mcp_tools
@@ -3154,9 +3158,12 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
+        pool = _server_pool(self)
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
+            _forget_mcp_tool_definition(tool_name, pool)
+            if not _mcp_tool_defined_in_other_pool(tool_name, pool):
+                registry.deregister(tool_name)
+                _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
@@ -3197,6 +3204,11 @@ class MCPServerPool:
     error_counts: Dict[str, int] = field(default_factory=dict)
     breaker_opened_at: Dict[str, float] = field(default_factory=dict)
     parallel_safe_servers: set[str] = field(default_factory=set)
+    tool_definitions: Dict[str, dict] = field(default_factory=dict)
+    tool_toolsets: Dict[str, str] = field(default_factory=dict)
+    toolset_aliases: Dict[str, str] = field(default_factory=dict)
+    tool_server_names: Dict[str, str] = field(default_factory=dict)
+    generation: int = 0
 
 
 _legacy_pool = MCPServerPool()
@@ -3303,6 +3315,151 @@ def _current_mcp_pool(*, create: bool = True) -> Optional[MCPServerPool]:
             pool = MCPServerPool(key=key)
             _profile_pools[key] = pool
         return pool
+
+
+def _is_mcp_multiplex_active() -> bool:
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
+
+
+def _is_mcp_multiplex_active_strict() -> bool:
+    from agent.secret_scope import is_multiplex_active
+    return bool(is_multiplex_active())
+
+
+def is_mcp_multiplex_runtime_active() -> bool:
+    return _is_mcp_multiplex_active()
+
+
+_MCP_MULTIPLEX_UNAVAILABLE_FINGERPRINT = ("multiplex-unavailable",)
+
+
+def _mcp_pool_cache_fingerprint_locked(key: Optional[MCPPoolKey]) -> tuple:
+    """Return current multiplex MCP fingerprint; caller must hold _lock."""
+    if key is None:
+        return ("multiplex", None, None, 0)
+    pool = _profile_pools.get(key)
+    generation = pool.generation if pool is not None else 0
+    return ("multiplex", key.profile_id, key.conversation_scope, generation)
+
+
+def _mcp_pool_cache_fingerprint_probe() -> tuple[Optional[MCPPoolKey], Optional[tuple]]:
+    try:
+        active = _is_mcp_multiplex_active_strict()
+    except Exception:
+        return None, _MCP_MULTIPLEX_UNAVAILABLE_FINGERPRINT
+    if not active:
+        return None, None
+    key = _strict_current_mcp_pool_key()
+    with _lock:
+        return key, _mcp_pool_cache_fingerprint_locked(key)
+
+
+def current_mcp_pool_cache_fingerprint() -> Optional[tuple]:
+    """Return the current multiplex MCP pool/generation for schema caches."""
+    return _mcp_pool_cache_fingerprint_probe()[1]
+
+
+def _empty_if_mcp_toolset_name_or_alias(name: str) -> Optional[set[str]]:
+    if name.startswith("mcp-"):
+        return set()
+    try:
+        from tools.registry import registry
+        alias_target = registry.get_toolset_alias_target(name)
+    except Exception:
+        alias_target = None
+    if isinstance(alias_target, str) and alias_target.startswith("mcp-"):
+        return set()
+    return None
+
+
+def resolve_current_mcp_toolset(name: str) -> Optional[set[str]]:
+    """Resolve an MCP toolset against the current strict pool under multiplex.
+
+    ``None`` means the name is not an MCP toolset and normal global toolset
+    resolution may continue. A set, including an empty set, means the request
+    was MCP-scoped and must not fall back to the global registry union.
+    """
+    try:
+        active = _is_mcp_multiplex_active_strict()
+    except Exception:
+        return _empty_if_mcp_toolset_name_or_alias(name)
+    if not active:
+        return None
+
+    pool = _current_mcp_pool(create=False)
+    if pool is not None:
+        target = pool.toolset_aliases.get(name, name)
+        tool_names = {
+            tool_name
+            for tool_name, toolset in pool.tool_toolsets.items()
+            if toolset == target
+        }
+        if tool_names or target in set(pool.tool_toolsets.values()):
+            return tool_names
+
+    return _empty_if_mcp_toolset_name_or_alias(name)
+
+
+def current_mcp_tool_definitions(tool_names: set[str]) -> List[dict]:
+    """Return current-pool MCP tool definitions for selected tool names."""
+    try:
+        active = _is_mcp_multiplex_active_strict()
+    except Exception:
+        return []
+    if not active:
+        return []
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return []
+    with _lock:
+        return [
+            deepcopy(pool.tool_definitions[name])
+            for name in sorted(tool_names)
+            if name in pool.tool_definitions
+        ]
+
+
+def _remember_mcp_tool_definition(
+    tool_name: str,
+    toolset_name: str,
+    schema: dict,
+    server_name: str,
+    pool: Optional[MCPServerPool],
+) -> None:
+    if pool is None:
+        return
+    safe_server_name = sanitize_mcp_name_component(server_name)
+    with _lock:
+        pool.tool_definitions[tool_name] = {
+            "type": "function",
+            "function": {**deepcopy(schema), "name": tool_name},
+        }
+        pool.tool_toolsets[tool_name] = toolset_name
+        pool.tool_server_names[tool_name] = safe_server_name
+        pool.generation += 1
+
+
+def _forget_mcp_tool_definition(tool_name: str, pool: Optional[MCPServerPool]) -> None:
+    if pool is None:
+        return
+    with _lock:
+        removed = False
+        removed = pool.tool_definitions.pop(tool_name, None) is not None or removed
+        toolset_name = pool.tool_toolsets.pop(tool_name, None)
+        removed = toolset_name is not None or removed
+        removed = pool.tool_server_names.pop(tool_name, None) is not None or removed
+        if toolset_name is not None and toolset_name not in pool.tool_toolsets.values():
+            pool.toolset_aliases = {
+                alias: target
+                for alias, target in pool.toolset_aliases.items()
+                if target != toolset_name
+            }
+        if removed:
+            pool.generation += 1
 
 
 def _server_pool(server: Any) -> Optional[MCPServerPool]:
@@ -5100,9 +5257,12 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
+def _track_mcp_tool_server(tool_name: str, server_name: str, pool: Optional[MCPServerPool] = None) -> None:
     """Remember the exact MCP server that registered *tool_name*."""
     safe_server_name = sanitize_mcp_name_component(server_name)
+    if pool is not None:
+        with _lock:
+            pool.tool_server_names[tool_name] = safe_server_name
     with _lock:
         _mcp_tool_server_names[tool_name] = safe_server_name
 
@@ -5111,6 +5271,17 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+
+
+def _mcp_tool_defined_in_other_pool(
+    tool_name: str,
+    pool: Optional[MCPServerPool],
+) -> bool:
+    with _lock:
+        return any(
+            other is not pool and tool_name in other.tool_definitions
+            for other in _profile_pools.values()
+        )
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -5207,6 +5378,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    pool = _server_pool(server)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec):
@@ -5255,7 +5427,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(tool_name_prefixed, name)
+        _remember_mcp_tool_definition(tool_name_prefixed, toolset_name, schema, name, pool)
+        _track_mcp_tool_server(tool_name_prefixed, name, pool)
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
@@ -5292,11 +5465,16 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(util_name, name)
+        _remember_mcp_tool_definition(util_name, toolset_name, schema, name, pool)
+        _track_mcp_tool_server(util_name, name, pool)
         registered_names.append(util_name)
 
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
+        if pool is not None:
+            with _lock:
+                pool.toolset_aliases[name] = toolset_name
+                pool.generation += 1
 
     return registered_names
 
@@ -5536,7 +5714,13 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     if pool is None:
         return False
     with _lock:
-        server_name = _mcp_tool_server_names.get(tool_name)
+        server_name = (
+            pool.tool_server_names.get(tool_name)
+            if pool.key is not None
+            else _mcp_tool_server_names.get(tool_name)
+        )
+        if server_name is None and pool.key is not None:
+            server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in pool.parallel_safe_servers)
 
 
@@ -5707,8 +5891,11 @@ def has_registered_mcp_tools() -> bool:
     registered TOOLS, not connected servers, so a server that registers no tools
     doesn't keep the hook firing every turn.
     """
+    pool = _current_mcp_pool(create=False)
+    if pool is None:
+        return False
     with _lock:
-        return bool(_mcp_tool_server_names)
+        return bool(pool.tool_definitions if pool.key is not None else _mcp_tool_server_names)
 
 
 def refresh_agent_mcp_tools(
@@ -5775,6 +5962,7 @@ def refresh_agent_mcp_tools(
     # computed an OLDER set must not clobber a newer set another caller already
     # published. ``registry._generation`` bumps on every (de)register.
     snapshot_generation = registry._generation
+    snapshot_mcp_key, snapshot_mcp_fingerprint = _mcp_pool_cache_fingerprint_probe()
 
     # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
@@ -5803,34 +5991,44 @@ def refresh_agent_mcp_tools(
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
-    with _agent_tools_lock:
-        # Defensive: the published generation should be an int, but tolerate an
-        # agent that never set it (or set a non-int, e.g. a test mock) rather
-        # than throwing TypeError on the comparison and silently failing the
-        # whole refresh.
-        published_gen_raw = getattr(agent, "_tool_snapshot_generation", -1)
-        published_gen = published_gen_raw if isinstance(published_gen_raw, int) else -1
-        if snapshot_generation < published_gen:
-            # A newer snapshot already won; our set is stale — drop it.
+    with _lock:
+        if snapshot_mcp_fingerprint is None:
+            current_mcp_fingerprint = None
+        else:
+            current_mcp_fingerprint = _mcp_pool_cache_fingerprint_locked(snapshot_mcp_key)
+        if (
+            registry._generation,
+            current_mcp_fingerprint,
+        ) != (snapshot_generation, snapshot_mcp_fingerprint):
             return set()
-        current = {
-            t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
-        }
-        if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
+        with _agent_tools_lock:
+            # Defensive: the published generation should be an int, but tolerate an
+            # agent that never set it (or set a non-int, e.g. a test mock) rather
+            # than throwing TypeError on the comparison and silently failing the
+            # whole refresh.
+            published_gen_raw = getattr(agent, "_tool_snapshot_generation", -1)
+            published_gen = published_gen_raw if isinstance(published_gen_raw, int) else -1
+            if snapshot_generation < published_gen:
+                # A newer snapshot already won; our set is stale — drop it.
+                return set()
+            current = {
+                t["function"]["name"]
+                for t in (getattr(agent, "tools", None) or [])
+            }
+            if new_names == current:
+                # No change → leave the live snapshot untouched (no churn), but
+                # record the generation so an in-flight older caller can't clobber.
+                agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+                return set()
+            agent.tools = new_defs
+            agent.valid_tool_names = new_names
+            # Publish context-engine routing names atomically with the snapshot.
+            engine_names = getattr(agent, "_context_engine_tool_names", None)
+            if isinstance(engine_names, set):
+                engine_names.clear()
+                engine_names.update(staged_engine_names)
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-            return set()
-        agent.tools = new_defs
-        agent.valid_tool_names = new_names
-        # Publish context-engine routing names atomically with the snapshot.
-        engine_names = getattr(agent, "_context_engine_tool_names", None)
-        if isinstance(engine_names, set):
-            engine_names.clear()
-            engine_names.update(staged_engine_names)
-        agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        return new_names - current
+            return new_names - current
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
@@ -5961,6 +6159,12 @@ def _shutdown_mcp_pool(pool: MCPServerPool, *, stop_loop: bool) -> None:
             pool.error_counts.clear()
             pool.breaker_opened_at.clear()
             pool.parallel_safe_servers.clear()
+            if pool.key is not None:
+                pool.tool_definitions.clear()
+                pool.tool_toolsets.clear()
+                pool.toolset_aliases.clear()
+                pool.tool_server_names.clear()
+                pool.generation += 1
 
     with _lock:
         loop = _mcp_loop

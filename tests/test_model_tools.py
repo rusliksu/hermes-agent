@@ -8,6 +8,7 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
@@ -282,6 +283,56 @@ class TestHandleFunctionCall:
         ))
 
         assert result == {"ok": True, "tool": bridged}
+
+
+def test_multiplex_mcp_helper_failure_fails_closed_without_registry_fallback(monkeypatch):
+    import agent.secret_scope as secret_scope
+    from gateway.session_context import reset_session_vars
+    from tools.registry import registry
+    import model_tools
+
+    tool_name = "mcp__global_alias_guard__echo"
+    secret_scope.set_multiplex_active(True)
+    reset_session_vars()
+    model_tools._tool_defs_cache.clear()
+    registry.register(
+        name=tool_name,
+        toolset="mcp-global_alias_guard",
+        schema={
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "must not leak under multiplex helper failure",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        handler=lambda args, **kw: "{}",
+        override=True,
+    )
+    registry.register_toolset_alias("global_alias_guard", "mcp-global_alias_guard")
+    monkeypatch.setattr(
+        secret_scope,
+        "is_multiplex_active",
+        lambda: (_ for _ in ()).throw(RuntimeError("state probe failed")),
+    )
+
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=["global_alias_guard"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        registry.deregister(tool_name)
+        model_tools._tool_defs_cache.clear()
+        reset_session_vars()
+        secret_scope.set_multiplex_active(False)
+
+    assert [
+        d["function"]["name"]
+        for d in definitions
+        if d["function"]["name"].startswith("mcp__")
+    ] == []
 
 
 # =========================================================================

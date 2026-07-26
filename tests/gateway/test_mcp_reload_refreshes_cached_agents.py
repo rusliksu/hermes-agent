@@ -81,10 +81,24 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.append_to_transcript = MagicMock()
 
+    class _AsyncStore:
+        async def get_or_create_session(self, _source):
+            return session_entry
+
+        async def append_to_transcript(self, *_args, **_kwargs):
+            return None
+
+    runner._async_session_store = _AsyncStore()
+
     # Build N fake cached agents with stale `tools` + `valid_tool_names`.
     runner._agent_cache = OrderedDict()
     runner._agent_cache_lock = threading.Lock()
+    async def _direct_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _direct_executor
     for i in range(num_agents):
+        context = _resolved_context(f"profile-{i}")
         stale_tool = {
             "type": "function",
             "function": {"name": f"stale_tool_{i}", "description": "old"},
@@ -94,6 +108,7 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
             valid_tool_names={f"stale_tool_{i}"},
             enabled_toolsets=None,
             disabled_toolsets=None,
+            _gateway_resolved_access_context=context,
         )
         runner._agent_cache[f"session-{i}"] = (agent, f"sig-{i}")
 
@@ -247,3 +262,61 @@ async def test_reload_mcp_uses_context_preserving_current_pool_helpers():
     ]
     assert "current-profile-server" in result
     assert "foreign-server" not in result
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_refreshes_each_cached_agent_under_its_own_context():
+    from gateway.session_context import bind_resolved_access_context, get_resolved_access_context
+
+    runner = _make_runner_with_cached_agents(num_agents=0)
+    ctx_a = _resolved_context("profile-a")
+    ctx_b = _resolved_context("profile-b")
+    agent_a = SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        _gateway_resolved_access_context=ctx_a,
+    )
+    agent_b = SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        _gateway_resolved_access_context=ctx_b,
+    )
+    contextless = SimpleNamespace(
+        tools=[{"type": "function", "function": {"name": "stale"}}],
+        valid_tool_names={"stale"},
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+    )
+    runner._agent_cache["a"] = (agent_a, "sig-a")
+    runner._agent_cache["b"] = (agent_b, "sig-b")
+    runner._agent_cache["contextless"] = (contextless, "sig-c")
+
+    def _defs(**_kwargs):
+        profile_id = get_resolved_access_context().profile_id
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"mcp__{profile_id}__echo",
+                    "description": "",
+                    "parameters": {},
+                },
+            }
+        ]
+
+    with (
+        bind_resolved_access_context(ctx_a),
+        patch("tools.mcp_tool.shutdown_current_mcp_servers"),
+        patch("tools.mcp_tool.discover_mcp_tools", return_value=["echo"]),
+        patch("tools.mcp_tool.snapshot_current_mcp_server_names", return_value={"demo"}),
+        patch("model_tools.get_tool_definitions", side_effect=_defs),
+    ):
+        await _execute_reload_and_close_executor(runner)
+
+    assert agent_a.valid_tool_names == {"mcp__profile-a__echo"}
+    assert agent_b.valid_tool_names == {"mcp__profile-b__echo"}
+    assert contextless.valid_tool_names == {"stale"}

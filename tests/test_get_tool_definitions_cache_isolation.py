@@ -74,6 +74,21 @@ class TestQuietModeCacheIsolation:
         assert "lcm_grep" not in names
         assert "lcm_expand" not in names
 
+    def test_nested_schema_mutation_does_not_poison_cache(self):
+        first = model_tools.get_tool_definitions(quiet_mode=True)
+        target = next(t for t in first if t.get("function", {}).get("parameters"))
+        name = target["function"]["name"]
+        target["function"]["description"] = "poisoned nested cache"
+        target["function"]["parameters"].setdefault("properties", {})["poison"] = {
+            "type": "string",
+        }
+
+        second = model_tools.get_tool_definitions(quiet_mode=True)
+        refreshed = next(t for t in second if t["function"]["name"] == name)
+
+        assert refreshed["function"].get("description") != "poisoned nested cache"
+        assert "poison" not in refreshed["function"]["parameters"].get("properties", {})
+
     def test_repeated_caller_mutation_does_not_accumulate(self):
         """The original Gateway symptom: every agent init in a long-lived
         process appends LCM schemas, accumulating duplicates over time."""
