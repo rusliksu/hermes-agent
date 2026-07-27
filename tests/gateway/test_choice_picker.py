@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
@@ -68,6 +69,23 @@ def _make_runner(adapter=None):
     return runner
 
 
+def _access_context() -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family_standard",
+        profile_id="family-profile",
+        conversation_scope="private",
+        capabilities=frozenset({"model_switch"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="67890",
+            thread_id=None,
+        ),
+    )
+
+
 class TestReasoningChoicePicker:
     @pytest.mark.asyncio
     async def test_bare_reasoning_sends_picker_when_adapter_supports_it(self, tmp_path, monkeypatch):
@@ -86,6 +104,25 @@ class TestReasoningChoicePicker:
         assert values[0] == "none"
         assert values[1:1 + len(VALID_REASONING_EFFORTS)] == list(VALID_REASONING_EFFORTS)
         assert values[-3:] == ["reset", "show", "hide"]
+
+    @pytest.mark.asyncio
+    async def test_try_send_choice_picker_passes_source_resolved_context(self):
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        event = _make_event("/reasoning")
+        context = _access_context()
+        event.source.resolved_access_context = context
+
+        sent = await runner._try_send_choice_picker(
+            event,
+            session_key="s",
+            title="Pick",
+            choices=[{"value": "fast", "label": "Fast"}],
+            on_choice_selected=AsyncMock(),
+        )
+
+        assert sent is True
+        assert adapter.calls[0]["metadata"]["_resolved_access_context"] is context
 
     @pytest.mark.asyncio
     async def test_bare_reasoning_falls_back_to_text_without_picker(self, tmp_path, monkeypatch):

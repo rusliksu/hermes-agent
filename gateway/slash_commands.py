@@ -1837,6 +1837,9 @@ class GatewaySlashCommandsMixin:
                             )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if getattr(source, "resolved_access_context", None) is not None:
+                        metadata = dict(metadata or {})
+                        metadata["_resolved_access_context"] = source.resolved_access_context
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -2899,6 +2902,9 @@ class GatewaySlashCommandsMixin:
             metadata = self._thread_metadata_for_source(
                 event.source, self._reply_anchor_for_event(event)
             )
+            if getattr(event.source, "resolved_access_context", None) is not None:
+                metadata = dict(metadata or {})
+                metadata["_resolved_access_context"] = event.source.resolved_access_context
             result = await adapter.send_choice_picker(
                 chat_id=event.source.chat_id,
                 title=title,

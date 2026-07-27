@@ -5249,7 +5249,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
             self._model_picker_state[str(chat_id)] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
@@ -5258,6 +5257,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "provider_page": 0,
+                "resolved_access_context": (metadata or {}).get("_resolved_access_context"),
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -5324,6 +5324,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "choices": choices,
                 "session_key": session_key,
                 "on_choice_selected": on_choice_selected,
+                "resolved_access_context": (metadata or {}).get("_resolved_access_context"),
             }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5334,24 +5335,26 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
-        if not state:
-            await query.answer(text="Picker expired — run the command again.")
+        allowed, registry, callback_context = self._authorize_picker_callback(query)
+        if not allowed:
+            await self._answer_unauthorized_picker_callback(query)
             return
 
-        # Same authorization gate as approval buttons: unauthorized users in a
-        # shared group must not flip session/config state via someone else's
-        # picker message.
-        query_message = getattr(query, "message", None)
-        query_chat = getattr(query_message, "chat", None)
-        if not self._is_callback_user_authorized(
-            str(getattr(query.from_user, "id", "")),
-            chat_id=getattr(query_message, "chat_id", None),
-            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
-            thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
-            user_name=getattr(query.from_user, "first_name", None),
+        state = self._choice_picker_state.get(chat_id)
+        if not state:
+            await self._answer_unavailable_picker_callback(query)
+            return
+
+        if not self._access_registry_picker_context_matches(
+            registry,
+            state.get("resolved_access_context"),
+            callback_context,
         ):
-            await query.answer(text="⛔ You are not authorized to change this setting.")
+            await self._answer_unavailable_picker_callback(query)
+            return
+
+        if not self._picker_message_matches(state, query):
+            await self._answer_unavailable_picker_callback(query)
             return
 
         try:
@@ -5506,9 +5509,24 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
+        allowed, registry, callback_context = self._authorize_picker_callback(query)
+        if not allowed:
+            await self._answer_unauthorized_picker_callback(query)
+            return
+
         state = self._model_picker_state.get(chat_id)
         if not state:
-            await query.answer(text="Picker expired — use /model again.")
+            await self._answer_unavailable_picker_callback(query)
+            return
+        if not self._access_registry_picker_context_matches(
+            registry,
+            state.get("resolved_access_context"),
+            callback_context,
+        ):
+            await self._answer_unavailable_picker_callback(query)
+            return
+        if not self._picker_message_matches(state, query):
+            await self._answer_unavailable_picker_callback(query)
             return
 
         try:
@@ -7846,6 +7864,112 @@ class TelegramAdapter(BasePlatformAdapter):
         if runner is not None:
             return runner
         return getattr(getattr(self, "_message_handler", None), "__self__", None)
+
+    def _gateway_runner_for_callback_auth(self):
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            return runner
+        return getattr(getattr(self, "_message_handler", None), "__self__", None)
+
+    def _callback_source_from_query(self, query):
+        from gateway.session import SessionSource
+
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        raw_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = "dm"
+        if raw_chat_type in {"group", "supergroup"}:
+            chat_type = "group"
+        elif raw_chat_type == "channel":
+            chat_type = "channel"
+
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None:
+            chat_id = getattr(chat, "id", None)
+        user_id = str(getattr(user, "id", "") or "").strip() or None
+        user_name = (
+            str(
+                getattr(user, "username", "")
+                or getattr(user, "full_name", "")
+                or getattr(user, "first_name", "")
+                or ""
+            ).strip()
+            or None
+        )
+        message_id = getattr(message, "message_id", None)
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(chat_id) if chat_id is not None else "",
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=self._effective_message_thread_id(message) if message is not None else None,
+            message_id=str(message_id) if message_id is not None else None,
+            route_account=self._profile_route_account_label(),
+        )
+
+    def _authorize_access_registry_callback(self, query):
+        runner = self._gateway_runner_for_callback_auth()
+        registry = getattr(runner, "access_registry", None)
+        if registry is None:
+            return True, None, None
+        guard = getattr(runner, "_allow_access_registry_ingress", None)
+        if not callable(guard):
+            return False, registry, None
+        source = self._callback_source_from_query(query)
+        event = MessageEvent(
+            text="",
+            source=source,
+            raw_message=getattr(query, "message", None),
+            message_id=source.message_id,
+        )
+        if not guard(event):
+            return False, registry, None
+        context = getattr(source, "resolved_access_context", None)
+        return context is not None, registry, context
+
+    def _authorize_picker_callback(self, query):
+        allowed, registry, callback_context = self._authorize_access_registry_callback(query)
+        if not allowed or registry is not None:
+            return allowed, registry, callback_context
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        return (
+            self._is_callback_user_authorized(
+                str(getattr(query.from_user, "id", "")),
+                chat_id=getattr(query_message, "chat_id", None),
+                chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
+                thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
+                user_name=getattr(query.from_user, "first_name", None),
+            ),
+            None,
+            None,
+        )
+
+    def _access_registry_picker_context_matches(
+        self,
+        registry,
+        expected_context,
+        callback_context,
+    ) -> bool:
+        if registry is None:
+            return True
+        try:
+            return registry.validate_resolved_context(expected_context) == callback_context
+        except Exception:
+            return False
+
+    def _picker_message_matches(self, state, query) -> bool:
+        expected = state.get("msg_id")
+        actual = getattr(getattr(query, "message", None), "message_id", None)
+        return expected is not None and actual is not None and str(expected) == str(actual)
+
+    async def _answer_unauthorized_picker_callback(self, query) -> None:
+        await query.answer(text="⛔ You are not authorized to change this setting.")
+
+    async def _answer_unavailable_picker_callback(self, query) -> None:
+        await query.answer(text="Picker expired or unauthorized — run the command again.")
 
     def _prehandle_telegram_media_event(self, event: MessageEvent) -> bool:
         runner = self._gateway_runner_for_media_prehandle()
