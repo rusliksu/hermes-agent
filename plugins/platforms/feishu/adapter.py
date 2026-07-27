@@ -1489,8 +1489,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
-        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
-        self._approval_state: Dict[int, Dict[str, str]] = {}
+        # Exec approval button state (approval_id → server-side request metadata)
+        self._approval_state: Dict[int, Dict[str, Any]] = {}
         self._approval_counter = itertools.count(1)
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
@@ -1993,6 +1993,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+            if not approval_request_id:
+                return SendResult(success=False, error="approval request id missing")
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
 
@@ -2004,11 +2007,15 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
+            allowed_choices = ["once"]
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
             if not smart_denied:
+                allowed_choices.append("session")
                 actions.append(_btn("✅ Session", "approve_session"))
                 if allow_permanent:
+                    allowed_choices.append("always")
                     actions.append(_btn("✅ Always", "approve_always"))
+            allowed_choices.append("deny")
             actions.append(_btn("❌ Deny", "deny", "danger"))
             scope_note = "\n\n**Smart DENY:** owner override applies to this one operation only." if smart_denied else ""
             card = {
@@ -2042,6 +2049,8 @@ class FeishuAdapter(BasePlatformAdapter):
             if result.success:
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
+                    "approval_request_id": approval_request_id,
+                    "allowed_choices": allowed_choices,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
@@ -2711,7 +2720,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
-        choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
+        action_name = action_value.get("hermes_action")
+        choice = _APPROVAL_CHOICE_MAP.get(action_name)
+        if not choice:
+            logger.debug("[Feishu] Card action has invalid approval action=%r", action_name)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        allowed_choices = {str(item) for item in state.get("allowed_choices") or []}
+        if choice not in allowed_choices:
+            logger.debug("[Feishu] Card action choice %s not rendered for approval %s", choice, approval_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
@@ -2722,7 +2739,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+        if expected_chat_id and callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Approval callback chat mismatch for %s (expected=%s, got=%s)",
                 approval_id,
@@ -2832,22 +2849,33 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
-        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+        if expected_chat_id and chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] Approval %s chat mismatch (expected=%s, got=%s)",
                 approval_id, expected_chat_id, chat_id,
             )
             return
-        state = self._approval_state.pop(approval_id, None)
-        if not state:
-            logger.debug("[Feishu] Approval %s already resolved while validating callback", approval_id)
+        allowed_choices = {str(item) for item in state.get("allowed_choices") or []}
+        if choice not in allowed_choices:
+            logger.debug("[Feishu] Approval %s choice %s not rendered", approval_id, choice)
+            return
+        approval_request_id = str(state.get("approval_request_id") or "")
+        session_key = str(state.get("session_key") or "")
+        if not session_key or not approval_request_id:
+            logger.debug("[Feishu] Approval %s missing server request metadata", approval_id)
             return
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                expected_request_id=approval_request_id,
+            )
+            if count:
+                self._approval_state.pop(approval_id, None)
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count, state["session_key"], choice, user_name,
+                count, session_key, choice, user_name,
             )
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)

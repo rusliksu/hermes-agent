@@ -110,6 +110,20 @@ def _make_adapter(**overrides):
     return adapter
 
 
+def _exec_approval_state(
+    session_key: str = "sess-app-1",
+    request_id: str = "request-1",
+    *,
+    chat_id: str = "15551234567",
+):
+    return {
+        "session_key": session_key,
+        "approval_request_id": request_id,
+        "allowed_choices": ["approve", "deny"],
+        "chat_id": chat_id,
+    }
+
+
 @pytest.fixture
 def authorized_interactive_env(monkeypatch):
     """``dm_policy: open`` requires an explicit allow-all opt-in on main."""
@@ -1744,6 +1758,7 @@ class TestSendExecApprovalButtons:
             command="rm -rf /tmp/foo",
             session_key="sess-app-1",
             description="cleanup script",
+            metadata={"approval_request_id": "request-1"},
         )
 
         assert result.success
@@ -1762,7 +1777,30 @@ class TestSendExecApprovalButtons:
         body = payload["interactive"]["body"]["text"]
         assert "rm -rf /tmp/foo" in body
         assert "cleanup script" in body
-        assert adapter._exec_approval_state[approval_id] == "sess-app-1"
+        assert adapter._exec_approval_state[approval_id] == {
+            "session_key": "sess-app-1",
+            "approval_request_id": "request-1",
+            "allowed_choices": ["approve", "deny"],
+            "chat_id": "15551234567",
+            "reply_to_message_id": "",
+        }
+
+    @pytest.mark.asyncio
+    async def test_approval_missing_request_id_fails_closed_without_send(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+
+        result = await adapter.send_exec_approval(
+            chat_id="15551234567",
+            command="rm -rf /tmp/foo",
+            session_key="sess-app-1",
+        )
+
+        assert result.success is False
+        assert result.error == "approval request id missing"
+        adapter._http_client.post.assert_not_called()
+        assert adapter._exec_approval_state == {}
 
     @pytest.mark.asyncio
     async def test_long_command_is_truncated(self):
@@ -1778,6 +1816,7 @@ class TestSendExecApprovalButtons:
             chat_id="15551234567",
             command=huge,
             session_key="sess-x",
+            metadata={"approval_request_id": "request-x"},
         )
         assert result.success
         payload = adapter._http_client.post.call_args.kwargs["json"]
@@ -1960,7 +1999,12 @@ class TestDispatchInteractiveReplyApproval:
     @pytest.mark.asyncio
     async def test_approve_tap_calls_resolver_and_confirms(self, monkeypatch):
         adapter = _make_adapter()
-        adapter._exec_approval_state["app1"] = "sess-app-1"
+        adapter._exec_approval_state["app1"] = {
+            "session_key": "sess-app-1",
+            "approval_request_id": "request-1",
+            "allowed_choices": ["approve", "deny"],
+            "chat_id": "15551234567",
+        }
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(
             return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
@@ -1969,7 +2013,7 @@ class TestDispatchInteractiveReplyApproval:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, **kwargs: calls.append((session_key, choice, kwargs)) or 1,
         )
 
         raw = {
@@ -1983,7 +2027,7 @@ class TestDispatchInteractiveReplyApproval:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "approve", {"expected_request_id": "request-1"})]
         assert "app1" not in adapter._exec_approval_state
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert confirm_payload["type"] == "text"
@@ -1992,7 +2036,12 @@ class TestDispatchInteractiveReplyApproval:
     @pytest.mark.asyncio
     async def test_deny_tap_passes_deny_choice(self, monkeypatch):
         adapter = _make_adapter()
-        adapter._exec_approval_state["app2"] = "sess-app-2"
+        adapter._exec_approval_state["app2"] = {
+            "session_key": "sess-app-2",
+            "approval_request_id": "request-2",
+            "allowed_choices": ["approve", "deny"],
+            "chat_id": "15551234567",
+        }
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(
             return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
@@ -2001,7 +2050,7 @@ class TestDispatchInteractiveReplyApproval:
         choices_seen = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: choices_seen.append(choice) or 1,
+            lambda session_key, choice, **_kwargs: choices_seen.append(choice) or 1,
         )
 
         raw = {
@@ -2017,6 +2066,59 @@ class TestDispatchInteractiveReplyApproval:
         assert choices_seen == ["deny"]
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert "Denied" in confirm_payload["text"]["body"]
+
+    @pytest.mark.asyncio
+    async def test_sender_chat_mismatch_does_not_resolve_or_consume(self, monkeypatch):
+        adapter = _make_adapter(_dm_policy="open")
+        adapter._exec_approval_state["app3"] = {
+            "session_key": "sess-app-3",
+            "approval_request_id": "request-3",
+            "allowed_choices": ["approve", "deny"],
+            "chat_id": "15551234567",
+        }
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda *_args, **_kwargs: pytest.fail("must not resolve"),
+        )
+
+        raw = {
+            "from": "19998887777",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app3:approve", "title": "Approve"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert adapter._exec_approval_state["app3"]["approval_request_id"] == "request-3"
+
+    @pytest.mark.asyncio
+    async def test_missing_sender_chat_does_not_resolve_or_consume(self, monkeypatch):
+        adapter = _make_adapter(_dm_policy="open")
+        adapter._exec_approval_state["app4"] = {
+            "session_key": "sess-app-4",
+            "approval_request_id": "request-4",
+            "allowed_choices": ["approve", "deny"],
+            "chat_id": "15551234567",
+        }
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda *_args, **_kwargs: pytest.fail("must not resolve"),
+        )
+
+        raw = {
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app4:approve", "title": "Approve"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert adapter._exec_approval_state["app4"]["approval_request_id"] == "request-4"
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")
@@ -2114,11 +2216,11 @@ class TestDispatchInteractiveReplyAuthorization:
             _dm_policy="allowlist",
             _allow_from={"19998887777"},
         )
-        adapter._exec_approval_state["app1"] = "sess-app-1"
+        adapter._exec_approval_state["app1"] = _exec_approval_state()
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, **kwargs: calls.append((session_key, choice, kwargs)) or 1,
         )
 
         raw = {
@@ -2133,7 +2235,7 @@ class TestDispatchInteractiveReplyAuthorization:
 
         assert handled is True
         assert calls == []
-        assert adapter._exec_approval_state["app1"] == "sess-app-1"
+        assert adapter._exec_approval_state["app1"]["session_key"] == "sess-app-1"
 
     @pytest.mark.asyncio
     async def test_approval_tap_allowed_when_sender_allowlisted(self, monkeypatch):
@@ -2141,7 +2243,7 @@ class TestDispatchInteractiveReplyAuthorization:
             _dm_policy="allowlist",
             _allow_from={"15551234567"},
         )
-        adapter._exec_approval_state["app1"] = "sess-app-1"
+        adapter._exec_approval_state["app1"] = _exec_approval_state()
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(
             return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
@@ -2149,7 +2251,7 @@ class TestDispatchInteractiveReplyAuthorization:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, **kwargs: calls.append((session_key, choice, kwargs)) or 1,
         )
 
         raw = {
@@ -2163,7 +2265,7 @@ class TestDispatchInteractiveReplyAuthorization:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "approve", {"expected_request_id": "request-1"})]
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")

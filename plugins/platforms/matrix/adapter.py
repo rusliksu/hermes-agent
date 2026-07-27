@@ -312,6 +312,8 @@ class _MatrixApprovalPrompt:
         resolved: bool = False,
         requester_user_id: str | None = None,
         expires_at: float | None = None,
+        approval_request_id: str = "",
+        allowed_choices: list[str] | None = None,
     ):
         self.session_key = session_key
         self.chat_id = chat_id
@@ -319,6 +321,8 @@ class _MatrixApprovalPrompt:
         self.resolved = resolved
         self.requester_user_id = requester_user_id
         self.expires_at = expires_at
+        self.approval_request_id = approval_request_id
+        self.allowed_choices = list(allowed_choices or [])
         self.bot_reaction_events: dict[str, str] = {}  # emoji -> event_id
 
 
@@ -2031,6 +2035,9 @@ class MatrixAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+        if not approval_request_id:
+            return SendResult(success=False, error="approval request id missing")
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
         scope_choices = ""
@@ -2067,7 +2074,14 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        reactions = ("✅", "❌") if smart_denied or not allow_permanent else ("✅", "♾️", "❌")
+        if smart_denied or not allow_permanent:
+            reactions = ("✅", "❌")
+            allowed_choices = ["once", "deny"]
+        else:
+            reactions = ("✅", "♾️", "❌")
+            allowed_choices = ["once", "always", "deny"]
+        prompt.approval_request_id = approval_request_id
+        prompt.allowed_choices = allowed_choices
         for emoji in reactions:
             try:
                 reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
@@ -3348,7 +3362,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 ):
                     return
                 choice = self._approval_reaction_map.get(key)
-                if not choice:
+                if not choice or choice not in {str(item) for item in prompt.allowed_choices}:
                     await self._send_invalid_reaction_feedback(
                         room_id,
                         reacts_to,
@@ -3358,7 +3372,19 @@ class MatrixAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import resolve_gateway_approval
 
-                    count = resolve_gateway_approval(prompt.session_key, choice)
+                    approval_request_id = str(getattr(prompt, "approval_request_id", "") or "")
+                    if not approval_request_id:
+                        await self._send_invalid_reaction_feedback(
+                            room_id,
+                            reacts_to,
+                            "This approval prompt is no longer valid.",
+                        )
+                        return
+                    count = resolve_gateway_approval(
+                        prompt.session_key,
+                        choice,
+                        expected_request_id=approval_request_id,
+                    )
                     if count:
                         prompt.resolved = True
                         self._approval_prompts_by_event.pop(reacts_to, None)

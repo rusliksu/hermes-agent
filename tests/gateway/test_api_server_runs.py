@@ -11,7 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -71,6 +71,14 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _approval_request(run_id: str, body: dict) -> MagicMock:
+    request = MagicMock()
+    request.match_info = {"run_id": run_id}
+    request.headers = {}
+    request.json = AsyncMock(return_value=body)
+    return request
 
 
 def _make_slow_agent(**kwargs):
@@ -325,8 +333,6 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
-
-
     @pytest.mark.asyncio
     async def test_approval_response_without_pending_returns_409(self, adapter):
         app = _create_runs_app(adapter)
@@ -345,7 +351,7 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"choice": "once", "approval_request_id": "unknown-request"},
                 )
                 assert approval_resp.status == 409
                 approval_data = await approval_resp.json()
@@ -357,27 +363,109 @@ class TestRunEvents:
     @pytest.mark.asyncio
     async def test_approval_string_false_does_not_resolve_all(self, adapter):
         """Quoted false must not fan out approval resolution across the queue."""
-        app = _create_runs_app(adapter)
         run_id = "run_bool_parse"
         adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
         adapter._run_approval_sessions[run_id] = "session-123"
+        adapter._run_pending_approvals[run_id] = {
+            "request-1": {"allowed_choices": ["once", "deny"]}
+        }
 
-        async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-                approval_resp = await cli.post(
-                    f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once", "all": "false"},
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            approval_resp = await adapter._handle_run_approval(
+                _approval_request(
+                    run_id,
+                    {"choice": "once", "all": "false", "approval_request_id": "request-1"},
                 )
+            )
 
         assert approval_resp.status == 200
         mock_resolve.assert_called_once_with(
             "session-123",
             "once",
             resolve_all=False,
+            expected_request_id="request-1",
         )
 
     @pytest.mark.asyncio
-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+    async def test_approval_requires_matching_request_id_before_resolver(self, adapter):
+        run_id = "run_exact"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = "session-123"
+        adapter._run_pending_approvals[run_id] = {
+            "request-1": {"allowed_choices": ["once", "deny"]}
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            missing = await adapter._handle_run_approval(
+                _approval_request(run_id, {"choice": "once"})
+            )
+            foreign = await adapter._handle_run_approval(
+                _approval_request(run_id, {"choice": "once", "approval_request_id": "foreign"})
+            )
+            hidden = await adapter._handle_run_approval(
+                _approval_request(run_id, {"choice": "always", "approval_request_id": "request-1"})
+            )
+            fanout = await adapter._handle_run_approval(
+                _approval_request(
+                    run_id,
+                    {"choice": "once", "approval_request_id": "request-1", "resolve_all": True},
+                )
+            )
+
+        assert missing.status == 400
+        assert foreign.status == 409
+        assert hidden.status == 400
+        assert fanout.status == 400
+        mock_resolve.assert_not_called()
+        assert "request-1" in adapter._run_pending_approvals[run_id]
+
+    @pytest.mark.asyncio
+    async def test_approval_request_id_cannot_cross_runs_and_success_cleans_exact_state(self, adapter):
+        victim_run = "run_victim"
+        attacker_run = "run_attacker"
+        adapter._run_statuses[victim_run] = {"run_id": victim_run, "status": "waiting_for_approval"}
+        adapter._run_statuses[attacker_run] = {"run_id": attacker_run, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[victim_run] = "session-victim"
+        adapter._run_approval_sessions[attacker_run] = "session-attacker"
+        adapter._run_pending_approvals[victim_run] = {
+            "request-victim": {"allowed_choices": ["once", "deny"]}
+        }
+        adapter._run_pending_approvals[attacker_run] = {
+            "request-attacker": {"allowed_choices": ["once", "deny"]}
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            foreign = await adapter._handle_run_approval(
+                _approval_request(
+                    attacker_run,
+                    {"choice": "once", "approval_request_id": "request-victim"},
+                )
+            )
+        assert foreign.status == 409
+        mock_resolve.assert_not_called()
+        assert "request-victim" in adapter._run_pending_approvals[victim_run]
+        assert "request-attacker" in adapter._run_pending_approvals[attacker_run]
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            success = await adapter._handle_run_approval(
+                _approval_request(
+                    attacker_run,
+                    {"choice": "once", "approval_request_id": "request-attacker"},
+                )
+            )
+
+        assert success.status == 200
+        mock_resolve.assert_called_once_with(
+            "session-attacker",
+            "once",
+            resolve_all=False,
+            expected_request_id="request-attacker",
+        )
+        assert "request-victim" in adapter._run_pending_approvals[victim_run]
+        assert attacker_run not in adapter._run_pending_approvals
+
+    @pytest.mark.asyncio
+    async def test_approval_exact_request_id_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -411,25 +499,34 @@ class TestRunEvents:
                     "command": "bash -c victim-danger",
                     "description": "victim approval",
                     "pattern_keys": ["shell-c"],
+                    "approval_request_id": "request-victim",
                 })
                 attacker_entry = approval_mod._ApprovalEntry({
                     "command": "bash -c attacker-danger",
                     "description": "attacker approval",
                     "pattern_keys": ["shell-c"],
+                    "approval_request_id": "request-attacker",
                 })
                 with approval_mod._lock:
                     approval_mod._gateway_queues[victim_run] = [victim_entry]
                     approval_mod._gateway_queues[attacker_run] = [attacker_entry]
+                auth_adapter._run_pending_approvals[victim_run] = {
+                    "request-victim": {"allowed_choices": ["once", "deny"]}
+                }
+                auth_adapter._run_pending_approvals[attacker_run] = {
+                    "request-attacker": {"allowed_choices": ["once", "always", "deny"]}
+                }
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"choice": "always", "approval_request_id": "request-attacker"},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
+                assert approval_data["approval_request_id"] == "request-attacker"
                 assert attacker_entry.result == "always"
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
@@ -438,6 +535,8 @@ class TestRunEvents:
                     assert approval_mod._gateway_queues[victim_run] == [victim_entry]
                     assert victim_run in approval_mod._gateway_queues
                     assert attacker_run not in approval_mod._gateway_queues
+                assert "request-victim" in auth_adapter._run_pending_approvals[victim_run]
+                assert attacker_run not in auth_adapter._run_pending_approvals
 
                 # Clean up the synthetic pending victim approval and unblock the
                 # slow test agents so their background run tasks can finish.
@@ -504,9 +603,13 @@ class TestRunLifecycleSweep:
                     "command": "bash -c long-running",
                     "description": "approval after stream TTL",
                     "pattern_keys": ["shell-c"],
+                    "approval_request_id": "request-live",
                 })
                 with approval_mod._lock:
                     approval_mod._gateway_queues[run_id] = [pending]
+                adapter._run_pending_approvals[run_id] = {
+                    "request-live": {"allowed_choices": ["once", "deny"]}
+                }
 
                 adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
                 # Exercise one real sweeper iteration without waiting 60 seconds.
@@ -522,6 +625,9 @@ class TestRunLifecycleSweep:
                 assert run_id not in adapter._run_streams
                 assert run_id not in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
+                assert adapter._run_pending_approvals[run_id] == {
+                    "request-live": {"allowed_choices": ["once", "deny"]}
+                }
 
                 limited = adapter._concurrency_limited_response()
                 assert limited is not None
@@ -529,9 +635,11 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"choice": "once", "approval_request_id": "request-live"},
                 )
                 assert approval_resp.status == 200
+                approval_data = await approval_resp.json()
+                assert approval_data["approval_request_id"] == "request-live"
                 assert pending.event.is_set()
                 assert pending.result == "once"
 

@@ -311,12 +311,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # fallback path, same as after a gateway restart).
         #   _clarify_state:        clarify_id → session_key (resolves via
         #                          tools.clarify_gateway.resolve_gateway_clarify)
-        #   _exec_approval_state:  approval_id → session_key (resolves via
-        #                          tools.approval.resolve_gateway_approval)
+        #   _exec_approval_state:  approval_id → server-side request metadata
+        #                          (resolves via tools.approval.resolve_gateway_approval)
         #   _slash_confirm_state:  confirm_id → session_key (resolves via
         #                          tools.slash_confirm.resolve)
         self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
-        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
 
         # Runtime
@@ -833,6 +833,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         del allow_permanent  # This adapter already offers one-shot Approve / Deny only.
+        approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+        if not approval_request_id:
+            return SendResult(success=False, error="approval request id missing")
         # WhatsApp body caps at 1024 chars; reserve room for the
         # framing prose around the command.
         cmd = command or ""
@@ -866,7 +869,17 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         result = await self._post_interactive(chat_id, interactive, reply_to=reply_to)
         if result.success:
-            self._bounded_put(self._exec_approval_state, approval_id, session_key)
+            self._bounded_put(
+                self._exec_approval_state,
+                approval_id,
+                {
+                    "session_key": session_key,
+                    "approval_request_id": approval_request_id,
+                    "allowed_choices": ["approve", "deny"],
+                    "chat_id": str(chat_id),
+                    "reply_to_message_id": str(reply_to or ""),
+                },
+            )
         return result
 
     async def send_slash_confirm(
@@ -1768,17 +1781,31 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if len(parts) != 3:
                 return False
             _, approval_id, choice = parts
-            session_key = self._exec_approval_state.pop(approval_id, None)
-            if not session_key:
+            state = self._exec_approval_state.get(approval_id)
+            if not isinstance(state, dict):
                 logger.info(
                     "[whatsapp_cloud] approval tap with no matching state "
                     "(approval_id=%s) — likely stale; falling back to text",
                     approval_id,
                 )
                 return False
-            if choice not in ("approve", "deny"):
-                self._exec_approval_state[approval_id] = session_key
-                return False
+            allowed_choices = {str(item) for item in state.get("allowed_choices") or []}
+            if choice not in allowed_choices:
+                return True
+            expected_chat_id = str(state.get("chat_id") or "")
+            if expected_chat_id and sender_id != expected_chat_id:
+                logger.warning(
+                    "[whatsapp_cloud] approval sender/chat mismatch for %s "
+                    "(expected=%s, got=%s)",
+                    approval_id,
+                    expected_chat_id,
+                    sender_id,
+                )
+                return True
+            approval_request_id = str(state.get("approval_request_id") or "")
+            session_key = str(state.get("session_key") or "")
+            if not session_key or not approval_request_id:
+                return True
             try:
                 from tools.approval import resolve_gateway_approval
             except ImportError:
@@ -1786,13 +1813,19 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
                 return False
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                expected_request_id=approval_request_id,
+            )
             if not count:
                 logger.info(
                     "[whatsapp_cloud] approval resolver reported no waiter "
                     "(session_key=%s) — likely already resolved",
                     session_key,
                 )
+                return True
+            self._exec_approval_state.pop(approval_id, None)
             # Send confirmation message — paralleling Telegram's UX.
             try:
                 confirm_text = (
