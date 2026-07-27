@@ -206,7 +206,8 @@ def test_group_messages_can_be_opened_via_config():
 def test_single_principal_shared_group_requires_exact_trigger_and_exact_chat():
     adapter = _make_adapter(
         require_mention=False,
-        free_response_chats=["-100"],
+        free_response_topics=["-100:7"],
+        guest_mode=True,
         mention_patterns=[r"^gurra\b"],
     )
     _attach_single_principal(adapter, ["-100"])
@@ -214,6 +215,9 @@ def test_single_principal_shared_group_requires_exact_trigger_and_exact_chat():
     mention_text = "hi @hermes_bot"
     command_text = "/status@hermes_bot"
     assert adapter._should_process_message(_group_message("ambient", chat_id=-100)) is False
+    assert adapter._should_process_message(
+        _group_message("ambient topic", chat_id=-100, thread_id=7)
+    ) is False
     assert adapter._should_process_message(_group_message("gurra help", chat_id=-100)) is False
     assert adapter._should_process_message(
         _group_message(
@@ -252,6 +256,146 @@ def test_single_principal_shared_group_requires_exact_trigger_and_exact_chat():
     anonymous.from_user = None
     anonymous.sender_chat = SimpleNamespace(id=-100, title="Test Group")
     assert adapter._is_user_authorized_from_message(anonymous) is False
+
+
+def test_single_principal_free_response_shared_group_dispatches_all_topics_with_thread_isolation():
+    from gateway.session import build_session_key
+
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    _attach_single_principal(adapter, ["-100"])
+
+    first = _group_message("ambient one", chat_id=-100, thread_id=7, is_forum=True)
+    second = _group_message("ambient two", chat_id=-100, thread_id=8, is_forum=True)
+
+    assert adapter._should_process_message(first) is True
+    assert adapter._should_process_message(second) is True
+
+    first_source = adapter._build_message_event(first, MessageType.TEXT).source
+    second_source = adapter._build_message_event(second, MessageType.TEXT).source
+    assert first_source.chat_id == second_source.chat_id == "-100"
+    assert first_source.thread_id == "7"
+    assert second_source.thread_id == "8"
+    assert build_session_key(first_source, group_sessions_per_user=False) != build_session_key(
+        second_source,
+        group_sessions_per_user=False,
+    )
+
+
+def test_single_principal_free_response_shared_group_text_dispatch_is_not_passive_observation():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            free_response_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        runner = _attach_single_principal(adapter, ["-100"])
+        adapter.handle_message = runner.handle
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1006,
+            message=_group_message(
+                "ambient in shared room",
+                chat_id=-100,
+                thread_id=7,
+                is_forum=True,
+            ),
+            effective_message=None,
+        )
+
+        try:
+            await adapter._handle_text_message(update, SimpleNamespace())
+            batch_tasks = list(adapter._pending_text_batch_tasks.values())
+            assert len(batch_tasks) == 1
+            await asyncio.gather(*batch_tasks)
+
+            assert runner.handle_calls == 1
+            assert store.messages == []
+            assert adapter._pending_text_batch_tasks == {}
+        finally:
+            pending_tasks = [
+                task
+                for task in adapter._pending_text_batch_tasks.values()
+                if not task.done()
+            ]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            adapter._pending_text_batch_tasks.clear()
+
+    asyncio.run(_run())
+
+
+def test_single_principal_other_shared_group_without_free_response_stays_mention_only():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-100"])
+    _attach_single_principal(adapter, ["-100", "-200"])
+
+    assert adapter._should_process_message(_group_message("ambient", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message("reply", chat_id=-200, reply_to_bot=True)
+    ) is True
+
+    text = "hi @hermes_bot"
+    assert adapter._should_process_message(
+        _group_message(text, chat_id=-200, entities=[_mention_entity(text)])
+    ) is True
+
+
+def test_single_principal_free_response_unknown_chat_fails_closed():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+    _attach_single_principal(adapter, ["-100"])
+
+    assert adapter._should_process_message(_group_message("ambient", chat_id=-200)) is False
+
+
+def test_single_principal_free_response_runs_after_own_ignored_and_allowed_topic_gates():
+    own = _make_adapter(require_mention=True, free_response_chats=["-100"])
+    _attach_single_principal(own, ["-100"])
+    assert own._should_process_message(
+        _group_message("ambient", chat_id=-100, from_user_id=999)
+    ) is False
+
+    ignored = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        ignored_threads=[42],
+    )
+    _attach_single_principal(ignored, ["-100"])
+    assert ignored._should_process_message(
+        _group_message("ambient", chat_id=-100, thread_id=42)
+    ) is False
+
+    topic_gated = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        allowed_topics=["7"],
+    )
+    _attach_single_principal(topic_gated, ["-100"])
+    assert topic_gated._should_process_message(
+        _group_message("ambient", chat_id=-100, thread_id=8)
+    ) is False
+
+
+def test_single_principal_free_response_dispatch_bypasses_observation_only_for_exact_chat():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    _attach_single_principal(adapter, ["-100", "-200"])
+
+    free_response = _group_message("ambient", chat_id=-100)
+    assert adapter._should_process_message(free_response) is True
+    assert adapter._should_observe_unmentioned_group_message(free_response) is False
+
+    mention_only = _group_message("ambient", chat_id=-200)
+    assert adapter._should_process_message(mention_only) is False
+    assert adapter._should_observe_unmentioned_group_message(mention_only) is True
 
 
 def test_single_principal_general_forum_topic_keeps_stable_thread_identity():

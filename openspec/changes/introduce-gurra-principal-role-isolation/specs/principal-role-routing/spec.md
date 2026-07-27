@@ -30,6 +30,29 @@
 - **WHEN** model args, command args или callback payload include tool name, MCP server, capability, profile, scope или delivery target для shared room turn
 - **THEN** система MUST authorize только exact configured room tools из validated room `ResolvedAccessContext`, configured Telegram tool profile и backend policy
 
+### Requirement: Telegram free-response trigger для configured shared room
+Система SHALL использовать `telegram.free_response_chats` только как серверную транспортную политику запуска для уже настроенных Telegram shared rooms, а не как authorization, membership, role, capability, profile, scope или delivery authority.
+
+#### Scenario: Free-response запускает agent во всех topics configured группы
+- **WHEN** exact `chat_id` Telegram group является active server-configured shared room, тот же exact `chat_id` включен в `telegram.free_response_chats`, отправитель является allowed participant, а сообщение в любом topic этой группы не является mention или reply
+- **THEN** система SHALL разрешить этому сообщению запустить agent с тем же shared-room `ResolvedAccessContext` и topic-specific `delivery_target`, которые использовал бы обычный mention/reply ingress
+
+#### Scenario: Free-response не меняет topic isolation
+- **WHEN** два неупомянутых сообщения приходят в два разных topic одной free-response configured shared room
+- **THEN** система SHALL сохранить отдельные topic `delivery_target`, session scope и memory namespace для каждого topic и MUST NOT склеивать topic context
+
+#### Scenario: `Free-response` gates выполняются после более ранних Telegram gates
+- **WHEN** event в free-response configured shared room является own message, ignored thread или topic вне `allowed_topics`
+- **THEN** система MUST отказать или проигнорировать event до применения free-response trigger policy и MUST NOT создавать session, memory read/write или model call
+
+#### Scenario: Другие shared rooms все еще требуют mention или reply
+- **WHEN** сообщение приходит в другую active shared room, exact `chat_id` которой не включен в `telegram.free_response_chats`, и сообщение не является mention или reply
+- **THEN** система MUST NOT запускать agent через free-response policy и MUST сохранить существующее требование mention/reply
+
+#### Scenario: Неизвестный chat остается fail-closed
+- **WHEN** Telegram group `chat_id` включен в `telegram.free_response_chats`, но не является active server-configured shared room с matching `SharedScopeBinding`
+- **THEN** система MUST отказать до session lookup, model init, memory hydration или tool schema staging и MUST NOT создавать room membership или fallback в owner/default
+
 ### Requirement: Проверенный семейный roster до provisioning и cutover
 Система MUST требовать private manually confirmed roster `transport identity -> opaque principal_id -> role_id -> profile_id` для всех девяти family transport identities до provisioning, migration preflight или live cutover; тот же private roster MUST содержать ровно одну `family_sandbox` binding и восемь `family_standard` bindings. Wolfram MUST назначаться через role policy для всех personal family profiles, а не через roster.
 

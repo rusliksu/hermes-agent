@@ -15,6 +15,10 @@
 - **WHEN** message text, callback payload или command args contain role/profile claim
 - **THEN** система MUST ignore that claim for authorization
 
+#### Scenario: Free-response trigger не является authorization
+- **WHEN** `telegram.free_response_chats` содержит exact `chat_id` Telegram group
+- **THEN** система MUST использовать эту запись только как server-side transport trigger policy после shared-room binding и participant validation, и MUST NOT выводить из нее room membership, role, capabilities, profile, scope, delivery target или поля `ResolvedAccessContext`
+
 ### Requirement: Positive intersection permissions для policy
 Система MUST compute effective permission as positive intersection of role policy, scope policy and backend/tool capability.
 

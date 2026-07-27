@@ -18,6 +18,8 @@ Minor baseline clarification по credential-safe live audit: Руслан яв�
 
 Подтвержденная архитектурная дельта 2026-07-25 после static audit: текущий MCP discovery/startup path запускается один раз при старте gateway до `_profile_runtime_scope`, а `_servers` является global registry по server name. В multiplex это небезопасно для profile secrets: scoped interpolation fail-closes unscoped startup, а literal secrets в MCP config могли бы создать global subprocess, доступный не тому profile. Поэтому MCP startup, schema discovery и dispatch должны стать profile-bound и context-bound; unscoped process-start discovery в multiplex запрещается.
 
+Подтвержденная material delta 2026-07-27: если Telegram group уже является server-configured shared room и exact chat id этой группы включен в `telegram.free_response_chats`, то неупомянутое сообщение любого разрешенного участника должно запускать agent во всех topics этой группы. `free_response_chats` является серверной транспортной политикой запуска, а не authorization: он не создает room membership, не расширяет role/capabilities, не меняет `ResolvedAccessContext` и не дает fallback для unknown/unregistered chats. Own messages, ignored threads и `allowed_topics` gates остаются раньше free-response trigger; другие shared rooms сохраняют mention/reply requirement.
+
 ## Цели / Не-цели
 
 **Цели:**
@@ -68,6 +70,8 @@ Owner binding закрепляет Руслана как `owner` и сохран
 Оператор вручную подтверждает одну sandbox binding. Только она получает `family_sandbox`; остальные восемь family identities получают `family_standard`. Wolfram не назначается через private roster: все personal family profiles получают его через role policy после валидного role/profile roster. Username/display-name сохраняются максимум как redacted admin labels для операторского UI/audit и не являются authority. Любой missing, duplicate или ambiguous roster mapping для identity, role или profile блокирует profile provisioning, migration preflight и live cutover.
 
 Shared room разрешается через `SharedScopeBinding`, а не через principal роль. Room membership дает только room scope, если binding активен; роль principal остается отдельной. Один человек может иметь DM role и room membership, но effective permission считается пересечением role/scope/backend.
+
+Для Telegram free-response в shared rooms действует отдельная транспортная политика запуска: exact group `chat_id` должен быть уже server-configured shared room и одновременно входить в `telegram.free_response_chats`. Только после более ранних gates для own messages, ignored threads и `allowed_topics` такое неупомянутое сообщение разрешенного участника может запустить agent в любом topic этой группы. Этот trigger не выдает membership, role, capabilities, profile, scope или delivery target; downstream получает тот же `ResolvedAccessContext`, который был бы получен при обычном mention/reply ingress для этой комнаты/topic. Unknown/unregistered chats fail closed, а shared rooms без exact entry в `telegram.free_response_chats` продолжают требовать mention или reply.
 
 Альтернатива: один общий shared profile для семьи. Отклонено, потому что он смешивает private sessions, memory, attachments, browser state и guessed IDs, а также делает rollback/migration недетерминированными.
 
