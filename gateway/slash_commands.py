@@ -365,6 +365,8 @@ class GatewaySlashCommandsMixin:
                 with _profile_runtime_scope(profile_home):
                     display = display_hermes_home()
             except Exception:
+                if getattr(source, "resolved_access_context", None) is not None:
+                    return "Profile unavailable."
                 display = display_hermes_home()
         else:
             display = display_hermes_home()

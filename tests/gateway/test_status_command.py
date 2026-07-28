@@ -704,6 +704,45 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_profile_command_fails_closed_when_typed_profile_resolution_fails(monkeypatch):
+    """A typed multiplexed context must not fall back to the owner home."""
+    from gateway.profile_routing import ProfileRoutingError
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.config.multiplex_profiles = True
+
+    event = _make_event("/profile")
+    event.source.profile = "family-profile"
+    event.source.resolved_access_context = SimpleNamespace(profile_id="family-profile")
+
+    def raise_missing_resolved_profile(_source):
+        raise ProfileRoutingError("missing_resolved_profile")
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_profile_home_for_source",
+        raise_missing_resolved_profile,
+    )
+    monkeypatch.setattr(
+        "hermes_constants.display_hermes_home",
+        lambda: "/owner/default/home",
+    )
+
+    result = await runner._handle_profile_command(event)
+
+    assert result == "Profile unavailable."
+    assert "/owner/default/home" not in result
+
+
+@pytest.mark.asyncio
 async def test_profile_command_ignores_stamp_when_multiplexing_off(monkeypatch, tmp_path):
     """Without ``gateway.multiplex_profiles`` a stamped source is ignored:
     /profile keeps reporting the active profile and the default home,
