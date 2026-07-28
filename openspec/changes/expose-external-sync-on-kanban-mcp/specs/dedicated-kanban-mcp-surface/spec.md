@@ -314,12 +314,66 @@ handlers, FastMCP registration, instructions и mode gating, но MUST NOT
 ### Requirement: Standalone rollout управляется одним fail-closed helper
 
 Репозиторий SHALL предоставлять один stdlib-only helper
-`scripts/hermes_kanban_mcp_rollout.py` с командами `prepare`, `switch` и
-`rollback`. Каждая команда MUST работать в dry-run mode по умолчанию и MUST
-писать только при явном `--apply`. Helper MUST принимать только явные
-абсолютные source/runtime/state/wrapper paths, полные current/candidate Git
-SHA и ожидаемый текущий wrapper SHA-256; он MUST NOT читать `.env`,
-credentials, tokens, sessions, live DB или Hermes state.
+`scripts/hermes_kanban_mcp_rollout.py` с командами `bootstrap-prepare`,
+`prepare`, `switch` и `rollback`. Каждая команда MUST работать в dry-run mode
+по умолчанию и MUST писать только при явном `--apply`. Helper MUST принимать
+только явные абсолютные source/runtime/state/wrapper paths, полные
+current/candidate Git SHA и ожидаемые SHA-256 evidence; он MUST NOT читать
+`.env`, credentials, tokens, sessions, live DB или неуказанный Hermes state.
+
+#### Scenario: Bootstrap dry-run планирует переход из export в baseline
+
+- **WHEN** оператор вызывает `bootstrap-prepare` без `--apply` с exact export
+  manifest path, source commit, venv/interpreter и wrapper evidence
+- **THEN** helper печатает derived state root, baseline path,
+  `bootstrap-<SOURCE_COMMIT>` snapshot ID, observed manifest SHA-256 и wrapper
+  хэши `before/after`
+- **AND** state root, baseline, snapshot и stable wrapper не создаются и не
+  изменяются
+
+#### Scenario: Bootstrap apply создаёт baseline без переключения
+
+- **WHEN** state root отсутствует, его canonical parent существует и все
+  evidence совпадают
+- **AND** оператор передал manifest SHA-256, одобренный по dry-run plan
+- **AND** оператор вызывает `bootstrap-prepare --apply`
+- **THEN** helper эксклюзивно создаёт exact state root mode `0700`
+- **AND** создаёт detached baseline
+  `<state-root>/hermes-kanban-mcp-<SOURCE_COMMIT>` с exact HEAD и clean
+  состоянием отслеживаемых файлов
+- **AND** копирует только выбранный top-level venv
+- **AND** создаёт bootstrap snapshot, но не меняет stable wrapper
+- **AND** не запускает процессы, services, network или DB actions
+
+#### Scenario: Bootstrap apply без pinned manifest hash отклоняется
+
+- **WHEN** оператор вызывает `bootstrap-prepare --apply` без
+  `--expected-export-manifest-sha256`
+- **THEN** helper завершается до создания state root
+- **AND** dry-run без этого аргумента остаётся разрешённым для получения
+  наблюдаемого хэша
+
+#### Scenario: Экспортный манифест разбирается как строки `key=value`
+
+- **WHEN** `bootstrap-prepare` читает `manifest.txt`, являющийся обычным
+  файлом без символьных ссылок строго внутри экспортированной среды
+- **AND** файл содержит непустые строки `key=value` в корректной кодировке
+  `UTF-8`, уникальные непустые ключи и не содержит `NUL`
+- **AND** `source_commit` присутствует ровно один раз, является полным
+  `Git SHA` и равен явно переданному `--expected-source-commit`
+- **THEN** helper принимает манифест и использует `source_commit` как
+  идентичность исходного объекта
+- **AND** неизвестные ключи разрешены, но их значения не выводятся и не
+  копируются в снимок
+
+#### Scenario: Повреждённый экспортный манифест отклоняется
+
+- **WHEN** `manifest.txt` содержит пустую строку, строку без `=`, пустой или
+  повторяющийся ключ, ошибочный `UTF-8`, `NUL`, отсутствующий либо
+  несовпадающий `source_commit`
+- **THEN** пробный запуск и `--apply` завершаются до любого примитива записи
+- **AND** отдельная политика манифеста, общая система конфигурации или
+  библиотека схем не создаётся
 
 #### Scenario: Prepare dry-run только печатает полный план
 
@@ -379,20 +433,68 @@ credentials, tokens, sessions, live DB или Hermes state.
   либо неожиданный существующий candidate
 - **THEN** helper отклоняет план до любого write primitive
 
+### Requirement: Snapshot schema различает export bootstrap и обычный rollout
+
+Helper MUST использовать только `schema_version=2` с
+`snapshot_kind=bootstrap|rollout` и общей before/after runtime model.
+Bootstrap snapshot MUST закреплять export manifest path/byte SHA-256 и
+`source_commit`; rollout snapshot MUST иметь Git before/after runtimes.
+Schema v1 backward compatibility MUST NOT добавляться, пока dedicated live
+state root и snapshots отсутствуют. Существующий state root или schema v1
+artifact MUST закрывать bootstrap apply без migration или cleanup.
+
+#### Scenario: Bootstrap manifest закрепляет оба runtime identity
+
+- **WHEN** `bootstrap-prepare --apply` завершён во временном дереве
+- **THEN** manifest имеет `schema_version=2` и
+  `snapshot_kind=bootstrap`
+- **AND** before runtime имеет kind `export`, pinned manifest path/hash и
+  `source_commit`
+- **AND** after runtime имеет kind `git`, exact baseline path и тот же commit
+- **AND** wrapper replacement count равен ровно одному
+
+#### Scenario: Обычный prepare создаёт rollout manifest schema v2
+
+- **WHEN** обычный `prepare --apply` строит target из exact Git baseline
+- **THEN** manifest имеет `snapshot_kind=rollout`
+- **AND** before/after runtimes имеют kind `git` и разные exact commit SHA
+- **AND** export manifest fields равны JSON `null`
+
+#### Scenario: Один consumer проверяет bootstrap switch
+
+- **WHEN** `switch` или `rollback` читает bootstrap snapshot
+- **THEN** общий snapshot validator повторно проверяет export manifest
+  хэш/`source_commit`, `venv` экспорта, точный `Git HEAD` базовой среды и `tracked`
+  cleanliness и baseline venv
+- **AND** общий atomic transition primitive выбирает `wrapper.after` для
+  switch или `wrapper.before` для rollback
+- **AND** отдельная bootstrap switch/rollback policy не существует
+
+#### Scenario: Unified root остаётся exact-contained
+
+- **WHEN** baseline и target должны жить в dedicated state root
+- **THEN** helper разрешает `runtime-root == state-root`
+- **AND** runtime paths выводятся только как
+  `hermes-kanban-mcp-<FULL_GIT_SHA>`
+- **AND** snapshots выводятся только как `snapshots/<VALID_SNAPSHOT_ID>`
+- **AND** разные nested runtime/state roots по-прежнему отклоняются
+
 ### Requirement: Helper проверяется только во временном окружении
 
 Automated tests helper MUST находиться в
-`tests/scripts/test_hermes_kanban_mcp_rollout.py`, MUST использовать только
-временный Git repo/runtime/state/wrapper и MUST запускаться через
+`tests/scripts/test_hermes_kanban_mcp_rollout.py` и отдельном
+`tests/scripts/test_hermes_kanban_mcp_bootstrap.py`, MUST использовать только
+временный Git repo/export/runtime/state/wrapper и MUST запускаться через
 `scripts/run_tests.sh`. Tests MUST проверять поведение helper вызовом его
-Python API/CLI, а не чтением source text. Automated suite MUST NOT выполнять
-live apply, обращаться к live/staging/Hermes paths, запускать MCP/Hermes/Gurra
-process, читать secrets или изменять DB/services.
+Python API/CLI, а не чтением source text. Каждый source/test file MUST
+содержать меньше 1000 строк. Automated suite MUST NOT выполнять live apply,
+обращаться к live/staging/Hermes paths, запускать MCP/Hermes/Gurra process,
+читать secrets или изменять DB/services.
 
 #### Scenario: Dry-run oracle доказывает отсутствие записи
 
-- **WHEN** temp-only suite выполняет `prepare`, `switch` и `rollback` без
-  `--apply`
+- **WHEN** temp-only suite выполняет `bootstrap-prepare`, `prepare`, `switch`
+  и `rollback` без `--apply`
 - **THEN** полный filesystem oracle до/после каждой команды идентичен
 - **AND** ни один write primitive не вызывается
 
@@ -405,6 +507,25 @@ process, читать secrets или изменять DB/services.
 - **AND** rollback восстанавливает byte-identical `wrapper.before` и mode
 - **AND** stale/tampered/hash/path failure cases не изменяют wrapper
 
+#### Scenario: Bootstrap lifecycle проверяется end-to-end
+
+- **WHEN** набор тестов создаёт во временном каталоге экспортированную среду
+  вне `Git`, `manifest.txt` с ключами `source_commit`, `deployed_utc`,
+  `python_version`, `mcp_version`, `command`, фиктивный `venv`, `wrapper` и
+  репозиторий источника с расходящимися коммитами источника и цели
+- **THEN** bootstrap создаёт exact baseline/snapshot без switch
+- **AND** switch переводит wrapper export→baseline
+- **AND** rollback byte-for-byte возвращает export wrapper и mode
+- **AND** обычный prepare после bootstrap может построить target из baseline
+
+#### Scenario: Ошибки формата экспортного манифеста проверяются локально
+
+- **WHEN** набор тестов по отдельности создаёт дубликат ключа, повреждённую
+  строку, `NUL` или несовпадение `source_commit`
+- **THEN** каждый случай отклоняется до записи
+- **AND** все входы и результаты остаются только во временном каталоге без
+  чтения рабочих путей
+
 #### Scenario: Тесты не используют live targets
 
 - **WHEN** focused helper tests завершены
@@ -415,11 +536,12 @@ process, читать secrets или изменять DB/services.
 ### Requirement: Изменение не требует DB migration и отделено от live rollout
 
 Forward-port и новый tool MUST использовать существующую схему Kanban DB и
-MUST NOT добавлять migration. Implementation SHALL доставляться сначала
-отдельным task-owned PR. Rollout helper SHALL доставляться вторым отдельным
-task-owned PR без live effects. Новый immutable runtime, snapshot, точечное
-переключение MCP wrapper, запуск нового MCP process и smoke MUST требовать
-отдельного post-helper-merge approval.
+MUST NOT добавлять migration. PR #15 и rollout-helper PR #16 SHALL оставаться
+закрытыми delivery steps. Bootstrap-helper SHALL доставляться третьим
+отдельным task-owned PR без live effects. Новый state root, immutable
+baseline/target, snapshot, точечное переключение MCP wrapper, запуск нового
+MCP process и smoke MUST требовать отдельного post-bootstrap-helper-merge
+approval.
 
 #### Scenario: Изменения проверяются до PR
 
@@ -429,20 +551,22 @@ task-owned PR без live effects. Новый immutable runtime, snapshot, то�
 - **AND** diff не добавляет зависимостей
 - **AND** task-owned PR является первым delivery step
 
-#### Scenario: Helper PR не выполняет rollout
+#### Scenario: Bootstrap-helper PR не выполняет rollout
 
-- **WHEN** helper и temp-only tests реализованы и проверены
+- **WHEN** bootstrap capability, schema v2 и temp-only tests реализованы и
+  проверены
 - **THEN** diff не содержит production module/script/test changes вне exact
   областей helper/test/OpenSpec
-- **AND** live candidate, snapshot, wrapper switch, process и smoke не
-  выполняются
-- **AND** helper PR является отдельным delivery step после PR #15
+- **AND** действующий корень состояния, базовая среда, целевая среда, снимок, переключение `wrapper`,
+  process и smoke не выполняются
+- **AND** bootstrap-helper PR является отдельным delivery step после PR #16
 
 #### Scenario: Доставка после слияния остаётся закрыта
 
-- **WHEN** PR #15 и helper PR слиты
-- **THEN** новый immutable runtime ещё не создаётся
-- **AND** snapshot, MCP wrapper, process или smoke ещё не выполняются без
-  отдельного одобрения exact dry-run plan
+- **WHEN** bootstrap-helper PR слит
+- **THEN** state root, baseline, target и snapshot ещё не создаются
+- **AND** `bootstrap-prepare --apply`, обычный `prepare --apply`, wrapper
+  switch, process или smoke ещё не выполняются без отдельного одобрения exact
+  `dry-run`-плана
 - **AND** глобальный Hermes symlink, Hermes/Gurra restart и dirty Telegram
   patch остаются вне scope

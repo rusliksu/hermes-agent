@@ -199,7 +199,6 @@ def layout(tmp_path: Path) -> Layout:
     source = tmp_path / "source"
     runtime_root = tmp_path / "runtimes"
     state_root = tmp_path / "rollout-state"
-    current_runtime = runtime_root / "current-runtime"
     stable_wrapper = tmp_path / "bin" / "hermes-kanban-mcp"
     source.mkdir()
     runtime_root.mkdir()
@@ -214,6 +213,7 @@ def layout(tmp_path: Path) -> Layout:
     _git(source, "add", "payload.txt")
     _git(source, "commit", "-m", "current")
     current_sha = _git(source, "rev-parse", "HEAD")
+    current_runtime = runtime_root / f"hermes-kanban-mcp-{current_sha}"
     payload.write_text("candidate\n", encoding="utf-8")
     _git(source, "commit", "-am", "candidate")
     candidate_sha = _git(source, "rev-parse", "HEAD")
@@ -255,9 +255,9 @@ def _forbid_write_primitives(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rollout, "_create_candidate", forbidden)
     monkeypatch.setattr(rollout, "_copy_venv", forbidden)
     monkeypatch.setattr(rollout, "_write_snapshot", forbidden)
-    monkeypatch.setattr(rollout, "_atomic_replace", forbidden)
+    monkeypatch.setattr(rollout.state, "_atomic_replace", forbidden)
     monkeypatch.setattr(rollout.shutil, "copytree", forbidden)
-    monkeypatch.setattr(rollout.tempfile, "mkstemp", forbidden)
+    monkeypatch.setattr(rollout.state.tempfile, "mkstemp", forbidden)
     monkeypatch.setattr(rollout.os, "replace", forbidden)
     original_git = rollout._run_git
 
@@ -338,11 +338,15 @@ def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible
         "source_repo",
         "runtime_root",
         "state_root",
-        "current_runtime",
-        "candidate_path",
+        "before_runtime_path",
+        "after_runtime_path",
         "stable_wrapper",
     ):
         assert Path(manifest[key]).is_relative_to(layout.root)
+    assert manifest["schema_version"] == 2
+    assert manifest["snapshot_kind"] == "rollout"
+    assert manifest["before_manifest_path"] is None
+    assert manifest["before_manifest_sha256"] is None
     assert (layout.snapshot_path / "wrapper.before").read_bytes() == layout.wrapper_before
 
     _assert_dry_run(
@@ -423,7 +427,7 @@ def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible
         ),
         lambda layout, args: _replace_option(args, "--runtime-root", "runtimes"),
         lambda layout, args: _replace_option(
-            args, "--state-root", str(layout.runtime_root)
+            args, "--state-root", str(layout.current_runtime)
         ),
         lambda layout, args: _replace_option(
             args, "--runtime-root", str(layout.source)
@@ -440,7 +444,7 @@ def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible
         "stale-current-runtime-sha",
         "candidate-matches-current",
         "relative-path",
-        "same-managed-roots",
+        "nested-managed-roots",
         "source-repo-as-managed-root",
         "current-runtime-outside-root",
         "broad-nested-runtime-root",
@@ -611,8 +615,8 @@ def test_switch_rejects_tampered_prepared_state_without_changing_wrapper(
 @pytest.mark.parametrize(
     "field",
     [
-        "current_runtime",
-        "candidate_path",
+        "before_runtime_path",
+        "after_runtime_path",
         "source_repo",
         "runtime_root",
         "state_root",
@@ -638,8 +642,8 @@ def test_switch_rejects_schema_valid_manifest_path_substitutions(
     alternate_wrapper.write_bytes(layout.wrapper_before)
     alternate_wrapper.chmod(layout.wrapper_mode)
     substitutions = {
-        "current_runtime": str(layout.candidate_path),
-        "candidate_path": str(layout.current_runtime),
+        "before_runtime_path": str(layout.candidate_path),
+        "after_runtime_path": str(layout.current_runtime),
         "source_repo": str(other_source),
         "runtime_root": str(layout.state_root),
         "state_root": str(layout.runtime_root),
@@ -673,7 +677,7 @@ def test_partial_prepare_failures_keep_only_exact_fail_closed_artifacts(
     stage: str,
 ) -> None:
     before = _content_oracle(layout.root)
-    original_write = rollout._write_exclusive_file
+    original_write = rollout.state._write_exclusive_file
 
     def fail_after_snapshot_file(path: Path, data: bytes) -> None:
         original_write(path, data)
@@ -698,7 +702,9 @@ def test_partial_prepare_failures_keep_only_exact_fail_closed_artifacts(
                 ),
             )
         else:
-            failure.setattr(rollout, "_write_exclusive_file", fail_after_snapshot_file)
+            failure.setattr(
+                rollout.state, "_write_exclusive_file", fail_after_snapshot_file
+            )
         assert rollout.main(layout.prepare_args(apply=True)) == 2
     capsys.readouterr()
 
@@ -760,7 +766,7 @@ def test_atomic_pre_replace_failures_remove_exact_temporary_file(
     assert rollout.main(layout.prepare_args(apply=True)) == 0
     capsys.readouterr()
     before = layout.stable_wrapper.read_bytes()
-    original_read = rollout._read_wrapper
+    original_read = rollout.state.read_wrapper
     stable_reads = 0
 
     def fail_latest_guard(path: Path) -> rollout.Wrapper:
@@ -790,7 +796,7 @@ def test_atomic_pre_replace_failures_remove_exact_temporary_file(
                 ),
             )
         elif failure_point == "latest-guard":
-            failure.setattr(rollout, "_read_wrapper", fail_latest_guard)
+            failure.setattr(rollout.state, "read_wrapper", fail_latest_guard)
         else:
             failure.setattr(
                 rollout.os,
@@ -816,7 +822,7 @@ def test_atomic_cleanup_failure_preserves_primary_error_and_warns_safely(
     assert rollout.main(layout.prepare_args(apply=True)) == 0
     capsys.readouterr()
     created: list[Path] = []
-    original_mkstemp = rollout.tempfile.mkstemp
+    original_mkstemp = rollout.state.tempfile.mkstemp
 
     def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
         descriptor, name = original_mkstemp(*args, **kwargs)
@@ -824,7 +830,7 @@ def test_atomic_cleanup_failure_preserves_primary_error_and_warns_safely(
         return descriptor, name
 
     with monkeypatch.context() as failure:
-        failure.setattr(rollout.tempfile, "mkstemp", recording_mkstemp)
+        failure.setattr(rollout.state.tempfile, "mkstemp", recording_mkstemp)
         failure.setattr(
             rollout.os,
             "replace",
@@ -873,7 +879,7 @@ def test_post_replace_failures_report_applied_state_and_expected_hash(
     wrapper_after = (layout.snapshot_path / "wrapper.after").read_bytes()
     expected_hash = _hash(wrapper_after)
     original_fsync = rollout.os.fsync
-    original_read = rollout._read_wrapper
+    original_read = rollout.state.read_wrapper
     fsync_calls = 0
 
     def fail_directory_fsync(descriptor: int) -> None:
@@ -893,7 +899,7 @@ def test_post_replace_failures_report_applied_state_and_expected_hash(
         if failure_point == "directory-fsync":
             failure.setattr(rollout.os, "fsync", fail_directory_fsync)
         else:
-            failure.setattr(rollout, "_read_wrapper", fail_installed_read)
+            failure.setattr(rollout.state, "read_wrapper", fail_installed_read)
         assert rollout.main(
             layout.transition_args("switch", layout.wrapper_before_hash, apply=True)
         ) == 2
@@ -911,3 +917,62 @@ def test_post_replace_failures_report_applied_state_and_expected_hash(
     assert layout.stable_wrapper.read_bytes() == wrapper_after
     assert stat.S_IMODE(layout.stable_wrapper.stat().st_mode) == layout.wrapper_mode
     assert _rollout_temporary_paths(layout) == ()
+
+
+def test_unified_root_rollout_uses_schema_v2_and_remains_reversible(
+    layout: Layout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    layout.state_root.rmdir()
+    layout.state_root = layout.runtime_root
+    assert rollout.main(layout.prepare_args(apply=True)) == 0
+    capsys.readouterr()
+    manifest = json.loads((layout.snapshot_path / "manifest.json").read_text())
+    assert manifest["schema_version"] == 2
+    assert manifest["snapshot_kind"] == "rollout"
+    assert manifest["runtime_root"] == manifest["state_root"] == str(layout.runtime_root)
+    wrapper_after = (layout.snapshot_path / "wrapper.after").read_bytes()
+    after_hash = _hash(wrapper_after)
+    assert rollout.main(
+        layout.transition_args("switch", layout.wrapper_before_hash, apply=True)
+    ) == 0
+    capsys.readouterr()
+    assert layout.stable_wrapper.read_bytes() == wrapper_after
+    assert rollout.main(layout.transition_args("rollback", after_hash, apply=True)) == 0
+    capsys.readouterr()
+    assert layout.stable_wrapper.read_bytes() == layout.wrapper_before
+
+
+def test_schema_v1_snapshot_is_rejected(
+    layout: Layout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert rollout.main(layout.prepare_args(apply=True)) == 0
+    capsys.readouterr()
+    manifest_path = layout.snapshot_path / "manifest.json"
+    prepared = json.loads(manifest_path.read_text())
+    manifest_v1 = {
+        "schema_version": 1,
+        "created_at": prepared["created_at"],
+        "source_repo": prepared["source_repo"],
+        "runtime_root": prepared["runtime_root"],
+        "state_root": prepared["state_root"],
+        "current_runtime": prepared["before_runtime_path"],
+        "current_runtime_sha": prepared["before_runtime_sha"],
+        "candidate_sha": prepared["after_runtime_sha"],
+        "candidate_path": prepared["after_runtime_path"],
+        "snapshot_id": prepared["snapshot_id"],
+        "stable_wrapper": prepared["stable_wrapper"],
+        "venv_dirname": prepared["venv_dirname"],
+        "venv_interpreter_sha256": prepared["venv_interpreter_sha256"],
+        "venv_interpreter_mode": prepared["venv_interpreter_mode"],
+        "wrapper_before_sha256": prepared["wrapper_before_sha256"],
+        "wrapper_after_sha256": prepared["wrapper_after_sha256"],
+        "wrapper_mode": prepared["wrapper_mode"],
+        "runtime_path_replacements": prepared["runtime_path_replacements"],
+    }
+    manifest_path.write_text(json.dumps(manifest_v1), encoding="utf-8")
+    before = layout.stable_wrapper.read_bytes()
+    assert rollout.main(
+        layout.transition_args("switch", layout.wrapper_before_hash, apply=True)
+    ) == 2
+    capsys.readouterr()
+    assert layout.stable_wrapper.read_bytes() == before

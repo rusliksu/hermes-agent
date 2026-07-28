@@ -106,15 +106,17 @@
   task-owned PR; не выполнять
   deploy, symlink switch, restart или live process changes.
 
-## 7. Сохранённый high-level гейт доставки после PR #15
+## 7. Сохранённый high-level live gate
 
-- [ ] 7.1 После merge отдельно запросить одобрение на новый immutable runtime
-  из merge SHA и зафиксировать rollback target.
-- [ ] 7.2 Только после отдельного одобрения точечно переключить MCP wrapper и
-  запустить новый MCP process; не менять глобальный Hermes symlink, не
-  перезапускать Hermes/Gurra и не переносить dirty Telegram patch.
+- [ ] 7.1 После merge bootstrap-helper PR отдельно запросить одобрение exact
+  bootstrap dry-run и зафиксировать export rollback target; merge PR не
+  считается live approval.
+- [ ] 7.2 Только после последовательных gated
+  bootstrap/prepare/switch steps точечно заменить standalone MCP process; не
+  менять глобальный Hermes symlink, не перезапускать Hermes/Gurra и не
+  переносить dirty Telegram patch.
 
-## 8. Гейт material delta отдельного helper PR
+## 8. Выполненный гейт material delta helper PR #16
 
 - [x] 8.1 Зафиксировать явное одобрение material delta: отдельный helper PR
   без live rollout; текущий запуск — только planning/OpenSpec.
@@ -123,7 +125,7 @@
   отсутствие material изменения standalone layout; при расхождении
   остановиться и оформить новый delta.
 
-## 9. Отдельный helper PR
+## 9. Выполненный helper PR #16
 
 - [x] 9.1 Добавить один `scripts/hermes_kanban_mcp_rollout.py` на Python
   stdlib с argparse-командами `prepare`, `switch`, `rollback`; отсутствие
@@ -155,7 +157,7 @@
   tokens/sessions/DB, не управляет processes/services, не использует broad
   `rm`, `rmtree`, `reset`, `clean`, globs и не меняет global Hermes symlink.
 
-## 10. Temp-only tests и проверки helper PR
+## 10. Выполненные temp-only tests и проверки PR #16
 
 - [x] 10.1 Добавить
   `tests/scripts/test_hermes_kanban_mcp_rollout.py` с временным Git repo
@@ -189,27 +191,124 @@
   после зелёных tests/review создать отдельный task-owned PR без live
   rollout.
 
-## 11. Точный live gate после merge helper PR
+## 11. Планирование существенного изменения для `PR` вспомогательного инструмента `bootstrap`
 
-- [ ] 11.1 Отдельно запросить одобрение exact dry-run plan с current/candidate
-  полными Git SHA, текущим SHA-256 wrapper, путями runtime/state/wrapper,
-  candidate path и snapshot ID; approval helper PR не считается live
-  approval.
-- [ ] 11.2 После одобрения повторить `prepare` без `--apply`, сопоставить plan
-  с одобренными exact values и остановиться при любом расхождении.
-- [ ] 11.3 Выполнить `prepare --apply`; проверить manifest hashes, current
-  rollback target, candidate exact HEAD/tracked cleanliness и candidate
-  interpreter. Stable wrapper/process/DB ещё не менять.
-- [ ] 11.4 Повторить `switch` без `--apply`, проверить stale-wrapper guard и
-  только затем выполнить `switch --apply`.
-- [ ] 11.5 Запустить или заменить только standalone Kanban MCP process;
-  глобальный Hermes symlink, Hermes/Gurra processes, services, Windows
-  config, dirty Telegram patch и live DB не менять.
-- [ ] 11.6 Выполнить bounded MCP `initialize`, exact `tools/list` 2/11 и
-  `kanban_sync_external_task` с `dry_run=true`; подтвердить отсутствие live
-  DB writes.
-- [ ] 11.7 При провале switch/process/smoke выполнить сначала `rollback` без
-  `--apply`, затем `rollback --apply`, вернуть только предыдущий standalone
-  MCP process и повторить bounded smoke.
-- [ ] 11.8 Сохранить evidence exact plan/manifest/hashes/process/smoke или
-  rollback outcome; candidate и snapshot не удалять автоматически.
+- [x] 11.1 Зафиксировать предоставленный evidence без повторного чтения live
+  пути: экспорт вне `Git`, `SHA` источника, кандидата и базы слияния, хэши `wrapper/venv`
+  и отсутствие dedicated state root/baseline/target.
+- [x] 11.2 Зафиксировать material divergence: schema v1 не представляет
+  export→Git переход с одинаковым source SHA; перейти на schema v2 variants и
+  unified runtime/state root без второй switch/rollback policy.
+- [x] 11.3 Обновить на русском proposal, design, capability spec, tasks и
+  README этого change; сохранить выполненные PR #15/#16 tasks закрытыми.
+- [x] 11.4 Выполнить `openspec status`, strict validation и
+  `git diff --check`; implementation files/tests не менять.
+
+## 12. Реализация отдельного bootstrap-helper PR
+
+Baseline реализации явно одобрен пользователем 2026-07-28.
+
+- [x] 12.1 Добавить в `scripts/hermes_kanban_mcp_rollout.py` exact CLI
+  `bootstrap-prepare` с обязательными source repo, absent state root, export
+  runtime/manifest, source commit, venv/interpreter и stable wrapper evidence;
+  экспортный манифест проверять как обычный файл без символьных ссылок строго
+  внутри экспортированной среды и разбирать как непустые строки `key=value` в
+  `UTF-8`. Запретить пустой или повторяющийся ключ, повреждённую строку и
+  `NUL`; потребовать `source_commit` ровно один раз как полный `Git SHA`,
+  равный явно ожидаемому значению. Неизвестные ключи разрешать, но их значения
+  не выводить и не переносить в снимок. Пробный запуск печатает наблюдаемый
+  `SHA-256` сырых байтов, а `--apply` требует его явное ожидаемое значение.
+- [x] 12.2 Реализовать `bootstrap-prepare --apply`: exclusive state root mode
+  `0700` при validated existing parent, exact detached baseline worktree,
+  copy-only выбранного venv и stable wrapper unchanged.
+- [x] 12.3 Вынести schema/snapshot/transition ownership в
+  `scripts/hermes_kanban_mcp_rollout_state.py`; перевести новые bootstrap и
+  обычные rollout snapshots на exact schema v2 без schema v1 compatibility.
+- [x] 12.4 Перевести существующие `switch/rollback` на один общий schema v2
+  loader/validator и существующий atomic replacement primitive; для
+  bootstrap повторно проверять export manifest/venv и baseline exact
+  `HEAD`, чистоту отслеживаемых файлов и `venv`.
+- [x] 12.5 Разрешить только exact equality `runtime-root == state-root` для
+  unified layout; сохранить запрет разных nested roots, symlink/broad/path
+  escape и exact temp unlink policy.
+- [x] 12.6 Подтвердить stdlib-only implementation без dependencies,
+  общей системы конфигурации, библиотеки схем, второй политики манифеста,
+  операций с процессами, сервисами, сетью и БД, широкого удаления, `reset`,
+  `clean`, `rmtree` или шаблонов путей.
+
+## 13. Тесты только во временной среде для `PR` вспомогательного инструмента `bootstrap`
+
+- [x] 13.1 Добавить
+  `tests/scripts/test_hermes_kanban_mcp_bootstrap.py` с non-Git export,
+  `manifest.txt` в формате `UTF-8` строк `key=value` с фактическими ключами
+  `source_commit`, `deployed_utc`, `python_version`, `mcp_version`, `command`,
+  расходящимися коммитами источника и цели, фиктивным `venv` и `wrapper`
+  только во временном каталоге.
+- [x] 13.2 Проверить `bootstrap-prepare` dry-run полным filesystem oracle и
+  запретом write primitives; state root до apply отсутствует.
+- [x] 13.3 Проверить apply: exact state root mode `0700`, baseline detached
+  HEAD/tracked cleanliness, copy-only venv, schema v2 bootstrap snapshot и
+  неизменный стабильный `wrapper`.
+- [x] 13.4 Проверить закрытие при дубликате ключа, повреждённой или пустой
+  строке, пустом ключе, `NUL`, ошибке `UTF-8`, отсутствующем/несовпадающем
+  `source_commit`, изменении сырых байтов/`SHA-256` и символьной ссылке
+  манифеста; отдельно проверить разрешённый неизвестный ключ без вывода или
+  копирования его значения. Сохранить проверки ровно одной замены `wrapper`,
+  `venv/interpreter`, `path/root`, существующего/частичного состояния и
+  отсутствия автоматической очистки.
+- [x] 13.5 Проверить bootstrap switch/rollback end-to-end через общий
+  consumer: repeated export/baseline evidence, wrapper export→baseline и
+  побайтово идентичный откат `baseline→export`.
+- [x] 13.6 Обновить
+  `tests/scripts/test_hermes_kanban_mcp_rollout.py` для schema v2 regression и
+  unified-root baseline→target обычного prepare/switch/rollback.
+- [x] 13.7 Удержать каждый source/test file ниже 1000 строк и не добавлять
+  tests, читающие source text.
+- [x] 13.8 Запустить оба focused test files только через
+  `scripts/run_tests.sh`; подтвердить, что artifacts не выходят из temp
+  directories.
+- [x] 13.9 Закрыть два `P3` validation gap из независимого ревью
+  `APPROVE WITH RISKS` без blockers: проверить настоящий schema v1 manifest
+  по контракту base `9fcd666`, а также отклонение отсутствующего state root
+  с symlink parent и broad target до write primitives. Production source не
+  потребовал изменений; focused suite — `73 passed`, `py_compile` и
+  `git diff --check` зелёные, максимальный размер файла — `978` строк.
+
+## 14. Review и отдельный bootstrap-helper PR
+
+- [x] 14.1 Проверить exact diff scope: два helper source files, два helper
+  test files и этот OpenSpec change; без production modules, dependencies,
+  DB migration, live config/wrapper/runtime/state или service artifacts.
+- [x] 14.2 Выполнить strict OpenSpec validation, `git diff --check` и
+  независимое code review без `BLOCK`.
+- [ ] 14.3 Создать отдельный task-owned bootstrap-helper PR без live effects;
+  не выполнять commit/push/PR в planning run.
+- [ ] 14.4 Зафиксировать в PR и handoff: merge bootstrap-helper PR не
+  разрешает никакой live apply.
+
+## 15. Новый точный live gate после merge bootstrap-helper PR
+
+- [ ] 15.1 Отдельно подтвердить отсутствие exact dedicated state root и
+  schema v1 artifacts; при наличии остановиться и оформить material replan.
+- [ ] 15.2 Выполнить только `bootstrap-prepare` dry-run, сопоставить export
+  manifest SHA-256/source commit, wrapper/venv evidence и derived
+  baseline/snapshot paths с отдельным approval.
+- [ ] 15.3 Только после нового approval выполнить
+  `bootstrap-prepare --apply`; проверить schema v2 snapshot, exact baseline
+  HEAD/tracked cleanliness/venv и неизменный stable wrapper.
+- [ ] 15.4 Выполнить bootstrap `switch` dry-run и только после отдельного
+  подтверждения — `switch --apply`; wrapper должен atomically repoint
+  путь из `export` в `baseline`.
+- [ ] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
+  только после отдельного gate `prepare --apply`; проверить target и rollout
+  снимок со `schema_version=2`.
+- [ ] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
+  глобальный Hermes symlink, connector config, DB или services.
+- [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
+  Kanban MCP process и выполнить bounded initialize/tools-list/dry-run sync
+  smoke без DB writes.
+- [ ] 15.8 При любом провале использовать соответствующий schema v2 rollback
+  сначала dry-run, затем gated apply; восстановить wrapper byte-identically,
+  не удаляя baseline/target/snapshots.
+- [ ] 15.9 Сохранить exact plan/manifest/hash/process/smoke или rollback
+  evidence. Ни merge PR, ни planning approval не считаются live approval.
