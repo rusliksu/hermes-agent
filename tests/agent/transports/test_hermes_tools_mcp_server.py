@@ -9,10 +9,15 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
+import sys
+from types import ModuleType
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    EXPOSED_TOOLS,
+    KANBAN_EXTERNAL_SYNC_TOOL,
     _signature_from_schema,
+    kanban_sync_external_task,
 )
 
 
@@ -215,6 +220,50 @@ class TestModuleSurface:
             assert orch_tool in EXPOSED_TOOLS, (
                 f"{orch_tool!r} missing from codex callback"
             )
+
+    def test_external_sync_tool_exposed_with_guarded_schema(self, monkeypatch):
+        registered = {}
+
+        class FakeFastMCP:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def add_tool(self, handler, *, name, description):
+                registered[name] = handler
+
+        mcp_module = ModuleType("mcp")
+        server_module = ModuleType("mcp.server")
+        fastmcp_module = ModuleType("mcp.server.fastmcp")
+        fastmcp_module.FastMCP = FakeFastMCP
+        model_tools = ModuleType("model_tools")
+        model_tools.get_tool_definitions = lambda quiet_mode: []
+        model_tools.handle_function_call = lambda name, args: "{}"
+        monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+        monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+        monkeypatch.setitem(sys.modules, "model_tools", model_tools)
+
+        from agent.transports.hermes_tools_mcp_server import _build_server
+
+        _build_server()
+
+        assert registered[KANBAN_EXTERNAL_SYNC_TOOL] is kanban_sync_external_task
+        signature = inspect.signature(registered[KANBAN_EXTERNAL_SYNC_TOOL])
+        required = {
+            name
+            for name, param in signature.parameters.items()
+            if param.default is inspect.Parameter.empty
+        }
+        assert required == {
+            "external_key",
+            "source_path",
+            "title",
+            "assignee",
+            "desired_status",
+            "dry_run",
+        }
+        assert signature.parameters["expected_current_status"].default is None
+        assert KANBAN_EXTERNAL_SYNC_TOOL not in EXPOSED_TOOLS
 
 
 class TestMain:
