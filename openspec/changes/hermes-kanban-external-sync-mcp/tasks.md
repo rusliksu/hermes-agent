@@ -22,7 +22,7 @@
 - [x] 4.1 Запустить affected tests через `scripts/run_tests.sh`.
 - [x] 4.2 Проверить `git diff` на отсутствие новой sync-логики, dependencies, DB schema changes, deploy/restart scripts и credential/task-body output.
 - [x] 4.3 Запустить strict OpenSpec validation.
-- [ ] 4.4 Открыть task-owned PR после зелёных проверок и verified diff.
+- [x] 4.4 Открыть task-owned PR после зелёных проверок и verified diff.
 
 ## 5. Отдельный live gate
 
@@ -48,4 +48,6 @@
   deploy/restart scripts и обычная Hermes tool registration не менялись.
 - Проверка: `openspec validate hermes-kanban-external-sync-mcp --type change --strict --no-interactive`
   — успешно.
-- PR и live rollout не выполнялись по явному ограничению текущего packet.
+- PR: task-owned draft PR https://github.com/rusliksu/hermes-agent/pull/12
+  создан из head `9264b53d65990f0fe34d6278626657e911000a66` в `main` после
+  зелёных проверок; live rollout не выполнялся.
