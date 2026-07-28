@@ -40,23 +40,37 @@ read-only URI с `immutable=1` может игнорировать uncheckpointe
 соответствующие решения; его точный WAL-контракт повторно явно одобрен.
 
 После закрытия этих замечаний реализация была слита как PR #15 на exact
-commit `062f2f0f1f6947830d1b222a3ef470e145a7c34d`. Этот commit является
-текущим base task-owned worktree и сохраняет завершённую историю секций 1–6
-`tasks.md`. Live rollout после merge не выполнялся. Новый одобренный material
-delta касается только репозиторного helper PR, который делает оставшийся
-standalone rollout воспроизводимым и rollback-ready; текущий запуск остаётся
-planning-only.
+коммите `062f2f0f1f6947830d1b222a3ef470e145a7c34d`. Защищённый вспомогательный инструмент
+`prepare/switch/rollback` затем был слит отдельным PR #16 на exact commit
+`9fcd66651768e3cf220d5cd501efbec5ae3e2550`. Выполненные sections 1–10
+`tasks.md` сохраняются закрытыми. Live rollout после merge не выполнялся.
 
-Разрешённая repo-only проверка подтверждает текущий standalone контракт:
-внешний стабильный wrapper запускает CLI
-`hermes mcp serve-kanban --allow-write` из отдельного immutable Git runtime;
-в репозитории нет deploy/rollback helper для этого wrapper. Сам live wrapper,
-staging runtime, процессы и Hermes state в этом planning запуске не читались
-и не инспектировались. Поэтому helper не кодирует live paths и не угадывает
-состояние: он принимает их только явно вместе с exact SHA/hash и отклоняет
-неподдерживаемый layout. Пункт 8.2 требует material replan, если последующий
-разрешённый dry-run обнаружит расхождение с regular-wrapper/immutable-runtime
-контрактом.
+Новый material delta основан только на явно предоставленном evidence; live
+пути в planning run повторно не читались. Evidence фиксирует:
+
+- export runtime `/home/openclaw/.hermes/mcp/hermes-kanban` не является Git
+  worktree;
+- экспортный манифест
+  `/home/openclaw/.hermes/mcp/hermes-kanban/manifest.txt` использует формат
+  строк `key=value` в `UTF-8` и содержит
+  `source_commit=6f8738dc308f909bf1735883344f2fcc12f3cbcd`;
+- candidate main равен
+  `9fcd66651768e3cf220d5cd501efbec5ae3e2550`; source/candidate histories не
+  находятся в ancestor relation, merge-base равен
+  `9de9c25f620ff7f1ce0fd5457d596052d5159596`;
+- wrapper SHA-256 равен
+  `20e2cb13c7162a833fea32f79aea59591e759c4ca2ab181e0c0a12f0e3add089` и
+  содержит ровно одну ссылку на export runtime;
+- venv dirname равен `venv`, interpreter SHA-256 равен
+  `1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118`;
+- выделенный каталог `/home/openclaw/.hermes/mcp-rollout-state`, вычисленная базовая среда
+  `hermes-kanban-mcp-6f873...` и target `hermes-kanban-mcp-9fcd...`
+  отсутствуют.
+
+Обычный `prepare` из PR #16 намеренно требует current runtime как exact clean
+Git worktree. Поэтому он не должен ослаблять этот guard для export layout.
+Нужен отдельный bootstrap contract, который сначала создаёт immutable exact
+Git baseline, не заменяя export in-place и не меняя stable wrapper.
 
 ## Цели / вне целей
 
@@ -89,6 +103,12 @@ staging runtime, процессы и Hermes state в этом planning запу�
   фазе;
 - проверить helper только во временных Git/runtime деревьях без live process,
   DB, wrapper, service или secret access.
+- добавить одну dry-run-first команду `bootstrap-prepare`, которая создаёт
+  exact Git baseline из non-Git export evidence до обычного `prepare`;
+- сохранить одну общую schema/validation/atomic transition policy для
+  bootstrap и обычных snapshots;
+- удержать каждый source/test file ниже 1000 строк через одну реальную
+  ownership extraction, а не thin wrappers.
 
 **Вне целей:**
 
@@ -111,6 +131,10 @@ staging runtime, процессы и Hermes state в этом planning запу�
   dependency installer, package builder или поддержка произвольных layout;
 - перенос незакоммиченных tracked файлов, untracked runtime state, `.env`,
   credentials, tokens, sessions или иных secret/state файлов в candidate.
+- замена export runtime in-place, его превращение в Git worktree или удаление;
+- ancestry/rebase/merge между source commit и candidate main;
+- live state root, baseline, snapshot, prepare, switch, process или smoke в
+  bootstrap-helper PR.
 
 ## Решения
 
@@ -345,7 +369,7 @@ Focused tests запускаются через `scripts/run_tests.sh`. Они �
 Тестовое окружение задаёт временные `HERMES_HOME`, `HOME` и
 `HERMES_KANBAN_DB`; live DB path должен быть явно исключён.
 
-### 10. Один helper и три явные фазы являются достаточным rollout API
+### 10. PR #16: один helper и три явные фазы являются rollout baseline
 
 Новый файл SHALL быть ровно
 `scripts/hermes_kanban_mcp_rollout.py`. Он использует только Python stdlib и
@@ -432,10 +456,11 @@ guard, и с `wrapper_after_sha256` manifest. После полной повто
 Альтернатива: один `rollout --apply`, объединяющий prepare и switch. Она
 отвергнута, потому что не оставляет оператору проверяемой паузы между
 созданием candidate/snapshot и live cutover. Альтернатива: shell script.
-Она отвергнута из-за более сложной fail-closed проверки путей, JSON manifest,
-hashing и temp-only unit tests.
+Она отвергнута из-за более сложной закрывающей проверки путей,
+`JSON`-манифеста снимка, хэширования и модульных тестов только во временной
+среде.
 
-### 11. Snapshot и manifest являются минимальным состоянием rollback
+### 11. PR #16: schema v1 фиксирует обычный Git-to-Git rollout
 
 Snapshot ID SHALL детерминированно иметь вид
 `<CURRENT_FULL_SHA>-to-<CANDIDATE_FULL_SHA>` и создаваться эксклюзивно под
@@ -472,7 +497,7 @@ paths, не запускает автоматический cleanup и заст�
 лишняя и потенциально захватывающая secrets/state; immutable current runtime
 плюс exact SHA и byte-identical wrapper дают достаточный rollback oracle.
 
-### 12. Path validation и тестовый oracle закрывают опасные края
+### 12. PR #16: path validation и test oracle закрывают опасные края
 
 Все пути должны быть абсолютными, без `..`, NUL и shell expansion. Managed
 roots, candidate, snapshot и stable wrapper не могут быть symlink; existing
@@ -517,6 +542,207 @@ runtime-root и state-root. Основной oracle:
 Tests запускаются только через
 `scripts/run_tests.sh tests/scripts/test_hermes_kanban_mcp_rollout.py`.
 Live apply и process/smoke отсутствуют в automated suite.
+
+### 13. `bootstrap-prepare` является единственным входом из export layout
+
+PR #16 не считается ошибочным: обычный `prepare` сохраняет Git-to-Git
+precondition. Bootstrap-helper PR SHALL добавить только одну новую команду:
+
+```text
+python scripts/hermes_kanban_mcp_rollout.py bootstrap-prepare \
+  --source-repo ABS_EXISTING_GIT_WORKTREE \
+  --state-root ABS_NONEXISTENT_PATH \
+  --export-runtime ABS_EXISTING_PATH \
+  --export-manifest ABS_EXISTING_FILE_UNDER_EXPORT \
+  [--expected-export-manifest-sha256 FULL_SHA256] \
+  --expected-source-commit FULL_GIT_SHA \
+  --venv-dirname .venv|venv \
+  --expected-venv-interpreter-sha256 FULL_SHA256 \
+  --stable-wrapper ABS_EXISTING_FILE \
+  --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--apply]
+```
+
+Отсутствие `--apply` строит полный JSON plan без write primitives. Dry-run
+MAY не получать expected manifest SHA-256: тогда он вычисляет и печатает
+наблюдаемый byte hash для exact approval. `--apply` MUST требовать
+`--expected-export-manifest-sha256` и сравнить его с текущими bytes, чтобы
+apply не принял незаметно изменившийся manifest после dry-run. Команда
+требует, чтобы state root отсутствовал, а его canonical non-symlink parent
+уже существовал и прошёл broad-target checks. `--apply` создаёт ровно этот
+leaf через exclusive `mkdir` с итоговым mode `0700`; parent, соседние paths и
+export runtime не создаются и не меняются.
+
+Экспортный манифест обязан быть обычным файлом без символьных ссылок строго
+внутри экспортированной среды. Его сырые байты сначала проверяются на
+отсутствие `NUL` и хэшируются без преобразований, затем файл строго
+декодируется как `UTF-8`. Разборщик принимает только непустые строки
+`key=value`, разделяя строку по первому `=`. Ключ обязан быть непустым и
+уникальным; пустая строка, строка без `=`, пустой ключ, повтор ключа,
+ошибка `UTF-8` или `NUL` отклоняют манифест целиком. Пустое значение и
+дополнительный `=` внутри значения разрешены.
+
+Ключ `source_commit` обязан присутствовать ровно один раз, содержать полный
+`Git SHA` и совпадать с явно переданным
+`--expected-source-commit`. Неизвестные ключи разрешены, но их значения не
+выводятся в план и не копируются в снимок. Разборщик не вводит общую систему
+конфигурации, библиотеку схем или вторую политику манифеста: это один
+локальный контракт чтения экспортного `manifest.txt`. Репозиторий источника
+обязан содержать этот точный объект коммита. Связь предок→потомок между
+источником и целью не проверяется: изолированное рабочее дерево строится по
+идентичности объекта, а не по топологии.
+
+Точный `SHA-256` сырых байтов остаётся защитой доверия независимо от разбора
+строк. Пробный запуск без ожидаемого хэша печатает наблюдаемый хэш.
+`--apply` обязан получить `--expected-export-manifest-sha256` и сравнить его
+с повторно прочитанными сырыми байтами до записи.
+
+Baseline path детерминирован:
+`<state-root>/hermes-kanban-mcp-<SOURCE_COMMIT>`. Helper создаёт его через
+`git worktree add --detach` и требует exact HEAD и пустой tracked status
+`--untracked-files=no`. Затем он переносит только exact top-level venv
+directory. Export и baseline interpreter должны совпасть с explicit
+interpreter SHA-256; executable mode export interpreter фиксируется в
+snapshot и повторно проверяется на baseline. Никакие другие export files не
+копируются.
+
+Wrapper обязан быть executable regular non-symlink UTF-8 file, совпасть с
+explicit SHA-256, содержать standalone `mcp serve-kanban --allow-write`,
+ровно один раз содержать exact export runtime path и ещё не содержать
+baseline path. `wrapper.after` является единственной byte transformation:
+одна замена exact export path на exact baseline path. Stable wrapper в
+`bootstrap-prepare` не меняется.
+
+Альтернатива: ослабить обычный `prepare`, чтобы он принимал non-Git current
+runtime. Она отвергнута: тогда schema и switch policy перестают отличать
+доказанный export от immutable Git runtime.
+
+### 14. Schema v2 объединяет bootstrap и rollout без второй transition policy
+
+Schema v1 из PR #16 недостаточна: она предполагает два разных Git SHA и
+Git-clean current runtime. Bootstrap имеет export и baseline с одним
+`source_commit`, но разными runtime kinds. Bootstrap-helper PR SHALL
+однократно перейти на `schema_version=2`; schema v1 reader/migration не
+добавляется.
+
+Каждый v2 manifest содержит общий exact set:
+
+- `schema_version=2`, `snapshot_kind=bootstrap|rollout`, UTC `created_at`;
+- `source_repo`, `runtime_root`, `state_root`, `snapshot_id`,
+  `stable_wrapper`;
+- `before_runtime_kind=export|git`, `before_runtime_path`,
+  `before_runtime_sha`, `before_manifest_path`,
+  `before_manifest_sha256`;
+- `after_runtime_kind=git`, `after_runtime_path`, `after_runtime_sha`;
+- `venv_dirname`, `venv_interpreter_sha256`, `venv_interpreter_mode`;
+- `wrapper_before_sha256`, `wrapper_after_sha256`, `wrapper_mode`,
+  `runtime_path_replacements`.
+
+Для `bootstrap` before manifest fields являются non-null absolute path и
+full SHA-256; before/after SHA оба равны source commit; replacement count
+равен ровно `1`. Для `rollout` manifest fields равны JSON `null`, before и
+after являются exact Git commits и различаются. Variant с иными
+kind/null/hash combinations отклоняется.
+
+Snapshot IDs детерминированы:
+
+- bootstrap: `bootstrap-<SOURCE_COMMIT>`;
+- rollout: `<CURRENT_COMMIT>-to-<TARGET_COMMIT>`.
+
+Snapshot directory остаётся
+`<state-root>/snapshots/<snapshot-id>` с mode `0700` и ровно тремя files
+`manifest.json`, `wrapper.before`, `wrapper.after` mode `0600`.
+
+Live schema migration не нужна и backward compatibility не добавляется,
+потому что зафиксированный evidence подтверждает отсутствие dedicated state
+root, baseline, target и snapshots. Перед любым будущем live
+`bootstrap-prepare --apply` оператор обязан отдельно подтвердить, что exact
+state root всё ещё отсутствует; существующий root, включая schema v1
+artifacts, закрывает apply без cleanup или migration.
+
+### 15. Один validator обслуживает `switch/rollback` обоих snapshot kinds
+
+Существующие `switch/rollback` SHALL читать schema v2 через одну общую
+snapshot loader/validator функцию и использовать существующий единый
+примитив `_atomic_replace`. Отдельный обработчик `switch/rollback` для `bootstrap`,
+отдельная atomic policy или дублированные stale-wrapper guards запрещены.
+
+Общая проверка всегда подтверждает snapshot hashes/modes, exact derived
+пути, явно заданные SHA-256 и режим текущего `wrapper`, а также точную `before→after`
+replacement и after runtime exact detached Git HEAD/tracked cleanliness/venv
+evidence.
+
+Для `snapshot_kind=bootstrap` общий валидатор дополнительно при каждом
+пробном запуске и `--apply`:
+
+1. повторно читает экспортный `manifest.txt` по закреплённому пути;
+2. сравнивает точный `SHA-256` сырых байтов и заново применяет тот же
+   контракт `key=value`, включая `source_commit`;
+3. повторно проверяет export venv/interpreter evidence;
+4. проверяет baseline exact HEAD, tracked cleanliness и baseline interpreter;
+5. требует wrapper before для `switch` и wrapper after для `rollback`.
+
+Для `snapshot_kind=rollout` validator проверяет оба Git runtime и их venv по
+существующей policy. Switch и rollback отличаются только required current
+wrapper hash и выбором `wrapper.after`/`wrapper.before`; rollback
+восстанавливает exact bytes и mode.
+
+После отдельно одобренного bootstrap switch обычный `prepare` получает
+baseline как `--current-runtime` и target SHA. Для этого dedicated layout
+`runtime-root` и `state-root` MAY быть одним exact canonical root. Это не
+ослабляет containment: equality разрешена только как unified layout;
+неравные nested roots по-прежнему запрещены, candidate всегда находится в
+`hermes-kanban-mcp-<SHA>`, snapshot — только в `snapshots/<ID>`, а roots
+никогда не являются write targets целиком.
+
+### 16. File split следует ownership, а не командам
+
+Текущий executable helper имеет 850 строк, а существующий rollout test file —
+913. Bootstrap-helper PR MUST удержать каждый source/test file ниже 1000
+строк.
+
+Разрешена одна extraction:
+
+- `scripts/hermes_kanban_mcp_rollout.py` владеет argparse, command contexts,
+  dry-run plans и `prepare`/`bootstrap-prepare` orchestration;
+- `scripts/hermes_kanban_mcp_rollout_state.py` владеет schema v2
+  serialization/validation, snapshot files и общей atomic `switch/rollback`
+  политику перехода.
+
+Это реальная ownership boundary: persistent rollback evidence и transition
+policy отделены от способов построения runtimes. Модуль не является thin
+wrapper, не получает второй CLI и не дублирует path/hash primitives.
+Bootstrap tests живут в отдельном
+`tests/scripts/test_hermes_kanban_mcp_bootstrap.py`; существующий rollout test
+file проверяет regression обычного prepare/switch/rollback и schema v2.
+
+Оба файла тестов используют только временные деревья
+`Git`/экспорта/среды. Корректный тестовый `manifest.txt` использует фактические
+ключи `source_commit`, `deployed_utc`, `python_version`, `mcp_version`,
+`command` в формате строк `key=value`. Проверки обязаны включать дубликат
+ключа, повреждённую или пустую строку, пустой ключ, `NUL`, ошибку `UTF-8`,
+несовпадение `source_commit`, неизвестный ключ, подмену сырых байтов после
+пробного запуска и отсутствие значений неизвестных ключей в плане и снимке.
+
+Остальная матрица сохраняет полный файловый снимок до и после пробного
+запуска, отсутствие корня состояния до `--apply`, точный режим корня, точный
+`HEAD` базовой среды, копирование только `venv`, число замен `wrapper`,
+сохранение частичных свидетельств, побайтовую идентичность
+`switch`/`rollback` для `bootstrap`, обычный переход
+`prepare` от базовой среды к цели при едином корне и лимит строк `<1000`.
+Тесты не читают исходный текст и не обращаются к рабочим путям.
+
+### 17. Bootstrap-helper PR не является live approval
+
+Bootstrap-helper PR добавляет capability и temp-only tests, но не создаёт
+даже пустой live state root. В PR фазе запрещены live apply, baseline,
+снимок, изменение `wrapper`, обычный `prepare` и `process/service/network/DB`
+actions и smoke.
+
+После merge требуется новый gate: exact `bootstrap-prepare` dry-run,
+сопоставление всех paths/hashes/source commit с одобренным evidence и
+отдельное разрешение на `--apply`. Merge PR, зелёные tests или одобрение
+этого design сами по себе live apply не разрешают.
 
 ## Риски / компромиссы
 
@@ -565,27 +791,45 @@ Live apply и process/smoke отсутствуют в automated suite.
 - [Копирование runtime переносит dirty patch] → candidate создаётся из exact
   Git object, переносится только выбранный venv, tracked cleanliness обоих
   worktree проверяется.
+- [Non-Git export ошибочно принимается обычным prepare] → сохранить Git
+  precondition обычного prepare и ввести только explicit `bootstrap-prepare`.
+- [Source и target не ancestor] → не выполнять merge/rebase/ancestry gate;
+  проверять каждый exact commit object и exact detached HEAD независимо.
+- [Bootstrap получает отдельную switch policy] → schema v2 variant и один
+  общий loader/validator/atomic transition для обоих snapshot kinds.
+- [State root частично создан после ошибки] → не очищать автоматически;
+  сохранять exact evidence и закрывать повторный apply на existing root.
+- [Schema v1 migration расширяет риск] → не поддерживать v1, так как live
+  snapshots отсутствуют; existing state root всегда требует stop/replan.
+- [Helper/test превышает 1000 строк] → одна ownership extraction для
+  snapshot/transition policy и отдельный bootstrap test file.
 
 ## План доставки
 
-1. Сохранить завершённую историю PR #15 на
-   `062f2f0f1f6947830d1b222a3ef470e145a7c34d`; не переоткрывать его
-   задачи реализации.
-2. Реализовать в отдельном task-owned PR только один helper и его temp-only
-   tests; до merge не создавать live candidate/snapshot и не переключать
-   wrapper.
-3. Запустить focused helper tests, strict OpenSpec validation и diff gates на
-   отсутствие production/runtime/service/DB/dependency изменений.
-4. После merge helper PR отдельно запросить одно live approval на exact
-   candidate SHA и конкретные paths/hashes из dry-run plan.
-5. Только после approval выполнить `prepare --apply`, вручную проверить
-   manifest/candidate, затем `switch --apply`.
-6. Отдельно от helper запустить только новый standalone Kanban MCP process и
-   выполнить bounded MCP `initialize`/`tools/list`/dry-run sync smoke.
-7. При провале switch/process/smoke выполнить `rollback --apply`, вернуть
-   только предыдущий standalone MCP process и повторить bounded smoke.
-8. Не менять глобальный Hermes symlink, не перезапускать Hermes/Gurra, не
-   переносить dirty Telegram patch и не писать live DB.
+1. Сохранить закрытыми выполненные PR #15 на
+   `062f2f0f1f6947830d1b222a3ef470e145a7c34d` и PR #16 на
+   `9fcd66651768e3cf220d5cd501efbec5ae3e2550`.
+2. Реализовать отдельным task-owned bootstrap-helper PR только новую command,
+   schema v2/shared transition ownership module и temp-only tests.
+3. До merge не создавать live state root/baseline/snapshot, не менять wrapper
+   и не выполнять обычный prepare, process/service/network/DB actions или
+   smoke.
+4. Запустить оба focused helper test files через `scripts/run_tests.sh`,
+   проверить line counts `<1000`, strict OpenSpec validation и exact diff
+   scope.
+5. Получить независимое code review без `BLOCK`, затем создать отдельный PR;
+   merge PR не открывает live gate.
+6. После merge отдельно выполнить только `bootstrap-prepare` dry-run,
+   сопоставить exact evidence и запросить live approval.
+7. Только после approval выполнить `bootstrap-prepare --apply`, проверить
+   schema v2 snapshot/baseline и снова отдельно пройти dry-run `switch`.
+8. После одобренного bootstrap switch обычный `prepare` строит target из
+   baseline; каждый последующий apply остаётся отдельным gated шагом.
+9. Process replacement и bounded MCP smoke выполняются только после
+   repository lifecycle и не входят в bootstrap-helper PR.
+10. При провале использовать тот же schema v2 `rollback`; не удалять
+    baseline/target/snapshots и не менять глобальный Hermes symlink,
+    Hermes/Gurra, services, connector config или live DB.
 
 Будущий rollback, если отдельный rollout будет одобрен, ограничивается
 `rollback --apply` по exact snapshot, возвратом предыдущего standalone MCP
@@ -594,6 +838,8 @@ evidence; автоматического cleanup нет.
 
 ## Открытые вопросы
 
-Блокирующих архитектурных вопросов нет. Material helper delta явно одобрен;
-его реализация остаётся отдельным PR, а live candidate/snapshot/switch/process/
-smoke — отдельным post-PR approval gate.
+Блокирующих архитектурных вопросов нет. Единственное material divergence от
+предпочтительного shape — schema v1 заменяется schema v2 и допускается единый
+runtime/state root: без этого bootstrap snapshot нельзя безопасно consume
+существующими `switch/rollback`, а обычный `prepare` не сможет построить
+target рядом с baseline. Scope live действий не расширяется.
