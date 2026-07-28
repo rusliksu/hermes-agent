@@ -9828,18 +9828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
-        """
-        Handle an incoming message from any platform.
-        
-        This is the core message processing pipeline:
-        1. Check user authorization
-        2. Check for commands (/new, /reset, etc.)
-        3. Check for running agent and interrupt if needed
-        4. Get or create session
-        5. Build context for agent
-        6. Run agent conversation
-        7. Return response
-        """
+        """Resolve ingress, then handle typed multiplex messages in profile scope."""
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -9861,6 +9850,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not self._allow_access_registry_ingress(event):
             return None
+
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(source, "resolved_access_context", None) is not None
+        ):
+            with _profile_runtime_scope(
+                self._resolve_profile_home_for_source(source)
+            ):
+                return await self._handle_message_after_ingress(event)
+        return await self._handle_message_after_ingress(event)
+
+    async def _handle_message_after_ingress(
+        self,
+        event: MessageEvent,
+    ) -> Optional[str]:
+        """Handle an ingress-validated message through the shared dispatch path."""
+        source = event.source
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -15581,6 +15587,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             async def _guarded_handler(choice: str):
                 if not _captured_context_is_current():
                     return None
+                if (
+                    getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                    and captured_context is not None
+                ):
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        return await handler(choice)
                 return await handler(choice)
 
             registered_handler = _guarded_handler

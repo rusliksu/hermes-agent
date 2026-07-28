@@ -239,6 +239,7 @@ def _guard_denied_downstream(monkeypatch, runner):
 @pytest.fixture(autouse=True)
 def _gateway_stubs(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profiles" / "family-profile").mkdir(parents=True)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: [])
     monkeypatch.setattr("tools.slash_confirm.get_pending", lambda *args, **kwargs: None)
     monkeypatch.setattr("tools.slash_confirm.clear_if_stale", lambda *args, **kwargs: None)
