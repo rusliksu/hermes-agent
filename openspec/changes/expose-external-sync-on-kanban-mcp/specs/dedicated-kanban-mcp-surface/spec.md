@@ -311,12 +311,115 @@ handlers, FastMCP registration, instructions и mode gating, но MUST NOT
   модуле
 - **AND** новая transport-specific копия shared sync wrapper отсутствует
 
+### Requirement: Standalone rollout управляется одним fail-closed helper
+
+Репозиторий SHALL предоставлять один stdlib-only helper
+`scripts/hermes_kanban_mcp_rollout.py` с командами `prepare`, `switch` и
+`rollback`. Каждая команда MUST работать в dry-run mode по умолчанию и MUST
+писать только при явном `--apply`. Helper MUST принимать только явные
+абсолютные source/runtime/state/wrapper paths, полные current/candidate Git
+SHA и ожидаемый текущий wrapper SHA-256; он MUST NOT читать `.env`,
+credentials, tokens, sessions, live DB или Hermes state.
+
+#### Scenario: Prepare dry-run только печатает полный план
+
+- **WHEN** оператор вызывает `prepare` без `--apply` с валидными paths и hashes
+- **THEN** helper печатает candidate path, snapshot ID, wrapper before/after
+  hashes и все планируемые операции
+- **AND** filesystem, Git worktrees и stable wrapper остаются byte-for-byte
+  неизменными
+
+#### Scenario: Prepare apply создаёт exact candidate и rollback snapshot
+
+- **WHEN** оператор вызывает `prepare --apply` с полным candidate Git SHA,
+  exact expected current runtime SHA и current wrapper SHA-256
+- **THEN** helper создаёт detached candidate
+  `<runtime-root>/hermes-kanban-mcp-<FULL_GIT_SHA>` с exact `HEAD`
+- **AND** переносит только явно выбранный top-level `.venv` или `venv`, но не
+  runtime state, secrets, config, DB, sessions или dirty tracked patch
+- **AND** создаёт exclusive versioned snapshot с `manifest.json`,
+  `wrapper.before` и `wrapper.after`
+- **AND** stable wrapper ещё не изменяется
+
+#### Scenario: Switch atomically меняет только stable wrapper
+
+- **WHEN** подготовленный snapshot/candidate не изменены
+- **AND** `switch --apply` получает SHA-256, совпадающий с текущим wrapper и
+  `wrapper_before_sha256` manifest
+- **THEN** helper повторно проверяет paths, exact Git SHA, venv и оба snapshot
+  hashes
+- **AND** заменяет stable wrapper одним same-filesystem `os.replace` после
+  синхронизации файла через `fsync`
+- **AND** новый wrapper byte-for-byte совпадает с `wrapper.after`
+- **AND** helper не запускает и не останавливает процессы и не пишет DB
+
+#### Scenario: Rollback восстанавливает точный предыдущий wrapper
+
+- **WHEN** текущий wrapper SHA-256 совпадает с явным guard и
+  `wrapper_after_sha256` manifest
+- **AND** оператор вызывает `rollback --apply` для exact snapshot ID
+- **THEN** helper атомарно восстанавливает bytes и executable mode
+  `wrapper.before`
+- **AND** candidate и snapshot сохраняются
+- **AND** никакой process restart или smoke автоматически не выполняется
+
+#### Scenario: Stale или tampered state блокирует запись
+
+- **WHEN** расходится expected wrapper SHA-256, current/candidate Git SHA,
+  manifest, snapshot hash, venv/interpreter или canonical path
+- **THEN** `prepare`, `switch` или `rollback` завершается fail-closed до
+  изменения stable wrapper
+- **AND** helper не пытается исправлять состояние через delete, `rm`,
+  `rmtree`, `git reset`, `git clean` или wildcard cleanup
+
+#### Scenario: Path escape и symlink target отклоняются
+
+- **WHEN** managed root, candidate, snapshot или stable wrapper использует
+  relative path, `..`, symlink, broad target, path вне явно разрешённого root
+  либо неожиданный существующий candidate
+- **THEN** helper отклоняет план до любого write primitive
+
+### Requirement: Helper проверяется только во временном окружении
+
+Automated tests helper MUST находиться в
+`tests/scripts/test_hermes_kanban_mcp_rollout.py`, MUST использовать только
+временный Git repo/runtime/state/wrapper и MUST запускаться через
+`scripts/run_tests.sh`. Tests MUST проверять поведение helper вызовом его
+Python API/CLI, а не чтением source text. Automated suite MUST NOT выполнять
+live apply, обращаться к live/staging/Hermes paths, запускать MCP/Hermes/Gurra
+process, читать secrets или изменять DB/services.
+
+#### Scenario: Dry-run oracle доказывает отсутствие записи
+
+- **WHEN** temp-only suite выполняет `prepare`, `switch` и `rollback` без
+  `--apply`
+- **THEN** полный filesystem oracle до/после каждой команды идентичен
+- **AND** ни один write primitive не вызывается
+
+#### Scenario: Apply и rollback проверяются end-to-end во временном дереве
+
+- **WHEN** suite создаёт временный Git repo с current/candidate commits,
+  fake venv/interpreter и stable wrapper
+- **THEN** prepare создаёт exact candidate/snapshot без switch
+- **AND** switch устанавливает exact `wrapper.after`
+- **AND** rollback восстанавливает byte-identical `wrapper.before` и mode
+- **AND** stale/tampered/hash/path failure cases не изменяют wrapper
+
+#### Scenario: Тесты не используют live targets
+
+- **WHEN** focused helper tests завершены
+- **THEN** все созданные candidate/snapshot/wrapper artifacts находятся под
+  временным каталогом теста
+- **AND** suite не требует secrets, network, services, processes или live DB
+
 ### Requirement: Изменение не требует DB migration и отделено от live rollout
 
 Forward-port и новый tool MUST использовать существующую схему Kanban DB и
 MUST NOT добавлять migration. Implementation SHALL доставляться сначала
-отдельным task-owned PR. Новый immutable runtime и точечное переключение MCP
-wrapper/нового MCP process MUST требовать отдельного post-merge approval.
+отдельным task-owned PR. Rollout helper SHALL доставляться вторым отдельным
+task-owned PR без live effects. Новый immutable runtime, snapshot, точечное
+переключение MCP wrapper, запуск нового MCP process и smoke MUST требовать
+отдельного post-helper-merge approval.
 
 #### Scenario: Изменения проверяются до PR
 
@@ -326,11 +429,20 @@ wrapper/нового MCP process MUST требовать отдельного po
 - **AND** diff не добавляет зависимостей
 - **AND** task-owned PR является первым delivery step
 
+#### Scenario: Helper PR не выполняет rollout
+
+- **WHEN** helper и temp-only tests реализованы и проверены
+- **THEN** diff не содержит production module/script/test changes вне exact
+  областей helper/test/OpenSpec
+- **AND** live candidate, snapshot, wrapper switch, process и smoke не
+  выполняются
+- **AND** helper PR является отдельным delivery step после PR #15
+
 #### Scenario: Доставка после слияния остаётся закрыта
 
-- **WHEN** task-owned PR слит
+- **WHEN** PR #15 и helper PR слиты
 - **THEN** новый immutable runtime ещё не создаётся
-- **AND** MCP wrapper или process ещё не переключается без отдельного
-  одобрения
+- **AND** snapshot, MCP wrapper, process или smoke ещё не выполняются без
+  отдельного одобрения exact dry-run plan
 - **AND** глобальный Hermes symlink, Hermes/Gurra restart и dirty Telegram
   patch остаются вне scope

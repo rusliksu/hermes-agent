@@ -39,6 +39,25 @@ read-only URI с `immutable=1` может игнорировать uncheckpointe
 продолжение после malformed nonblank frame. Этот material delta заменяет
 соответствующие решения; его точный WAL-контракт повторно явно одобрен.
 
+После закрытия этих замечаний реализация была слита как PR #15 на exact
+commit `062f2f0f1f6947830d1b222a3ef470e145a7c34d`. Этот commit является
+текущим base task-owned worktree и сохраняет завершённую историю секций 1–6
+`tasks.md`. Live rollout после merge не выполнялся. Новый одобренный material
+delta касается только репозиторного helper PR, который делает оставшийся
+standalone rollout воспроизводимым и rollback-ready; текущий запуск остаётся
+planning-only.
+
+Разрешённая repo-only проверка подтверждает текущий standalone контракт:
+внешний стабильный wrapper запускает CLI
+`hermes mcp serve-kanban --allow-write` из отдельного immutable Git runtime;
+в репозитории нет deploy/rollback helper для этого wrapper. Сам live wrapper,
+staging runtime, процессы и Hermes state в этом planning запуске не читались
+и не инспектировались. Поэтому helper не кодирует live paths и не угадывает
+состояние: он принимает их только явно вместе с exact SHA/hash и отклоняет
+неподдерживаемый layout. Пункт 8.2 требует material replan, если последующий
+разрешённый dry-run обнаружит расхождение с regular-wrapper/immutable-runtime
+контрактом.
+
 ## Цели / вне целей
 
 **Цели:**
@@ -62,6 +81,14 @@ read-only URI с `immutable=1` может игнорировать uncheckpointe
 - подтвердить поведение целевыми unit-тестами и реальным stdio
   `list_tools` smoke, включая фрагментированный/объединённый ввод и чистое
   завершение по EOF.
+- добавить один минимальный stdlib Python helper для подготовки exact-SHA
+  standalone candidate, versioned rollback snapshot, атомарного переключения
+  стабильного MCP wrapper и его точного восстановления;
+- сделать `prepare`, `switch` и `rollback` dry-run-only по умолчанию, с
+  отдельным явным `--apply` и stale-wrapper SHA-256 guard в каждой пишущей
+  фазе;
+- проверить helper только во временных Git/runtime деревьях без live process,
+  DB, wrapper, service или secret access.
 
 **Вне целей:**
 
@@ -77,6 +104,13 @@ read-only URI с `immutable=1` может игнорировать uncheckpointe
   `/home/openclaw/staging/hermes-deploy-bbe92d297-20260728`;
 - глобальный `/home/openclaw/.hermes/hermes-agent` symlink, restart
   Hermes/Gurra или перенос dirty Telegram patch.
+- автоматический restart/start/stop, process discovery, MCP smoke, DB probe,
+  изменение connector/Windows config или любое действие над live/staging
+  target в helper PR;
+- общий deployment framework, новый CLI Hermes, новая библиотека,
+  dependency installer, package builder или поддержка произвольных layout;
+- перенос незакоммиченных tracked файлов, untracked runtime state, `.env`,
+  credentials, tokens, sessions или иных secret/state файлов в candidate.
 
 ## Решения
 
@@ -311,6 +345,179 @@ Focused tests запускаются через `scripts/run_tests.sh`. Они �
 Тестовое окружение задаёт временные `HERMES_HOME`, `HOME` и
 `HERMES_KANBAN_DB`; live DB path должен быть явно исключён.
 
+### 10. Один helper и три явные фазы являются достаточным rollout API
+
+Новый файл SHALL быть ровно
+`scripts/hermes_kanban_mcp_rollout.py`. Он использует только Python stdlib и
+уже обязательный для source checkout executable `git`; новый package,
+Hermes subcommand, reusable deployment abstraction или shell wrapper не
+добавляются.
+
+CLI contract:
+
+```text
+python scripts/hermes_kanban_mcp_rollout.py prepare \
+  --source-repo ABS_PATH \
+  --runtime-root ABS_PATH \
+  --state-root ABS_PATH \
+  --current-runtime ABS_PATH \
+  --expected-current-runtime-sha FULL_GIT_SHA \
+  --candidate-sha FULL_GIT_SHA \
+  --venv-dirname .venv|venv \
+  --stable-wrapper ABS_PATH \
+  --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--apply]
+
+python scripts/hermes_kanban_mcp_rollout.py switch \
+  --runtime-root ABS_PATH \
+  --state-root ABS_PATH \
+  --snapshot-id SNAPSHOT_ID \
+  --stable-wrapper ABS_PATH \
+  --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--apply]
+
+python scripts/hermes_kanban_mcp_rollout.py rollback \
+  --runtime-root ABS_PATH \
+  --state-root ABS_PATH \
+  --snapshot-id SNAPSHOT_ID \
+  --stable-wrapper ABS_PATH \
+  --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--apply]
+```
+
+Отсутствие `--apply` всегда означает dry-run. Отдельный `--dry-run` не нужен:
+это единственный default mode. `--apply` не принимается вместе с
+неизвестными аргументами, не запрашивает интерактивное подтверждение и не
+расширяет область путей.
+
+`prepare --apply`:
+
+1. повторяет все read-only preconditions;
+2. создаёт candidate как detached Git worktree на полном
+   `candidate-sha` по производному пути
+   `<runtime-root>/hermes-kanban-mcp-<FULL_GIT_SHA>`;
+3. копирует только указанный top-level `.venv` или `venv` из чистого
+   текущего immutable runtime в candidate, не копируя `.env`, config, DB,
+   sessions, patches или другие runtime files;
+4. строит candidate wrapper заменой точного абсолютного
+   `current-runtime` на точный candidate path в существующем стабильном
+   wrapper, сохраняя остальной byte content и executable mode;
+5. создаёт immutable rollback snapshot и завершает работу без переключения
+   стабильного wrapper.
+
+Трансформация wrapper разрешена только если он является обычным
+несимвольным executable UTF-8 файлом, содержит текущий runtime path хотя бы
+один раз, не содержит candidate path и содержит запускаемый контракт
+`mcp serve-kanban` с `--allow-write`. Иначе helper завершается fail-closed.
+Это сохраняет существующий standalone launcher без нового шаблонизатора.
+
+`switch --apply` повторно проверяет snapshot, оба exact Git SHA, candidate
+venv/interpreter, byte hashes `wrapper.before`/`wrapper.after`, путь wrapper
+и переданный expected current wrapper SHA-256. Только после этого он пишет
+same-directory temp file, выполняет file `fsync`, сохраняет executable mode,
+делает один `os.replace(temp, stable_wrapper)` и `fsync` каталога.
+При любой ошибке до успешного `os.replace` helper в `finally` удаляет только
+созданный этим вызовом exact temp path; cleanup failure не скрывает первичную
+ошибку и выдаёт безопасное предупреждение без broad cleanup. После успешного
+`os.replace` состояние считается применённым: ошибка directory `fsync` или
+post-install verification завершается с кодом 2, но печатает однозначный JSON
+stderr с `replacement_applied=true`, ожидаемым installed SHA-256 и действием
+`inspect/rollback`. Процессы и DB helper не трогает.
+
+`rollback --apply` требует, чтобы текущий wrapper SHA-256 совпадал и с явным
+guard, и с `wrapper_after_sha256` manifest. После полной повторной проверки
+он тем же атомарным primitive восстанавливает точные bytes и mode
+`wrapper.before`. Candidate и snapshot не удаляются.
+
+Альтернатива: один `rollout --apply`, объединяющий prepare и switch. Она
+отвергнута, потому что не оставляет оператору проверяемой паузы между
+созданием candidate/snapshot и live cutover. Альтернатива: shell script.
+Она отвергнута из-за более сложной fail-closed проверки путей, JSON manifest,
+hashing и temp-only unit tests.
+
+### 11. Snapshot и manifest являются минимальным состоянием rollback
+
+Snapshot ID SHALL детерминированно иметь вид
+`<CURRENT_FULL_SHA>-to-<CANDIDATE_FULL_SHA>` и создаваться эксклюзивно под
+`<state-root>/snapshots/<snapshot-id>`. Поэтому dry-run и последующий apply
+формируют один exact path без скрытого clock input. Повторное использование
+существующего ID запрещено. Snapshot содержит только:
+
+- `manifest.json` с `schema_version=1`, UTC timestamp, всеми нормализованными
+  путями, полными current/candidate Git SHA, wrapper before/after SHA-256,
+  mode, candidate path, venv dirname и числом точных замен runtime path;
+- `wrapper.before` с исходными bytes;
+- `wrapper.after` с candidate bytes.
+
+Manifest не содержит environment, token, credential, DB data или wrapper
+text. Snapshot files создаются с owner-only permissions и после записи
+проверяются повторным hash. Текущий runtime не копируется: он уже immutable,
+его полный SHA и путь зафиксированы, а rollback snapshot сохраняет exact
+wrapper, который на него указывает. Ни prepare, ни rollback не удаляют
+runtime/snapshot и не используют `rm`, `rmtree`, `git reset`, `git clean`,
+wildcards или cleanup globs.
+
+Candidate считается готовым только если его `HEAD` равен полному
+`candidate-sha`, tracked status чист, ожидаемый venv/interpreter существует,
+а путь находится строго внутри `runtime-root`. Текущий runtime аналогично
+должен иметь exact expected `HEAD` и чистые tracked files; это исключает
+перенос dirty Telegram patch. Создание candidate из уже существующего пути
+запрещено: helper не пытается исправлять, очищать или перезаписывать
+сомнительное состояние. Ошибка после частичного создания candidate, venv или
+snapshot сохраняет evidence только в exact производных candidate/snapshot
+paths, не запускает автоматический cleanup и заставляет повторный `prepare`
+завершиться fail-closed на существующем candidate или snapshot.
+
+Альтернатива: полный tar/copy snapshot текущего runtime. Она отвергнута как
+лишняя и потенциально захватывающая secrets/state; immutable current runtime
+плюс exact SHA и byte-identical wrapper дают достаточный rollback oracle.
+
+### 12. Path validation и тестовый oracle закрывают опасные края
+
+Все пути должны быть абсолютными, без `..`, NUL и shell expansion. Managed
+roots, candidate, snapshot и stable wrapper не могут быть symlink; existing
+ancestors разрешаются через `resolve(strict=True)` и обязаны оставаться под
+явно переданным root. Helper отклоняет `/`, home directory и source repo root
+в качестве managed runtime/state target, одинаковые/вложенные друг в друга
+state/runtime roots и любой candidate или snapshot вне производного exact
+path. Stable wrapper допускается только как ровно указанный существующий
+regular file; helper не ищет его по имени.
+
+`prepare`, `switch` и `rollback` сначала строят полный JSON plan в памяти и
+проверяют все доступные preconditions. Dry-run печатает этот plan и
+завершается, не вызывая `mkdir`, `copytree`, `git worktree add`, temp-file
+creation или `os.replace`.
+
+Automated tests живут только в
+`tests/scripts/test_hermes_kanban_mcp_rollout.py`, создают локальный
+временный Git repo с двумя commits, fake venv/interpreter, wrapper,
+runtime-root и state-root. Основной oracle:
+
+- полный snapshot временного filesystem до/после каждого dry-run идентичен;
+- wrapper hash/mode неизменны при любом precondition/path/hash failure;
+- successful prepare создаёт exact candidate и три snapshot files с
+  согласованными hashes, но не меняет stable wrapper;
+- successful switch меняет только stable wrapper на exact
+  `wrapper.after`;
+- rollback dry-run ничего не меняет, а rollback apply восстанавливает
+  byte-identical `wrapper.before` и mode;
+- stale/tampered wrapper, manifest, snapshot, candidate SHA, venv и symlink
+  path отклоняются без switch;
+- schema-valid подмена каждого manifest path, mode snapshot file/directory,
+  candidate HEAD mismatch, dirty current runtime и symlink parent будущего
+  candidate/snapshot отклоняются fail-closed;
+- все pre-replace failure injections удаляют exact rollout temp; directory
+  fsync и post-install verification после replace подтверждают изменённый
+  wrapper и структурированный `replacement_applied=true`;
+- partial prepare failures оставляют только exact candidate/snapshot evidence,
+  не меняют stable wrapper и закрывают повторный prepare;
+- test double Git runner подтверждает отсутствие `reset`, `clean`, `rm` и
+  иных delete primitives.
+
+Tests запускаются только через
+`scripts/run_tests.sh tests/scripts/test_hermes_kanban_mcp_rollout.py`.
+Live apply и process/smoke отсутствуют в automated suite.
+
 ## Риски / компромиссы
 
 - [Старый blob перезаписывает свежий main] → переносить по файлам и функциям,
@@ -343,32 +550,50 @@ Focused tests запускаются через `scripts/run_tests.sh`. Они �
   констант.
 - [Merge не обновляет активный connector] → rollout вынесен в отдельный
   post-merge approval и новый immutable runtime.
+- [Dry-run сам создаёт candidate/snapshot] → plan-only code path не вызывает
+  ни одного write primitive; filesystem before/after oracle покрывает все три
+  команды.
+- [Stale wrapper переключается поверх чужого изменения] → обязательный
+  exact SHA-256 guard на prepare/switch/rollback и повторная проверка сразу
+  перед `os.replace`.
+- [Path escape или symlink направляет запись наружу] → абсолютные allow-listed
+  roots, canonical containment, запрет symlink managed paths и fail-closed
+  точные вычисленные пути candidate/snapshot.
+- [Rollback snapshot захватывает secrets] → snapshot содержит только
+  manifest и bytes стабильного wrapper; runtime/Hermes home/env/DB не
+  копируются и не читаются.
+- [Копирование runtime переносит dirty patch] → candidate создаётся из exact
+  Git object, переносится только выбранный venv, tracked cleanliness обоих
+  worktree проверяется.
 
 ## План доставки
 
-1. Зафиксировать полученное повторное явное одобрение material delta после
-   ревью `BLOCK`.
-2. Перед возобновлением implementation повторно сверить task branch с authoritative
-   `origin/main`; при изменении base оформить material delta.
-3. Переделать незакоммиченную реализацию по ownership boundaries, публичному
-   DB API, WAL-aware read-only, post-commit lifecycle и усиленным framer
-   контрактам.
-4. Запустить focused tests, line-count/file containment checks, language
-   check, strict OpenSpec validation и проверить diff на отсутствие
-   migration/dependency/deploy/live изменений.
-5. Получить новое независимое ревью без `BLOCK`.
-6. Только после зелёного ревью создать отдельный task-owned PR; до merge
-   никаких live действий.
-7. После merge запросить отдельное одобрение на новый immutable runtime из
-   merge SHA и точечное переключение только MCP wrapper/нового MCP process.
-8. Не менять глобальный Hermes symlink и не перезапускать Hermes/Gurra.
+1. Сохранить завершённую историю PR #15 на
+   `062f2f0f1f6947830d1b222a3ef470e145a7c34d`; не переоткрывать его
+   задачи реализации.
+2. Реализовать в отдельном task-owned PR только один helper и его temp-only
+   tests; до merge не создавать live candidate/snapshot и не переключать
+   wrapper.
+3. Запустить focused helper tests, strict OpenSpec validation и diff gates на
+   отсутствие production/runtime/service/DB/dependency изменений.
+4. После merge helper PR отдельно запросить одно live approval на exact
+   candidate SHA и конкретные paths/hashes из dry-run plan.
+5. Только после approval выполнить `prepare --apply`, вручную проверить
+   manifest/candidate, затем `switch --apply`.
+6. Отдельно от helper запустить только новый standalone Kanban MCP process и
+   выполнить bounded MCP `initialize`/`tools/list`/dry-run sync smoke.
+7. При провале switch/process/smoke выполнить `rollback --apply`, вернуть
+   только предыдущий standalone MCP process и повторить bounded smoke.
+8. Не менять глобальный Hermes symlink, не перезапускать Hermes/Gurra, не
+   переносить dirty Telegram patch и не писать live DB.
 
 Будущий rollback, если отдельный rollout будет одобрен, ограничивается
-возвратом MCP wrapper на предыдущий immutable target и перезапуском только
-нового MCP process. Конкретный rollback target фиксируется в отдельном
-пакете доставки.
+`rollback --apply` по exact snapshot, возвратом предыдущего standalone MCP
+process и повторным bounded smoke. Candidate/snapshot сохраняются как
+evidence; автоматического cleanup нет.
 
 ## Открытые вопросы
 
-Блокирующих архитектурных вопросов нет. Material delta явно одобрен;
-публикация и rollout остаются закрыты следующими отдельными гейтами.
+Блокирующих архитектурных вопросов нет. Material helper delta явно одобрен;
+его реализация остаётся отдельным PR, а live candidate/snapshot/switch/process/
+smoke — отдельным post-PR approval gate.
