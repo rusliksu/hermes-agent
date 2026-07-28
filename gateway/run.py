@@ -11696,13 +11696,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length_async
 
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
                 _msg_config_ctx = None
                 _msg_cfg = None
                 _msg_model_cfg = {}
                 _msg_custom_providers = []
+                _msg_profile_home = None
+                _msg_typed_context = isinstance(
+                    getattr(source, "resolved_access_context", None),
+                    ResolvedAccessContext,
+                )
                 try:
-                    _msg_cfg = _load_gateway_config()
+                    if _msg_typed_context:
+                        _msg_profile_home = Path(
+                            self._resolve_profile_home_for_source(source)
+                        ).resolve()
+                        if not _msg_profile_home.is_dir():
+                            raise ValueError("resolved profile home is not a directory")
+                        with _profile_runtime_scope(_msg_profile_home):
+                            _msg_cfg = _load_gateway_config()
+                    else:
+                        _msg_cfg = _load_gateway_config()
                     _msg_model_cfg = _msg_cfg.get("model", {})
                     if isinstance(_msg_model_cfg, dict):
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
@@ -11716,6 +11729,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _msg_custom_providers = _msg_cfg.get("custom_providers") or []
                 except Exception:
                     pass
+                if _msg_typed_context:
+                    if _msg_profile_home is None:
+                        raise ValueError("resolved profile home unavailable")
+                    _msg_cwd = str(_msg_profile_home)
+                    _msg_terminal_cfg = (
+                        _msg_cfg.get("terminal") if isinstance(_msg_cfg, dict) else None
+                    )
+                    _msg_configured_cwd = (
+                        _msg_terminal_cfg.get("cwd")
+                        if isinstance(_msg_terminal_cfg, dict)
+                        else None
+                    )
+                    if isinstance(_msg_configured_cwd, str):
+                        _msg_candidate = _msg_configured_cwd.strip()
+                        try:
+                            _msg_candidate_path = Path(_msg_candidate)
+                            if (
+                                _msg_candidate
+                                and _msg_candidate.lower() not in CWD_PLACEHOLDERS
+                                and "\x00" not in _msg_candidate
+                                and _msg_candidate_path.is_absolute()
+                                and _msg_candidate_path.is_dir()
+                            ):
+                                _msg_cwd = str(_msg_candidate_path)
+                        except (OSError, ValueError):
+                            pass
+                else:
+                    _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
                 # Resolve the session's actual model/provider/base_url the
                 # same way the hygiene compression block does (~11080).
                 # GatewayRunner has no self._model/self._base_url attrs
