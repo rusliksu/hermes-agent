@@ -2430,6 +2430,7 @@ class BasePlatformAdapter(ABC):
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+        self._ingress_guard: Optional[Callable[[MessageEvent], bool]] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -2907,6 +2908,19 @@ class BasePlatformAdapter(ABC):
             event.source = dataclasses.replace(source, thread_id=str(recovered))
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
+
+    def set_ingress_guard(self, guard: Optional[Callable[[MessageEvent], bool]]) -> None:
+        self._ingress_guard = guard
+
+    def _allow_ingress(self, event: MessageEvent) -> bool:
+        guard = getattr(self, "_ingress_guard", None)
+        if guard is None:
+            return True
+        try:
+            return bool(guard(event))
+        except Exception:
+            logger.error("Ingress guard failed; dropping message")
+            return False
 
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
@@ -4725,6 +4739,9 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        if not self._allow_ingress(event):
+            return
 
         session_key = build_session_key(
             event.source,

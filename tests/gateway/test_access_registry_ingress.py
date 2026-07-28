@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from gateway.access_registry import (
@@ -18,6 +20,7 @@ from gateway.platforms.base import (
 )
 from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
+from gateway.session import build_session_key
 
 
 ACCOUNT = "bot-a"
@@ -193,6 +196,12 @@ def _assert_no_raw_access_values(rendered):
         assert raw_value not in rendered
 
 
+def _queued_or_debounced_events(adapter):
+    events = list(adapter._pending_messages.values())
+    events.extend(state.event for state in adapter._text_debounce.values())
+    return events
+
+
 def _guard_denied_downstream(monkeypatch, runner):
     called = {
         "queued": False,
@@ -318,6 +327,83 @@ async def test_registry_denials_stop_before_gateway_downstream(
         "plugin": False,
     }
     _assert_no_raw_access_values(_rendered_logs(caplog))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_kwargs,registry",
+    [
+        ({"user_id": "unknown"}, _registry()),
+        ({"account": ""}, _registry()),
+        ({"user_id": "u1", "chat_id": "other"}, _registry()),
+        ({}, _registry(active=False)),
+    ],
+)
+async def test_registry_denied_active_session_follow_up_stops_before_adapter_queue(
+    event_kwargs,
+    registry,
+):
+    runner = _runner(registry)
+    adapter = _Adapter(runner=runner)
+    adapter.set_ingress_guard(runner._allow_access_registry_ingress)
+    event = _event(adapter, **event_kwargs)
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    handler_called = False
+
+    async def handler(event):
+        nonlocal handler_called
+        handler_called = True
+        pytest.fail("denied active-session ingress reached the message handler")
+
+    adapter.set_message_handler(handler)
+
+    await adapter.handle_message(event)
+
+    assert handler_called is False
+    assert event not in _queued_or_debounced_events(adapter)
+    assert adapter._pending_messages == {}
+    assert adapter._text_debounce == {}
+    assert event.source.resolved_access_context is None
+    assert event.source.profile in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_registry_valid_active_session_follow_up_binds_context_before_adapter_queue():
+    runner = _runner(_registry())
+    adapter = _Adapter(runner=runner)
+    adapter.set_ingress_guard(runner._allow_access_registry_ingress)
+    event = _event(adapter)
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    handler_called = False
+
+    async def handler(event):
+        nonlocal handler_called
+        handler_called = True
+        pytest.fail("valid active-session follow-up should queue instead of dispatch")
+
+    adapter.set_message_handler(handler)
+
+    await adapter.handle_message(event)
+
+    assert handler_called is False
+    assert adapter._text_debounce == {}
+    assert adapter._pending_messages[session_key] is event
+    assert event.source.profile == "family-profile"
+    assert event.source.route_account == "bot-a"
+    assert event.source.resolved_access_context is not None
+    assert event.source.resolved_access_context.profile_id == "family-profile"
+    assert event.source.resolved_access_context.principal_id == "principal-family"
+    assert event.source.resolved_access_context.delivery_target.account == "bot-a"
 
 
 @pytest.mark.asyncio
