@@ -2675,20 +2675,36 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
-        from gateway.run import _hermes_home
         from tools.checkpoint_manager import CheckpointManager, format_checkpoint_list
+
+        typed_multiplex = (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(getattr(event, "source", None), "resolved_access_context", None)
+            is not None
+        )
+        if typed_multiplex:
+            try:
+                config_home = self._resolve_profile_home_for_source(event.source)
+            except Exception:
+                return t("gateway.rollback.not_enabled")
+        else:
+            from gateway.run import _hermes_home
+
+            config_home = _hermes_home
 
         # Read checkpoint config from config.yaml
         cp_cfg = {}
+        terminal_cfg = {}
         try:
             import yaml as _y
-            _cfg_path = _hermes_home / "config.yaml"
+            _cfg_path = config_home / "config.yaml"
             if _cfg_path.exists():
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _data = _y.safe_load(_f) or {}
                 cp_cfg = _data.get("checkpoints", {})
                 if isinstance(cp_cfg, bool):
                     cp_cfg = {"enabled": cp_cfg}
+                terminal_cfg = _data.get("terminal", {})
         except Exception:
             pass
 
@@ -2702,7 +2718,19 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_cfg.get("max_file_size_mb", 10),
         )
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        if typed_multiplex:
+            cwd_value = terminal_cfg.get("cwd") if isinstance(terminal_cfg, dict) else None
+            if not isinstance(cwd_value, str):
+                return t("gateway.rollback.not_enabled")
+            cwd_value = cwd_value.strip()
+            if not cwd_value or cwd_value in {".", "auto", "cwd"}:
+                return t("gateway.rollback.not_enabled")
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.is_absolute() or not cwd_path.is_dir():
+                return t("gateway.rollback.not_enabled")
+            cwd = str(cwd_path)
+        else:
+            cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
