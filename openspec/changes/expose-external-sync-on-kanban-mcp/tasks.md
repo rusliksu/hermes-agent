@@ -288,11 +288,20 @@ Baseline реализации явно одобрен пользователем
 
 ## 15. Новый точный live gate после merge bootstrap-helper PR
 
-- [ ] 15.1 Отдельно подтвердить отсутствие exact dedicated state root и
-  schema v1 artifacts; при наличии остановиться и оформить material replan.
-- [ ] 15.2 Выполнить только `bootstrap-prepare` dry-run, сопоставить export
-  manifest SHA-256/source commit, wrapper/venv evidence и derived
-  baseline/snapshot paths с отдельным approval.
+- [x] 15.1 Точный выделенный каталог состояния
+  `/home/openclaw/.hermes/mcp-rollout-state` отсутствует, поэтому артефакты
+  `schema v1` внутри отсутствуют; доказательство — запуск
+  `20260728T211855Z-kanban-bootstrap-readonly-preflight`.
+- [x] 15.2 Один пробный запуск `bootstrap-prepare` завершён с кодом выхода `0`,
+  операции не выполнялись (`0`, `apply=false`); наблюдаемый SHA-256 манифеста
+  `caf998929f3778e37bd2b516821aad5ab2dd7c7cf3f43a15147eca97a2cbf616`;
+  базовый каталог
+  `/home/openclaw/.hermes/mcp-rollout-state/hermes-kanban-mcp-6f8738dc308f909bf1735883344f2fcc12f3cbcd`;
+  снимок
+  `/home/openclaw/.hermes/mcp-rollout-state/snapshots/bootstrap-6f8738dc308f909bf1735883344f2fcc12f3cbcd`;
+  SHA-256 `wrapper` до `20e2cb13...` и запланированный после `17052c7d...`;
+  контрольные снимки до и после совпали; доказательство — запуск
+  `20260728T212721Z-kanban-bootstrap-exact-dry-run`.
 - [ ] 15.3 Только после нового approval выполнить
   `bootstrap-prepare --apply`; проверить schema v2 snapshot, exact baseline
   HEAD/tracked cleanliness/venv и неизменный stable wrapper.
