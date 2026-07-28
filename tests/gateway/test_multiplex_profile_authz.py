@@ -8,6 +8,7 @@ import pytest
 from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
+from gateway.single_principal import SinglePrincipalPolicy
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -64,6 +65,16 @@ def _coder_wecom_dm_context(profile_id: str = "coder") -> ResolvedAccessContext:
             peer_kind="dm",
             chat_id="wecom-dm-chat",
         ),
+    )
+
+
+def _single_principal_policy() -> SinglePrincipalPolicy:
+    return SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": "owner-user",
+            "allow_owner_bound_relay": True,
+        }
     )
 
 
@@ -159,6 +170,48 @@ def test_adapter_for_source_uses_typed_context_profile_when_source_profile_missi
     )
 
     assert runner._adapter_for_source(source) is secondary_adapter
+
+
+def test_typed_authz_no_default_relay(monkeypatch):
+    runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
+    policy = _single_principal_policy()
+    runner.config.single_principal = policy
+    runner._single_principal_policy = policy
+    default_adapter.authorization_is_upstream = True
+    secondary_adapter.authorization_is_upstream = False
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="family-user",
+        chat_id="wecom-dm-chat",
+        user_name="family-user",
+        chat_type="dm",
+        profile=None,
+        resolved_access_context=_coder_wecom_dm_context(),
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+def test_typed_elevated_no_default_relay(monkeypatch):
+    runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
+    policy = _single_principal_policy()
+    runner.config.single_principal = policy
+    runner._single_principal_policy = policy
+    default_adapter.authorization_is_upstream = True
+    secondary_adapter.authorization_is_upstream = False
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="family-user",
+        chat_id="wecom-dm-chat",
+        user_name="family-user",
+        chat_type="dm",
+        profile=None,
+        resolved_access_context=_coder_wecom_dm_context(),
+    )
+
+    assert runner._is_elevated_user_authorized(source) is False
 
 
 def test_adapter_for_source_rejects_source_profile_mismatch_with_typed_context(monkeypatch):

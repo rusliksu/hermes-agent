@@ -124,6 +124,13 @@ class GatewayAuthorizationMixin:
             return False
         return bool(getattr(adapter, "authorization_is_upstream", False))
 
+    def _source_adapter_authorization_is_upstream(
+        self,
+        source: Optional[SessionSource],
+    ) -> bool:
+        adapter = self._adapter_for_source(source)
+        return bool(getattr(adapter, "authorization_is_upstream", False))
+
     def _adapter_enforces_own_access_policy(
         self,
         platform: Optional[Platform],
@@ -308,10 +315,7 @@ class GatewayAuthorizationMixin:
         if single_principal is not None and single_principal.enabled:
             upstream_authenticated = (
                 source.delivered_via_upstream_relay is True
-                or self._adapter_authorization_is_upstream(
-                    source.platform,
-                    profile=source.profile,
-                )
+                or self._source_adapter_authorization_is_upstream(source)
             )
             return bool(
                 single_principal.authorize(
@@ -355,9 +359,9 @@ class GatewayAuthorizationMixin:
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
-            source.platform,
-            profile=source.profile,
+        if (
+            source.delivered_via_upstream_relay is True
+            or self._source_adapter_authorization_is_upstream(source)
         ):
             return True
 
@@ -657,10 +661,7 @@ class GatewayAuthorizationMixin:
         if single_principal is not None and single_principal.enabled:
             upstream_authenticated = (
                 source.delivered_via_upstream_relay is True
-                or self._adapter_authorization_is_upstream(
-                    source.platform,
-                    profile=source.profile,
-                )
+                or self._source_adapter_authorization_is_upstream(source)
             )
             return bool(
                 single_principal.authorize_elevated(
