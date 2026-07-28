@@ -16,6 +16,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+LIVE_KANBAN_DB = Path("/home/openclaw/.hermes/kanban.db")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -4959,3 +4961,252 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def _kanban_snapshots(conn):
+    return {
+        table: [
+            dict(row)
+            for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")
+        ]
+        for table in ("tasks", "task_runs", "task_events")
+    }
+
+
+def test_upsert_openspec_definition_retries_tasks_id_collision_once(
+    kanban_home,
+    monkeypatch,
+):
+    assert kb.kanban_db_path().resolve() != LIVE_KANBAN_DB.resolve()
+    generated_ids = iter(("t_collision", "t_unique"))
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(generated_ids))
+    definition = kb.OpenSpecTaskDefinition(
+        external_key="repo::change::1.1",
+        source_path="/tmp/tasks.md",
+        title="Первая задача",
+        body="Тело первой задачи",
+    )
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, status, priority, created_at, workspace_kind
+            ) VALUES ('t_collision', 'existing', 'ready', 0, 1, 'scratch')
+            """
+        )
+        result = kb.upsert_openspec_task_definitions(
+            conn,
+            [definition],
+            external_key_prefix="repo::change::",
+        )
+
+    assert result.items[0].task_id == "t_unique"
+    assert result.items[0].action == "created"
+
+
+def test_upsert_openspec_definition_two_id_collisions_roll_back_batch(
+    kanban_home,
+    monkeypatch,
+):
+    generated: list[str] = []
+    generated_ids = iter(("t_batch_first", "t_collision_1", "t_collision_2"))
+
+    def new_task_id():
+        task_id = next(generated_ids)
+        generated.append(task_id)
+        return task_id
+
+    monkeypatch.setattr(kb, "_new_task_id", new_task_id)
+    definitions = [
+        kb.OpenSpecTaskDefinition(
+            external_key="repo::change::1.1",
+            source_path="/tmp/tasks.md",
+            title="Первая задача",
+            body="Тело первой задачи",
+        ),
+        kb.OpenSpecTaskDefinition(
+            external_key="repo::change::1.2",
+            source_path="/tmp/tasks.md",
+            title="Вторая задача",
+            body="Тело второй задачи",
+        ),
+    ]
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, status, priority, created_at, workspace_kind
+            ) VALUES
+                ('t_collision_1', 'existing 1', 'ready', 0, 1, 'scratch'),
+                ('t_collision_2', 'existing 2', 'ready', 0, 1, 'scratch')
+            """
+        )
+        before = _kanban_snapshots(conn)
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match=r"UNIQUE constraint failed: tasks\.id",
+        ):
+            kb.upsert_openspec_task_definitions(
+                conn,
+                definitions,
+                external_key_prefix="repo::change::",
+            )
+        after = _kanban_snapshots(conn)
+
+    assert generated == ["t_batch_first", "t_collision_1", "t_collision_2"]
+    assert after == before
+
+
+def test_upsert_openspec_definition_unrelated_integrity_error_does_not_retry(
+    kanban_home,
+    monkeypatch,
+):
+    calls = 0
+
+    def new_task_id():
+        nonlocal calls
+        calls += 1
+        return "t_trigger_rejected"
+
+    monkeypatch.setattr(kb, "_new_task_id", new_task_id)
+    definition = kb.OpenSpecTaskDefinition(
+        external_key="repo::change::1.1",
+        source_path="/tmp/tasks.md",
+        title="Первая задача",
+        body="Тело первой задачи",
+    )
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER reject_openspec_definition
+            BEFORE INSERT ON tasks
+            BEGIN
+                SELECT RAISE(ABORT, 'reject OpenSpec definition');
+            END
+            """
+        )
+        before = _kanban_snapshots(conn)
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="reject OpenSpec definition",
+        ):
+            kb.upsert_openspec_task_definitions(
+                conn,
+                [definition],
+                external_key_prefix="repo::change::",
+            )
+        after = _kanban_snapshots(conn)
+
+    assert calls == 1
+    assert after == before
+
+
+@pytest.mark.parametrize("status", ["running", "done"])
+def test_upsert_openspec_definition_updates_only_source_owned_fields(
+    kanban_home,
+    status,
+):
+    original = kb.OpenSpecTaskDefinition(
+        external_key="repo::change::1.1",
+        source_path="/old/tasks.md",
+        title="Старое название",
+        body="Старое тело",
+    )
+    changed = kb.OpenSpecTaskDefinition(
+        external_key=original.external_key,
+        source_path="/new/tasks.md",
+        title="Новое название",
+        body="Новое тело",
+    )
+
+    with kb.connect_closing() as conn:
+        created = kb.upsert_openspec_task_definitions(
+            conn,
+            [original],
+            external_key_prefix="repo::change::",
+        )
+        task_id = created.items[0].task_id
+        run_id = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status, claim_lock, claim_expires,
+                worker_pid, max_runtime_seconds, last_heartbeat_at, started_at,
+                metadata
+            ) VALUES (?, 'alice', 'step', 'running', 'claim', 9000, 42, 3600,
+                      8000, 7000, '{"keep": true}')
+            """,
+            (task_id,),
+        ).lastrowid
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, assignee = 'alice', priority = 99,
+                   claim_lock = 'claim', claim_expires = 9000, worker_pid = 42,
+                   max_runtime_seconds = 3600, last_heartbeat_at = 8000,
+                   current_run_id = ?, result = 'результат',
+                   consecutive_failures = 4, last_failure_error = 'ошибка',
+                   workflow_template_id = 'workflow', current_step_key = 'step',
+                   skills = '["skill"]', model_override = 'model',
+                   max_retries = 5, goal_mode = 1, goal_max_turns = 6,
+                   session_id = 'session', block_kind = 'transient',
+                   block_recurrences = 2
+             WHERE id = ?
+            """,
+            (status, run_id, task_id),
+        )
+        before_task = dict(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+        before_run = dict(
+            conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        )
+
+        updated = kb.upsert_openspec_task_definitions(
+            conn,
+            [changed],
+            external_key_prefix="repo::change::",
+        )
+        after_task = dict(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+        after_run = dict(
+            conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        )
+        events_after_update = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )
+        ]
+        unchanged = kb.upsert_openspec_task_definitions(
+            conn,
+            [changed],
+            external_key_prefix="repo::change::",
+        )
+        events_after_unchanged = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )
+        ]
+
+    assert updated.items[0].action == "updated"
+    assert updated.items[0].changed_fields == ("body", "source_path", "title")
+    assert after_task == {
+        **before_task,
+        "source_path": changed.source_path,
+        "title": changed.title,
+        "body": changed.body,
+    }
+    assert after_run == before_run
+    assert [event["kind"] for event in events_after_update] == [
+        "created",
+        "external_synced",
+    ]
+    assert unchanged.items[0].action == "unchanged"
+    assert events_after_unchanged == events_after_update
