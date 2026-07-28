@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.transports.hermes_tools_mcp_server import kanban_sync_external_task
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban import run_slash
@@ -117,6 +118,120 @@ def test_sync_external_dry_run_does_not_write(kanban_home):
             "SELECT COUNT(*) FROM tasks WHERE external_key = ?",
             ("jira/OPS-9",),
         ).fetchone()[0] == 0
+
+
+def test_mcp_sync_external_uses_exact_key_not_title(kanban_home):
+    with kb.connect_closing() as conn:
+        unrelated = kb.create_task(conn, title="same upstream title", assignee="alice")
+
+    result = json.loads(
+        kanban_sync_external_task(
+            external_key="linear/MCP-1",
+            source_path="/queue/MCP-1",
+            title="same upstream title",
+            assignee="codex",
+            desired_status="Ready",
+            dry_run=True,
+        )
+    )
+
+    assert result["action"] == "create"
+    assert result["task_id"] is None
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, unrelated).assignee == "alice"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE external_key = ?",
+            ("linear/MCP-1",),
+        ).fetchone()[0] == 0
+
+
+def test_mcp_sync_external_dry_run_writes_no_rows(kanban_home):
+    with kb.connect_closing() as conn:
+        before = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        }
+
+    result = json.loads(
+        kanban_sync_external_task(
+            external_key="jira/MCP-2",
+            source_path="/queue/MCP-2",
+            title="preview only",
+            assignee="codex",
+            desired_status="Done",
+            dry_run=True,
+        )
+    )
+
+    assert result["action"] == "create"
+    assert result["dry_run"] is True
+    with kb.connect_closing() as conn:
+        after = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("tasks", "task_runs", "task_events")
+        }
+    assert after == before
+
+
+def test_mcp_sync_external_rejects_stale_expected_status(kanban_home):
+    with kb.connect_closing() as conn:
+        created = kb.sync_external_task(
+            conn,
+            external_key="github/MCP-3",
+            source_path="/queue/MCP-3",
+            title="original title",
+            assignee="codex",
+            desired_status="Ready",
+        )
+        before = kb.get_task(conn, created.task_id)
+
+    result = json.loads(
+        kanban_sync_external_task(
+            external_key="github/MCP-3",
+            source_path="/queue/changed",
+            title="should not land",
+            assignee="alice",
+            desired_status="Done",
+            dry_run=False,
+            expected_current_status="Done",
+        )
+    )
+
+    assert "expected current status" in result["error"]
+    with kb.connect_closing() as conn:
+        after = kb.get_task(conn, created.task_id)
+    assert (
+        after.status,
+        after.title,
+        after.assignee,
+        after.external_key,
+        after.source_path,
+    ) == (
+        before.status,
+        before.title,
+        before.assignee,
+        before.external_key,
+        before.source_path,
+    )
+
+
+def test_mcp_sync_external_requires_expected_status_for_apply(kanban_home):
+    result = json.loads(
+        kanban_sync_external_task(
+            external_key="github/MCP-4",
+            source_path="/queue/MCP-4",
+            title="must stay absent",
+            assignee="codex",
+            desired_status="Ready",
+            dry_run=False,
+        )
+    )
+
+    assert result["error"] == (
+        "expected_current_status is required when dry_run is false"
+    )
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_sync_external_attach_existing_task_dry_run_and_apply(kanban_home):
