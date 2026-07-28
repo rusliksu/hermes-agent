@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -459,6 +460,62 @@ class TestExactTelegramDmProfileRouting:
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
             with patch("hermes_cli.profiles.get_profile_dir", return_value=Path("/hermes/profiles/owner")):
                 assert mock_runner._resolve_profile_home_for_source(source) == Path("/hermes/profiles/owner")
+
+
+class TestSessionKeyResolution:
+    def _runner_with_store_failure(self, exc):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                multiplex_profiles=True,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+                single_principal=None,
+            ),
+            session_store=SimpleNamespace(
+                _generate_session_key=MagicMock(side_effect=exc),
+            ),
+        )
+
+    def test_resolved_context_profile_denial_is_not_legacy_fallback(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="family-chat",
+            chat_type="dm",
+            profile="owner",
+        )
+        source.resolved_access_context = _resolved_context("family-alpha")
+        runner = self._runner_with_store_failure(
+            ProfileRoutingError("resolved_profile_mismatch")
+        )
+
+        session_key_for_source = GatewayRunner._session_key_for_source.__get__(
+            runner, GatewayRunner
+        )
+        with pytest.raises(ProfileRoutingError) as exc:
+            session_key_for_source(source)
+
+        assert exc.value.reason == "resolved_profile_mismatch"
+        runner.session_store._generate_session_key.assert_called_once_with(source)
+
+    def test_legacy_store_failure_still_falls_back_to_active_profile_key(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="legacy-chat",
+            chat_type="dm",
+            profile=None,
+        )
+        source.resolved_access_context = None
+        runner = self._runner_with_store_failure(RuntimeError("store unavailable"))
+
+        session_key_for_source = GatewayRunner._session_key_for_source.__get__(
+            runner, GatewayRunner
+        )
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="owner"):
+            assert (
+                session_key_for_source(source)
+                == "agent:owner:telegram:dm:legacy-chat"
+            )
+        runner.session_store._generate_session_key.assert_called_once_with(source)
 
 
 class TestGatewayRunnerInjection:

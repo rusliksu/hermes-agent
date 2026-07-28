@@ -3763,7 +3763,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
-                pass
+                if getattr(source, "resolved_access_context", None) is not None:
+                    # Bound access contexts must not fall through to legacy defaults.
+                    raise
         config = getattr(self, "config", None)
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy
