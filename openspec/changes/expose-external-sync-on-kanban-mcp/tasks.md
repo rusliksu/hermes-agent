@@ -106,10 +106,110 @@
   task-owned PR; не выполнять
   deploy, symlink switch, restart или live process changes.
 
-## 7. Отдельный гейт доставки после слияния
+## 7. Сохранённый high-level гейт доставки после PR #15
 
 - [ ] 7.1 После merge отдельно запросить одобрение на новый immutable runtime
   из merge SHA и зафиксировать rollback target.
 - [ ] 7.2 Только после отдельного одобрения точечно переключить MCP wrapper и
   запустить новый MCP process; не менять глобальный Hermes symlink, не
   перезапускать Hermes/Gurra и не переносить dirty Telegram patch.
+
+## 8. Гейт material delta отдельного helper PR
+
+- [x] 8.1 Зафиксировать явное одобрение material delta: отдельный helper PR
+  без live rollout; текущий запуск — только planning/OpenSpec.
+- [x] 8.2 Перед реализацией повторно подтвердить task-owned worktree/branch,
+  exact base `062f2f0f1f6947830d1b222a3ef470e145a7c34d`, чистый status и
+  отсутствие material изменения standalone layout; при расхождении
+  остановиться и оформить новый delta.
+
+## 9. Отдельный helper PR
+
+- [x] 9.1 Добавить один `scripts/hermes_kanban_mcp_rollout.py` на Python
+  stdlib с argparse-командами `prepare`, `switch`, `rollback`; отсутствие
+  `--apply` должно быть единственным dry-run default.
+- [x] 9.2 Реализовать общую read-only validation/plan фазу: полные Git
+  SHA/SHA-256, абсолютные canonical paths, root containment, запрет symlink и
+  broad targets, exact current runtime/wrapper preconditions и JSON plan без
+  примитивов записи.
+- [x] 9.3 Реализовать `prepare --apply`: exact detached Git worktree
+  `<runtime-root>/hermes-kanban-mcp-<FULL_GIT_SHA>`, перенос только указанного
+  `.venv`/`venv`, проверка exact HEAD и tracked cleanliness без
+  `reset`/`clean`/delete.
+- [x] 9.4 Создать exclusive deterministic snapshot
+  `<state-root>/snapshots/<CURRENT_FULL_SHA>-to-<CANDIDATE_FULL_SHA>`
+  только с `manifest.json`, `wrapper.before`, `wrapper.after`, owner-only
+  modes и повторной проверкой hashes; stable wrapper на prepare не менять.
+- [x] 9.5 Реализовать `switch --apply` с повторной проверкой manifest,
+  snapshot, candidate, venv и expected current wrapper SHA-256; выполнить
+  только same-directory temp write, file fsync, один `os.replace` stable
+  wrapper и directory fsync; exact temp удалять в `finally` только до
+  успешной замены, а post-replace fsync/verification failure возвращать с
+  `replacement_applied=true`, expected installed SHA-256 и
+  `inspect/rollback`.
+- [x] 9.6 Реализовать `rollback --apply` с guard текущего wrapper против
+  `wrapper_after_sha256` и явного expected SHA-256; атомарно восстановить
+  byte-identical `wrapper.before` и executable mode без удаления candidate
+  или snapshot.
+- [x] 9.7 Подтвердить в code review, что helper не читает env/credentials/
+  tokens/sessions/DB, не управляет processes/services, не использует broad
+  `rm`, `rmtree`, `reset`, `clean`, globs и не меняет global Hermes symlink.
+
+## 10. Temp-only tests и проверки helper PR
+
+- [x] 10.1 Добавить
+  `tests/scripts/test_hermes_kanban_mcp_rollout.py` с временным Git repo
+  current/candidate commits, fake venv/interpreter, runtime/state roots и
+  обычным исполняемым stable wrapper.
+- [x] 10.2 Для `prepare`, `switch`, `rollback` проверить default dry-run
+  полным filesystem before/after oracle и отсутствием write primitive calls.
+- [x] 10.3 Проверить temp-only happy path end-to-end: prepare создаёт exact
+  candidate/snapshot без switch, switch устанавливает exact
+  `wrapper.after`, rollback восстанавливает byte-identical
+  `wrapper.before` и mode.
+- [x] 10.4 Проверить fail-closed cases: stale expected wrapper/runtime SHA,
+  изменённые manifest/snapshot/candidate/venv, относительные, выходящие за
+  границы, слишком широкие пути и пути с symlink, существующий candidate и
+  искусственно вызванный сбой рабочего дерева, снимка или замены;
+  stable wrapper не меняется до `os.replace`; отдельно проверить exact temp
+  очистку, `stderr` состояния `applied-state` после замены, подстановки пути
+  `manifest`, валидного по схеме, snapshot modes, HEAD/dirty tamper, future parent symlink и
+  partial candidate/venv/snapshot evidence без автоматического cleanup.
+- [x] 10.5 Запустить focused tests только через
+  `scripts/run_tests.sh tests/scripts/test_hermes_kanban_mcp_rollout.py` и
+  подтвердить, что все artifacts находятся под test temp directory.
+- [x] 10.6 Проверить diff helper PR: только exact helper/test/OpenSpec files,
+  без production modules, dependencies, DB migration, live config/wrapper,
+  runtime artifacts, services или process changes.
+- [x] 10.7 Выполнить
+  `/home/openclaw/.local/bin/openspec validate
+  expose-external-sync-on-kanban-mcp --strict --no-interactive` и
+  `git diff --check`.
+- [x] 10.8 Получить независимое review helper реализации без `BLOCK`; только
+  после зелёных tests/review создать отдельный task-owned PR без live
+  rollout.
+
+## 11. Точный live gate после merge helper PR
+
+- [ ] 11.1 Отдельно запросить одобрение exact dry-run plan с current/candidate
+  полными Git SHA, текущим SHA-256 wrapper, путями runtime/state/wrapper,
+  candidate path и snapshot ID; approval helper PR не считается live
+  approval.
+- [ ] 11.2 После одобрения повторить `prepare` без `--apply`, сопоставить plan
+  с одобренными exact values и остановиться при любом расхождении.
+- [ ] 11.3 Выполнить `prepare --apply`; проверить manifest hashes, current
+  rollback target, candidate exact HEAD/tracked cleanliness и candidate
+  interpreter. Stable wrapper/process/DB ещё не менять.
+- [ ] 11.4 Повторить `switch` без `--apply`, проверить stale-wrapper guard и
+  только затем выполнить `switch --apply`.
+- [ ] 11.5 Запустить или заменить только standalone Kanban MCP process;
+  глобальный Hermes symlink, Hermes/Gurra processes, services, Windows
+  config, dirty Telegram patch и live DB не менять.
+- [ ] 11.6 Выполнить bounded MCP `initialize`, exact `tools/list` 2/11 и
+  `kanban_sync_external_task` с `dry_run=true`; подтвердить отсутствие live
+  DB writes.
+- [ ] 11.7 При провале switch/process/smoke выполнить сначала `rollback` без
+  `--apply`, затем `rollback --apply`, вернуть только предыдущий standalone
+  MCP process и повторить bounded smoke.
+- [ ] 11.8 Сохранить evidence exact plan/manifest/hashes/process/smoke или
+  rollback outcome; candidate и snapshot не удалять автоматически.

@@ -17,6 +17,14 @@ EOF, несколько frames, пустые строки и продолжен�
 Поэтому продолжение реализации потребовало новый material delta и повторное
 явное одобрение; точный WAL-контракт этого delta одобрен.
 
+Эта реализация уже доставлена отдельным PR #15 на exact commit
+`062f2f0f1f6947830d1b222a3ef470e145a7c34d`, но live rollout не выполнялся.
+Оставшийся ручной этап переключения standalone Kanban MCP wrapper не имеет
+репозиторного dry-run helper с проверкой текущего wrapper hash и
+воспроизводимым rollback. Одобренный material delta добавляет сначала
+отдельный helper PR; текущий запуск ограничен обновлением OpenSpec и не
+реализует helper и не касается live среды.
+
 ## Что меняется
 
 - Минимально перенести на актуальный `main` выделенный
@@ -68,6 +76,19 @@ EOF, несколько frames, пустые строки и продолжен�
   строк, protocol validation error для непустого malformed frame без потери
   последующих frames и сохранение clean EOF exit с кодом 0.
 - Не добавлять миграцию или изменение схемы БД.
+- В отдельном PR добавить один stdlib-only helper
+  `scripts/hermes_kanban_mcp_rollout.py` с фазами `prepare`, `switch` и
+  `rollback`; каждая фаза по умолчанию только печатает план, а запись
+  разрешается только явным `--apply`.
+- `prepare` должен проверить полные Git SHA, текущий immutable runtime,
+  exact SHA-256 текущего стабильного wrapper, безопасные абсолютные пути и
+  создать versioned rollback snapshot и candidate runtime на точном commit.
+- `switch` должен повторно проверить snapshot, candidate и ожидаемый текущий
+  wrapper SHA-256, затем атомарно заменить только стабильный standalone MCP
+  wrapper. `rollback` должен выполнить симметричную проверку и байт-в-байт
+  восстановить wrapper из snapshot.
+- Добавить только temp-dir automated tests helper; tests не запускают live
+  apply, процессы Hermes/Gurra или live MCP process и не читают secrets.
 
 ## Возможности
 
@@ -95,12 +116,16 @@ EOF, несколько frames, пустые строки и продолжен�
   узкие tests shared MCP boundary,
   `tests/hermes_cli/test_kanban_openspec.py` и
   `tests/hermes_cli/test_kanban_db.py`.
+- Новый helper PR затрагивает только
+  `scripts/hermes_kanban_mcp_rollout.py` и
+  `tests/scripts/test_hermes_kanban_mcp_rollout.py` плюс этот OpenSpec
+  change; production modules, DB, services и runtime scripts не меняются.
 - Новых зависимостей, обычного Hermes core/model tool и DB migration нет.
 - Контракт поверхности остаётся неизменным: ровно 2 read-only и 11 write
   tools.
-- Текущая реализация остаётся незакоммиченной и не публикуется. Повторное
-  явное одобрение material delta получено; implementation проходит новую
-  проверку и затем независимое ревью.
+- История выполненной реализации сохраняется: PR #15 уже слит на
+  `062f2f0f1f6947830d1b222a3ef470e145a7c34d`; его выполненные tasks не
+  переоткрываются.
 - Копия DB или snapshot workaround не создаются; live DB не изменяется.
 - Read-only путь не переключает quiescent DB в `DELETE`: после checkpoint и
   закрытия writer исходно отсутствующие `-wal`/`-shm` могут быть созданы
@@ -111,3 +136,6 @@ EOF, несколько frames, пустые строки и продолжен�
   runtime `/home/openclaw/staging/hermes-deploy-bbe92d297-20260728` не
   изменяются.
 - Rollout остаётся отдельным post-merge gate.
+- Создание live candidate/snapshot, atomic wrapper switch, запуск нового MCP
+  process, smoke и возможный rollback остаются закрыты отдельным post-helper-PR
+  approval gate. Helper PR сам ничего из этого не выполняет.
