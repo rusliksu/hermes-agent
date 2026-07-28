@@ -38,6 +38,26 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
     )
     add_accept_hooks_flag(mcp_serve_p)
 
+    mcp_serve_kanban_p = mcp_sub.add_parser(
+        "serve-kanban",
+        help="Run the dedicated Hermes Kanban MCP server",
+        description=(
+            "Run the narrow Hermes Kanban MCP server over stdio. The default "
+            "mode is read-only; pass --allow-write to expose the write tools."
+        ),
+    )
+    mcp_serve_kanban_p.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Expose narrow Kanban write tools in addition to read tools",
+    )
+    mcp_serve_kanban_p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging on stderr",
+    )
+
     mcp_add_p = mcp_sub.add_parser(
         "add", help="Add an MCP server (discovery-first install)"
     )

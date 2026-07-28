@@ -1051,6 +1051,20 @@ def mcp_command(args):
         run_mcp_server(verbose=getattr(args, "verbose", False))
         return
 
+    if action == "serve-kanban":
+        from agent.transports import hermes_kanban_mcp_server
+        import sys as _sys
+
+        argv = []
+        if getattr(args, "allow_write", False):
+            argv.append("--allow-write")
+        if getattr(args, "verbose", False):
+            argv.append("--verbose")
+        rc = hermes_kanban_mcp_server.main(argv)
+        if rc:
+            _sys.exit(rc)
+        return
+
     # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so
     # the original `mcp_config` module stays import-cheap.
     if action == "picker":

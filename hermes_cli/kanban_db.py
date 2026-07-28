@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2509,6 +2509,221 @@ class ExternalTaskSyncSpec:
         )
 
 
+@dataclass(frozen=True)
+class OpenSpecTaskDefinition:
+    """Source-owned fields for one exact-key OpenSpec task definition."""
+
+    external_key: str
+    source_path: str
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class OpenSpecTaskDefinitionUpsert:
+    task_id: str
+    external_key: str
+    action: Literal["created", "updated", "unchanged"]
+    changed_fields: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MissingOpenSpecTaskDefinition:
+    task_id: str
+    external_key: str
+    title: str
+    status: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "id": self.task_id,
+            "external_key": self.external_key,
+            "title": self.title,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class OpenSpecTaskDefinitionBatchResult:
+    items: tuple[OpenSpecTaskDefinitionUpsert, ...]
+    missing: tuple[MissingOpenSpecTaskDefinition, ...]
+
+
+def _is_tasks_id_collision(exc: sqlite3.IntegrityError) -> bool:
+    """Return whether ``exc`` is exactly a primary-key collision on tasks.id."""
+    return (
+        getattr(exc, "sqlite_errorcode", None)
+        == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
+        and str(exc) == "UNIQUE constraint failed: tasks.id"
+    )
+
+
+def upsert_openspec_task_definitions(
+    conn: sqlite3.Connection,
+    definitions: Iterable[OpenSpecTaskDefinition],
+    *,
+    external_key_prefix: str,
+) -> OpenSpecTaskDefinitionBatchResult:
+    """Atomically persist OpenSpec source definitions by exact external key."""
+    definitions = tuple(definitions)
+    if not isinstance(external_key_prefix, str) or not external_key_prefix:
+        raise ValueError("external_key_prefix is required")
+
+    seen: set[str] = set()
+    for index, definition in enumerate(definitions):
+        if not isinstance(definition, OpenSpecTaskDefinition):
+            raise TypeError(
+                f"definition {index} must be an OpenSpecTaskDefinition"
+            )
+        for field_name in ("external_key", "source_path", "title", "body"):
+            if not isinstance(getattr(definition, field_name), str):
+                raise TypeError(f"definition {index} {field_name} must be a string")
+        if not definition.external_key.strip():
+            raise ValueError(f"definition {index} external_key is required")
+        if not definition.external_key.startswith(external_key_prefix):
+            raise ValueError(
+                f"definition {index} external_key must start with "
+                f"{external_key_prefix!r}"
+            )
+        if definition.external_key in seen:
+            raise ValueError(
+                f"duplicate OpenSpec external_key {definition.external_key!r}"
+            )
+        if not definition.source_path.strip():
+            raise ValueError(f"definition {index} source_path is required")
+        if not definition.title.strip():
+            raise ValueError(f"definition {index} title is required")
+        seen.add(definition.external_key)
+
+    results: list[OpenSpecTaskDefinitionUpsert] = []
+    missing: list[MissingOpenSpecTaskDefinition] = []
+    now = int(time.time())
+    with write_txn(conn):
+        for definition in definitions:
+            row = conn.execute(
+                """
+                SELECT id, source_path, title, body
+                  FROM tasks
+                 WHERE external_key = ?
+                """,
+                (definition.external_key,),
+            ).fetchone()
+            if row is None:
+                for attempt in range(2):
+                    task_id = _new_task_id()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO tasks (
+                                id, title, body, status, priority, created_by,
+                                created_at, workspace_kind, external_key, source_path
+                            ) VALUES (?, ?, ?, 'todo', 0, 'openspec', ?,
+                                      'scratch', ?, ?)
+                            """,
+                            (
+                                task_id,
+                                definition.title,
+                                definition.body,
+                                now,
+                                definition.external_key,
+                                definition.source_path,
+                            ),
+                        )
+                        break
+                    except sqlite3.IntegrityError as exc:
+                        if attempt == 1 or not _is_tasks_id_collision(exc):
+                            raise
+                _append_event(
+                    conn,
+                    task_id,
+                    "created",
+                    {
+                        "assignee": None,
+                        "status": "todo",
+                        "parents": [],
+                        "tenant": None,
+                        "branch_name": None,
+                        "skills": None,
+                        "goal_mode": None,
+                        "external_key": definition.external_key,
+                        "source": "openspec",
+                    },
+                )
+                results.append(
+                    OpenSpecTaskDefinitionUpsert(
+                        task_id=task_id,
+                        external_key=definition.external_key,
+                        action="created",
+                        changed_fields=("body", "source_path", "title"),
+                    )
+                )
+                continue
+
+            updates = {
+                field_name: getattr(definition, field_name)
+                for field_name in ("source_path", "title", "body")
+                if row[field_name] != getattr(definition, field_name)
+            }
+            if not updates:
+                results.append(
+                    OpenSpecTaskDefinitionUpsert(
+                        task_id=str(row["id"]),
+                        external_key=definition.external_key,
+                        action="unchanged",
+                    )
+                )
+                continue
+
+            assignments = ", ".join(f"{field_name} = ?" for field_name in updates)
+            conn.execute(
+                f"UPDATE tasks SET {assignments} WHERE id = ?",
+                (*updates.values(), row["id"]),
+            )
+            changed_fields = tuple(sorted(updates))
+            _append_event(
+                conn,
+                str(row["id"]),
+                "external_synced",
+                {
+                    "external_key": definition.external_key,
+                    "changed_fields": list(changed_fields),
+                },
+            )
+            results.append(
+                OpenSpecTaskDefinitionUpsert(
+                    task_id=str(row["id"]),
+                    external_key=definition.external_key,
+                    action="updated",
+                    changed_fields=changed_fields,
+                )
+            )
+
+        rows = conn.execute(
+            """
+            SELECT id, external_key, title, status
+              FROM tasks
+             WHERE substr(external_key, 1, ?) = ?
+             ORDER BY external_key ASC
+            """,
+            (len(external_key_prefix), external_key_prefix),
+        ).fetchall()
+        missing.extend(
+            MissingOpenSpecTaskDefinition(
+                task_id=str(row["id"]),
+                external_key=str(row["external_key"]),
+                title=str(row["title"]),
+                status=str(row["status"]),
+            )
+            for row in rows
+            if row["external_key"] not in seen
+        )
+
+    return OpenSpecTaskDefinitionBatchResult(
+        items=tuple(results),
+        missing=tuple(missing),
+    )
+
+
 @dataclass
 class _ExternalTaskSyncCompletion:
     task_id: str
@@ -3780,7 +3995,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now,
             run_id,
         ),
@@ -3842,7 +4057,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now, now,
         ),
     )
@@ -5381,6 +5596,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5413,176 +5629,111 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    routed_to = "blocked"
+    transitioned = False
+    run_id: Optional[int] = None
+    blocked_task: Optional[Task] = None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if cur_row is None:
-            return False
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
-        prev_recurrences = (
-            int(cur_row["block_recurrences"])
-            if "block_recurrences" in cur_row.keys()
-            and cur_row["block_recurrences"] is not None
-            else 0
-        )
+        if cur_row is not None:
+            prev_kind = (
+                cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+            )
+            prev_recurrences = (
+                int(cur_row["block_recurrences"])
+                if "block_recurrences" in cur_row.keys()
+                and cur_row["block_recurrences"] is not None
+                else 0
+            )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+            # Dependency blocks never enter the human ``blocked`` bucket — they
+            # wait in ``todo`` and let ``recompute_ready`` gate on parents.
+            if kind == "dependency":
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'todo',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, task_id) if expected_run_id is None
+                    else (kind, task_id, int(expected_run_id)),
                 )
-            _append_event(
-                conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
-            )
-            routed_to = "todo"
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                event_kind = "dependency_wait"
+                event_payload = {"reason": reason, "kind": kind}
+            else:
+                # Truly-blocked kinds increment the unblock-loop counter and
+                # route repeated same-cause blocks to human triage.
+                same_cause = prev_kind == kind
+                recurrences = prev_recurrences + 1 if same_cause else 1
+                route_to_triage = recurrences >= BLOCK_RECURRENCE_LIMIT
+                status = "triage" if route_to_triage else "blocked"
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                       SET status        = '{status}',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id) if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
                 )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
+                event_kind = "block_loop_detected" if route_to_triage else "blocked"
+                event_payload = {
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                },
-                run_id=run_id,
-            )
-            routed_to = "triage"
-        else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
+                }
+                if route_to_triage:
+                    event_payload["limit"] = BLOCK_RECURRENCE_LIMIT
+
+            if cur.rowcount == 1:
+                transitioned = True
+                run_id = _end_run(
+                    conn,
+                    task_id,
                     outcome="blocked",
+                    status="blocked",
                     summary=reason,
+                    metadata=metadata,
                 )
-            _append_event(
-                conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
-                run_id=run_id,
-            )
-        _blocked_task = get_task(conn, task_id)
+                # Preserve the reason/metadata in attempt history even for a
+                # task that was never claimed.
+                if run_id is None and (reason or metadata is not None):
+                    run_id = _synthesize_ended_run(
+                        conn,
+                        task_id,
+                        outcome="blocked",
+                        summary=reason,
+                        metadata=metadata,
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    event_kind,
+                    event_payload,
+                    run_id=run_id,
+                )
+                blocked_task = get_task(conn, task_id)
+    if not transitioned:
+        return False
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
         board=get_current_board(),
-        assignee=_blocked_task.assignee if _blocked_task else None,
+        assignee=blocked_task.assignee if blocked_task else None,
         run_id=run_id,
         reason=reason,
     )
