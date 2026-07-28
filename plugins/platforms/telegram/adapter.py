@@ -7676,7 +7676,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(message):
             return False
         if single_principal_enabled:
-            return True
+            return chat_id_str not in self._telegram_free_response_chats()
 
         # Legacy observation applies only to messages skipped by its normal
         # require-mention gate. Single-principal invocation ignores these
@@ -8055,9 +8055,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if single_principal_enabled:
             if shared_scope is None:
                 return False
-            # Shared rooms are intentionally people-active: no ambient
-            # observation, wake-word patterns, guest mode, or free-response
-            # bypasses. Commands must use Telegram's addressed /cmd@bot form.
+            if chat_id_str in self._telegram_free_response_chats():
+                return True
+            # Shared rooms are intentionally people-active outside exact
+            # group-level free-response: no wake-word patterns, guest mode, or
+            # topic-level bypasses. Commands must use Telegram's addressed
+            # /cmd@bot form.
             return self._is_reply_to_bot(message) or self._message_mentions_bot(message)
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
