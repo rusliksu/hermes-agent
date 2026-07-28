@@ -127,6 +127,20 @@ def test_format_footer_drops_cwd_when_empty(monkeypatch):
     assert out == "gpt-5.4 · 50%"
 
 
+def test_format_footer_explicit_empty_cwd_ignores_ambient_env(monkeypatch):
+    monkeypatch.setenv("TERMINAL_CWD", "/srv/owner-ambient")
+
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        fields=("cwd",),
+    )
+
+    assert out == ""
+
+
 def test_format_footer_custom_field_order():
     out = format_runtime_footer(
         model="openai/gpt-5.4",

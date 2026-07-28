@@ -12967,14 +12967,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
+                _footer_line = self._build_runtime_footer_for_source(
+                    source,
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -18535,6 +18532,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
         )
         return None
+
+    def _build_runtime_footer_for_source(
+        self,
+        source: SessionSource,
+        *,
+        model: Optional[str],
+        context_tokens: int,
+        context_length: Optional[int],
+    ) -> str:
+        """Build a final footer without typed-profile fallback to global state."""
+        from gateway.runtime_footer import build_footer_line
+
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            return build_footer_line(
+                user_config=_load_gateway_config(),
+                platform_key=_platform_config_key(source.platform),
+                model=model,
+                context_tokens=context_tokens,
+                context_length=context_length,
+                cwd=None,
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            user_config = _load_gateway_config()
+            terminal = user_config.get("terminal")
+            configured_cwd = terminal.get("cwd") if isinstance(terminal, dict) else None
+            cwd = ""
+            if isinstance(configured_cwd, str):
+                candidate = configured_cwd.strip()
+                try:
+                    if (
+                        candidate.lower() not in CWD_PLACEHOLDERS
+                        and "\x00" not in candidate
+                        and Path(candidate).is_absolute()
+                    ):
+                        cwd = candidate
+                except (OSError, ValueError):
+                    pass
+            return build_footer_line(
+                user_config=user_config,
+                platform_key=_platform_config_key(source.platform),
+                model=model,
+                context_tokens=context_tokens,
+                context_length=context_length,
+                cwd=cwd,
+            )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
