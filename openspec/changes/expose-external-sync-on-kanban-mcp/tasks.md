@@ -281,9 +281,9 @@ Baseline реализации явно одобрен пользователем
   DB migration, live config/wrapper/runtime/state или service artifacts.
 - [x] 14.2 Выполнить strict OpenSpec validation, `git diff --check` и
   независимое code review без `BLOCK`.
-- [ ] 14.3 Создать отдельный task-owned bootstrap-helper PR без live effects;
+- [x] 14.3 Создать отдельный task-owned bootstrap-helper PR без live effects;
   не выполнять commit/push/PR в planning run.
-- [ ] 14.4 Зафиксировать в PR и handoff: merge bootstrap-helper PR не
+- [x] 14.4 Зафиксировать в PR и handoff: merge bootstrap-helper PR не
   разрешает никакой live apply.
 
 ## 15. Новый точный live gate после merge bootstrap-helper PR
