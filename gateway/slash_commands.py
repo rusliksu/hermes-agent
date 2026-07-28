@@ -681,7 +681,7 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
             adapter = self._adapter_for_source(source)
-            scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
+            scope = getattr(adapter, "_matrix_session_scope", "auto")
             thread = source.thread_id or "none"
             lines.extend([
                 "",

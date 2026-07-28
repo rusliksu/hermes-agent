@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from hermes_state import AsyncSessionDB
@@ -380,6 +381,35 @@ async def test_matrix_status_reports_current_matrix_room_scope():
     assert "session_key: sha256:" in result
     assert PROJECT_A_NAME not in result
     assert PROJECT_A_ROOM_ID not in result
+
+
+@pytest.mark.asyncio
+async def test_matrix_status_typed_context_without_adapter_does_not_inherit_process_scope(monkeypatch):
+    monkeypatch.setenv("MATRIX_SESSION_SCOPE", "thread")
+    source_a = _make_matrix_source(PROJECT_A_ROOM_ID, PROJECT_A_NAME, PROJECT_A_TOPIC)
+    source_b = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    source_b.resolved_access_context = ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family_standard",
+        profile_id="family-matrix",
+        conversation_scope="room",
+        capabilities=frozenset({"public_web", "matrix_room"}),
+        delivery_target=DeliveryTarget(
+            platform="matrix",
+            account="matrix-bot",
+            peer_kind="room",
+            chat_id=PROJECT_B_ROOM_ID,
+            thread_id=None,
+        ),
+    )
+    entry_b = _entry(source_b, "session-b", "Project B Plan")
+    runner = _make_runner(source_b, [_entry(source_a, "session-a", "Project A Plan"), entry_b])
+    runner._profile_adapters = {}
+
+    result = await runner._handle_status_command(_event("/status", source_b))
+
+    assert "session_scope: auto" in result
+    assert "session_scope: thread" not in result
 
 
 @pytest.mark.asyncio
