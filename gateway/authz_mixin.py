@@ -79,9 +79,25 @@ class GatewayAuthorizationMixin:
             return None
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
+        profile = getattr(source, "profile", None)
+        resolved_access_context = getattr(source, "resolved_access_context", None)
+        if resolved_access_context is not None:
+            context_profile = getattr(resolved_access_context, "profile_id", None)
+            if not isinstance(context_profile, str):
+                return None
+            context_profile = context_profile.strip()
+            if not context_profile or context_profile == "default":
+                return None
+            if profile is not None:
+                if not isinstance(profile, str):
+                    return None
+                source_profile = profile.strip()
+                if source_profile and source_profile != context_profile:
+                    return None
+            profile = context_profile
         return self._authorization_adapter(
             getattr(source, "platform", None),
-            getattr(source, "profile", None),
+            profile,
         )
 
     def _adapter_authorization_is_upstream(

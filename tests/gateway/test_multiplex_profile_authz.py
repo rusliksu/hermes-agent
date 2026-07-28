@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 
@@ -48,6 +49,22 @@ def _make_multiplex_runner(monkeypatch):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     return runner, default_adapter, secondary_adapter
+
+
+def _coder_wecom_dm_context(profile_id: str = "coder") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"chat"}),
+        delivery_target=DeliveryTarget(
+            platform=Platform.WECOM.value,
+            account="corp-coder",
+            peer_kind="dm",
+            chat_id="wecom-dm-chat",
+        ),
+    )
 
 
 def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):
@@ -125,6 +142,59 @@ def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
             profile=None,
         )
     ) is default_adapter
+
+
+def test_adapter_for_source_uses_typed_context_profile_when_source_profile_missing(monkeypatch):
+    """Typed access context profile must route replies to the secondary adapter."""
+    runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="coder-user",
+        chat_id="wecom-dm-chat",
+        user_name="coder-user",
+        chat_type="dm",
+        profile=None,
+        resolved_access_context=_coder_wecom_dm_context(),
+    )
+
+    assert runner._adapter_for_source(source) is secondary_adapter
+
+
+def test_adapter_for_source_rejects_source_profile_mismatch_with_typed_context(monkeypatch):
+    """A source stamp that contradicts typed context must not fall back to default."""
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="coder-user",
+        chat_id="wecom-dm-chat",
+        user_name="coder-user",
+        chat_type="dm",
+        profile="default",
+        resolved_access_context=_coder_wecom_dm_context(),
+    )
+
+    assert runner._adapter_for_source(source) is None
+
+
+def test_adapter_for_source_rejects_default_typed_context_without_source_profile(monkeypatch):
+    """A typed default profile must not fall back to the unstamped adapter."""
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="coder-user",
+        chat_id="wecom-dm-chat",
+        user_name="coder-user",
+        chat_type="dm",
+        profile=None,
+        resolved_access_context=_coder_wecom_dm_context(profile_id="default"),
+    )
+
+    adapter = runner._adapter_for_source(source)
+
+    assert adapter is None
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
