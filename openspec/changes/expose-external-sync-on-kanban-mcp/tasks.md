@@ -332,6 +332,29 @@ Baseline реализации явно одобрен пользователем
 - [ ] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
   только после отдельного gate `prepare --apply`; проверить target и rollout
   снимок со `schema_version=2`.
+  Частичная evidence от 2026-07-29: модель `gpt-5.6-sol`, запуск
+  `20260729T083434Z-hermes-prepare-dryrun`; один ordinary `prepare` dry-run
+  без `--apply` завершён с `exit 0`. Candidate target —
+  `30500cf973a40bb0918d33eb0476c1025e08ac0f`: между ним и current main
+  `1e2b27126e4500edc3ad40f733575f9122b9d7c4` менялся только
+  `openspec/.../tasks.md`, non-OpenSpec production diff отсутствует и деревья
+  одинаковы. Запланированы candidate
+  `/home/openclaw/.hermes/mcp-rollout-state/hermes-kanban-mcp-30500cf973a40bb0918d33eb0476c1025e08ac0f`
+  и snapshot
+  `/home/openclaw/.hermes/mcp-rollout-state/snapshots/6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`;
+  запланированный SHA-256 `wrapper.after` —
+  `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`.
+  State oracle до и после одинаков:
+  `ec357d753a678b6f37010f4ee98b5966e529bc61a6794feb2d0f738236417fb1`
+  (`total=10093`, `files=8744`, `dirs=1345`, `symlinks=4`, top-level `2`).
+  Wrapper не изменился: обычный файл `0755`, `286` bytes, SHA-256
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`;
+  ссылки `baseline=1`, `candidate=0`, `export=0`. Baseline — exact HEAD
+  `6f8738dc308f909bf1735883344f2fcc12f3cbcd`, без изменений отслеживаемых файлов; репозиторий — точный
+  HEAD `1e2b27126e4500edc3ad40f733575f9122b9d7c4`, clean до и после. Candidate
+  и snapshot отсутствовали до и после, записей нет. Следующий gate —
+  отдельное разрешение exact `prepare --apply`; поэтому checkbox остаётся
+  незакрытым.
 - [ ] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
   глобальный Hermes symlink, connector config, DB или services.
 - [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
