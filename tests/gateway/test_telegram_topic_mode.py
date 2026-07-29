@@ -27,6 +27,9 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+pytestmark = pytest.mark.usefixtures("inline_asyncio_to_thread")
+
+
 def _make_source(*, thread_id: str | None = None) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,

@@ -36,6 +36,8 @@ RAW_LOG_VALUES = (
     "other-profile",
 )
 
+pytestmark = pytest.mark.usefixtures("inline_asyncio_to_thread")
+
 
 class _Adapter(BasePlatformAdapter):
     def __init__(self, *, account=ACCOUNT, runner=None):
