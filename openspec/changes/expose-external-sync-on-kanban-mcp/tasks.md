@@ -377,7 +377,7 @@ Baseline реализации явно одобрен пользователем
   Switch/restart/deploy/process smoke/DB/MCP/Kanban действий не было,
   secrets не читались. Следующий gate — ordinary `switch` dry-run без
   `--apply`.
-- [ ] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
+- [x] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
   глобальный Hermes symlink, connector config, DB или services.
   Частичная evidence от 2026-07-29: первый запуск
   `20260729T122316Z-hermes-switch-dryrun` fail-closed остановился до helper
@@ -412,6 +412,35 @@ Baseline реализации явно одобрен пользователем
   Следующий точный gate — отдельное разрешение на `switch --apply` с expected
   исходный SHA wrapper
   `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`.
+  Apply-evidence от 2026-07-29: запуск
+  `20260729T124801Z-hermes-switch-apply`, модель `gpt-5.6-sol`, sandbox
+  `danger-full-access`, точно одобренная пользователем область. Точная команда `switch --apply`
+  выполнен ровно один раз: `exit 0`; JSON `command=switch`, `mode=apply`,
+  `result=switched`. Stable wrapper атомарно заменён:
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9` →
+  `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`;
+  это regular non-symlink `0755`, `286` bytes, побайтово равный snapshot
+  `wrapper.after`; ссылки baseline/candidate/export изменились `1/0/0` →
+  `0/1/0`, контракт `mcp serve-kanban --allow-write` сохранён. Repo exact
+  ветка main и локальный origin
+  `47c3f9e8f159fbf9bd891429db7abab081331156`, без изменений; SHA-256 snapshot
+  manifest
+  `83db7f0c4cd2a3239e5d52402f6b8b88e1a66ca46ba1daa5677249fcac4a196f`.
+  До и после совпали: snapshot oracle
+  `de01265155da79290c444d76ac29c55411b3a0bbdb2b716ec5f2f41d2a3a018d`,
+  контрольное значение корня состояния
+  `0902084da8ab7d83ae476c6b634dfb52725d2d9fe23bfb1fa498c4107750fd5a`,
+  контрольное значение baseline
+  `9d2347c35662c9e9a9c9a9d0f94f46ba0a6eef2ec3da886fe541be71139e1e57`
+  и контрольное значение candidate
+  `b89a0fc05617e7131c8ad8443ffa43ea0a9bff7e663ec6b3abaa2d22f06ecbad`;
+  rollout temp files отсутствуют. Process oracle до и после совпал: `14`
+  существующих standalone Kanban MCP процессов не перезапускались и всё ещё
+  используют baseline interpreter/command; это подтверждено независимой
+  проверкой. Restart/deploy/process replacement/smoke, rollback,
+  DB/MCP/Kanban calls и network не выполнялись. Следующий отдельный gate —
+  `15.7`: отдельное разрешение заменить standalone Kanban MCP process и
+  выполнить bounded initialize/tools-list/dry-run sync smoke без DB writes.
 - [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
   Kanban MCP process и выполнить bounded initialize/tools-list/dry-run sync
   smoke без DB writes.
