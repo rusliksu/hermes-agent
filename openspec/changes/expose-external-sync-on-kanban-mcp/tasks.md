@@ -379,6 +379,39 @@ Baseline реализации явно одобрен пользователем
   `--apply`.
 - [ ] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
   глобальный Hermes symlink, connector config, DB или services.
+  Частичная evidence от 2026-07-29: первый запуск
+  `20260729T122316Z-hermes-switch-dryrun` fail-closed остановился до helper
+  из-за DNS GitHub внутри read-only sandbox; изменений и запуска helper не
+  было. Внешний read-only `git ls-remote` на HOSTKEY подтвердил remote main
+  `55b436ac284de514263e94311961d7e58f236a59`. Успешный offline-запуск
+  `20260729T122702Z-hermes-switch-dryrun-offline`, модель `gpt-5.6-sol`,
+  sandbox read-only: выполнен ровно один actual `switch` dry-run без
+  `--apply`, `exit 0`; JSON: `command=switch`, `mode=dry-run`,
+  `snapshot_kind=rollout`, snapshot
+  `6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`.
+  `wrapper.before=17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`,
+  planned
+  `wrapper.after=5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`.
+  Контрольные значения до и после совпали: корень состояния
+  `798f493e4bc2522f5963a8137333cf2d1a00a6b6f930a813bf03fdf431f7187a`,
+  snapshot
+  `f008bac0e75a1e4bc294dac6a1ae1c63494d29e5c1c9d06d0ac610e228e8f31e`,
+  контрольное значение wrapper
+  `d3a3620c44d267f08d90d65af1ff07fb9480cd2aa65305f3e04ed9691af90625`,
+  байты wrapper
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`,
+  worktrees
+  `0de76d66263f0cb981bb96f07042f0143c5abe6ab7884bc2404cf278bc7230ff`.
+  State counts неизменны: `total=20660`, `files=17910`, `dirs=2743`,
+  `symlinks=8`, `top_level=3`; временные rollout-файлы отсутствуют. Repo main
+  clean на точном `55b436ac284de514263e94311961d7e58f236a59`; baseline
+  `6f8738dc308f909bf1735883344f2fcc12f3cbcd` и candidate
+  `30500cf973a40bb0918d33eb0476c1025e08ac0f` detached, clean и на точных SHA;
+  snapshot и interpreter валидированы. Stable wrapper остался baseline;
+  switch/restart/deploy/process smoke/DB/MCP/Kanban sync не выполнялись.
+  Следующий точный gate — отдельное разрешение на `switch --apply` с expected
+  исходный SHA wrapper
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`.
 - [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
   Kanban MCP process и выполнить bounded initialize/tools-list/dry-run sync
   smoke без DB writes.
