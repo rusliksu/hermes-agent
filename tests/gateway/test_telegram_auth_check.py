@@ -257,7 +257,7 @@ def test_registry_callback_runner_error_ignores_process_env(monkeypatch):
 @pytest.mark.asyncio
 async def test_authorized_user_processed_normally():
     """Authorized user's message should pass the auth check and build an event."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
 
     build_called = False
     original_build = adapter._build_message_event
@@ -283,7 +283,7 @@ async def test_authorized_user_processed_normally():
 @pytest.mark.asyncio
 async def test_channel_post_passes_auth():
     """Messages with no from_user (channel posts) should pass user-level auth."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
 
     build_called = False
     original_build = adapter._build_message_event
@@ -329,7 +329,7 @@ async def test_command_from_unauthorized_user_blocked():
 @pytest.mark.asyncio
 async def test_command_from_authorized_user_processed():
     """Commands from authorized users should be processed."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
     adapter.handle_message = AsyncMock()
 
     update = SimpleNamespace(

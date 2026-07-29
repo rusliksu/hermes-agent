@@ -1,10 +1,10 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from gateway.config import Platform, PlatformConfig, load_gateway_config
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
 from gateway.single_principal import SinglePrincipalPolicy
@@ -25,6 +25,7 @@ def _make_adapter(
     guest_mode=None,
     observe_unmentioned_group_messages=None,
     bot_username="hermes_bot",
+    account=None,
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -67,6 +68,8 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if account is not None:
+        extra["account"] = account
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -197,6 +200,83 @@ def _attach_single_principal(adapter, shared_chat_ids):
     return runner
 
 
+def _shared_access_registry(*, room_ids=("-100",), account="bot-a", member_id="111"):
+    from gateway.access_registry import (
+        AccessRegistry,
+        DeliveryTarget,
+        ParticipantIdentity,
+        RolePolicy,
+        SharedScopeBinding,
+        TransportIdentity,
+    )
+
+    roles = {"shared_room": RolePolicy("shared_room", frozenset({"chat"}))}
+    profiles = frozenset(f"room-profile-{index}" for index, _ in enumerate(room_ids))
+    scope_capabilities = {
+        f"room-scope-{index}": frozenset({"chat"})
+        for index, _ in enumerate(room_ids)
+    }
+    bindings = []
+    for index, room_id in enumerate(room_ids):
+        identity = TransportIdentity(
+            platform="telegram",
+            account=account,
+            peer_kind="group",
+            user_id=member_id,
+            chat_id=room_id,
+        )
+        bindings.append(
+            SharedScopeBinding(
+                principal_id=f"principal-room-{index}",
+                role_id="shared_room",
+                profile_id=f"room-profile-{index}",
+                room_identity=identity,
+                conversation_scope=f"room-scope-{index}",
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account=account,
+                    peer_kind="group",
+                    chat_id=room_id,
+                ),
+                participant_identities=(
+                    ParticipantIdentity("telegram", account, member_id),
+                ),
+            )
+        )
+    return AccessRegistry(
+        roles=roles,
+        profiles=profiles,
+        shared_scope_bindings=tuple(bindings),
+        scope_capabilities=scope_capabilities,
+        backend_capabilities=frozenset({"chat"}),
+    )
+
+
+def _attach_access_registry(adapter, registry):
+    from gateway.run import GatewayRunner
+
+    class Runner:
+        def __init__(self):
+            self.config = GatewayConfig(multiplex_profiles=True)
+            self.access_registry = registry
+            self.handle_calls = 0
+            self.events = []
+            self._allow_access_registry_ingress = MethodType(
+                GatewayRunner._allow_access_registry_ingress,
+                self,
+            )
+
+        async def handle(self, event):
+            self.handle_calls += 1
+            self.events.append(event)
+            return None
+
+    runner = Runner()
+    adapter._message_handler = runner.handle
+    del adapter._is_callback_user_authorized
+    return runner
+
+
 def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 
@@ -283,6 +363,119 @@ def test_single_principal_free_response_shared_group_dispatches_all_topics_with_
         second_source,
         group_sessions_per_user=False,
     )
+
+
+def test_access_registry_free_response_uses_config_not_process_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_CHATS", "-100,-200")
+    monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_TOPICS", "-100:8")
+    monkeypatch.setenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION", "false")
+
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=False,
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    configured_room = _group_message(
+        "ambient",
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=8,
+        is_forum=True,
+    )
+    env_only_room = _group_message("ambient", chat_id=-200, from_user_id=111)
+
+    assert adapter._should_process_message(configured_room) is False
+    assert adapter._should_observe_unmentioned_group_message(configured_room) is False
+    assert adapter._should_process_message(env_only_room) is False
+
+
+def test_access_registry_configured_free_response_room_policy_works():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100", "-200"), account="bot-a", member_id="111"),
+    )
+
+    first = _group_message("ambient one", chat_id=-100, from_user_id=111, thread_id=7, is_forum=True)
+    second = _group_message("ambient two", chat_id=-100, from_user_id=111, thread_id=8, is_forum=True)
+    other_room = _group_message("ambient other", chat_id=-200, from_user_id=111)
+
+    assert adapter._should_process_message(first) is True
+    assert adapter._should_process_message(second) is True
+    assert adapter._should_observe_unmentioned_group_message(first) is False
+    assert adapter._should_process_message(other_room) is False
+    assert adapter._should_observe_unmentioned_group_message(other_room) is True
+
+
+def test_access_registry_missing_policy_requires_mention_and_disables_passive(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_CHATS", "-100")
+    monkeypatch.setenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION", "false")
+
+    adapter = _make_adapter(account="bot-a")
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    ambient = _group_message("ambient", chat_id=-100, from_user_id=111)
+    mention_text = "hi @hermes_bot"
+    mentioned = _group_message(
+        mention_text,
+        chat_id=-100,
+        from_user_id=111,
+        entities=[_mention_entity(mention_text)],
+    )
+
+    assert adapter._should_process_message(ambient) is False
+    assert adapter._should_observe_unmentioned_group_message(ambient) is False
+    assert adapter._should_process_message(mentioned) is True
+
+
+def test_access_registry_malformed_server_bound_topic_policy_denies():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        allowed_topics={"topic": "7"},
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    mention_text = "hi @hermes_bot"
+    message = _group_message(
+        mention_text,
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=7,
+        is_forum=True,
+        entities=[_mention_entity(mention_text)],
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is False
+
+
+def test_legacy_no_registry_env_free_response_still_bypasses_mention(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_CHATS", "-100")
+
+    adapter = _make_adapter(require_mention=True)
+
+    assert adapter._should_process_message(_group_message("ambient", chat_id=-100)) is True
+    assert adapter._should_process_message(_group_message("ambient", chat_id=-200)) is False
 
 
 def test_single_principal_free_response_shared_group_text_dispatch_is_not_passive_observation():
@@ -1301,7 +1494,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
-    # free_response_chats is bridged to the env var only (not PlatformConfig.extra).
+    assert tg_cfg.extra.get("free_response_chats") == ["-123"]
+    # free_response_chats is also bridged to the env var for legacy adapters.
     # TELEGRAM_FREE_RESPONSE_CHATS is not a key that appears in developer .env
     # files, so asserting it via os.environ stays deterministic.
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
@@ -1370,7 +1564,7 @@ def test_dm_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
 
 
 def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
-    adapter = _make_adapter(group_allow_from=["111"])
+    adapter = _make_adapter(require_mention=False, group_allow_from=["111"])
 
     assert adapter._should_process_message(_group_message("hello", from_user_id=333)) is True
 

@@ -7354,14 +7354,72 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # ── Group mention gating ──────────────────────────────────────────────
 
+    def _telegram_access_registry_policy_active(self) -> bool:
+        runner = self._gateway_runner_for_callback_auth()
+        return getattr(runner, "access_registry", None) is not None
+
+    def _telegram_policy_value(self, key: str, env_name: str, default: Any = "") -> Any:
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        if isinstance(extra, dict) and key in extra:
+            return extra[key]
+        if self._telegram_access_registry_policy_active():
+            return default
+        return os.getenv(env_name, default)
+
+    def _telegram_policy_bool(
+        self,
+        key: str,
+        env_name: str,
+        *,
+        default: bool = False,
+        registry_default: Optional[bool] = None,
+    ) -> bool:
+        raw = self._telegram_policy_value(
+            key,
+            env_name,
+            registry_default if registry_default is not None else default,
+        )
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off", ""}:
+                return False
+            return registry_default if self._telegram_access_registry_policy_active() and registry_default is not None else default
+        if self._telegram_access_registry_policy_active():
+            return registry_default if registry_default is not None else default
+        return bool(raw)
+
+    def _telegram_policy_string_set(self, key: str, env_name: str) -> tuple[set[str], bool]:
+        raw = self._telegram_policy_value(key, env_name)
+        strict = self._telegram_access_registry_policy_active()
+        if isinstance(raw, str):
+            return {part.strip() for part in raw.split(",") if part.strip()}, False
+        if isinstance(raw, list):
+            values: set[str] = set()
+            for part in raw:
+                if not isinstance(part, (str, int)) or isinstance(part, bool):
+                    return set(), strict
+                text = str(part).strip()
+                if text:
+                    values.add(text)
+            return values, False
+        if raw in (None, ""):
+            return set(), False
+        if strict:
+            return set(), True
+        return {part.strip() for part in str(raw).split(",") if part.strip()}, False
+
     def _telegram_require_mention(self) -> bool:
         """Return whether group chats should require an explicit bot trigger."""
-        configured = self.config.extra.get("require_mention")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return self._telegram_policy_bool(
+            "require_mention",
+            "TELEGRAM_REQUIRE_MENTION",
+            default=False,
+            registry_default=True,
+        )
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -7371,40 +7429,49 @@ class TelegramAdapter(BasePlatformAdapter):
         transcript, but only dispatch the agent when the bot is explicitly
         addressed.
         """
-        configured = self.config.extra.get("observe_unmentioned_group_messages")
-        if configured is None:
-            configured = self.config.extra.get("ingest_unmentioned_group_messages")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        if (
+            isinstance(extra, dict)
+            and "observe_unmentioned_group_messages" not in extra
+            and "ingest_unmentioned_group_messages" in extra
+        ):
+            raw = extra["ingest_unmentioned_group_messages"]
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"true", "1", "yes", "on"}
+            return False if self._telegram_access_registry_policy_active() else bool(raw)
+        return self._telegram_policy_bool(
+            "observe_unmentioned_group_messages",
+            "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES",
+            default=False,
+            registry_default=False,
+        )
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
-        configured = self.config.extra.get("guest_mode")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
+        return self._telegram_policy_bool(
+            "guest_mode",
+            "TELEGRAM_GUEST_MODE",
+            default=False,
+            registry_default=False,
+        )
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
-        configured = self.config.extra.get("exclusive_bot_mentions")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
+        return self._telegram_policy_bool(
+            "exclusive_bot_mentions",
+            "TELEGRAM_EXCLUSIVE_BOT_MENTIONS",
+            default=True,
+            registry_default=True,
+        )
 
     def _telegram_free_response_chats(self) -> set[str]:
-        raw = self.config.extra.get("free_response_chats")
-        if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+        values, _malformed = self._telegram_policy_string_set(
+            "free_response_chats",
+            "TELEGRAM_FREE_RESPONSE_CHATS",
+        )
+        return values
 
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
@@ -7413,12 +7480,11 @@ class TelegramAdapter(BasePlatformAdapter):
         forum topic for free-response. A missing/omitted thread id on incoming
         messages is normalized to the General topic (``1``).
         """
-        raw = self.config.extra.get("free_response_topics")
-        if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+        values, _malformed = self._telegram_policy_string_set(
+            "free_response_topics",
+            "TELEGRAM_FREE_RESPONSE_TOPICS",
+        )
+        return values
 
     def _telegram_is_free_response_topic(self, message: Message) -> bool:
         """True when the message's chat/topic pair is in ``free_response_topics``."""
@@ -7479,12 +7545,14 @@ class TelegramAdapter(BasePlatformAdapter):
         ``message_thread_id`` for the forum General topic, so ``None`` is
         treated as topic ``1`` for matching purposes.
         """
-        raw = self.config.extra.get("allowed_topics")
-        if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_TOPICS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+        values, _malformed = self._telegram_allowed_topics_policy()
+        return values
+
+    def _telegram_allowed_topics_policy(self) -> tuple[set[str], bool]:
+        return self._telegram_policy_string_set(
+            "allowed_topics",
+            "TELEGRAM_ALLOWED_TOPICS",
+        )
 
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
@@ -7753,6 +7821,27 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return None, True
 
+    def _access_registry_shared_scope(self, message: Message):
+        """Resolve active AccessRegistry shared-room context for trigger policy."""
+        runner = self._gateway_runner_for_callback_auth()
+        if getattr(runner, "access_registry", None) is None:
+            return None, False
+        try:
+            source = self._source_from_message_for_auth(message)
+            allowed = self._authorize_access_registry_source(source)
+            if not allowed:
+                return None, True
+            context = getattr(source, "resolved_access_context", None)
+            if getattr(context, "role_id", None) != "shared_room":
+                return None, True
+            return context, True
+        except Exception:
+            logger.warning(
+                "[Telegram] AccessRegistry shared-scope resolution failed",
+                exc_info=True,
+            )
+            return None, True
+
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
@@ -7779,7 +7868,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
         thread_id = getattr(message, "message_thread_id", None)
-        allowed_topics = self._telegram_allowed_topics()
+        allowed_topics, malformed_allowed_topics = self._telegram_allowed_topics_policy()
+        if malformed_allowed_topics:
+            return False
         if allowed_topics:
             topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
             if topic_id not in allowed_topics:
@@ -7800,6 +7891,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._message_mentions_bot(message):
             return False
+        registry_scope, registry_enabled = self._access_registry_shared_scope(message)
+        if registry_enabled:
+            if registry_scope is None:
+                return False
+            return chat_id_str not in self._telegram_free_response_chats()
         if single_principal_enabled:
             return chat_id_str not in self._telegram_free_response_chats()
 
@@ -8300,7 +8396,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
         thread_id = self._effective_message_thread_id(message)
-        allowed_topics = self._telegram_allowed_topics()
+        allowed_topics, malformed_allowed_topics = self._telegram_allowed_topics_policy()
+        if malformed_allowed_topics:
+            return False
         if allowed_topics:
             topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
             if topic_id not in allowed_topics:
@@ -8337,6 +8435,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # group-level free-response: no wake-word patterns, guest mode, or
             # topic-level bypasses. Commands must use Telegram's addressed
             # /cmd@bot form.
+            return self._is_reply_to_bot(message) or self._message_mentions_bot(message)
+
+        registry_scope, registry_enabled = self._access_registry_shared_scope(message)
+        if registry_enabled:
+            if registry_scope is None:
+                return False
+            if chat_id_str in self._telegram_free_response_chats():
+                return True
             return self._is_reply_to_bot(message) or self._message_mentions_bot(message)
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
@@ -9682,7 +9788,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(group_allowed_chats, list):
             group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
         os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
+    for _key in (
+        "guest_mode",
+        "disable_link_previews",
+        "observe_unmentioned_group_messages",
+        "free_response_chats",
+        "free_response_topics",
+    ):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
     # Pass through telegram-specific extra keys (e.g. base_url proxy override),
