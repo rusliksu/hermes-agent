@@ -329,7 +329,7 @@ Baseline реализации явно одобрен пользователем
   Baseline, snapshot и export не изменились, временные helper-файлы
   отсутствуют. Restart, deploy, process smoke, DB и Kanban sync не
   выполнялись.
-- [ ] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
+- [x] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
   только после отдельного gate `prepare --apply`; проверить target и rollout
   снимок со `schema_version=2`.
   Частичная evidence от 2026-07-29: модель `gpt-5.6-sol`, запуск
@@ -352,9 +352,31 @@ Baseline реализации явно одобрен пользователем
   ссылки `baseline=1`, `candidate=0`, `export=0`. Baseline — exact HEAD
   `6f8738dc308f909bf1735883344f2fcc12f3cbcd`, без изменений отслеживаемых файлов; репозиторий — точный
   HEAD `1e2b27126e4500edc3ad40f733575f9122b9d7c4`, clean до и после. Candidate
-  и snapshot отсутствовали до и после, записей нет. Следующий gate —
-  отдельное разрешение exact `prepare --apply`; поэтому checkbox остаётся
-  незакрытым.
+  и snapshot отсутствовали до и после, записей нет. На момент dry-run
+  следующим gate было отдельное разрешение exact `prepare --apply`.
+  Apply-evidence от 2026-07-29: модель `gpt-5.6-sol`, sandbox
+  `danger-full-access`, exact user-approved scope; запуск
+  `20260729T102235Z-hermes-prepare-apply`. Ровно один обычный
+  `prepare --apply` завершён с `exit 0`; JSON:
+  `command=prepare`, `mode=apply`, `result=prepared`. Candidate
+  `/home/openclaw/.hermes/mcp-rollout-state/hermes-kanban-mcp-30500cf973a40bb0918d33eb0476c1025e08ac0f`
+  зарегистрирован как detached worktree на exact HEAD
+  `30500cf973a40bb0918d33eb0476c1025e08ac0f`, tracked-clean;
+  `venv/bin/python` исполняемый, Python `3.12.3`. rollout-снимок
+  `/home/openclaw/.hermes/mcp-rollout-state/snapshots/6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`
+  имеет каталог `0700`, ровно `manifest.json`, `wrapper.before`,
+  `wrapper.after` mode `0600`, `schema_version=2`,
+  `snapshot_kind=rollout`, `runtime_path_replacements=1`; SHA-256:
+  manifest `83db7f0c4cd2a3239e5d52402f6b8b88e1a66ca46ba1daa5677249fcac4a196f`,
+  before `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`,
+  after `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`.
+  Stable wrapper независимо подтверждён неизменным: regular non-symlink
+  `0755`, `286` bytes, SHA-256 `17052c7d...`, ссылки `baseline=1`,
+  `candidate=0`. Baseline — точный HEAD `6f8738dc...`, без изменений; репозиторий —
+  точный HEAD `347c74323cbd4fd56a36be972be4c8142a7dca66`, без изменений.
+  Switch/restart/deploy/process smoke/DB/MCP/Kanban действий не было,
+  secrets не читались. Следующий gate — ordinary `switch` dry-run без
+  `--apply`.
 - [ ] 15.6 Выполнить обычный target `switch` dry-run и gated apply; не менять
   глобальный Hermes symlink, connector config, DB или services.
 - [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
