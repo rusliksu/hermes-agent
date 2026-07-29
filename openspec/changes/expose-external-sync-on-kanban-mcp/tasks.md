@@ -444,8 +444,48 @@ Baseline реализации явно одобрен пользователем
 - [ ] 15.7 Только после repository lifecycle отдельно заменить standalone
   Kanban MCP process и выполнить bounded initialize/tools-list/dry-run sync
   smoke без DB writes.
+  Evidence ownership/import-origin audit: unbiased process audit без VPS Codex
+  обнаружил на HOSTKEY `11` live stdio MCP children; каждый является direct
+  child отдельного `sshd: openclaw@notty`, а не systemd/standalone service,
+  имеет pipes на `fd0/fd1/fd2` и отдельный session scope. Из них `7`
+  используют baseline interpreter `6f8738dc...`, `4` — candidate interpreter
+  `30500cf...`. На Windows им соответствуют те же `11` процессов `ssh.exe` с
+  точная команда
+  `hostkey-codex /home/openclaw/.hermes/mcp/hermes-kanban/run.sh`; все они —
+  children `codex.exe` PID `26004`, поэтому массовое завершение затронуло бы
+  другие задачи Codex. Read-only pulse `mode=ro/query_only`
+  `kanban_board_status` по I/O точно связал текущий connector с HOSTKEY PID
+  `3118916` на candidate runtime; по времени ему соответствует Windows
+  `ssh.exe` PID `428`.
+  Import-origin audit: stable wrapper SHA `5e03752f...` запускает
+  `candidate/venv/bin/python -m hermes_cli.main`, однако fresh candidate
+  interpreter разрешает импорты `hermes_cli.main` и
+  `agent.transports.hermes_kanban_mcp_server` из
+  `candidate/venv/lib/python3.12/site-packages`, дистрибутив `hermes-agent
+  0.18.2`. Candidate source server имеет SHA-256
+  `dd065b21caa73cda4c1f2d74a0139afed0c5df880ce65d9a27b0ed8b3dcc8e1f` и
+  содержит `2` ссылки `kanban_sync_external_task`, тогда как server в
+  candidate venv site-packages имеет SHA-256
+  `fa01ac3d129f875144f40df0cc512a561ecbb8e018b0ba467f0f91c97376e174`,
+  побайтово совпадает с baseline venv site-packages и не содержит
+  `kanban_sync_external_task`. Runtime `WRITE_TOOLS` остаётся старым и не
+  включает external sync. Поэтому process replacement/smoke не может
+  подтвердить feature и запрещён до rollback/remediation.
 - [ ] 15.8 При любом провале использовать соответствующий schema v2 rollback
   сначала dry-run, затем gated apply; восстановить wrapper byte-identically,
   не удаляя baseline/target/snapshots.
+  Partial evidence rollback dry-run: выполнена exact rollback-команда для
+  snapshot `6f8738dc...-to-30500cf...` с expected current wrapper SHA
+  `5e03752f...`, без `--apply`; `exit 0`, JSON `command=rollback`,
+  `mode=dry-run`. Planned `wrapper.before` SHA —
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`.
+  До и после stable wrapper SHA остался
+  `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`,
+  контрольное значение снимка —
+  `9bb98617befe30c274a049cecd2ee68408b19aec7cfc3b7424a29ade3d7a6bf9`,
+  process counts — `baseline:7`, `candidate:4`; временные файлы отсутствуют,
+  `NO_WRITES=yes`. Rollback `--apply` не выполнялся. Следующий отдельный gate
+  — explicit permission на exact rollback `--apply`; после rollback требуется
+  material repair baseline для coherence source/package.
 - [ ] 15.9 Сохранить exact plan/manifest/hash/process/smoke или rollback
   evidence. Ни merge PR, ни planning approval не считаются live approval.
