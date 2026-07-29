@@ -13,12 +13,31 @@ from gateway.single_principal import SinglePrincipalPolicy
 
 def _clear_auth_env(monkeypatch) -> None:
     for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_ALLOW_BOTS",
+        "TELEGRAM_ALLOW_ALL_USERS",
         "WECOM_ALLOWED_USERS",
         "GATEWAY_ALLOWED_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
         "WECOM_ALLOW_ALL_USERS",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def _make_auth_runner(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    return runner
 
 
 def _make_multiplex_runner(monkeypatch):
@@ -68,6 +87,41 @@ def _coder_wecom_dm_context(profile_id: str = "coder") -> ResolvedAccessContext:
     )
 
 
+def _typed_telegram_context() -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-synthetic",
+        role_id="family_standard",
+        profile_id="family-synthetic",
+        conversation_scope="private",
+        capabilities=frozenset({"chat"}),
+        delivery_target=DeliveryTarget(
+            platform=Platform.TELEGRAM.value,
+            account="bot-synthetic",
+            peer_kind="dm",
+            chat_id="synthetic-user",
+        ),
+    )
+
+
+def _telegram_source(
+    *,
+    user_id: str | None = "synthetic-user",
+    chat_id: str = "synthetic-user",
+    chat_type: str = "dm",
+    resolved_access_context: ResolvedAccessContext | None = None,
+    is_bot: bool = False,
+) -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=user_id,
+        chat_id=chat_id,
+        user_name="synthetic",
+        chat_type=chat_type,
+        is_bot=is_bot,
+        resolved_access_context=resolved_access_context,
+    )
+
+
 def _single_principal_policy() -> SinglePrincipalPolicy:
     return SinglePrincipalPolicy.from_dict(
         {
@@ -76,6 +130,86 @@ def _single_principal_policy() -> SinglePrincipalPolicy:
             "allow_owner_bound_relay": True,
         }
     )
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"GATEWAY_ALLOW_ALL_USERS": "true"},
+        {"TELEGRAM_ALLOW_ALL_USERS": "true"},
+        {"TELEGRAM_ALLOWED_USERS": "synthetic-user"},
+    ],
+)
+def test_typed_context_ignores_process_global_dm_auth_env(monkeypatch, env):
+    runner = _make_auth_runner(monkeypatch)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    assert runner._is_user_authorized(
+        _telegram_source(resolved_access_context=_typed_telegram_context())
+    ) is False
+
+
+def test_typed_context_ignores_process_group_allowlists(monkeypatch):
+    runner = _make_auth_runner(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "synthetic-group")
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "synthetic-user")
+
+    assert runner._is_user_authorized(
+        _telegram_source(
+            chat_id="synthetic-group",
+            chat_type="group",
+            resolved_access_context=_typed_telegram_context(),
+        )
+    ) is False
+
+
+def test_typed_context_ignores_process_allow_bots(monkeypatch):
+    runner = _make_auth_runner(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
+
+    assert runner._is_user_authorized(
+        _telegram_source(
+            user_id=None,
+            is_bot=True,
+            resolved_access_context=_typed_telegram_context(),
+        )
+    ) is False
+
+
+def test_typed_context_uses_scoped_auth_provider(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    runner = _make_auth_runner(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "other-process-user")
+    token = set_secret_scope({"TELEGRAM_ALLOWED_USERS": "synthetic-user"})
+    try:
+        assert runner._is_user_authorized(
+            _telegram_source(resolved_access_context=_typed_telegram_context())
+        ) is True
+    finally:
+        reset_secret_scope(token)
+
+
+def test_legacy_no_context_still_uses_process_auth_env(monkeypatch):
+    runner = _make_auth_runner(monkeypatch)
+
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    assert runner._is_user_authorized(_telegram_source()) is True
+
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "synthetic-user")
+    assert runner._is_user_authorized(_telegram_source()) is True
+
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "synthetic-group")
+    assert runner._is_user_authorized(
+        _telegram_source(user_id=None, chat_id="synthetic-group", chat_type="group")
+    ) is True
+
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
+    assert runner._is_user_authorized(_telegram_source(user_id=None, is_bot=True)) is True
 
 
 def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):
