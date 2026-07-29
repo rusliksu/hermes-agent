@@ -316,9 +316,13 @@ Baseline реализации явно одобрен пользователем
   Stable wrapper, export manifest и venv неизменны; SHA-256 wrapper
   `20e2cb13...`, SHA-256 манифеста `caf99892...`, запланированный SHA-256 `wrapper.after`
   `17052c7d...`. Switch/restart/deploy/process/smoke не выполнялись.
-- [ ] 15.4 Выполнить bootstrap `switch` dry-run и только после отдельного
-  подтверждения — `switch --apply`; wrapper должен atomically repoint
-  путь из `export` в `baseline`.
+- [ ] 15.4 Один bootstrap `switch` dry-run
+  `20260729T073641Z-kanban-bootstrap-switch-dry-run` завершён с exit 0:
+  действия не выполнялись (0), `apply=false`; идентификатор снимка
+  `bootstrap-6f8738dc308f909bf1735883344f2fcc12f3cbcd`. Текущий SHA-256 wrapper
+  `20e2cb13...`, expected installed SHA `17052c7d...`. Post-oracle совпал,
+  wrapper всё ещё указывает на `export`. `switch --apply` требует нового
+  явного разрешения.
 - [ ] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
   только после отдельного gate `prepare --apply`; проверить target и rollout
   снимок со `schema_version=2`.
