@@ -892,7 +892,25 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
+                    route_account=self._profile_route_account_label(),
                 )
+                registry_allowed = self._authorize_access_registry_source(source)
+                if registry_allowed is not None:
+                    if not registry_allowed:
+                        return False
+                    if require_elevated:
+                        elevated_auth_fn = getattr(runner, "_is_elevated_user_authorized", None)
+                        if not callable(elevated_auth_fn):
+                            return False
+                        try:
+                            return bool(elevated_auth_fn(source))
+                        except Exception:
+                            logger.debug(
+                                "[Telegram] Scoped callback elevated auth failed",
+                                exc_info=True,
+                            )
+                            return False
+                    return bool(auth_fn(source))
                 policy = getattr(runner, "_single_principal_policy", None)
                 if (
                     getattr(policy, "enabled", False)
@@ -911,6 +929,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 if single_principal_enabled:
+                    return False
+                if getattr(runner, "access_registry", None) is not None:
+                    logger.debug(
+                        "[Telegram] Scoped callback auth failed closed",
+                        exc_info=True,
+                    )
                     return False
                 logger.debug(
                     "[Telegram] Falling back to env-only callback auth for user %s",
@@ -973,7 +997,21 @@ class TelegramAdapter(BasePlatformAdapter):
             user_name=user_name,
             thread_id=thread_id,
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
+            route_account=self._profile_route_account_label(),
         )
+
+    def _authorize_access_registry_source(self, source) -> Optional[bool]:
+        runner = self._gateway_runner_for_callback_auth()
+        if getattr(runner, "access_registry", None) is None:
+            return None
+        guard = getattr(runner, "_allow_access_registry_ingress", None)
+        if not callable(guard):
+            return False
+        try:
+            allowed = bool(guard(MessageEvent(text="", source=source)))
+        except Exception:
+            return False
+        return allowed and getattr(source, "resolved_access_context", None) is not None
 
     def _telegram_auth_env_configured(self) -> bool:
         """Return True when Telegram auth env vars make an early decision safe."""
@@ -1000,6 +1038,9 @@ class TelegramAdapter(BasePlatformAdapter):
         source = self._source_from_message_for_auth(message)
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
+        registry_allowed = self._authorize_access_registry_source(source)
+        if registry_allowed is not None:
+            return registry_allowed
         single_principal_enabled = bool(
             getattr(
                 getattr(runner, "_single_principal_policy", None),
