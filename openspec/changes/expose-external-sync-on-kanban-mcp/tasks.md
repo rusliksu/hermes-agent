@@ -302,9 +302,20 @@ Baseline реализации явно одобрен пользователем
   SHA-256 `wrapper` до `20e2cb13...` и запланированный после `17052c7d...`;
   контрольные снимки до и после совпали; доказательство — запуск
   `20260728T212721Z-kanban-bootstrap-exact-dry-run`.
-- [ ] 15.3 Только после нового approval выполнить
-  `bootstrap-prepare --apply`; проверить schema v2 snapshot, exact baseline
-  HEAD/tracked cleanliness/venv и неизменный stable wrapper.
+- [x] 15.3 Один одобренный `bootstrap-prepare --apply` завершён с `exit 0`,
+  `result=prepared`; запуск
+  `20260729T065556Z-apply-kanban-bootstrap-baseline`. Каталог состояния
+  `/home/openclaw/.hermes/mcp-rollout-state` имеет mode `0700`; baseline
+  `/home/openclaw/.hermes/mcp-rollout-state/hermes-kanban-mcp-6f8738dc308f909bf1735883344f2fcc12f3cbcd`
+  имеет detached HEAD на exact source SHA, tracked-clean, SHA/mode
+  интерпретатора venv совпали. Snapshot
+  `/home/openclaw/.hermes/mcp-rollout-state/snapshots/bootstrap-6f8738dc308f909bf1735883344f2fcc12f3cbcd`:
+  `schema_version=2`, `snapshot_kind=bootstrap`, каталог `0700`, три файла
+  `0600`, SHA-256 манифеста
+  `b3206d44bf1dd34988223725aff539408734d45eb2334908892a48af42c2309d`.
+  Stable wrapper, export manifest и venv неизменны; SHA-256 wrapper
+  `20e2cb13...`, SHA-256 манифеста `caf99892...`, запланированный SHA-256 `wrapper.after`
+  `17052c7d...`. Switch/restart/deploy/process/smoke не выполнялись.
 - [ ] 15.4 Выполнить bootstrap `switch` dry-run и только после отдельного
   подтверждения — `switch --apply`; wrapper должен atomically repoint
   путь из `export` в `baseline`.
