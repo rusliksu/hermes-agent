@@ -316,13 +316,19 @@ Baseline реализации явно одобрен пользователем
   Stable wrapper, export manifest и venv неизменны; SHA-256 wrapper
   `20e2cb13...`, SHA-256 манифеста `caf99892...`, запланированный SHA-256 `wrapper.after`
   `17052c7d...`. Switch/restart/deploy/process/smoke не выполнялись.
-- [ ] 15.4 Один bootstrap `switch` dry-run
-  `20260729T073641Z-kanban-bootstrap-switch-dry-run` завершён с exit 0:
-  действия не выполнялись (0), `apply=false`; идентификатор снимка
-  `bootstrap-6f8738dc308f909bf1735883344f2fcc12f3cbcd`. Текущий SHA-256 wrapper
-  `20e2cb13...`, expected installed SHA `17052c7d...`. Post-oracle совпал,
-  wrapper всё ещё указывает на `export`. `switch --apply` требует нового
-  явного разрешения.
+- [x] 15.4 Один одобренный bootstrap `switch --apply` без повторной попытки
+  завершён с `exit 0`, `result=switched`; запуск
+  `20260729T081940Z-apply-kanban-bootstrap-switch`. Изменён только
+  `/home/openclaw/.hermes/mcp/hermes-kanban/run.sh`. Новый wrapper является
+  каноническим обычным файлом без символьной ссылки с mode `0755` и SHA-256
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`,
+  побайтово совпадает со snapshot `wrapper.after`, содержит одну ссылку на
+  baseline и ни одной ссылки на export; контракт сохранён. Oracle отката
+  `wrapper.before` имеет SHA-256
+  `20e2cb13c7162a833fea32f79aea59591e759c4ca2ab181e0c0a12f0e3add089`.
+  Baseline, snapshot и export не изменились, временные helper-файлы
+  отсутствуют. Restart, deploy, process smoke, DB и Kanban sync не
+  выполнялись.
 - [ ] 15.5 Выполнить обычный `prepare` baseline→target сначала dry-run, затем
   только после отдельного gate `prepare --apply`; проверить target и rollout
   снимок со `schema_version=2`.
