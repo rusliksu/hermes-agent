@@ -1,12 +1,14 @@
 """Tests for gateway/channel_directory.py — channel resolution and display."""
 
 import asyncio
+import importlib
 import json
 import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import gateway.channel_directory as channel_directory_module
 from gateway.channel_directory import (
     build_channel_directory,
     lookup_channel_type,
@@ -17,6 +19,7 @@ from gateway.channel_directory import (
     _build_from_sessions,
     _build_slack,
 )
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
 import pytest
@@ -83,6 +86,60 @@ class TestBuildChannelDirectoryWrites:
             result = load_directory()
 
         assert result == previous
+
+
+class TestProfileScopedPaths:
+    def test_profile_override_controls_directory_aliases_and_build_path(
+        self, tmp_path, monkeypatch
+    ):
+        owner_home = tmp_path / "owner-home"
+        profile_home = tmp_path / "profile-home"
+        owner_home.mkdir()
+        profile_home.mkdir()
+        _write_directory(owner_home, {
+            "telegram": [{"id": "owner-chat", "name": "Owner Directory", "type": "dm"}]
+        })
+        _write_directory(profile_home, {
+            "telegram": [{"id": "profile-chat", "name": "raw", "type": "dm"}]
+        })
+        (owner_home / "channel_aliases.json").write_text(
+            json.dumps({"telegram": {"profile-chat": "Owner Alias"}}),
+            encoding="utf-8",
+        )
+        (profile_home / "channel_aliases.json").write_text(
+            json.dumps({
+                "telegram": {
+                    "profile-chat": "Profile Alias",
+                    "profile-only": "Profile Only",
+                }
+            }),
+            encoding="utf-8",
+        )
+        owner_before = json.loads((owner_home / "channel_directory.json").read_text())
+
+        monkeypatch.setenv("HERMES_HOME", str(owner_home))
+        module = importlib.reload(channel_directory_module)
+        monkeypatch.setattr(module, "DIRECTORY_PATH", None)
+        monkeypatch.setattr(module, "CHANNEL_ALIASES_PATH", None)
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            loaded = module.load_directory()
+            asyncio.run(module.build_channel_directory({}))
+        finally:
+            reset_hermes_home_override(token)
+
+        loaded_entries = loaded["platforms"]["telegram"]
+        assert {entry["id"] for entry in loaded_entries} == {"profile-chat", "profile-only"}
+        assert {entry["name"] for entry in loaded_entries} == {"Profile Alias", "Profile Only"}
+
+        owner_after = json.loads((owner_home / "channel_directory.json").read_text())
+        profile_after = json.loads((profile_home / "channel_directory.json").read_text())
+        assert owner_after == owner_before
+        assert {entry["name"] for entry in profile_after["platforms"]["telegram"]} == {
+            "Profile Alias",
+            "Profile Only",
+        }
 
 
 class TestBuildChannelDirectoryOffload:
