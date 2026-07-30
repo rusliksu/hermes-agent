@@ -710,7 +710,14 @@ def _enforce_persisted_cron_context(job: dict):
             raise RuntimeError("owner cron requires cron capability")
         return context
     if role_id == "shared_room":
-        raise RuntimeError("cron is not available from shared_room context")
+        if "cron" not in capabilities:
+            raise RuntimeError("shared room cron requires cron capability")
+        deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        if deliver != "origin":
+            raise RuntimeError("shared room cron requires deliver=origin")
+        if _origin_matches_resolved_access_context(job, context):
+            return context
+        raise RuntimeError("shared room cron origin does not match resolved access context")
     if role_id in {"family_standard", "family_sandbox"}:
         if "self_reminder" not in capabilities:
             raise RuntimeError("family cron requires self_reminder capability")

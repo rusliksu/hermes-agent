@@ -355,7 +355,17 @@ def _guard_configured_cron_action(
 
     context, serialized = snapshot
     if _context_role(context) == "shared_room":
-        raise ValueError("cron is not available from shared_room context")
+        if "cron" not in getattr(context, "capabilities", frozenset()):
+            raise ValueError("shared room cron requires cron capability")
+        if action == "create" and not _family_deliver_allowed(deliver):
+            raise ValueError("shared room cron can only deliver to the current room/topic")
+        if (
+            action == "update"
+            and deliver is not None
+            and _normalize_deliver_param(deliver) != "origin"
+        ):
+            raise ValueError("shared room cron can only deliver to the current room/topic")
+        return serialized, _origin_from_resolved_access_context(context)
     if _is_family_context(context):
         if "self_reminder" not in getattr(context, "capabilities", frozenset()):
             raise ValueError("family cron requires self_reminder capability")
@@ -429,6 +439,11 @@ def _require_job_in_context(
         raise ValueError("cron job is outside the current resolved access context")
     if not _job_matches_resolved_context(job, snapshot[1]):
         raise ValueError("cron job is outside the current resolved access context")
+    if (
+        _context_role(snapshot[0]) == "shared_room"
+        and _normalize_deliver_param(job.get("deliver")) != "origin"
+    ):
+        raise ValueError("shared room cron can only deliver to the current room/topic")
     if _is_family_context(snapshot[0]) and _normalize_deliver_param(job.get("deliver")) != "origin":
         raise ValueError("family cron can only deliver to the current conversation")
 

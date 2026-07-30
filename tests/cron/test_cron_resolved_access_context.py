@@ -193,6 +193,62 @@ def test_family_denies_foreign_delivery_and_run_before_side_effects(monkeypatch)
         clear_session_vars(tokens)
 
 
+def test_shared_room_create_defaults_to_matching_origin_and_denies_explicit_target():
+    from cron.jobs import get_job, list_jobs
+    from tools.cronjob_tools import cronjob
+
+    shared = _ctx(
+        "room-1",
+        "shared_room",
+        chat_id="room-1",
+        thread_id="thread-1",
+        capabilities=frozenset({"cron"}),
+    )
+    tokens = _bind(shared)
+    try:
+        created = json.loads(
+            cronjob(action="create", prompt="room reminder", schedule="every 5m")
+        )
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored["deliver"] == "origin"
+        assert stored["origin"] == {
+            "platform": "telegram",
+            "chat_id": "room-1",
+            "thread_id": "thread-1",
+        }
+        assert stored["resolved_access_context"] == serialize_resolved_access_context(shared)
+
+        denied_update = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                deliver="telegram:private-chat",
+                name="mutated-room-reminder",
+            )
+        )
+        assert denied_update["success"] is False
+        assert "current room/topic" in denied_update["error"]
+        reloaded = get_job(created["job_id"])
+        assert reloaded["name"] == stored["name"]
+        assert reloaded["deliver"] == "origin"
+
+        job_count = len(list_jobs(include_disabled=True))
+        denied = json.loads(
+            cronjob(
+                action="create",
+                prompt="room reminder",
+                schedule="every 5m",
+                deliver="telegram:private-chat",
+            )
+        )
+        assert denied["success"] is False
+        assert "current room/topic" in denied["error"]
+        assert len(list_jobs(include_disabled=True)) == job_count
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_shared_room_denied_and_owner_keeps_legacy_behavior_with_snapshot():
     from cron.jobs import get_job, list_jobs
     from tools.cronjob_tools import cronjob
@@ -434,6 +490,82 @@ def test_scheduler_denies_family_persisted_non_origin_delivery_before_script(mon
     with pytest.raises(RuntimeError, match="requires deliver=origin"):
         run_job(job)
     assert script_calls == []
+
+
+def test_scheduler_resolves_shared_room_origin_target():
+    from cron.scheduler import _resolve_delivery_targets
+
+    shared = _ctx(
+        "room-1",
+        "shared_room",
+        chat_id="room-1",
+        thread_id="thread-1",
+        capabilities=frozenset({"cron"}),
+    )
+    job = {
+        "id": "shared-room-origin",
+        "name": "shared-room-origin",
+        "deliver": "origin",
+        "origin": {
+            "platform": "telegram",
+            "chat_id": "room-1",
+            "thread_id": "thread-1",
+        },
+        "resolved_access_context": serialize_resolved_access_context(shared),
+    }
+
+    assert _resolve_delivery_targets(job) == [
+        {
+            "platform": "telegram",
+            "chat_id": "room-1",
+            "thread_id": "thread-1",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("deliver", "origin", "message"),
+    [
+        (
+            "local",
+            {
+                "platform": "telegram",
+                "chat_id": "room-1",
+                "thread_id": "thread-1",
+            },
+            "requires deliver=origin",
+        ),
+        (
+            "origin",
+            {
+                "platform": "telegram",
+                "chat_id": "other-room",
+                "thread_id": "thread-1",
+            },
+            "origin does not match",
+        ),
+    ],
+)
+def test_scheduler_denies_invalid_shared_room_delivery_at_boundary(deliver, origin, message):
+    from cron.scheduler import _resolve_delivery_targets
+
+    shared = _ctx(
+        "room-1",
+        "shared_room",
+        chat_id="room-1",
+        thread_id="thread-1",
+        capabilities=frozenset({"cron"}),
+    )
+    job = {
+        "id": "shared-room-invalid",
+        "name": "shared-room-invalid",
+        "deliver": deliver,
+        "origin": origin,
+        "resolved_access_context": serialize_resolved_access_context(shared),
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        _resolve_delivery_targets(job)
 
 
 def test_scheduler_uses_owner_persisted_delivery_target_before_home_fallback(monkeypatch):
