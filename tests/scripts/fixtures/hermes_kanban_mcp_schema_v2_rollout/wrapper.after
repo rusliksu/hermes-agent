@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HERMES_HOME=/__schema_v2_golden__/home
+export PYTHONDONTWRITEBYTECODE=1
+
+exec /__schema_v2_golden__/state/hermes-kanban-mcp-30500cf973a40bb0918d33eb0476c1025e08ac0f/venv/bin/python -m hermes_cli.main mcp serve-kanban --allow-write

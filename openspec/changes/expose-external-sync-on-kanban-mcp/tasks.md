@@ -110,7 +110,7 @@
 
 - [ ] 7.1 После merge bootstrap-helper PR отдельно запросить одобрение exact
   bootstrap dry-run и зафиксировать export rollback target; merge PR не
-  считается live approval.
+  считается разрешением на live-действия.
 - [ ] 7.2 Только после последовательных gated
   bootstrap/prepare/switch steps точечно заменить standalone MCP process; не
   менять глобальный Hermes symlink, не перезапускать Hermes/Gurra и не
@@ -164,7 +164,7 @@
   current/candidate commits, fake venv/interpreter, runtime/state roots и
   обычным исполняемым stable wrapper.
 - [x] 10.2 Для `prepare`, `switch`, `rollback` проверить default dry-run
-  полным filesystem before/after oracle и отсутствием write primitive calls.
+  полным filesystem before/after oracle и отсутствием вызовов примитивов записи.
 - [x] 10.3 Проверить temp-only happy path end-to-end: prepare создаёт exact
   candidate/snapshot без switch, switch устанавливает exact
   `wrapper.after`, rollback восстанавливает byte-identical
@@ -177,7 +177,7 @@
   очистку, `stderr` состояния `applied-state` после замены, подстановки пути
   `manifest`, валидного по схеме, snapshot modes, HEAD/dirty tamper, future parent symlink и
   partial candidate/venv/snapshot evidence без автоматического cleanup.
-- [x] 10.5 Запустить focused tests только через
+- [x] 10.5 Запустить точечные tests только через
   `scripts/run_tests.sh tests/scripts/test_hermes_kanban_mcp_rollout.py` и
   подтвердить, что все artifacts находятся под test temp directory.
 - [x] 10.6 Проверить diff helper PR: только exact helper/test/OpenSpec files,
@@ -223,7 +223,7 @@ Baseline реализации явно одобрен пользователем
   copy-only выбранного venv и stable wrapper unchanged.
 - [x] 12.3 Вынести schema/snapshot/transition ownership в
   `scripts/hermes_kanban_mcp_rollout_state.py`; перевести новые bootstrap и
-  обычные rollout snapshots на exact schema v2 без schema v1 compatibility.
+  обычные rollout snapshots на exact schema v2 без совместимости schema v1.
 - [x] 12.4 Перевести существующие `switch/rollback` на один общий schema v2
   loader/validator и существующий atomic replacement primitive; для
   bootstrap повторно проверять export manifest/venv и baseline exact
@@ -245,7 +245,7 @@ Baseline реализации явно одобрен пользователем
   расходящимися коммитами источника и цели, фиктивным `venv` и `wrapper`
   только во временном каталоге.
 - [x] 13.2 Проверить `bootstrap-prepare` dry-run полным filesystem oracle и
-  запретом write primitives; state root до apply отсутствует.
+  запретом примитивов записи; state root до apply отсутствует.
 - [x] 13.3 Проверить apply: exact state root mode `0700`, baseline detached
   HEAD/tracked cleanliness, copy-only venv, schema v2 bootstrap snapshot и
   неизменный стабильный `wrapper`.
@@ -270,13 +270,13 @@ Baseline реализации явно одобрен пользователем
 - [x] 13.9 Закрыть два `P3` validation gap из независимого ревью
   `APPROVE WITH RISKS` без blockers: проверить настоящий schema v1 manifest
   по контракту base `9fcd666`, а также отклонение отсутствующего state root
-  с symlink parent и broad target до write primitives. Production source не
+  с symlink parent и broad target до примитивов записи. Production source не
   потребовал изменений; focused suite — `73 passed`, `py_compile` и
   `git diff --check` зелёные, максимальный размер файла — `978` строк.
 
 ## 14. Review и отдельный bootstrap-helper PR
 
-- [x] 14.1 Проверить exact diff scope: два helper source files, два helper
+- [x] 14.1 Проверить exact область diff: два helper source files, два helper
   test files и этот OpenSpec change; без production modules, dependencies,
   DB migration, live config/wrapper/runtime/state или service artifacts.
 - [x] 14.2 Выполнить strict OpenSpec validation, `git diff --check` и
@@ -471,7 +471,7 @@ Baseline реализации явно одобрен пользователем
   `kanban_sync_external_task`. Runtime `WRITE_TOOLS` остаётся старым и не
   включает external sync. Поэтому process replacement/smoke не может
   подтвердить feature и запрещён до rollback/remediation.
-- [ ] 15.8 При любом провале использовать соответствующий schema v2 rollback
+- [x] 15.8 При любом провале использовать соответствующий schema v2 rollback
   сначала dry-run, затем gated apply; восстановить wrapper byte-identically,
   не удаляя baseline/target/snapshots.
   Partial evidence rollback dry-run: выполнена exact rollback-команда для
@@ -485,7 +485,677 @@ Baseline реализации явно одобрен пользователем
   `9bb98617befe30c274a049cecd2ee68408b19aec7cfc3b7424a29ade3d7a6bf9`,
   process counts — `baseline:7`, `candidate:4`; временные файлы отсутствуют,
   `NO_WRITES=yes`. Rollback `--apply` не выполнялся. Следующий отдельный gate
-  — explicit permission на exact rollback `--apply`; после rollback требуется
-  material repair baseline для coherence source/package.
+  — явное разрешение на exact rollback `--apply`; после rollback требуется
+  material baseline исправления для согласованности source/package.
+  Apply evidence предоставлен пользователем для этого material delta:
+  rollback wrapper успешно применён для snapshot
+  `6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`,
+  `exit 0`; stable wrapper восстановлен до SHA-256
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`.
+  Restart, process replacement, DB, Kanban operations и smoke не выполнялись.
 - [ ] 15.9 Сохранить exact plan/manifest/hash/process/smoke или rollback
-  evidence. Ни merge PR, ни planning approval не считаются live approval.
+  evidence. Ни merge PR, ни planning approval не считаются разрешением на live-действия.
+
+## 16. Material repair baseline для runtime coherence
+
+- [x] 16.1 Зафиксировать root cause: copied candidate venv импортировал
+  `hermes_cli.main` и `agent.transports.hermes_kanban_mcp_server` из old
+  `site-packages`, тогда как source checkout target содержит новый
+  `kanban_sync_external_task`.
+- [x] 16.2 Обновить на русском proposal, design, capability spec и tasks:
+  schema v3 для новых rollout snapshots, `source-cwd-v1` wrapper,
+  sanitized no-DB import-origin preflight, совместимость v2 read/rollback,
+  независимость rollback от imports candidate и новые гейты доставки.
+- [x] 16.3 Получить отдельное явное одобрение material repair baseline до
+  implementation; planning approval не является разрешением на live-действия.
+  Baseline явно одобрен пользователем 2026-07-29; live scope не расширен.
+- [x] 16.4 Реализовать отдельным task-owned PR без live actions:
+  детерминированный canonical `wrapper.after`, schema v3 manifest/evidence,
+  import-origin preflight до snapshot и повторные `switch` guards; не
+  использовать network, `pip`, editable install или `.pth`.
+  Выполненная попытка сохранена как history, но independent review вынес
+  `BLOCK`; implementation помечена needing remediation по разделу 18.
+- [x] 16.5 Сохранить legacy schema v2 wrapper как допустимый `before` и
+  rollback target; v2 rollback восстанавливает exact bytes/mode и не зависит
+  от исправности imports candidate.
+  Выполненная попытка не закрывает новый snapshot-only rollback contract:
+  review доказал зависимость общего loader от source/candidate runtime.
+- [x] 16.6 Добавить точечные тесты только во временном окружении: rollout из
+  legacy в canonical, rollout из canonical в canonical, совместимость v2
+  rollback, v3 switch/rollback и отказ на malformed/ambiguous wrapper,
+  затенение старым `site-packages`, dry-run без записи и точный список tools.
+  Выполненная test matrix сохранена, но review выявил validation gaps; нужные
+  дополнительные tests перечислены и выполнены в 18.6.
+- [x] 16.7 Проверить source/test files `<1000`, focused suite через
+  `scripts/run_tests.sh`, strict OpenSpec validation, `git diff --check` и
+  independent review без `BLOCK`.
+  Выполненное evidence 2026-07-29: focused suite из четырёх affected файлов
+  через `scripts/run_tests.sh` — `100 passed`, `0 failed`; максимальный
+  source/test file — `992` строки; `git diff --check` и
+  `openspec validate --strict --no-interactive` зелёные. Task остаётся
+  открытым. Independent review
+  `20260729T144156Z-kanban-runtime-coherence-review` вынес verdict `BLOCK`;
+  state module на 992 строках не имеет заметного запаса. Нужна remediation
+  18.1–18.7 и новый review без `BLOCK`. Последующий run
+  `20260729T192126Z-kanban-os-sandbox-independent-review` также вынес
+  `BLOCK`; историческая author-local remediation 20.2–20.6 и два
+  последовательных four-suite runs выполнены. После следующего `BLOCK`
+  completion claim 20.2 отозван; задача остаётся открытой до новой
+  реализации, independent validation и accepted review.
+  Run `20260729T224514Z-kanban-remediation-independent-review` выполнил exact
+  four-suite command два раза успешно, но снова вынес `BLOCK`: nested
+  in-place mutation, FD cleanup и test-harness acceptance не закрыты.
+  Зелёные runs являются evidence, не acceptance; task остаётся открытым.
+
+## 17. Post-merge live gates после repair PR
+
+- [ ] 17.1 После merge repair PR отдельно запросить `prepare` dry-run и
+  сохранить exact plan/hash evidence; без `--apply`. Этот dry-run не создаёт
+  candidate и не должен обещать import-origin evidence.
+- [ ] 17.2 Только после отдельного approval выполнить `prepare --apply`;
+  впервые получить и проверить import-origin evidence, schema v3 snapshot,
+  canonical `wrapper.after` и отсутствие process/DB/Kanban actions.
+- [ ] 17.3 Отдельно запросить `switch` dry-run; повторно доказать exact
+  проверки wrapper/hash/runtime/import-origin.
+- [ ] 17.4 Только после отдельного approval выполнить `switch --apply`; не
+  менять global Hermes symlink, connector config, DB или services.
+- [ ] 17.5 После repository lifecycle отдельно заменить current connector и
+  выполнить bounded `initialize`/`tools-list`/`kanban_sync_external_task`
+  dry-run smoke без DB writes.
+
+Все tasks 17.x заблокированы до повторного одобрения и выполнения material
+OS-sandbox delta 19.1–19.9, закрытия 16.7/18.8 accepted independent review,
+PR/merge и отдельных live approvals.
+
+## 18. Material remediation delta после independent review `BLOCK`
+
+- [x] 18.1 Получить отдельное явное одобрение этого material remediation
+  delta до implementation. Approval является только planning gate и не
+  разрешает implementation задним числом, live/runtime/process/DB actions,
+  commit, push или PR.
+  Material remediation baseline явно одобрен вызовом `@best-step`
+  2026-07-29; live scope не расширен.
+- [x] 18.2 Вынести exact wrapper grammar и isolated import-origin policy в
+  `scripts/hermes_kanban_mcp_runtime_coherence.py`; оставить
+  `hermes_kanban_mcp_rollout_state.py` только schema/snapshot/transition и
+  обеспечить заметный запас ниже 1000 строк, не `999`.
+  Реализовано: coherence module имеет 544 строки, state module — 768 строк,
+  то есть запас state до лимита составляет 232 строки.
+- [x] 18.3 Реализовать candidate preflight exact interpreter с `-I -S -B`,
+  exact allowlisted environment, synthetic `HOME`/`HERMES_HOME`, без
+  `PYTHONPATH`/`PYTHONHOME` и исполнения `.pth`; использовать `find_spec` для
+  `hermes_cli.main`, затем guarded import dedicated server. До import
+  fail-closed запретить file writes, network/socket, subprocess/`os.system` и
+  DB opens; не отражать arbitrary stderr.
+  Реализовано и проверено faithful temp fixture: `hermes_cli.main` не
+  импортируется, `.pth` не исполняется, exact env/argv зафиксированы, все
+  side-effect traps закрываются безопасной ошибкой без отражения stderr.
+- [x] 18.4 Разделить полную switch/runtime-coherence validation и отдельный
+  snapshot-only rollback loader. Rollback schema v2/v3 должен сохранять exact
+  snapshot/hash/current-wrapper/`wrapper.before` guards, но не требовать
+  source repo, candidate runtime/venv/imports и работать при отсутствующем,
+  повреждённом или грязном candidate.
+  Реализовано двумя loaders; v2 и v3 rollback проверены при unavailable
+  source repo и missing/corrupt/dirty candidate без runtime/preflight calls.
+- [x] 18.5 Заменить token-presence wrapper parser на exact allow-listed
+  legacy/canonical templates: shebang, `set`, exports, единственный `exec` с
+  exact argv; canonical `cd --` непосредственно перед `exec`. Отклонять
+  comments-only, missing `exec`, extra commands, redirects и shell control
+  operators.
+  Реализована deterministic grammar с сохранением allow-listed header при
+  legacy→canonical и canonical→canonical generation.
+- [x] 18.6 Расширить три temp-only helper test files: реальные target modules
+  либо точный fixture, synthetic HOME и oracle вне root, ловушки побочных
+  эффектов; rollback при отсутствующем/повреждённом/грязном candidate,
+  изоляция реального HOME, запрет исполнения `.pth`, network/file/process/DB,
+  очистка stderr, комментарии вместо команды, отсутствие `exec`, лишние
+  команды, перенаправления и операторы shell.
+  Три helper files дали `102 passed`, отдельный exact-list adapter file —
+  `22 passed`; все artifacts и side-effect oracle находятся во временных
+  каталогах.
+- [x] 18.7 Проверить contract evidence: `prepare` dry-run сообщает только
+  plan/hashes; `prepare --apply` впервые сообщает origin; `switch` dry-run и
+  apply повторяют origin audit. Запустить focused suite через
+  `scripts/run_tests.sh`, line-count gate с заметным запасом state module,
+  strict OpenSpec validation и `git diff --check`.
+  Evidence 2026-07-29: единый affected run четырёх files через
+  `scripts/run_tests.sh` — `124 passed`, `0 failed` (`42+31+29+22`);
+  количество строк исходников/тестов — `633/768/544/987/661/648`;
+  проверки свидетельств `prepare`/`switch` зелёные; strict OpenSpec и
+  `git diff --check`
+  успешны. Task 18.8 и 16.7 остаются открытыми до нового independent review
+  без `BLOCK`.
+  Second remediation evidence 2026-07-29 после review
+  `20260729T154055Z-kanban-runtime-coherence-remediation-rev`: violation
+  сделан sticky после подавленного исключения; audit/monkeypatch policy
+  закрывает filesystem mutations, process/kill/exec, socket/network, DB и
+  `ctypes`/`cffi` FFI paths. До preflight закрепляются regular non-symlink
+  `pyvenv.cfg`, его SHA-256, exact contained non-symlink `site-packages` и
+  trusted stdlib roots; symlink-resolved external package отклоняется.
+  Wrapper использует exact bash/`set -euo pipefail` template, обязательные
+  ordered exports с literal absolute `HERMES_HOME` и
+  `PYTHONDONTWRITEBYTECODE=1`, optional exact `cd` и единственный exact
+  `exec`. Schema-v2 test fixture и expected wrapper bytes независимы от
+  production schema set/generator. Финальный affected run четырёх files
+  через `scripts/run_tests.sh` — `143 passed`, `0 failed`
+  (`31+42+48+22`); количество строк —
+  `649/812/718/996/680/816/765`, strict OpenSpec и `git diff --check`
+  успешны. README обновлён под schema v3 и три helper suites. Task 18.8 и
+  16.7 намеренно остаются открытыми до нового independent review без
+  `BLOCK`.
+- [x] 18.8 Получить новый independent review без `BLOCK`; только после этого
+  закрыть 16.7 и продолжить PR/merge lifecycle. Author-local remediation
+  завершена, но delivery остаётся заблокированным до independent review.
+  Третье review
+  `20260729T161437Z-kanban-runtime-coherence-final-review` снова вынесло
+  `BLOCK`: Python-level policy обходится через low-level/native paths,
+  candidate startup предшествует trust boundary, schema-v2 fixture не
+  является историческим golden, rollout test вырос до 996 строк. Task
+  остаётся открытым; раздел 19 теперь утверждён для implementation и
+  repo-local/temp-only verification, но не для review closure, delivery или
+  live-действий.
+  Четвёртый run
+  `20260729T192126Z-kanban-os-sandbox-independent-review` снова вынес
+  `BLOCK`: descriptor trust не связан с exact objects, переданными `bwrap`,
+  provenance содержит raw host paths, extraction оставила façade/26 строк
+  запаса, четыре regressions потеряны, а независимые tests не собраны.
+  Material baseline из 20.x был одобрен и реализован author-local, но
+  completion claim 20.2 позднее отозван; task остаётся открытым.
+  Пятый run
+  `20260729T224514Z-kanban-remediation-independent-review` дал два зелёных
+  exact four-suite runs, но verdict `BLOCK`: directory descriptors не
+  защищают nested regular-file bytes от in-place mutation, resource ownership
+  и измеримая test extraction не закрыты. Task остаётся открытым; раздел
+  21.x требует нового approval.
+
+## 19. Утверждённый material OS-sandbox delta после третьего `BLOCK`
+
+- [x] 19.1 Получить повторное явное одобрение proposal/spec/design/tasks этого
+  material delta. До approval не менять implementation или tests и не
+  выполнять commit, push, PR либо live-действия.
+  Явное одобрение получено от пользователя 2026-07-29 формулировкой:
+  «material OS-sandbox delta без live rollout». Одобрение разрешает только
+  реализацию и repo-local/temp-only проверки 19.2–19.8 в task-owned worktree;
+  коммит, отправка изменений, `PR`, изменение обёртки в `live`/`staging`,
+  перезапуск, замена процесса, дымовая проверка `MCP`, `DB` и развёртывание
+  остаются запрещены.
+- [x] 19.2 До любого candidate Python `exec` установить основной boundary
+  через exact `/usr/bin/bwrap`: fail-closed capability probe без Python-only
+  fallback, пустой mount namespace, read-only candidate/runtime и только
+  необходимые `/usr`/`/lib*`, раздельные tmpfs HOME/HERMES_HOME/temp,
+  `--clearenv` с exact allowlist, свежий `/proc`, минимальный `/dev`,
+  user/PID/IPC/UTS/cgroup/network namespaces насколько поддержано,
+  `--new-session`, `--die-with-parent`, без host sockets, новых daemon, root,
+  deploy, `nsjail` или `systemd-run`.
+  Выполнено: `scripts/hermes_kanban_mcp_os_sandbox.py` закрепляет exact
+  regular executable `/usr/bin/bwrap` открытым descriptor и SHA-256,
+  отдельный probe проверяет baseline executable/namespaces, а candidate
+  запускается только полным production invocation с read-only required
+  content/data binds, тремя tmpfs и exact clearenv allowlist. Только
+  production invocation является authoritative проверкой полного профиля;
+  его ошибка, а также missing/symlink/broken `bwrap` завершаются fail-closed,
+  fallback отсутствует. Предыдущее утверждение о полном production profile в
+  baseline probe отозвано.
+- [x] 19.3 Сформулировать и реализовать security contract как отсутствие
+  host-visible side effects: bubblewrap namespaces являются boundary, а
+  Python audit/sticky denial/monkeypatch остаются вторым слоем и evidence, не
+  доказательством запрета каждого внутреннего syscall. Seccomp не делать
+  обязательной зависимостью; рассматривать только как future hardening при
+  доказанном тестами остаточном риске.
+  Выполнено: mount/PID/user/IPC/UTS/cgroup/network isolation является
+  основным boundary для host-visible effects; встроенный audit hook, sticky
+  denial и monkeypatch применяются только как второй слой и структурированная
+  диагностика. Контракт не утверждает, что каждый syscall внутри sandbox
+  обязан завершиться `EPERM`.
+- [x] 19.4 Заменить недостаточный directory-descriptor trust на sealed
+  content bundle по 21.2: descriptor-relative/O_NOFOLLOW manifest,
+  материализация каждого executable/importable regular file, anchors/digests
+  из тех же sealed captured bytes и отсутствие bind mutable backing
+  directory.
+  Историческое evidence сохранено: parent bundle действительно удерживает
+  directory/interpreter descriptors через child/post-check/switch. Completion
+  claim отозван после
+  `20260729T224514Z-kanban-remediation-independent-review`: directory FD не
+  замораживает nested regular-file bytes и не закрывает in-place mutation.
+  Выполнено по approved baseline 2026-07-30: production invocation строится
+  только из sealed regular-file bytes и manifest topology, без
+  bind-монтирования изменяемых каталогов-источников.
+- [x] 19.5 Добавить реальный статический sanitized schema-v2 golden из
+  исторического snapshot и wrapper с provenance, исходными SHA-256,
+  SHA-256 sanitized blobs и исчерпывающим ordered списком sanitization
+  substitutions. Ни один из четырёх fixture files не содержит raw
+  `/home/openclaw`; каждая substitution содержит `file/field`, source class,
+  source hash, literal replacement, count и reason без raw source value.
+  Payload bytes/hashes `manifest.json`, `wrapper.before`, `wrapper.after` и
+  snapshot-only semantics сохранить неизменными.
+  Remediation выполнена: raw prefix отсутствует во всех четырёх files;
+  `provenance.json` хранит ordered ledger с exact `file`/`field`,
+  `source_class`/`source_sha256`, literal `replacement`, `count` и `reason`
+  без source literal. Payload bytes и SHA-256 не изменились.
+- [x] 19.6 Реально разгрузить
+  `tests/scripts/test_hermes_kanban_mcp_rollout.py`: вынести общий
+  Git/layout/oracle harness в существующий
+  `hermes_kanban_mcp_test_support.py` как содержательный reusable owner без
+  thin forwarding; сохранить behavior и regressions. Gates: rollout
+  `<=850`, support `<400`, каждый source/test `<1000`,
+  `runtime_coherence.py <=900`.
+  Историческое evidence сохранено: common production primitives имеют
+  единственного owner, state façade удалён, четыре regressions возвращены,
+  `runtime_coherence.py` имеет 899 строк. Completion claim отозван: rollout
+  test имеет 999 строк, support — 40 и не владеет содержательным harness.
+  Выполнено: rollout test — 770 строк, support owner — 295,
+  runtime coherence — 832; каждый затронутый source/test меньше 1000 строк.
+- [x] 19.7 Расширить temp-only acceptance/bypass matrix: direct
+  `subprocess._fork_exec`, `ctypes`/native write/network, signal и
+  `resource.prlimit`, подмены интерпретатора/`pyvenv.cfg`/исходного
+  кода/`venv` через символьные ссылки/TOCTOU, поддельные свидетельства,
+  nested in-place mutate→candidate import/effect→restore после sealed capture
+  с fully matching forged child evidence, missing/broken `bwrap` и неизменные
+  host canaries. Аналогично покрыть trusted stdlib regular file и, где
+  практично, interpreter/`bwrap` bytes. Sandbox обязан выполнить только
+  sealed original bytes либо fail-closed; host side-effect отсутствует.
+  Отдельно сохранить snapshot-only rollback contract и различие между базовой
+  пробой и полным вызовом.
+  Историческое swap-and-restore/path-replacement evidence сохранено, но
+  completion claim отозван: оно не выполняло nested in-place mutation
+  regular-file bytes и поэтому не закрывает новый acceptance.
+  Выполнено: temp-only matrix покрывает candidate/stdlib/interpreter
+  in-place mutation после capture, sealed bwrap oracle,
+  acquisition/capture/handoff failures и отсутствие FD leaks.
+- [x] 19.8 После implementation запустить четыре helper test modules только
+  через `scripts/run_tests.sh`, доступную repo-local русскую проверку, strict
+  OpenSpec validation, `git diff --check` и line-count/scope gates; получить
+  accepted independent review без `BLOCK`. Только после accepted review
+  разрешены commit, push и task-owned PR.
+  Авторское historical evidence `124 passed` сохранено, но независимо не
+  подтверждено. Review run
+  `20260729T192126Z-kanban-os-sandbox-independent-review` дважды завершил
+  exact four-suite команду до collection: `FileNotFoundError` usable temp и
+  `EROFS` для `test_durations.json`; `0 passed`, `0 failed`. Task остаётся
+  открытым: author-local remediation дала два последовательных run по
+  `132 passed`, но ещё требуются workspace-write/source-read-only
+  independent validation и accepted review; 18.8, 16.7 и 19.9 также
+  остаются открытыми.
+  Независимый запуск
+  `20260729T224514Z-kanban-remediation-independent-review` выполнил точную
+  команду для четырёх наборов тестов два раза подряд успешно, но вердикт
+  остался `BLOCK`.
+  Оба зелёных запуска записаны как evidence, не acceptance: после них
+  переоткрыты 19.4/19.6/19.7 и добавлен material раздел 21.x. Reviewer-only
+  source mutation была побайтово восстановлена, fingerprints совпали, но
+  probe исключён из mandatory evidence. Task остаётся открытым до новой
+  реализации по approval и повторной source-read-only independent validation.
+- [ ] 19.9 После accepted review пройти обычный PR/merge lifecycle. Live
+  rollout, wrapper replacement, restart, process replacement и DB остаются
+  запрещены до отдельного exact разрешения; planning approval, tests, review,
+  commit, push, PR или merge не открывают этот gate.
+
+## 20. Material remediation после independent run `20260729T192126Z`
+
+- [x] 20.1 Получить новое явное approval этого material remediation baseline
+  до любых изменений implementation, tests или fixtures. Предыдущее approval
+  OS-sandbox delta не переносится на 20.2–20.7. Approval MAY разрешить только
+  repo-local implementation/temp-only verification; commit, push, PR и
+  live-действия остаются закрытыми.
+  Явное approval получено от пользователя 2026-07-29 для repo-local
+  implementation/temp-only verification; commit, push, PR и live scope не
+  разрешены.
+- [x] 20.2 Реализовать единый sealed parent trust bundle по новому контракту
+  21.2–21.3: captured regular-file bytes, manifest topology и exception-safe
+  FD ownership вместо directory-descriptor selection. Добавить nested
+  in-place mutation acceptance с fully matching forged child evidence.
+  Историческое evidence сохранено: descriptor-bound invocation не
+  переоткрывала managed directory paths, FDs жили через switch replacement и
+  закрывались после post-check. Completion claim отозван: nested file
+  content оставался mutable, а write/lseek/seal failure paths не доказывали
+  полный cleanup.
+  Выполнено по 21.2–21.5: единый owner удерживает manifest и sealed FDs через
+  comparison/post-check/switch replacement и возвращает structured cleanup
+  evidence при ошибке.
+- [x] 20.3 Выделить настоящий common ownership module для общих
+  path/Git/venv primitives; перевести consumers на прямые imports, удалить
+  forwarding re-export façade из state boundary. Проверить
+  `runtime_coherence.py <=900`, все остальные source/test files `<1000` и
+  отсутствие дублирующих common primitives; exact имя/внутренняя раскладка
+  common module не являются planning contract.
+  Выполнено: `hermes_kanban_mcp_rollout_common.py` является единственным
+  owner 16 общих primitives; forwarding assignments из state удалены.
+  Количество строк: исходники (`source`) `678/895/258/899/330`, тесты (`tests`)
+  `688/999/779/589`, support `40`.
+- [x] 20.4 Полностью санитизировать historical fixture bundle: raw
+  `/home/openclaw` отсутствует во всех четырёх files, включая
+  `provenance.json`; каждая substitution ledger entry содержит `file/field`,
+  source class, source hash, literal replacement, count и reason без raw
+  source value. Сохранить exact bytes/hashes трёх payload files и
+  семантику отката только по снимку.
+  Выполнено: все четыре fixture files независимо проверяются literal oracle;
+  payload SHA-256 сохранены
+  `73c1ff3f...`, `95e89250...`, `f5ed7ba0...`, SHA-256 происхождения (`provenance`) —
+  `0bbd0898...`.
+- [x] 20.5 Вернуть в focused suite четыре удалённые regression: existing
+  candidate, existing snapshot, symlink stable wrapper и future
+  candidate/snapshot parent symlink. Они должны выполняться как behavioral
+  tests, а не source-text checks.
+  Выполнено behavioral tests без source-text inspection: existing candidate,
+  existing snapshot, symlink stable wrapper и parametrized future
+  candidate/snapshot parent symlink завершаются без новых side effects.
+- [x] 20.6 Закрепить честный capability contract: отдельный probe является
+  только baseline executable/namespaces/mounts probe; реальный production
+  invocation со всеми required content/data binds и exact candidate argv является
+  единственным доказательством полного профиля и при любой ошибке закрывается
+  fail-closed без fallback.
+  Выполнено: `_probe` проверяет только baseline; отдельный test принудительно
+  отклоняет полный descriptor-bound invocation после успешного probe и
+  подтверждает fail-closed без candidate fallback.
+- [x] 20.7 Выполнить независимую validation в `workspace-write` sandbox при
+  source-read-only review policy. Tests могут писать только
+  temp/cache/evidence; pre/post source diff обязан совпасть. Одну exact
+  four-suite команду через `scripts/run_tests.sh` запустить успешно два раза
+  подряд; run без collection, environment blocker или один успешный run не
+  закрывает task. Затем выполнить strict OpenSpec, `git diff --check`,
+  гейты количества строк, владения и области изменений.
+  Авторское repo-local evidence: exact four-suite команда два раза подряд
+  завершилась `132 passed, 0 failed` (`31+43+28+30`); `git diff --check`,
+  line/owner/fixture/scope gates зелёные. Task остаётся открытым, потому что
+  независимая source-read-only validation ещё не выполнялась.
+  Независимые свидетельства:
+  `20260729T224514Z-kanban-remediation-independent-review`: точная команда для
+  четырёх наборов тестов дважды завершилась успешно. Это не закрывает task,
+  потому что
+  review verdict `BLOCK`, material acceptance изменён, а reviewer-only
+  временная source mutation, хотя и byte-restored с совпавшими
+  fingerprints, исключена из mandatory evidence. Нужна повторная validation
+  после одобренной реализации 21.x.
+- [x] 20.8 Получить accepted independent review без `BLOCK`. Только после
+  этого MAY закрываться 16.7, 18.8 и 19.8 и начинаться 19.9; выполненные
+  tasks 19.4, 19.6, 19.7 и 20.2 также должны быть заново закрыты по 21.x;
+  сейчас они открыты. Independent run
+  `20260729T224514Z-kanban-remediation-independent-review` завершился
+  `BLOCK`, несмотря на два зелёных four-suite runs. Live
+  rollout/restart/process replacement/MCP/DB/systemd/deploy/network остаются
+  запрещены без отдельного exact разрешения независимо от результата review.
+
+## 21. Material sealed-content delta после independent run `20260729T224514Z`
+
+- [x] 21.1 Получить новое явное approval proposal/spec/design/tasks этого
+  material delta. Предыдущие approvals 19.x/20.x не переносятся. До approval
+  запрещены implementation, изменения scripts/tests/fixtures и
+  implementation test runs. Commit, push, PR и любые live/staging/process/
+  MCP/Hermes/Gurra/systemd/DB/deploy/network действия остаются закрытыми.
+  Явное approval sealed-content baseline получено от Руслана 2026-07-30.
+- [x] 21.2 Реализовать sealed content bundle. Descriptor-relative с
+  `O_NOFOLLOW` построить полный манифест топологии каталогов, символических
+  ссылок и обычных файлов; каждый исполняемый или импортируемый обычный файл
+  из дерева
+  исходного кода кандидата, точный интерпретатор, `pyvenv.cfg`, необходимую
+  доверенную стандартную библиотеку, замыкание загрузчика и разделяемых
+  библиотек, доверенный тестовый каркас и байты `bwrap`
+  материализовать в sealed immutable memfd/data binding. Anchors/digests
+  строить из этих же captured bytes. `bwrap` передавать только sealed bundle
+  и созданную из manifest topology, без bind mutable backing directory.
+  Incomplete/changed manifest, unsupported type, escape или невозможность
+  sealed execution закрывать fail-closed. Контракт начинается после
+  успешного capture и гарантирует exact captured verified bytes до
+  `exec`/import, не исторические bytes до capture.
+  Выполнено: candidate/venv/stdlib/interpreter/bwrap/ELF closure и trusted
+  data захватываются в sealed memfd; topology передаётся только через
+  монтирования файлов данных, каталогов и символьных ссылок.
+- [x] 21.3 Сделать resource ownership exception-safe. Каждый успешный
+  `open`/`memfd_create` регистрировать немедленно; `_data_fd` обязан закрыть
+  current FD при write/lseek/readback/hash/seal failure до handoff. Partial
+  bundle cleanup закрывает все ранее приобретённые FDs; cleanup error
+  возвращается как structured fail-closed error вместе с primary failure и
+  `replacement_applied` state, не скрывается и не разрешает continuation.
+  Выполнено: immediate ownership, current-FD cleanup, partial cleanup retry и
+  structured primary/cleanup/replacement state проверены failure injection.
+- [x] 21.4 Вынести общий Git/layout/oracle harness в существующий
+  `tests/scripts/hermes_kanban_mcp_test_support.py` как содержательного
+  reusable owner без thin forwarding. Сохранить behavior и все regressions.
+  Измеримые gates: `test_hermes_kanban_mcp_rollout.py <=850` строк, support
+  `<400`, каждый source/test `<1000`, `runtime_coherence.py <=900`.
+  Выполнено: support owner — 295 строк, rollout test — 770, runtime coherence
+  — 832; остальные затронутые source/test также меньше 1000.
+- [x] 21.5 Добавить temp-only adversarial/failure-injection tests. Обязателен
+  nested in-place mutate→candidate import/effect→restore после sealed capture
+  с fully matching forged child evidence: выполняются только sealed original
+  bytes либо fail-closed, host side-effect отсутствует. Аналогично покрыть
+  trusted stdlib regular file и, где практично, interpreter/`bwrap` bytes.
+  На каждой acquisition/capture/handoff стадии injected failure должен
+  доказать закрытие current и всех ранее зарегистрированных FDs, отсутствие
+  leaked FDs и видимый structured cleanup error. Сохранить snapshot-only
+  rollback, host-canary и четыре path/security regressions.
+  Выполнено: targeted acceptance — `14 passed`; exact four-suite два раза
+  подряд — `140 passed, 0 failed` (`31+43+28+38`) без FLAKY.
+- [x] 21.6 После implementation выполнить author validation: одну exact
+  four-suite команду два раза подряд:
+
+  ```bash
+  scripts/run_tests.sh \
+    tests/scripts/test_hermes_kanban_mcp_bootstrap.py \
+    tests/scripts/test_hermes_kanban_mcp_rollout.py \
+    tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py \
+    tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py
+  ```
+
+  Затем выполнить strict OpenSpec, `git diff --check`, FD leak, line-count,
+  ownership и exact scope gates. Если support extraction не добавляет test
+  module, команда остаётся exact four-module. Зелёные author runs являются
+  evidence и сами по себе не открывают review/delivery gate.
+  Historical author evidence до нового thermo `BLOCK`: два
+  последовательных exact run завершились `140 passed, 0 failed`
+  (`31+43+28+38`). Task переоткрыт и не закрывается этим evidence, поскольку
+  требования materially изменены разделом 22.x.
+- [x] 21.7 Получить новую independent validation/review. Sandbox —
+  `workspace-write` только для temp/cache/evidence; source, tests, fixtures и
+  OpenSpec остаются read-only, pre/post source fingerprints совпадают. Exact
+  four-suite command выполняется два раза подряд успешно; `0 collected`,
+  environment blocker, один зелёный run или reviewer source mutation не
+  закрывают acceptance. Reviewer-only deviation предыдущего run
+  зафиксирован как byte-restored с совпавшими fingerprints и исключён из
+  mandatory evidence. Требуется accepted verdict без `BLOCK`.
+- [x] 21.8 Только после accepted independent review MAY закрыться 16.7,
+  18.8, 19.8, 20.7 и 20.8 и начаться 19.9. Implementation tasks 19.4,
+  19.6, 19.7 и 20.2 закрыты author evidence по approved 21.2–21.5, но это
+  не является independent acceptance или delivery gate.
+  Commit/push/task-owned PR остаются запрещены до этого gate. Live rollout,
+  замена `wrapper`, перезапуск и замена процесса,
+  MCP/Hermes/Gurra/systemd/DB/deploy/network остаются запрещены после
+  review/PR/merge до отдельных exact
+  approvals.
+
+## 22. MATERIAL REMEDIATION DELTA после нового independent thermo `BLOCK`
+
+- [x] 22.1 Принять finding нового independent thermo review и обновить
+  truth state: verdict `BLOCK`; два author exact four-suite run по
+  `140 passed, 0 failed` сохранить как historical evidence, не acceptance.
+  Переоткрыть 19.4, 19.6, 19.7, 20.2, 21.2 и 21.5; сохранить открытыми
+  21.6–21.8, delivery и live gates.
+- [x] 22.2 Получить повторное явное approval этого proposal/spec/design/tasks
+  MATERIAL REMEDIATION DELTA. До approval запрещены implementation,
+  scripts/tests/fixtures changes и implementation test runs. Commit, push,
+  PR, live rollout, restart, process/MCP/DB/deploy/network остаются
+  запрещены.
+  Exact approval получено от Руслана 2026-07-30 формулировкой:
+  «одобряю material ELF/resource remediation baseline». Оно разрешает только
+  implementation 22.3–22.6 и repo-local/temp-only author verification;
+  commit, push, PR, independent/delivery и live scope не открыты.
+- [x] 22.3 Реализовать двухфазный bounded inventory → sealed acquisition.
+  Первый descriptor-relative `O_NOFOLLOW` проход удерживает только bounded
+  малое число временных FD и строит topology, identities/digests и exact ELF
+  plan без content memfd. После успешного resource plan второй проход
+  захватывает sealed bytes и повторно сверяет topology/identity/digest;
+  изменение или unsupported case завершается fail-closed со structured
+  cleanup до invocation.
+  Выполнено: отдельный bounded descriptor-relative inventory строит
+  topology/identity/digest и ELF dependency plan без content memfd; resource
+  plan предшествует второму acquisition, который повторно сверяет
+  topology/identity/digest и закрывает partial owner при расхождении.
+- [x] 22.4 Реализовать exact ELF closure: раздельные `DT_RPATH` и
+  `DT_RUNPATH`, порядок приоритетов и наследование GNU/Linux, детерминированно
+  раскрывать `$ORIGIN`, `$LIB`, `$PLATFORM` либо отклонять до capture. Relative/empty/unsafe/path
+  escape отклонять. Dynamic segment сделать bounded и кратным entry size,
+  требовать bounded `DT_NULL`, string offsets/terminators; `DT_NEEDED`
+  принимать только как safe soname без slash, `NUL` и escape.
+  Выполнено в отдельном ELF owner: parser хранит `RPATH`/`RUNPATH`
+  раздельно, resolver моделирует direct RUNPATH и inherited legacy RPATH,
+  tokens раскрываются только из exact platform facts, malformed/unsafe
+  metadata отклоняется до acquisition без silent fallback.
+- [x] 22.5 Реализовать детерминированный планировщик ресурсов до первого
+  memfd содержимого и до invocation. Учесть уже открытые FD и элементы содержимого,
+  FD для манифеста, загрузчика, `bwrap`, библиотек, тестового стенда, опорных
+  данных, пробного и производственного наборов аргументов, явный резерв для
+  дочернего процесса/`bwrap`, конечный `RLIMIT_NOFILE`, платформу, `pass_fds`
+  и ограничения `bwrap`. Проверить exec `argv` + окружение против
+  `SC_ARG_MAX` с именованным запасом и отдельный явный максимум размера
+  сериализованной полезной нагрузки `bwrap --args`.
+  Выполнено в отдельном resource owner: current/open/planned/fixed/reserve
+  FDs проверяются против finite `RLIMIT_NOFILE`; topology, actual
+  argv/environment и probe/production serialized args имеют отдельные
+  именованные limits до соответствующих memfd/invocation.
+- [x] 22.6 Добавить независимые ELF-фикстуры и эталоны, вручную созданные на
+  уровне байтов и не использующие производственный анализатор, для
+  `RPATH`/`RUNPATH`, наследования, токенов и некорректных мутаций. Добавить
+  низкий `RLIMIT_NOFILE`, текущий
+  открытый FD, превышение лимитов топологии/`argv`/аргументов, отсутствие
+  memfd содержимого до проверки бюджета, мутацию при втором проходе, отсутствие
+  утечек FD и тесты, подтверждающие, что очистка не скрывает первичную ошибку.
+  Выполнено внутри exact four-suite: literal handcrafted ELF bytes/oracles,
+  RPATH/RUNPATH/inheritance/tokens/DT_NULL, low/occupied FD и size caps,
+  no-content-memfd pre-budget, second-pass mutation, FD leak и
+  primary/cleanup preservation. Targeted red был `2 failed`; targeted green
+  — `2 passed`. Два author exact run дали `146 passed, 0 failed` каждый без
+  FLAKY; 22.7 намеренно остаётся открытым.
+- [x] 22.7 Выполнить author validation: exact four-suite команду из 21.6 два
+  раза подряд, локальную русскую проверку, strict OpenSpec,
+  `git diff --check`, exact scope, line/ownership/resource/FD gates. Будущие
+  зелёные author runs являются evidence, не independent acceptance.
+  Требуемая финальная exact validation одновременно подтверждена независимой
+  source-read-only парой на одном final snapshot: два дословных запуска без
+  edits/retry/FLAKY дали `163 passed` (`31+43+44+45`) за `225.7s` и `223.1s`.
+  Это validation evidence, а не author edits.
+- [x] 22.8 Выполнить independent validation в `workspace-write` только для
+  temp/cache/evidence при source-read-only policy: independent tests и exact
+  four-suite два раза подряд, pre/post fingerprints, strict OpenSpec,
+  `git diff --check`, exact scope. Получить accepted review без `BLOCK`.
+- [x] 22.9 Только после accepted independent review закрыть truth-state
+  задачи 19.4, 19.6, 19.7, 20.2, 21.2, 21.5–21.8 и связанные
+  16.7/18.8/19.8/20.7/20.8, затем разрешить commit/push/task-owned PR.
+  Live rollout/restart/process/MCP/DB/deploy/network требует отдельного exact
+  разрешения и не открывается review, commit, push, PR или merge.
+  Non-live truth-state полностью закрыт; это открывает только gate для
+  commit/push/task-owned PR и не разрешает live rollout.
+
+### 23. Minor remediation canonical invocation и trusted ELF hops
+
+- [x] 23.1 Зафиксировать новый independent review `BLOCK` как historical
+  evidence: inventory не перепроверял trusted roots после symlink hop,
+  probe actual loader argv не проходил authoritative `SC_ARG_MAX`, а
+  pre-acquisition resource plan использовал placeholder/file-only invocation.
+  Это несоответствия уже одобренным requirements 22.x, не material delta;
+  approval 2026-07-30 покрывает remediation. Independent/delivery truth
+  остаётся открытой.
+- [x] 23.2 Реализовать один substantive immutable canonical invocation owner
+  для probe и production: полная topology directories/files/symlinks/perms,
+  harness/anchors и FD roles. Pre-acquisition render использует
+  worst-case legal decimal FD width из finite `RLIMIT_NOFILE`; actual render
+  тем же spec обязан быть не больше bound и повторно проходит authoritative
+  args/exec/FD checks перед соответствующим memfd/subprocess.
+- [x] 23.3 Перепроверять lexical destination после каждого external ELF
+  symlink hop против injectable trusted roots; absolute/relative escape,
+  dangling target и cycle fail closed. Добавить valid-red regression tests:
+  trusted-root escape, oversized actual probe argv и directory/symlink-heavy
+  canonical topology с `memfd_calls == 0`. Targeted red: `3 failed`;
+  targeted green: `3 passed`; полный sandbox author run: `45 passed`.
+- [x] 23.4 Выполнить author exact four-suite два раза подряд без правок,
+  strict OpenSpec, diff/line/fixture/provenance/scope gates. Закрыть только
+  author validation claim после фактической проверки.
+  Выполнено: два последовательных exact run дали `149 passed, 0 failed`
+  каждый без retry/FLAKY и без правок между runs; strict OpenSpec valid,
+  в отслеживаемых и неотслеживаемых файлах нет проблем с пробельными символами, лимиты `source`/`test`/`rollout`/`support`
+  соблюдены, fixtures/provenance и exact task-owned scope проверены.
+- [x] 23.5 Получить новый accepted independent review без `BLOCK`.
+  Independent/delivery/live truth и commit/push/PR остаются открытыми.
+
+### 24. Незначительное исправление acquisition/final handoff/ownership
+
+- [x] 24.1 Зафиксировать latest independent `BLOCK` как historical evidence:
+  acquisition peak, final handoff, canonical ownership, exact role order и
+  symlink matrix не полностью реализовали уже одобренные requirements.
+  Material scope не изменён; новый approval не нужен. Independent, delivery,
+  commit/push/PR и live gates остаются открытыми.
+- [x] 24.2 Добавить в `InventoryPlan` named strict acquisition temporary
+  reserve из поддерживаемого `MAX_DIRECTORY_DEPTH` lifecycle; включить его в
+  pre-content resource plan. Перед каждым subprocess после создания всех
+  phase memfd выполнить authoritative exact final handoff check. Оставить
+  invocation module единственным owner constants/base/production policy и
+  отклонять missing/extra/reordered role maps до render/subprocess.
+- [x] 24.3 Добавить targeted valid-red→green regressions: subprocess-isolated
+  low-RLIMIT deep topology до первого content memfd без leak; late FD pressure
+  без subprocess; exact role maps; temp-only relative multi-hop/absolute
+  escape/relative escape/dangling/cycle symlink matrix с literal expected.
+  Целевой red: role-map `6 failed`, late-pressure достиг запрещённого
+  subprocess, deep acquisition не имел named bound; symlink valid path
+  проходил, четыре unsafe cases fail-closed. Targeted green: `12 passed` и
+  изолированный deep acquisition `1 passed`; набор sandbox `43 passed`.
+- [x] 24.4 Выполнить author exact four-suite два раза подряд без edits/retry,
+  строгую проверку OpenSpec, diff/no-index для неотслеживаемых файлов, подсчёт строк,
+  fixtures/provenance/scope. Закрыть только после фактической проверки.
+  Выполнено: два последовательных дословных запуска без edits/retry/FLAKY
+  дали `161 passed, 0 failed` (`31+43+44+43`) за `210.3s` и `210.1s`.
+  Строгая проверка OpenSpec успешна; проверки пробелов tracked/untracked и line-count,
+  fixtures/provenance и exact task-owned scope gates пройдены.
+- [x] 24.5 Получить новый accepted independent review без `BLOCK`.
+  Independent/delivery/live truth и commit/push/PR остаются открытыми.
+
+### 25. Историческое незначительное исправление согласованности топологии
+
+- [x] 25.1 Зафиксировать новый independent P1 `BLOCK` как historical
+  evidence существующего requirement: acquisition traversal не применял
+  canonical `MAX_DIRECTORY_DEPTH`, поэтому mutation между inventory и
+  acquisition могла создать content memfd до позднего topology mismatch.
+  Новый material delta и approval не требуются.
+- [x] 25.2 На время valid behavioral red переоткрыть claims 22.3, 22.5,
+  24.2 и load-bearing часть 24.3. Regression вызвал настоящий
+  `capture_bundle`, добавил после inventory topology глубже canonical cap при
+  наличии лексически раннего regular file и завершился `Failed: DID NOT
+  RAISE`, доказав implementation gap.
+- [x] 25.3 До первого content memfd повторно выполнить canonical inventory с
+  той же depth policy и exact сверить observed plan с approved
+  `InventoryPlan`. Structured inventory/topology failure происходит до
+  acquisition и не оставляет FD.
+- [x] 25.4 Независимо применить импортированный из canonical inventory owner
+  `MAX_DIRECTORY_DEPTH` в `_walk_directory`; проверять предел до открытия
+  следующего directory на запрещённой глубине. Post-preflight mutation hook
+  подтверждает fail-closed и отсутствие FD leak.
+- [x] 25.5 Закрыть claims 22.3, 22.5, 24.2 и load-bearing часть 24.3 только
+  после factual targeted green: два lifecycle regression и существующий
+  second-pass mutation прошли, `3 passed in 6.95s`; relevant sandbox author
+  run дал `45 passed за 219.2s`. Это author evidence, а не independent
+  acceptance. Independent 22.8, 22.9, 23.5, 24.5, delivery и live gates
+  остаются открытыми.
+- [x] 25.6 После последней line-cap правки до `sealed_bundle` 999 и sandbox
+  test 998 выполнены два clean exact four-suite именно на final snapshot:
+  `163 passed` (`31+43+44+45`) за `225.7s` и `223.1s`, без
+  правок и повторных запусков не было, FLAKY отсутствует.
+- [ ] 25.7 Зафиксировать truth/evidence: read-only probe normal HOSTKEY shell
+  и текущих MCP процессов показал finite soft `RLIMIT_NOFILE=1024`,
+  hard `RLIMIT_NOFILE=1048576`; current sealed inventory plan требует 1360 FD,
+  поэтому normal-shell exact run корректно fail-closed: `137 passed`,
+  `26 dependent failed`, второй run не запускался. Никакой limit не менялся.
+  Это не code defect по текущему requirement low-limit fail-closed, но
+  production/live capacity не готова; любой raise/config/launcher/service
+  environment change требует отдельного material approval и live gate.
+  Commit/push/PR/merge/live/deploy/restart/MCP/DB остаются закрытыми.
+
+### Принятый независимый обзор — синхронизация фактического состояния
+
+Reviewer session `019fb2a2-d9d0-7df1-a228-845e7ec59b3f` завершилась verdict
+`CODE VERDICT APPROVE`, findings отсутствуют. В review sandbox finite
+`RLIMIT_NOFILE` soft/hard был `1048576/1048576`, required `1360`, limit не
+изменялся. Strict OpenSpec, tracked/untracked whitespace, compile/static,
+line/fixture/provenance/scope gates прошли. Raw diff fingerprint до и после
+совпадает:
+`c97370a82677a491c3eeb9f8279631010a06427a892e8073f7b1e03ce4f6c0cf`.
+Это superseding acceptance для закрытых non-live truth-задач выше. Task 25.7
+остаётся открытым: normal HOSTKEY/current MCP soft limit `1024` меньше required
+`1360`, а material approval изменения environment capacity не получен.

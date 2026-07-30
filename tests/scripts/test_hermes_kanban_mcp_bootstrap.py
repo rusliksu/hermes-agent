@@ -13,6 +13,9 @@ from typing import Callable
 
 import pytest
 
+from tests.scripts.hermes_kanban_mcp_test_support import (
+    install_trusted_bwrap_result,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts" / "hermes_kanban_mcp_rollout.py"
@@ -21,6 +24,13 @@ assert SPEC is not None and SPEC.loader is not None
 rollout = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rollout
 SPEC.loader.exec_module(rollout)
+
+
+@pytest.fixture(autouse=True)
+def _trusted_bwrap_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_trusted_bwrap_result(monkeypatch, rollout, tmp_path)
 UNKNOWN_VALUE = "future-private-value=must-not-leak"
 
 
@@ -37,6 +47,19 @@ def _git(repo: Path, *arguments: str, check: bool = True) -> str:
 
 def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _wrapper_bytes(runtime: Path) -> bytes:
+    return (
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        f"export HERMES_HOME={runtime.parent}/hermes-home\n"
+        "export HERMES_QUIET=1\n"
+        "export HERMES_REDACT_SECRETS=true\n"
+        "export PYTHONDONTWRITEBYTECODE=1\n"
+        f"exec {runtime}/venv/bin/python"
+        ' -m hermes_cli.main mcp serve-kanban --allow-write "$@"\n'
+    ).encode()
 
 
 def _oracle(root: Path) -> tuple[tuple[object, ...], ...]:
@@ -206,7 +229,14 @@ def layout(tmp_path: Path) -> BootstrapLayout:
     _git(source, "config", "user.name", "Hermes bootstrap tests")
     payload = source / "payload.txt"
     payload.write_text("base\n", encoding="utf-8")
-    _git(source, "add", "payload.txt")
+    for package in ("hermes_cli", "agent", "agent/transports"):
+        (source / package).mkdir(exist_ok=True)
+        (source / package / "__init__.py").write_text("", encoding="utf-8")
+    (source / "hermes_cli" / "main.py").write_text("", encoding="utf-8")
+    (source / "agent" / "transports" / "hermes_kanban_mcp_server.py").write_text(
+        'WRITE_TOOLS = ("kanban_sync_external_task",)\n', encoding="utf-8"
+    )
+    _git(source, "add", ".")
     _git(source, "commit", "-m", "base")
     base_commit = _git(source, "rev-parse", "HEAD")
     payload.write_text("source\n", encoding="utf-8")
@@ -219,18 +249,24 @@ def layout(tmp_path: Path) -> BootstrapLayout:
 
     interpreter = export_runtime / "venv" / "bin" / "python"
     interpreter.parent.mkdir(parents=True)
-    interpreter.write_bytes(b"#!/bin/sh\nexit 0\n")
-    interpreter.chmod(0o700)
+    interpreter.write_bytes(Path(sys.executable).read_bytes())
+    interpreter.chmod(stat.S_IMODE(Path(sys.executable).stat().st_mode))
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (export_runtime / "venv" / "pyvenv.cfg").write_text(
+        f"home = {Path(getattr(sys, '_base_executable', sys.executable)).resolve().parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {version}\n",
+        encoding="utf-8",
+    )
+    (
+        export_runtime / "venv" / "lib" / f"python{version}" / "site-packages"
+    ).mkdir(parents=True)
     (export_runtime / "do-not-copy.txt").write_text(
         "export-only runtime state\n", encoding="utf-8"
     )
     export_manifest = export_runtime / "manifest.txt"
     export_manifest.write_bytes(_manifest_bytes(source_commit))
-    wrapper_before = (
-        b"#!/bin/sh\nexec "
-        + str(interpreter).encode()
-        + b" -m hermes_cli.main mcp serve-kanban --allow-write \"$@\"\n"
-    )
+    wrapper_before = _wrapper_bytes(export_runtime)
     wrapper_mode = 0o750
     stable_wrapper.write_bytes(wrapper_before)
     stable_wrapper.chmod(wrapper_mode)
@@ -613,8 +649,9 @@ def test_bootstrap_switch_rollback_and_followup_prepare_share_one_consumer(
         / "manifest.json"
     )
     manifest = json.loads(target_snapshot.read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "rollout"
+    assert manifest["wrapper_contract"] == "source-cwd-v1"
     assert manifest["runtime_root"] == manifest["state_root"] == str(layout.state_root)
     assert _git(layout.target_path, "rev-parse", "HEAD") == layout.target_commit
 

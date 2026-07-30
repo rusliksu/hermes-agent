@@ -1,3 +1,9 @@
+> **Статус MATERIAL REMEDIATION DELTA:** exact approval раздела 22.x получено
+> от Руслана 2026-07-30 формулировкой «одобряю material ELF/resource
+> remediation baseline». Разрешены только implementation 22.3–22.6 и
+> авторская проверка только в режимах repo-local/temp-only. Действия в
+> live-среде, commit/push/PR, независимая приёмка и delivery gates не открыты.
+
 ## Контекст
 
 Актуальная опорная вершина `main` репозитория `rusliksu/hermes-agent`:
@@ -72,6 +78,45 @@ Git worktree. Поэтому он не должен ослаблять этот 
 Нужен отдельный bootstrap contract, который сначала создаёт immutable exact
 Git baseline, не заменяя export in-place и не меняя stable wrapper.
 
+После двух remediation cycles третье независимое ревью
+`20260729T161437Z-kanban-runtime-coherence-final-review` снова вынесло
+`BLOCK`. Python-level audit/blocklist не перекрывает low-level/native paths,
+candidate interpreter стартует до появления policy, schema-v2 compatibility
+не закреплена реальным историческим golden, а rollout test достиг 996 строк.
+На HOSTKEY зафиксированы bubblewrap `0.9.0` и работоспособный Codex sandbox.
+Material OS-sandbox delta ниже явно утверждён пользователем 2026-07-29 только
+для implementation и repo-local/temp-only verification; delivery и live
+actions этим approval не разрешены.
+
+Независимый run
+`20260729T192126Z-kanban-os-sandbox-independent-review` после этой реализации
+снова вынес `BLOCK`. Review показал, что parent anchors и `bwrap` открывают
+не одни и те же runtime/venv/interpreter/stdlib objects; swap-and-restore
+может запустить другой interpreter и затем скрыть подмену. Оно также
+зафиксировало raw `/home/openclaw` в `provenance.json`, forwarding façade и
+всего 26 строк запаса в `runtime_coherence.py`, потерю четырёх security
+regressions и overclaim полного capability probe. Оба независимых four-suite
+run остановились до collection, потому что review sandbox был read-only и не
+предоставил usable temp/cache path. Эти факты образуют новый material
+baseline и не закрываются предыдущим approval.
+
+Независимый run
+`20260729T224514Z-kanban-remediation-independent-review` выполнил exact
+four-suite команду два раза подряд успешно, но вынес новый `BLOCK`.
+Зелёные runs подтверждают только regression evidence. Directory descriptor
+не замораживает bytes вложенного regular file: после построения anchors файл
+можно изменить in-place, выполнить candidate import/effect и восстановить,
+при этом directory identity и forged child evidence останутся
+согласованными. Review также обнаружил неполный FD cleanup при
+`write`/`lseek`/seal failure и отсутствие содержательной разгрузки:
+rollout test имеет 999 строк, а support — 40.
+
+Reviewer-only probe временно менял source file, затем побайтово восстановил
+его; pre/post fingerprints совпали. Это честно зафиксированный deviation, а
+не implementation change. Поскольку mandatory independent review должен
+быть source-read-only, probe исключён из acceptance evidence и в следующем
+цикле не повторяется как обязательное действие.
+
 ## Цели / вне целей
 
 **Цели:**
@@ -107,8 +152,29 @@ Git baseline, не заменяя export in-place и не меняя stable wrap
   exact Git baseline из non-Git export evidence до обычного `prepare`;
 - сохранить одну общую schema/validation/atomic transition policy для
   bootstrap и обычных snapshots;
-- удержать каждый source/test file ниже 1000 строк через одну реальную
-  ownership extraction, а не thin wrappers.
+- удержать rollout test `<=850` строк, существующий reusable support `<400`,
+  каждый source/test file ниже 1000 строк; общие path/Git/venv primitives
+  должны иметь отдельного настоящего owner без forwarding façade, а
+  `runtime_coherence.py` — минимум 100 строк запаса до лимита.
+- установить OS-level containment exact `/usr/bin/bwrap` до запуска любого
+  candidate Python и завершаться fail-closed без Python-only fallback;
+- материализовать каждый исполняемый/импортируемый regular file candidate
+  source, exact interpreter, required trusted stdlib/runtime closure и
+  `bwrap` в sealed immutable content bundle; строить anchors/digests из тех
+  же bytes и не bind mutable backing directory;
+- строить manifest descriptor-relative с `O_NOFOLLOW`, fail-closed при
+  неполном/изменившемся capture и гарантировать exact captured verified
+  bytes только от anchor construction до `exec`/import;
+- сделать ownership каждого `open`/`memfd` exception-safe и проверяемым
+  failure injection без leaked FDs или скрытых cleanup errors;
+- определить security contract как отсутствие host-visible side effects,
+  сохранив Python audit/sticky denial вторым слоем и evidence;
+- закрепить schema-v2 rollback полностью sanitized historical golden:
+  raw `/home/openclaw` отсутствует во всех четырёх fixture files, а
+  provenance ledger хранит только классы/хэши исходных значений;
+- разгрузить rollout test до `<=850` строк, превратив существующий
+  `hermes_kanban_mcp_test_support.py` в содержательного reusable owner
+  общего Git/layout/oracle harness размером `<400` строк; behavior unchanged.
 
 **Вне целей:**
 
@@ -118,6 +184,9 @@ Git baseline, не заменяя export in-place и не меняя stable wrap
   `sync_external_task`;
 - новый обычный Hermes model/core tool;
 - новая зависимость или DB migration;
+- новые daemon/root/deploy requirements, `nsjail` или `systemd-run`;
+- обязательный seccomp dependency; seccomp допускается только как отдельное
+  future hardening после доказанного acceptance tests остаточного риска;
 - копирование DB, snapshot workaround или запись в live DB;
 - изменение live connector, Windows config, wrapper, live DB или сервисов;
 - изменение immutable runtime
@@ -563,7 +632,7 @@ python scripts/hermes_kanban_mcp_rollout.py bootstrap-prepare \
   [--apply]
 ```
 
-Отсутствие `--apply` строит полный JSON plan без write primitives. Dry-run
+Отсутствие `--apply` строит полный JSON plan без примитивов записи. Dry-run
 MAY не получать expected manifest SHA-256: тогда он вычисляет и печатает
 наблюдаемый byte hash для exact approval. `--apply` MUST требовать
 `--expected-export-manifest-sha256` и сравнить его с текущими bytes, чтобы
@@ -617,7 +686,7 @@ baseline path. `wrapper.after` является единственной byte tr
 runtime. Она отвергнута: тогда schema и switch policy перестают отличать
 доказанный export от immutable Git runtime.
 
-### 14. Schema v2 объединяет bootstrap и rollout без второй transition policy
+### 14. Schema v2 остаётся bootstrap/legacy форматом, schema v3 — ordinary rollout
 
 Schema v1 из PR #16 недостаточна: она предполагает два разных Git SHA и
 Git-clean current runtime. Bootstrap имеет export и baseline с одним
@@ -625,7 +694,7 @@ Git-clean current runtime. Bootstrap имеет export и baseline с одним
 однократно перейти на `schema_version=2`; schema v1 reader/migration не
 добавляется.
 
-Каждый v2 manifest содержит общий exact set:
+Исторический bootstrap-helper создаёт schema v2 manifest с общим exact set:
 
 - `schema_version=2`, `snapshot_kind=bootstrap|rollout`, UTC `created_at`;
 - `source_repo`, `runtime_root`, `state_root`, `snapshot_id`,
@@ -640,9 +709,12 @@ Git-clean current runtime. Bootstrap имеет export и baseline с одним
 
 Для `bootstrap` before manifest fields являются non-null absolute path и
 full SHA-256; before/after SHA оба равны source commit; replacement count
-равен ровно `1`. Для `rollout` manifest fields равны JSON `null`, before и
-after являются exact Git commits и различаются. Variant с иными
-kind/null/hash combinations отклоняется.
+равен ровно `1`. Уже существующие legacy `rollout` schema v2 snapshots
+остаются readable только для snapshot-only rollback: их manifest fields
+равны JSON `null`, before и after являются exact Git commits и различаются.
+Новый ordinary `prepare` MUST создавать только schema v3. Новый
+switch-to-target по schema v2 запрещён. Variant с иными kind/null/hash
+combinations отклоняется.
 
 Snapshot IDs детерминированы:
 
@@ -653,39 +725,40 @@ Snapshot directory остаётся
 `<state-root>/snapshots/<snapshot-id>` с mode `0700` и ровно тремя files
 `manifest.json`, `wrapper.before`, `wrapper.after` mode `0600`.
 
-Live schema migration не нужна и backward compatibility не добавляется,
+Live schema migration не нужна и обратная совместимость не добавляется,
 потому что зафиксированный evidence подтверждает отсутствие dedicated state
 root, baseline, target и snapshots. Перед любым будущем live
 `bootstrap-prepare --apply` оператор обязан отдельно подтвердить, что exact
 state root всё ещё отсутствует; существующий root, включая schema v1
 artifacts, закрывает apply без cleanup или migration.
 
-### 15. Один validator обслуживает `switch/rollback` обоих snapshot kinds
+### 15. Проверка switch/runtime отделена от rollback только по snapshot
 
-Существующие `switch/rollback` SHALL читать schema v2 через одну общую
-snapshot loader/validator функцию и использовать существующий единый
-примитив `_atomic_replace`. Отдельный обработчик `switch/rollback` для `bootstrap`,
-отдельная atomic policy или дублированные stale-wrapper guards запрещены.
+`switch` SHALL использовать полную проверку согласованности runtime: schema,
+хеши и режимы snapshot, exact derived paths, guard текущего wrapper, target
+runtime/venv и, для schema v3, import-origin evidence. Bootstrap switch
+дополнительно повторно проверяет export manifest, source commit, export venv
+и exact baseline runtime. Один atomic replacement primitive и общие
+path/hash primitives сохраняются; отдельная atomic policy запрещена.
 
-Общая проверка всегда подтверждает snapshot hashes/modes, exact derived
-пути, явно заданные SHA-256 и режим текущего `wrapper`, а также точную `before→after`
-replacement и after runtime exact detached Git HEAD/tracked cleanliness/venv
-evidence.
+`rollback` SHALL использовать отдельный snapshot-only loader/validator. Он
+читает только exact `manifest.json`, `wrapper.before`, `wrapper.after`,
+проверяет schema v2/v3, размеры/modes/hashes snapshot, exact snapshot ID и
+stable-wrapper path, явный current-wrapper SHA-256 guard и соответствие
+current wrapper exact `wrapper.after`. Затем тот же atomic primitive
+восстанавливает exact bytes/mode `wrapper.before`.
 
-Для `snapshot_kind=bootstrap` общий валидатор дополнительно при каждом
-пробном запуске и `--apply`:
+Rollback только по snapshot MUST NOT:
 
-1. повторно читает экспортный `manifest.txt` по закреплённому пути;
-2. сравнивает точный `SHA-256` сырых байтов и заново применяет тот же
-   контракт `key=value`, включая `source_commit`;
-3. повторно проверяет export venv/interpreter evidence;
-4. проверяет baseline exact HEAD, tracked cleanliness и baseline interpreter;
-5. требует wrapper before для `switch` и wrapper after для `rollback`.
+1. требовать существования или cleanliness source repo;
+2. требовать существования, Git HEAD, venv или interpreter candidate/baseline;
+3. импортировать target modules или запускать import-origin preflight;
+4. читать export manifest/runtime, даже для bootstrap snapshot;
+5. ослаблять exact snapshot/hash/current-wrapper/`wrapper.before` guards.
 
-Для `snapshot_kind=rollout` validator проверяет оба Git runtime и их venv по
-существующей policy. Switch и rollback отличаются только required current
-wrapper hash и выбором `wrapper.after`/`wrapper.before`; rollback
-восстанавливает exact bytes и mode.
+Поэтому missing, corrupt или dirty candidate не блокирует emergency rollback.
+Ошибка только rollback-owned evidence по-прежнему закрывает запись
+fail-closed.
 
 После отдельно одобренного bootstrap switch обычный `prepare` получает
 baseline как `--current-runtime` и target SHA. Для этого dedicated layout
@@ -695,28 +768,48 @@ baseline как `--current-runtime` и target SHA. Для этого dedicated l
 `hermes-kanban-mcp-<SHA>`, snapshot — только в `snapshots/<ID>`, а roots
 никогда не являются write targets целиком.
 
-### 16. File split следует ownership, а не командам
+### 16. File split сохраняет реальные ownership boundaries и отдельный common owner
 
-Текущий executable helper имеет 850 строк, а существующий rollout test file —
-913. Bootstrap-helper PR MUST удержать каждый source/test file ниже 1000
-строк.
+Исторический bootstrap-helper baseline удерживал files ниже 1000 строк.
+Текущая truth state после remediation: rollout test — 999 строк, support —
+40. Новый material gate требует не только hard limit, но и измеримый запас:
+rollout test `<=850`, support `<400`, каждый source/test `<1000`.
 
-Разрешена одна extraction:
+Material remediation требует отдельную extraction:
 
 - `scripts/hermes_kanban_mcp_rollout.py` владеет argparse, command contexts,
   dry-run plans и `prepare`/`bootstrap-prepare` orchestration;
 - `scripts/hermes_kanban_mcp_rollout_state.py` владеет schema v2
-  serialization/validation, snapshot files и общей atomic `switch/rollback`
-  политику перехода.
+  и v3 serialization, snapshot files, snapshot-only rollback validation и
+  общей atomic transition policy;
+- `scripts/hermes_kanban_mcp_runtime_coherence.py` владеет exact
+  точной грамматикой и генерацией legacy/canonical wrapper, а также
+  политикой изолированной проверки происхождения импортов.
+- отдельный common ownership module владеет общими path/Git/venv primitives,
+  которые нужны более чем одному из orchestration/state/coherence modules.
+  Точное имя файла и внутренняя группировка helpers не являются контрактом.
 
-Это реальная ownership boundary: persistent rollback evidence и transition
-policy отделены от способов построения runtimes. Модуль не является thin
-wrapper, не получает второй CLI и не дублирует path/hash primitives.
+Это реальные ownership boundaries: persistent rollback evidence и transition
+policy отделены от построения runtimes, а shell/import security boundary —
+от schema/snapshot state. Общие primitives определены ровно в одном common
+owner; consumers импортируют их непосредственно. State module не
+реэкспортирует их и не сохраняет forwarding façade. Ни один модуль не
+получает второй CLI и не дублирует path/hash primitives.
+`runtime_coherence.py` MUST иметь измеримый запас не менее 100 строк до
+hard limit 1000, то есть не более 900 физических строк; остальные
+source/test files остаются `<1000`.
+Общий Git/layout/oracle test harness MUST содержательно принадлежать
+существующему `tests/scripts/hermes_kanban_mcp_test_support.py`; support не
+может быть thin forwarding façade. Extraction MUST сохранять behavior.
 Bootstrap tests живут в отдельном
 `tests/scripts/test_hermes_kanban_mcp_bootstrap.py`; существующий rollout test
-file проверяет regression обычного prepare/switch/rollback и schema v2.
+file проверяет regression обычного prepare/switch/rollback и schema v2/v3, а
+`tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py` проверяет exact
+wrapper grammar, parent evidence и исторический schema-v2 golden.
+`tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py` отдельно проверяет
+OS containment, bypass attempts и host canaries.
 
-Оба файла тестов используют только временные деревья
+Все четыре helper test modules используют только временные деревья
 `Git`/экспорта/среды. Корректный тестовый `manifest.txt` использует фактические
 ключи `source_commit`, `deployed_utc`, `python_version`, `mcp_version`,
 `command` в формате строк `key=value`. Проверки обязаны включать дубликат
@@ -732,7 +825,7 @@ file проверяет regression обычного prepare/switch/rollback и s
 `prepare` от базовой среды к цели при едином корне и лимит строк `<1000`.
 Тесты не читают исходный текст и не обращаются к рабочим путям.
 
-### 17. Bootstrap-helper PR не является live approval
+### 17. Bootstrap-helper PR не является разрешением на live-действия
 
 Bootstrap-helper PR добавляет capability и temp-only tests, но не создаёт
 даже пустой live state root. В PR фазе запрещены live apply, baseline,
@@ -743,6 +836,372 @@ actions и smoke.
 сопоставление всех paths/hashes/source commit с одобренным evidence и
 отдельное разрешение на `--apply`. Merge PR, зелёные tests или одобрение
 этого design сами по себе live apply не разрешают.
+
+### 18. Material repair baseline: откат завершён, причина rollout failure локализована
+
+Зафиксированный rollback evidence является новой baseline-точкой для
+ремонта: rollback wrapper для snapshot
+`6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`
+успешно применён с `exit 0`. Stable wrapper восстановлен до SHA-256
+`17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`.
+Restart, process replacement, DB, Kanban operations и smoke не выполнялись.
+Это закрывает emergency rollback step, но не даёт нового rollout evidence.
+
+Root cause: candidate runtime содержал target source checkout с новым
+`kanban_sync_external_task`, но candidate `venv` был скопирован из старой
+среды. Запуск `candidate/venv/bin/python -m hermes_cli.main` без явного
+source cwd импортировал `hermes_cli.main` и
+`agent.transports.hermes_kanban_mcp_server` из old `site-packages`, а не из
+target checkout. Поэтому runtime `WRITE_TOOLS` оставался старым, несмотря на
+правильный target path в wrapper.
+
+Исправление не должно решать это через network, `pip install`, editable install
+или файл `.pth`. Candidate venv остаётся переносимым артефактом, а source
+checkout становится каноническим корнем imports через wrapper cwd и preflight
+guards. Это меньше меняет состояние runtime и не требует изменения package.
+
+### 19. Schema v3 и canonical `source-cwd-v1` wrapper
+
+Новые ordinary rollout snapshots SHALL использовать `schema_version=3`.
+Schema v3 сохраняет общую before/after runtime модель schema v2, но добавляет
+evidence согласованности для imports из target source:
+
+- `wrapper_contract=source-cwd-v1`;
+- deterministic `wrapper.after` bytes и SHA-256;
+- exact target runtime cwd, exact target interpreter path и exact module
+  origin paths для `hermes_cli.main` и
+  `agent.transports.hermes_kanban_mcp_server`;
+- exact `WRITE_TOOLS` evidence, включающее
+  `kanban_sync_external_task`;
+- preflight command/result metadata без environment dump, secrets, DB data
+  или wrapper text.
+
+Canonical `source-cwd-v1` wrapper SHALL после switch явно выполнить
+`cd -- <EXACT_TARGET_RUNTIME>` непосредственно перед запуском
+`<EXACT_TARGET_RUNTIME>/<venv>/bin/python -m hermes_cli.main ...`. `cd`
+является частью контракта runtime, а не косметикой: он делает target checkout
+первым источником imports для `python -m`, чтобы copied venv `site-packages` не
+затенял source tree.
+
+Legacy schema v2 wrapper допускается как `before` и rollback target. Helper
+MUST сохранять exact `wrapper.before` bytes/mode и MAY rollback schema v2
+snapshots без проверок import-origin candidate. Новый switch на target MUST
+использовать schema v3 snapshot; schema v2 switch-to-target не является
+путём исправления.
+
+Wrapper parser/generator SHALL быть deterministic и fail-closed и принадлежать
+`scripts/hermes_kanban_mcp_runtime_coherence.py`. Parser принимает только
+явно перечисленные exact legacy/canonical templates: корректный shebang,
+ожидаемый `set`, exact allow-listed exports и единственный исполняемый
+`exec` с exact argv `-m hermes_cli.main mcp serve-kanban --allow-write "$@"`.
+Canonical template дополнительно требует exact `cd -- <runtime>`
+непосредственно перед `exec`.
+
+Parser MUST отклонять comments-only совпадение, отсутствующий `exec`,
+дополнительную команду до или после него, redirects, pipes, backgrounding,
+command substitution и shell control operators, лишние argv/exports,
+несколько runtime/interpreter paths, смешанные baseline/candidate paths,
+symlink wrapper и non-executable wrapper. Подстроки или token-presence не
+являются доказательством поддерживаемой grammar.
+
+### 20. Bubblewrap устанавливает boundary до candidate Python
+
+Новый `prepare` сначала строит target worktree/venv по существующей
+fail-closed policy и deterministic `wrapper.after`, затем доверенный parent
+готовит anchors и запускает sanitized import-origin preflight. Candidate
+Python никогда не стартует напрямую: единственная допустимая цепочка —
+зафиксированный и запечатанный образ `bwrap` → зафиксированный и запечатанный
+интерпретатор кандидата
+`-I -S -B`. Exact `/usr/bin/bwrap` является allow-listed capture source, а
+не повторно открываемым executable после anchor construction.
+На HOSTKEY наблюдаются bubblewrap `0.9.0` и работоспособный Codex sandbox, но
+это только входной planning evidence. Каждый production preflight обязан
+проверить exact executable и фактическую работоспособность containment.
+Отдельный capability probe является только baseline probe: он проверяет
+базовую возможность запустить exact `bwrap` с обязательными namespaces и
+synthetic mounts, но не утверждает, что проверил candidate-specific
+sealed content/data binds. Полный профиль доказывает только реальный
+production invocation со всем sealed bundle и exact candidate argv. Любая
+ошибка построения или выполнения этого invocation закрывает
+операцию fail-closed; Python-only, unsandboxed или частичный fallback
+отсутствует.
+
+Минимальный профиль `bwrap`:
+
+- новый пустой mount namespace без bind host `/`;
+- candidate/source/venv regular files доступны только из sealed content
+  bundle; directory/symlink topology создаётся из полного manifest;
+- exact interpreter, необходимые stdlib, loader/shared-library regular files
+  и bytes `bwrap` входят в тот же sealed capture closure. Mutable candidate,
+  `/usr`, `/lib*` или другой backing directory целиком не bind-mount-ится;
+  произвольные `/etc`, host home, runtime state и host sockets не монтируются;
+- отдельные tmpfs mounts для temp, `HOME` и `HERMES_HOME`, чтобы эти три
+  области не разделяли host backing store;
+- `--clearenv`, затем точный allowlist:
+  `HOME=/sandbox/home`, `HERMES_HOME=/sandbox/hermes-home`,
+  `TMPDIR=/sandbox/tmp`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `TZ=UTC`,
+  `PYTHONDONTWRITEBYTECODE=1`; `PATH`, `PYTHONPATH`, `PYTHONHOME`,
+  credentials и произвольный parent environment отсутствуют;
+- свежий `/proc` и минимальный `/dev`, без host device/socket passthrough;
+- отдельные user, PID, IPC, UTS, cgroup и network namespaces настолько,
+  насколько их поддерживают `bwrap` и kernel. Требуемые flags задаются
+  fail-closed: если согласованный профиль нельзя создать целиком, candidate
+  не запускается;
+- `--new-session` и `--die-with-parent`.
+
+Новые daemon, root privilege, deploy, `nsjail`, `systemd-run` или обязательный
+seccomp dependency не добавляются. Seccomp остаётся только возможным future
+hardening, если acceptance tests докажут реальный остаточный host-visible
+effect, не закрываемый bubblewrap namespaces.
+
+Security contract намеренно узкий и проверяемый: preflight не имеет
+host-visible side effects. Он не обещает, что каждый внутренний syscall
+вернёт `EPERM`: candidate может создать процесс внутри своего PID namespace
+или открыть socket внутри пустого network namespace, но не может изменить
+host files, sockets, процессы, signals, resource limits или DB. Существующие
+Python audit hook, sticky denial и monkeypatch guards сохраняются как второй
+слой, ранняя диагностика и структурированное evidence. Они не являются
+boundary и их blocklist не используется как доказательство полноты native
+изоляции.
+
+### 21. Sealed content bundle является trust boundary для bytes
+
+Directory descriptor не является content snapshot: вложенный regular file
+может измениться in-place без замены directory или inode. Поэтому прежний
+descriptor-pinned contract отозван как достаточный security boundary.
+Доверенный parent SHALL построить sealed content bundle до любого candidate
+`exec`/import.
+
+Capture состоит из двух фаз.
+
+1. Parent descriptor-relative обходит exact allow-listed roots. Каждый
+   компонент открывается относительно уже проверенного directory FD с
+   `O_NOFOLLOW`; `lstat`/`fstat` различают directory, symlink и regular file.
+   Unsupported file type, escape, цикл/ambiguous symlink, неполный manifest
+   или изменение проверяемого объекта во время capture закрывают операцию
+   fail-closed.
+2. Каждый исполняемый или импортируемый обычный файл материализуется в
+   отдельный объект данных `memfd`: дерево исходного кода кандидата, точный
+   интерпретатор, `pyvenv.cfg`, необходимая доверенная стандартная библиотека,
+   замыкание загрузчика и разделяемых библиотек, доверенный тестовый каркас и
+   точные байты исполняемого файла `bwrap`. После полной записи
+   parent выполняет `lseek`, повторное чтение/hash из memfd и seals,
+   запрещающие write/grow/shrink/future mutation. Manifest entry, anchor и
+   digest строятся только из уже sealed captured bytes, а не из повторного
+   чтения backing path.
+
+Контракт начинается в момент успешного завершения capture. Он не обещает
+недостижимую защиту исторических bytes до capture; он обещает, что от anchor
+construction до `exec`/import используются exact captured verified bytes.
+Если platform не позволяет sealed execution exact interpreter/`bwrap` и
+необходимого loader closure, operation завершается fail-closed без path-based
+fallback.
+
+Bubblewrap получает только:
+
+- sealed regular-file bundle через read-only data/FD bindings с exact
+  manifest destinations и allow-listed modes;
+- directory entries и symlinks, созданные из manifest в свежей sandbox
+  topology;
+- отдельные tmpfs `HOME`, `HERMES_HOME` и temp, минимальные `/proc`/`dev` и
+  согласованные namespaces.
+
+Mutable candidate/source/venv, `/usr`, `/lib*` или другой backing directory
+не bind-монтируется. Symlink topology не может добавлять path за пределами
+manifest. Exact `bwrap` image и его необходимый loader closure запускаются из
+captured sealed bytes через FD/fexecve-equivalent путь; обычный
+`/usr/bin/bwrap` path используется только для начального capture/diagnostic
+identity и не переоткрывается как executable после anchor construction.
+
+FD ownership централизован в одном bundle/resource owner:
+
+1. каждый успешный `open` и `memfd_create` регистрируется немедленно, до
+   следующей fallible операции;
+2. `_data_fd` владеет current FD до явного handoff и при ошибке `write`,
+   `lseek`, повторного чтения/hash или seal закрывает и снимает с регистрации
+   именно current FD;
+3. при ошибке построения partial bundle owner закрывает все ранее
+   приобретённые FDs в обратном порядке;
+4. при ошибке handoff/invocation/post-check/switch owner сохраняет тот же
+   контракт очистки;
+5. cleanup error не подавляется и не подменяет primary cause: наружу выходит
+   structured fail-closed error с primary failure, полным списком cleanup
+   failures и `replacement_applied` state. Snapshot/switch не продолжаются.
+
+Parent/child evidence сравнивается с manifest/digests sealed bundle. Child
+self-report не расширяет allowlist и не заменяет anchors. Nested
+in-place mutate→candidate import/effect→restore после capture, даже с
+полностью matching forged child JSON, может привести только к исполнению
+sealed original bytes либо к fail-closed до import/effect. То же правило
+применяется к trusted stdlib regular file и exact interpreter/`bwrap` bytes,
+где platform даёт воспроизводимый behavioral oracle. Во всех случаях host
+canary не меняется.
+
+Внутри sandbox `-S` отключает автоматический `site`/`.pth`, `-B` исключает
+bytecode writes. Origin `hermes_cli.main` определяется через
+`importlib.util.find_spec` без top-level import, затем импортируется
+`agent.transports.hermes_kanban_mcp_server`; оба origins должны принадлежать
+manifest topology sealed target source, а `WRITE_TOOLS` — содержать
+`kanban_sync_external_task`. Произвольные `stderr`, parent environment,
+реальный `HOME` и секретные значения наружу не отражаются.
+
+`prepare` dry-run не создаёт candidate/bundle и не запускает `bwrap`, поэтому
+показывает только deterministic plan/hash/wrapper evidence. Первое sealed
+bundle/import-origin evidence появляется на `prepare --apply` до snapshot.
+`switch` заново выполняет capture, sandbox preflight и проверки
+wrapper/hash/runtime на dry-run и перед atomic replacement.
+
+`rollback` использует только snapshot-owned evidence. Он не создаёт sealed
+bundle, не запускает `bwrap`/candidate interpreter и не зависит от source,
+venv, interpreter, stdlib или imports. Повреждение либо отсутствие этих
+candidate областей не блокирует snapshot-only rollback.
+
+### 22. Schema-v2 compatibility закреплена статическим golden
+
+Compatibility test использует реальный исторический schema-v2 snapshot:
+sanitized статические `manifest.json`, `wrapper.before` и `wrapper.after`.
+Fixture обязан хранить provenance исторического snapshot/wrapper, исходные
+SHA-256 каждого blob и исчерпывающий ordered список substitutions,
+выполненных только для удаления host-specific paths/идентификаторов. Для
+sanitized bytes также закрепляются собственные SHA-256.
+Ни один из четырёх файлов `manifest.json`, `wrapper.before`,
+`wrapper.after`, `provenance.json` не содержит raw `/home/openclaw` либо
+другое raw source path из этого prefix.
+
+Provenance фиксирует snapshot
+`6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`
+и исходные SHA-256 до sanitization:
+
+- `manifest.json` —
+  `83db7f0c4cd2a3239e5d52402f6b8b88e1a66ca46ba1daa5677249fcac4a196f`;
+- `wrapper.before` —
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`;
+- `wrapper.after` —
+  `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`.
+
+Каждая sanitization substitution MUST перечислять `file/field`, source class,
+SHA-256 исходного literal value, literal replacement, число замен и причину.
+Raw source value/path в provenance запрещён. Payload bytes и sanitized
+SHA-256 `manifest.json`, `wrapper.before`, `wrapper.after` не меняются при
+очистке provenance; меняется только metadata fixture `provenance.json`.
+Неперечисленная нормализация, перестановка JSON keys/whitespace или
+production-generated expected bytes запрещены.
+
+Expected bytes являются literal fixture data. Их запрещено строить schema-v3
+prepare flow, production schema constants, wrapper generator или production
+rewrite helper. Test отдельно доказывает, что текущий snapshot-only loader
+принимает исторический grammar и восстанавливает exact sanitized
+`wrapper.before`.
+
+### 23. Приёмка OS-sandbox delta и гейты доставки
+
+Automated acceptance MUST оставаться только во временном окружении и точечной.
+Минимальная матрица:
+
+- rollout из legacy в canonical: старый wrapper в `wrapper.before`, schema v3
+  snapshot, canonical `source-cwd-v1` в `wrapper.after`;
+- rollout из canonical в canonical: следующий target сохраняет canonical
+  контракт wrapper;
+- совместимость schema v2 rollback: существующий v2 snapshot может восстановить
+  exact previous wrapper bytes/mode без проверок imports candidate;
+- schema v3 switch/rollback: switch повторяет проверки import-origin, rollback
+  не зависит от imports candidate;
+- schema v2/v3 rollback при missing/corrupt/dirty candidate восстанавливает
+  exact `wrapper.before` либо fail-closed только по snapshot/current-wrapper
+  evidence;
+- snapshot-only rollback не запускает `bwrap`, candidate Python и не зависит
+  от source/venv/interpreter/import state;
+- comments-only wrapper, missing `exec`, extra commands, redirects и control
+  operators fail-closed до примитивов записи;
+- затенение старым `site-packages`: copied venv содержит старый installed
+  package, но wrapper/preflight доказывают imports из target checkout;
+- baseline capability probe не называется полным profile probe; полный
+  production invocation со всеми sealed content/data binds является
+  authoritative проверкой и при missing/broken `/usr/bin/bwrap` либо
+  неполном namespace/bind profile закрывается fail-closed без fallback;
+- direct `subprocess._fork_exec`, `ctypes`/native write/network, signal и
+  `resource.prlimit` attempts не меняют host canary files, sockets, processes
+  или limits;
+- symlink/TOCTOU interpreter, `pyvenv.cfg`, source и venv swaps fail-closed;
+- nested in-place mutate→candidate import/effect→restore после sealed capture
+  с полностью совпадающим forged child evidence выполняет только captured
+  original bytes либо fail-closed, а host side-effect отсутствует;
+- тот же oracle применяется к trusted stdlib regular file и, где практично,
+  точным байтам интерпретатора и `bwrap`;
+- failure injection на каждой acquisition/capture/handoff стадии доказывает
+  немедленную регистрацию FD, закрытие current `_data_fd`, cleanup всего
+  partial bundle, отсутствие leaked FDs и structured cleanup error;
+- trusted stdlib roots приходят из parent/system interpreter, child self-report
+  не расширяет trust;
+- preflight использует реальные target modules либо faithful fixture,
+  раздельные tmpfs HOME/HERMES_HOME/temp и outside-root/host-canary oracle;
+- real HOME не читается и не изменяется, `.pth` не исполняется, произвольный
+  `stderr` не отражается;
+- historical schema-v2 rollback проверяется статическим sanitized golden с
+  provenance, исходными SHA-256 и полным списком substitutions; raw
+  `/home/openclaw` отсутствует во всех четырёх fixture files, ledger содержит
+  поля `file/field`, `source class/hash`, `literal replacement`, `count/reason`; ожидаемые
+  payload bytes не генерирует production helper;
+- focused suite сохраняет regression cases existing candidate, existing
+  snapshot, symlink stable wrapper и future candidate/snapshot parent
+  symlink;
+- dry-run без записи oracle для `prepare`, `switch`, `rollback`; prepare
+  dry-run не содержит origin evidence, prepare apply и switch dry-run/apply
+  содержат;
+- точный список tools доказывает присутствие `kanban_sync_external_task` в
+  поверхности режима записи;
+- общий Git/layout/oracle harness содержательно принадлежит существующему
+  `hermes_kanban_mcp_test_support.py`, без thin forwarding; rollout test
+  `<=850` строк, support `<400`, behavior unchanged;
+- четыре helper test modules входят в focused suite; каждый source/test file
+  остаётся `<1000` строк, `runtime_coherence.py` имеет не менее 100 строк
+  запаса, common primitives имеют единственного owner без forwarding façade,
+  tests запускаются через `scripts/run_tests.sh`, strict OpenSpec validation
+  и independent review обязательны;
+- independent review запускается в `workspace-write` sandbox, но остаётся
+  source-read-only: tests пишут только temp/cache/evidence, а pre/post source
+  diff неизменен. Одна exact four-suite команда должна успешно завершиться
+  два раза подряд; `0 collected`, environment blocker или один успешный run
+  не являются acceptance. Если support extraction не добавляет test module,
+  exact four-module command остаётся неизменной.
+
+Гейты доставки после этого material delta:
+
+1. Независимый run
+   `20260729T224514Z-kanban-remediation-independent-review` зафиксирован как
+   `BLOCK`, несмотря на два зелёных exact four-suite runs. Он исторически
+   переоткрыл 19.4, 19.6, 19.7 и 20.2; текущая truth state приведена ниже.
+2. Material sealed-content baseline из раздела 21.x явно одобрен Русланом
+   2026-07-30; approval разрешило только remediation implementation/tests и
+   repo-local/temp-only verification в task-owned worktree.
+3. Sealed content bundle, exception-safe resource owner, содержательный
+   reusable test harness и adversarial nested-mutation tests реализованы.
+4. Author-local exact four-suite command два раза подряд завершён
+   `140 passed, 0 failed`; это evidence, но не independent acceptance.
+5. Live-действия, commit, push или PR этим approval и author evidence не
+   разрешены.
+6. Выполнить два последовательных four-suite runs в workspace-write
+   source-read-only review sandbox, strict checks и получить новый
+   independent review. До accepted review без `BLOCK`
+   запрещены commit, push и PR.
+7. Только после accepted review разрешаются commit/push/task-owned PR и
+   обычный repository lifecycle; merge не открывает live gate.
+8. После merge отдельно запросить и выполнить только `prepare` dry-run; он
+   доказывает plan/hashes, но не import-origin.
+9. После проверки dry-run evidence отдельно запросить `prepare --apply`; здесь
+   впервые появляется import-origin evidence.
+10. После проверки v3 snapshot отдельно запросить `switch` dry-run с повторной
+   проверкой происхождения импортов.
+11. После проверки switch dry-run отдельно запросить `switch --apply` с
+   повторным import-origin audit.
+12. Только после repository lifecycle и отдельного exact разрешения выполнить
+   current-connector
+   replacement и bounded smoke: `initialize`, `tools/list`,
+   `kanban_sync_external_task` dry-run без DB writes.
+13. Live rollout, wrapper/restart/process replacement и DB остаются отдельным
+   exact gate. Ни planning approval, tests, accepted review, commit, push, PR
+   или merge не разрешают global Hermes symlink, Hermes/Gurra restart,
+   service changes, DB writes или Kanban mutation.
 
 ## Риски / компромиссы
 
@@ -777,7 +1236,7 @@ actions и smoke.
 - [Merge не обновляет активный connector] → rollout вынесен в отдельный
   post-merge approval и новый immutable runtime.
 - [Dry-run сам создаёт candidate/snapshot] → plan-only code path не вызывает
-  ни одного write primitive; filesystem before/after oracle покрывает все три
+  ни одного примитива записи; filesystem before/after oracle покрывает все три
   команды.
 - [Stale wrapper переключается поверх чужого изменения] → обязательный
   exact SHA-256 guard на prepare/switch/rollback и повторная проверка сразу
@@ -795,51 +1254,256 @@ actions и smoke.
   precondition обычного prepare и ввести только explicit `bootstrap-prepare`.
 - [Source и target не ancestor] → не выполнять merge/rebase/ancestry gate;
   проверять каждый exact commit object и exact detached HEAD независимо.
-- [Bootstrap получает отдельную switch policy] → schema v2 variant и один
-  общий loader/validator/atomic transition для обоих snapshot kinds.
+- [Bootstrap получает отдельную atomic policy] → switch использует общий
+  runtime validator/atomic primitive; snapshot-only rollback имеет отдельный
+  loader, но тот же atomic primitive и exact guards.
 - [State root частично создан после ошибки] → не очищать автоматически;
   сохранять exact evidence и закрывать повторный apply на existing root.
 - [Schema v1 migration расширяет риск] → не поддерживать v1, так как live
   snapshots отсутствуют; existing state root всегда требует stop/replan.
-- [Helper/test превышает 1000 строк] → одна ownership extraction для
-  snapshot/transition policy и отдельный bootstrap test file.
+- [Common primitives перемещены, но ownership не изменился] → выделить
+  единственного common owner для path/Git/venv primitives, удалить state
+  forwarding re-export façade и измерять минимум 100 строк запаса у
+  `runtime_coherence.py`.
+- [Copied candidate venv затеняет target source через старый site-packages] →
+  canonical `source-cwd-v1` wrapper, `-I -S -B`, exact environment и guarded
+  import-origin preflight до snapshot и повторная проверка на switch; без
+  network, `pip`, editable install или `.pth`.
+- [Исправление ломает existing rollback oracle] → schema v2 остаётся readable для
+  snapshot-only rollback exact bytes/mode; rollback не зависит от source repo,
+  candidate runtime/venv/imports и работает при missing/corrupt/dirty candidate.
+- [Новый wrapper parser принимает неоднозначный legacy wrapper] →
+  allow-listed exact templates и rejection comments-only, missing exec, extra
+  commands, redirects и control operators до примитивов записи.
+- [Preflight читает real HOME или выполняет import side effects] → synthetic
+  HOME/HERMES_HOME, `find_spec` для `hermes_cli.main`, guards до dedicated
+  server import и traps для file/network/process/DB; stderr sanitization.
+- [Python audit/blocklist пропускает low-level или native syscall] →
+  обязательный exact `/usr/bin/bwrap` до candidate `exec`, пустой mount
+  namespace, read-only binds, PID/network/user/IPC/UTS/cgroup isolation и
+  host-canary acceptance; Python policy остаётся только вторым слоем.
+- [Directory FD не защищает nested in-place mutation] → не bind mutable
+  backing tree; каждый executable/importable regular file копируется в
+  sealed memfd, а anchors/digests строятся из тех же captured bytes.
+- [Capture обещает bytes до начала наблюдения] → явно ограничить контракт:
+  exact captured verified bytes от успешного anchor construction до
+  `exec`/`import`; неполный или конкурентно изменяемый сбор манифеста
+  завершается fail-closed.
+- [Candidate сам объявляет interpreter/stdlib доверенными] → parent строит
+  required runtime closure и sealed manifest; exact child match не заменяет
+  сбор, выполненный родительским процессом.
+- [Nested mutate→import/effect→restore скрывает подмену] → `bwrap` получает
+  только sealed regular files и manifest topology; forged matching child
+  evidence не влияет на selected bytes, host-canary oracle обязателен.
+- [Ошибка capture оставляет FDs] → немедленная регистрация каждого
+  `open`/`memfd`, current-FD cleanup в `_data_fd`, общий partial-bundle
+  cleanup и structured cleanup failures; failure injection на каждой стадии.
+- [Bubblewrap baseline probe ошибочно объявлен полным] → честно ограничить
+  probe базовыми namespaces/mounts; полный production invocation со всеми
+  sealed content/data binds является authoritative и fail-closed.
+- [Новая grammar незаметно ломает исторический v2 rollback] → статический
+  sanitized historical golden без raw host prefix во всех четырёх files;
+  provenance хранит source class/hash, но не source literal, payload hashes и
+  snapshot-only semantics неизменны.
+- [Разгрузка rollout test является thin forwarding] → существующий support
+  становится содержательным owner Git/layout/oracle harness; gates
+  rollout `<=850`, support `<400`, behavior unchanged и сохранение existing
+  candidate/snapshot, symlink stable wrapper и future parent symlink cases.
+- [Read-only review sandbox не даёт запустить tests] → независимая validation
+  использует workspace-write для temp/cache/evidence при source-read-only
+  review и требует два последовательных four-suite run.
 
 ## План доставки
 
 1. Сохранить закрытыми выполненные PR #15 на
    `062f2f0f1f6947830d1b222a3ef470e145a7c34d` и PR #16 на
    `9fcd66651768e3cf220d5cd501efbec5ae3e2550`.
-2. Реализовать отдельным task-owned bootstrap-helper PR только новую command,
-   schema v2/shared transition ownership module и temp-only tests.
-3. До merge не создавать live state root/baseline/snapshot, не менять wrapper
-   и не выполнять обычный prepare, process/service/network/DB actions или
-   smoke.
-4. Запустить оба focused helper test files через `scripts/run_tests.sh`,
-   проверить line counts `<1000`, strict OpenSpec validation и exact diff
-   scope.
-5. Получить независимое code review без `BLOCK`, затем создать отдельный PR;
-   merge PR не открывает live gate.
-6. После merge отдельно выполнить только `bootstrap-prepare` dry-run,
-   сопоставить exact evidence и запросить live approval.
-7. Только после approval выполнить `bootstrap-prepare --apply`, проверить
-   schema v2 snapshot/baseline и снова отдельно пройти dry-run `switch`.
-8. После одобренного bootstrap switch обычный `prepare` строит target из
-   baseline; каждый последующий apply остаётся отдельным gated шагом.
-9. Process replacement и bounded MCP smoke выполняются только после
-   repository lifecycle и не входят в bootstrap-helper PR.
-10. При провале использовать тот же schema v2 `rollback`; не удалять
-    baseline/target/snapshots и не менять глобальный Hermes symlink,
-    Hermes/Gurra, services, connector config или live DB.
+2. Bootstrap-helper PR уже доставлен; live bootstrap/prepare/switch evidence
+   сохранён в tasks.
+3. Rollout target откатан к baseline wrapper. Independent review
+   `20260729T224514Z-kanban-remediation-independent-review` зафиксирован как
+   `BLOCK`; два зелёных runs сохранены как evidence, не acceptance.
+4. Tasks 19.4, 19.6, 19.7, 20.2 и 21.2–21.5 закрыты по approval
+   2026-07-30 и фактической repo-local реализации; сохранить открытыми 16.7,
+   18.8, 19.8, 19.9, 20.7, 20.8 и 21.6–21.8.
+5. Author exact four-suite выполнен два раза подряд: `140 passed, 0 failed`;
+   line/FD/scope/strict gates фиксируются как author evidence, не review.
+6. В workspace-write/source-read-only review sandbox два раза подряд
+   запустить exact four-suite команду через `scripts/run_tests.sh`, проверить
+   acceptance/bypass matrix, отсутствие FD leaks, line counts и
+   `runtime_coherence.py <=900`, строгую проверку OpenSpec,
+   `git diff --check` и exact область diff.
+7. Получить independent review без `BLOCK`. Только после accepted review
+   разрешены commit, push и task-owned PR; затем обычный PR/merge lifecycle.
+8. После merge и отдельных exact approvals пройти `prepare` dry-run/apply и `switch`
+   dry-run/apply как четыре раздельных gates.
+9. Current-connector replacement и bounded `initialize`/`tools-list`/
+   dry-run-sync smoke выполняются только после repository lifecycle и без DB
+   writes.
+10. При провале использовать schema v2/v3 snapshot-only rollback; не
+   удалять baseline/target/snapshots и не менять global Hermes symlink,
+   Hermes/Gurra, services, connector config или live DB.
 
 Будущий rollback, если отдельный rollout будет одобрен, ограничивается
 `rollback --apply` по exact snapshot, возвратом предыдущего standalone MCP
 process и повторным bounded smoke. Candidate/snapshot сохраняются как
 evidence; автоматического cleanup нет.
 
+### 22. Двухфазный bounded inventory отделён от sealed acquisition
+
+Первый проход выполняет только descriptor-relative inventory с
+`O_NOFOLLOW`. Он удерживает одновременно не больше малого фиксированного
+числа временных FD, строит bounded topology, identities, digests и exact ELF
+dependency plan, но не создаёт content memfd. После inventory resource
+planner обязан доказать достаточность всех лимитов. Только затем второй
+проход открывает каждый объект descriptor-relative, захватывает bytes,
+создаёт sealed data object и повторно сверяет topology, identity и digest с
+inventory. Любое расхождение или превышение границы завершает операцию
+fail-closed с structured cleanup.
+
+Production invocation получает только bytes второго прохода, которые
+совпали с inventory и были sealed до handoff. Если platform не позволяет
+безопасно повторно открыть объект или доказать identity/digest, объект и весь
+invocation отклоняются. Однофазное создание content memfd отклонено:
+resource failure тогда возникал бы после partial sealed acquisition.
+
+### 23. ELF dependency plan моделирует GNU/Linux semantics точно
+
+ELF parser хранит `DT_RPATH` и `DT_RUNPATH` раздельно. Resolver моделирует
+GNU/Linux loader search order: `RUNPATH` defining object supersedes его
+`RPATH`, применяется к direct dependencies и не наследуется; legacy
+`RPATH` наследуется по dependency chain в точных условиях отсутствия
+`RUNPATH`. Default directories используются только после корректного
+применения этих правил.
+
+`$ORIGIN`, `$LIB` и `$PLATFORM` раскрываются детерминированно из exact
+runtime/platform facts. Если exact значение недоступно, token отклоняется до
+capture. Relative, empty и unsafe entries, path escape, slash/`NUL`/escape в
+`DT_NEEDED` запрещены. Dynamic segment bounded, его размер кратен entry size,
+`DT_NULL` обязан находиться внутри segment; каждый string offset и
+завершающий `NUL` проверяется внутри bounded string table.
+
+Tests используют независимые literal handcrafted ELF bytes и ожидаемые
+dependency plans; production parser не строит fixture или oracle. Mutations
+покрывают `RPATH`, `RUNPATH`, inheritance, tokens, alignment, missing
+`DT_NULL`, invalid string bounds и unsafe `DT_NEEDED`.
+
+### 24. Resource planner предшествует acquisition и invocation
+
+Planner получает current open FD count и считает content entries плюс
+manifest, loader, `bwrap`, libraries, harness, anchors, probe/prod args и
+явный subprocess/`bwrap` safety reserve. Сумма сравнивается с текущим finite
+soft `RLIMIT_NOFILE`; учитываются `pass_fds`, platform и `bwrap`
+constraints.
+
+Полный размер exec `argv` и environment в bytes сравнивается с
+`SC_ARG_MAX` за вычетом именованного safety margin. Payload для
+`bwrap --args` не считается подчинённым `ARG_MAX`, но имеет отдельный явный
+constant/configurable maximum и проверяется до создания его memfd и до
+invocation.
+
+Любой budget failure происходит до первого content memfd и до subprocess.
+Structured cleanup сохраняет primary failure, а cleanup failure добавляет
+отдельно. Independent minimal real capture исторически удержал `1238` FD при
+topology около `110908` bytes, поэтому прежняя проверка только
+`RLIMIT_NOFILE >= 64` не является capacity proof.
+
+### 25. Minor remediation: canonical invocation является budget owner
+
+Новый independent review обнаружил три несоответствия уже одобренному
+контракту 22.x: trusted ELF root не перепроверялся после symlink hop, actual
+probe loader argv не проверялся против `SC_ARG_MAX`, а pre-acquisition plan
+описывал placeholder probe/production и только file binds. Verdict сохранён
+как historical `BLOCK`; это minor remediation без изменения scope,
+observable requirements, architecture direction, environment или delivery
+gates, поэтому нового approval не требуется.
+
+Единственный immutable canonical invocation spec теперь одновременно задаёт
+probe и production bwrap args, loader/preload argv, полную topology
+directories/files/symlinks/perms, harness/anchors и именованные FD roles.
+Inventory строит этот spec до первого content memfd. Для каждого FD role
+pre-acquisition render использует строку из максимальной законной десятичной
+ширины `finite RLIMIT_NOFILE - 1`. Это консервативная верхняя граница:
+каждый actual FD неотрицателен и строго меньше soft limit, поэтому его
+десятичное представление не длиннее symbolic render. После acquisition тот
+же spec рендерится с actual role→FD map; код утверждает actual args/exec
+bytes `<=` prevalidated bound и повторно проверяет bwrap args cap,
+`SC_ARG_MAX`, current/peak FD и `pass_fds` перед соответствующим
+args-memfd/subprocess. Поэтому cap failure детерминированно происходит до
+content acquisition даже без преждевременного назначения actual FD numbers.
+
+External ELF inventory после каждого absolute или relative symlink hop
+нормализует оставшийся путь и заново проверяет containment в injectable
+trusted roots. Escape, dangling target и cycle завершаются fail closed;
+системные `/usr`, `/lib`, `/lib64` не изменяются, tests используют только
+временные корневые каталоги.
+
 ## Открытые вопросы
 
-Блокирующих архитектурных вопросов нет. Единственное material divergence от
-предпочтительного shape — schema v1 заменяется schema v2 и допускается единый
-runtime/state root: без этого bootstrap snapshot нельзя безопасно consume
-существующими `switch/rollback`, а обычный `prepare` не сможет построить
-target рядом с baseline. Scope live действий не расширяется.
+Sealed-content material baseline был одобрен 2026-07-30. Новый independent
+review вернул `BLOCK` по трём несоответствиям существующим requirements;
+verdict сохранён как historical evidence, а minor remediation 25 выполняется
+в рамках прежнего approval. Author exact validation и новая independent
+validation/review остаются открытыми до фактического прохождения; delivery
+truth также не закрывается. Commit/push/PR до accepted review запрещены.
+Scope live действий не расширяется; live
+rollout/wrapper/restart/process replacement/DB требуют отдельного exact
+разрешения.
+
+### 26. Minor remediation: acquisition peak и final handoff authoritative
+
+Latest independent review `BLOCK` зафиксирован как historical evidence:
+предыдущий planner учитывал steady-state content/fixed reserve, но не полный
+recursive acquisition lifecycle; final `pass_fds` проверялся до создания
+args/harness/anchors memfd; constants/base policy имели более одного owner;
+role map и symlink oracle были неполными. Это implementation gaps требований
+22.x/23.x без изменения scope, observable behavior, architecture direction,
+environment или delivery gates, поэтому новый approval не требуется.
+
+`InventoryPlan.acquisition_temporary_fds` задаёт отдельный строгий
+консервативный reserve: `MAX_DIRECTORY_DEPTH + 1` одновременно удерживаемых
+directory descriptors плюс source FD и создаваемый sealed memfd. Resource
+plan включает этот named reserve до первого content memfd; общий magic reserve
+для него не переиспользуется.
+
+Непосредственно после создания probe args FD и production harness/anchors/args
+FD parent локально фиксирует exact final `pass_fds`, сверяет его с
+authoritative bundle ownership, проверяет порядок, уникальность, открытость,
+finite soft limit, current open count и subprocess/bwrap peak reserve и затем
+сразу вызывает subprocess с тем же tuple. Любая ошибка становится structured
+fail-closed и subprocess не вызывается.
+
+Единственный owner `BWRAP`, `SANDBOX_RUNTIME`, `SANDBOX_ENV`, base и
+политика production — модуль invocation. Точный обязательный порядок ролей:
+
+- probe: `loader`, затем `library:0..N`, `bwrap`, `probe_args`;
+- production: ordered `file:<destination>` из canonical inventory, затем
+  `harness`, `anchors`, `loader`, `library:0..N`, `bwrap`,
+  `production_args`.
+
+Missing, extra или reordered map отклоняется `ResourceBudgetError` до render
+и subprocess. Temp-only literal symlink oracle закрепляет valid relative
+multi-hop и fail-closed absolute escape, relative escape, dangling и cycle,
+не меняя `/usr`, `/lib` или `/lib64`.
+
+### 27. Minor remediation: topology preflight и acquisition depth
+
+Новый independent review `BLOCK` выявил P1 implementation gap существующего
+контракта: named acquisition reserve выводился из `MAX_DIRECTORY_DEPTH`, но
+recursive sealed acquisition не применял этот предел. Mutation после
+inventory могла добавить слишком глубокую ветку; лексически ранние files
+успевали создать content memfd до итоговой сверки manifest.
+
+Непосредственно в начале `_BundleBuilder.build`, до `_walk_tree` и первого
+content memfd, тот же canonical `InventoryBuilder.tree` повторяет
+topology-only проход с теми же roots, exclusions и depth policy, не открывая
+и не читая regular-file content. Покрываемая topology path/kind/mode/symlink
+target должна совпасть с approved `InventoryPlan`; ошибка inventory либо
+расхождение возвращаются как structured `SandboxError`, пока FD owner пуст.
+
+После preflight `_walk_directory` независимо получает текущую depth и
+импортирует `MAX_DIRECTORY_DEPTH` из единственного inventory owner. Перед
+открытием следующего directory на запрещённой глубине traversal завершается
+fail closed. Этот guard остаётся load-bearing для mutation после preflight и
+сохраняет рассчитанный temporary FD peak; общий planner, sealing и final
+handoff не меняются.
