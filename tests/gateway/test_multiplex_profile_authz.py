@@ -1,12 +1,12 @@
 """Regression tests for multiplex profile-aware own-policy authorization."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig
 from gateway.session import SessionSource
 from gateway.single_principal import SinglePrincipalPolicy
 
@@ -38,6 +38,64 @@ def _make_auth_runner(monkeypatch):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     return runner
+
+
+def _make_proxy_runner(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    for key in ("GATEWAY_PROXY_URL", "GATEWAY_PROXY_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True, streaming=StreamingConfig(enabled=False))
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner._session_model_overrides = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    return runner
+
+
+class _ProxyResponse:
+    status = 200
+
+    def __init__(self, payload: bytes = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'):
+        self.content = self
+        self._payload = payload
+
+    async def text(self):
+        return ""
+
+    async def iter_any(self):
+        yield self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+
+class _ProxySession:
+    def __init__(self):
+        self.captured_url = None
+        self.captured_headers = None
+        self.captured_json = None
+
+    def post(self, url, json=None, headers=None, **_kwargs):
+        self.captured_url = url
+        self.captured_headers = headers
+        self.captured_json = json
+        return _ProxyResponse()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
 
 
 def _make_multiplex_runner(monkeypatch):
@@ -210,6 +268,120 @@ def test_legacy_no_context_still_uses_process_auth_env(monkeypatch):
     monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
     monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
     assert runner._is_user_authorized(_telegram_source(user_id=None, is_bot=True)) is True
+
+
+@pytest.mark.asyncio
+async def test_typed_context_ignores_poisoned_process_proxy_url_and_key(monkeypatch):
+    runner = _make_proxy_runner(monkeypatch)
+    source = _telegram_source(resolved_access_context=_typed_telegram_context())
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://owner-default.invalid:8642")
+    monkeypatch.setenv("GATEWAY_PROXY_KEY", "owner-default-key")
+    runner._run_agent_via_proxy = AsyncMock()
+
+    with patch("gateway.run._load_gateway_config", return_value={}):
+        try:
+            await runner._run_agent_inner("hi", "", [], source, "session")
+        except Exception:
+            pass
+
+    runner._run_agent_via_proxy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_context_malformed_server_bound_proxy_config_does_not_call_remote(
+    monkeypatch,
+):
+    runner = _make_proxy_runner(monkeypatch)
+    source = _telegram_source(resolved_access_context=_typed_telegram_context())
+    runner._run_agent_via_proxy = AsyncMock()
+
+    with patch(
+        "gateway.run._load_gateway_config",
+        return_value={"gateway": {"proxy_url": "not a url"}},
+    ):
+        try:
+            await runner._run_agent_inner("hi", "", [], source, "session")
+        except Exception:
+            pass
+
+    runner._run_agent_via_proxy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_typed_context_profile_proxy_uses_only_scoped_config_and_key(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    runner = _make_proxy_runner(monkeypatch)
+    source = _telegram_source(resolved_access_context=_typed_telegram_context())
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://owner-default.invalid:8642")
+    monkeypatch.setenv("GATEWAY_PROXY_KEY", "owner-default-key")
+    session = _ProxySession()
+    secret_token = set_secret_scope({"GATEWAY_PROXY_KEY": "scoped-profile-key"})
+    try:
+        with patch(
+            "gateway.run._load_gateway_config",
+            return_value={"gateway": {"proxy_url": "http://profile-proxy:8642/"}},
+        ), patch("aiohttp.ClientSession", return_value=session), patch("aiohttp.ClientTimeout"):
+            result = await runner._run_agent_via_proxy(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="typed-session",
+            )
+    finally:
+        reset_secret_scope(secret_token)
+
+    assert result["final_response"] == "ok"
+    assert session.captured_url == "http://profile-proxy:8642/v1/chat/completions"
+    assert session.captured_headers["Authorization"] == "Bearer scoped-profile-key"
+    assert session.captured_headers["X-Hermes-Session-Id"] == "typed-session"
+
+
+@pytest.mark.asyncio
+async def test_typed_context_proxy_secret_provider_error_fail_closed(monkeypatch):
+    runner = _make_proxy_runner(monkeypatch)
+    source = _telegram_source(resolved_access_context=_typed_telegram_context())
+    runner._run_agent_via_proxy = AsyncMock()
+
+    def _boom(_name, _default=None):
+        raise RuntimeError("scoped provider unavailable")
+
+    with patch(
+        "gateway.run._load_gateway_config",
+        return_value={"gateway": {"proxy_url": "http://profile-proxy:8642"}},
+    ), patch("agent.secret_scope.get_secret", side_effect=_boom):
+        try:
+            await runner._run_agent_inner("hi", "", [], source, "session")
+        except Exception:
+            pass
+
+    runner._run_agent_via_proxy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_no_context_proxy_env_parity_preserved(monkeypatch):
+    runner = _make_proxy_runner(monkeypatch)
+    runner.config.multiplex_profiles = False
+    source = _telegram_source()
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://legacy-env-proxy:8642")
+    monkeypatch.setenv("GATEWAY_PROXY_KEY", "legacy-env-key")
+    session = _ProxySession()
+
+    with patch(
+        "gateway.run._load_gateway_config",
+        return_value={"gateway": {"proxy_url": "http://profile-proxy:8642"}},
+    ), patch("aiohttp.ClientSession", return_value=session), patch("aiohttp.ClientTimeout"):
+        await runner._run_agent_via_proxy(
+            message="hi",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="legacy-session",
+        )
+
+    assert session.captured_url == "http://legacy-env-proxy:8642/v1/chat/completions"
+    assert session.captured_headers["Authorization"] == "Bearer legacy-env-key"
 
 
 def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):

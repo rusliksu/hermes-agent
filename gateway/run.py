@@ -46,6 +46,7 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, TYPE_CHECKING, Union
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from gateway.access_registry import AccessRegistry
@@ -18172,12 +18173,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Proxy mode: forward messages to a remote Hermes API server
     # ------------------------------------------------------------------
 
-    def _get_proxy_url(self) -> Optional[str]:
+    def _source_has_typed_access_context(self, source: Any = None) -> bool:
+        return isinstance(getattr(source, "resolved_access_context", None), ResolvedAccessContext)
+
+    @staticmethod
+    def _normalize_server_bound_proxy_url(raw: Any) -> Optional[str]:
+        if not isinstance(raw, str):
+            return None
+        url = raw.strip().rstrip("/")
+        if not url:
+            return None
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        return url
+
+    def _get_proxy_key(self, source: Any = None) -> Optional[str]:
+        if self._source_has_typed_access_context(source):
+            try:
+                from agent.secret_scope import current_secret_scope, get_secret
+
+                if current_secret_scope() is None:
+                    return None
+                key = get_secret("GATEWAY_PROXY_KEY", "") or ""
+            except Exception:
+                logger.warning("Proxy disabled for typed context: scoped proxy key unavailable")
+                return None
+            key = str(key).strip()
+            return key or None
+        return os.getenv("GATEWAY_PROXY_KEY", "").strip() or None
+
+    def _get_proxy_url(self, source: Any = None) -> Optional[str]:
         """Return the proxy URL if proxy mode is configured, else None.
 
-        Checks GATEWAY_PROXY_URL env var first (convenient for Docker),
-        then ``gateway.proxy_url`` in config.yaml.
+        Legacy no-context callers keep the env-first behavior. Typed
+        multiplex turns must use only the resolved profile config plus scoped
+        secret provider; process-global proxy env must not route the request.
         """
+        if self._source_has_typed_access_context(source):
+            try:
+                cfg = _load_gateway_config()
+            except Exception:
+                logger.warning("Proxy disabled for typed context: scoped proxy config unavailable")
+                return None
+            gateway_cfg = cfg.get("gateway") if isinstance(cfg, dict) else None
+            raw_url = gateway_cfg.get("proxy_url") if isinstance(gateway_cfg, dict) else None
+            proxy_url = self._normalize_server_bound_proxy_url(raw_url)
+            if proxy_url is None:
+                return None
+            if self._get_proxy_key(source) is None:
+                return None
+            return proxy_url
         url = os.getenv("GATEWAY_PROXY_URL", "").strip()
         if url:
             return url.rstrip("/")
@@ -18221,7 +18270,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": [],
             }
 
-        proxy_url = self._get_proxy_url()
+        proxy_url = self._get_proxy_url(source)
         if not proxy_url:
             return {
                 "final_response": "⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
@@ -18230,7 +18279,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": [],
             }
 
-        proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        proxy_key = self._get_proxy_key(source) or ""
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -18753,7 +18802,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
+        if self._get_proxy_url(source):
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
