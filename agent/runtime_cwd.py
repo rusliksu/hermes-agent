@@ -114,6 +114,11 @@ def _bound_profile_home() -> Path | None:
     return resolved
 
 
+def bound_profile_home() -> Path | None:
+    """Return the canonical home for the bound typed profile, if any."""
+    return _bound_profile_home()
+
+
 def bound_profile_terminal_config() -> dict[str, Any] | None:
     """Return raw terminal config for the bound typed profile, if any.
 

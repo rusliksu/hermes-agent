@@ -82,6 +82,8 @@ def _get_command_timeout() -> int:
 
 def _auth_headers() -> Dict[str, str]:
     """Return Authorization header when CAMOFOX_API_KEY is set."""
+    if _browser_authority() is not None:
+        return {}
     key = os.getenv("CAMOFOX_API_KEY", "").strip()
     if key:
         return {"Authorization": f"Bearer {key}"}
@@ -90,6 +92,9 @@ def _auth_headers() -> Dict[str, str]:
 
 def get_camofox_url() -> str:
     """Return the configured Camofox server URL, or empty string."""
+    authority = _browser_authority()
+    if authority is not None:
+        return authority.camofox_url
     return os.getenv("CAMOFOX_URL", "").rstrip("/")
 
 
@@ -100,6 +105,9 @@ def _config_cdp_url() -> str:
     a circular import) so Camofox can yield to a config-based CDP override the
     same way it already yields to the ``BROWSER_CDP_URL`` env override.
     """
+    authority = _browser_authority()
+    if authority is not None:
+        return authority.cdp_url
     try:
         from hermes_cli.config import read_raw_config
 
@@ -123,6 +131,9 @@ def is_camofox_mode() -> bool:
     var suppressed Camofox, so ``CAMOFOX_URL`` + a config CDP override still
     routed navigation through Camofox.)
     """
+    authority = _browser_authority()
+    if authority is not None:
+        return bool(authority.camofox_url)
     if os.getenv("BROWSER_CDP_URL", "").strip():
         return False
     if _config_cdp_url():
@@ -164,6 +175,9 @@ def get_vnc_url() -> Optional[str]:
 
 def _get_camofox_config() -> Dict[str, Any]:
     """Return the ``browser.camofox`` config block, or an empty dict."""
+    authority = _browser_authority()
+    if authority is not None:
+        return authority.camofox_config
     try:
         camofox_cfg = load_config().get("browser", {}).get("camofox", {})
     except Exception as exc:
@@ -191,6 +205,8 @@ def _camofox_identity_override(task_id: Optional[str], camofox_cfg: Dict[str, An
     so Hermes operates in the same browser profile instead of creating a
     separate private session.
     """
+    if _browser_authority() is not None:
+        return None
     user_id = os.getenv("CAMOFOX_USER_ID", "").strip() or str(camofox_cfg.get("user_id") or "").strip()
     if not user_id:
         return None
@@ -204,6 +220,8 @@ def _camofox_identity_override(task_id: Optional[str], camofox_cfg: Dict[str, An
 
 
 def _env_flag(name: str) -> Optional[bool]:
+    if _browser_authority() is not None:
+        return None
     raw = os.getenv(name, "").strip().lower()
     if not raw:
         return None
@@ -235,6 +253,8 @@ def _loopback_rewrite_enabled(camofox_cfg: Dict[str, Any]) -> bool:
     The rewrite is opt-in because non-Docker Camofox installs run the browser on
     the host, where loopback URLs are already correct.
     """
+    if _browser_authority() is not None:
+        return False
     env_value = _env_flag("CAMOFOX_REWRITE_LOOPBACK_URLS")
     if env_value is not None:
         return env_value
@@ -243,11 +263,42 @@ def _loopback_rewrite_enabled(camofox_cfg: Dict[str, Any]) -> bool:
 
 def _loopback_rewrite_host(camofox_cfg: Dict[str, Any]) -> str:
     """Return the host alias used when rewriting loopback page URLs."""
+    if _browser_authority() is not None:
+        return str(camofox_cfg.get("loopback_host_alias") or "host.docker.internal")
     return (
         os.getenv("CAMOFOX_LOOPBACK_HOST_ALIAS", "").strip()
         or str(camofox_cfg.get("loopback_host_alias") or "").strip()
         or "host.docker.internal"
     )
+
+
+def _browser_authority():
+    try:
+        from agent.runtime_browser import browser_request_authority
+
+        return browser_request_authority()
+    except ValueError:
+        raise
+    except Exception:
+        return None
+
+
+def _browser_scope_fingerprint() -> Optional[str]:
+    authority = _browser_authority()
+    if authority is None:
+        return None
+    return authority.scope_fingerprint
+
+
+def _scoped_task_key(task_id: Optional[str]) -> str:
+    try:
+        from agent.runtime_browser import browser_scoped_task_key
+
+        return browser_scoped_task_key(task_id or "default")
+    except ValueError:
+        raise
+    except Exception:
+        return task_id or "default"
 
 
 def _is_loopback_hostname(hostname: Optional[str]) -> bool:
@@ -359,10 +410,14 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     derived from the Hermes profile so the Camofox server can map it
     to the same persistent browser profile across restarts.
     """
-    task_id = task_id or "default"
+    task_id = _scoped_task_key(task_id)
+    access_fingerprint = _browser_scope_fingerprint()
     with _sessions_lock:
         if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
+            session = _sessions[task_id]
+            if access_fingerprint is not None and session.get("access_fingerprint") != access_fingerprint:
+                raise ValueError("typed browser session authority mismatch")
+            return _adopt_existing_tab(session)
 
         camofox_cfg = _get_camofox_config()
         identity_override = _camofox_identity_override(task_id, camofox_cfg)
@@ -391,6 +446,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 "managed": False,
                 "adopt_existing_tab": False,
             }
+        if access_fingerprint is not None:
+            session["access_fingerprint"] = access_fingerprint
         _sessions[task_id] = session
         return _adopt_existing_tab(session)
 
@@ -419,7 +476,7 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
-    task_id = task_id or "default"
+    task_id = _scoped_task_key(task_id)
     with _sessions_lock:
         return _sessions.pop(task_id, None)
 
@@ -604,6 +661,42 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
     }, ensure_ascii=False)
 
 
+def _camofox_private_landing_block(
+    data: Dict[str, Any],
+    session: Dict[str, Any],
+    task_id: Optional[str],
+) -> Optional[str]:
+    """Return a blocked payload when browser history lands on a private page."""
+    from tools.browser_tool import (
+        _camofox_current_page_private_url,
+        _eval_ssrf_guard_active,
+        _is_always_blocked_url,
+        _is_safe_url,
+    )
+
+    if not _eval_ssrf_guard_active(task_id or "default"):
+        return None
+    landed_url = str(data.get("url") or "").strip()
+    if landed_url and (_is_always_blocked_url(landed_url) or not _is_safe_url(landed_url)):
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Blocked: browser history navigation (back) landed on "
+                "a private or internal address."
+            ),
+        }, ensure_ascii=False)
+    blocked_url = _camofox_current_page_private_url(session["tab_id"], session["user_id"])
+    if not blocked_url:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": (
+            "Blocked: browser history navigation (back) landed on "
+            "a private or internal address."
+        ),
+    }, ensure_ascii=False)
+
+
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
                      user_task: Optional[str] = None) -> str:
     """Get accessibility tree snapshot from Camofox."""
@@ -721,6 +814,10 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
+        blocked = _camofox_private_page_block(session, task_id, "scroll")
+        if blocked:
+            return blocked
+
         _post(
             f"/tabs/{session['tab_id']}/scroll",
             {"userId": session["user_id"], "direction": direction},
@@ -741,6 +838,9 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             f"/tabs/{session['tab_id']}/back",
             {"userId": session["user_id"]},
         )
+        blocked = _camofox_private_landing_block(data, session, task_id)
+        if blocked:
+            return blocked
         return json.dumps({"success": True, "url": data.get("url", "")})
     except Exception as e:
         return tool_error(str(e), success=False)
@@ -944,6 +1044,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
-
-
