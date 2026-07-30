@@ -2108,6 +2108,53 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         matrix_device_id = getenv("MATRIX_DEVICE_ID", "")
         if matrix_device_id:
             matrix_config.extra["device_id"] = matrix_device_id
+    matrix_config = config.platforms.get(Platform.MATRIX)
+    if matrix_config is not None:
+        def _matrix_extra_matches_env(value: Any, raw: str) -> bool:
+            if isinstance(value, bool):
+                return str(raw).strip().lower() == str(value).lower()
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return str(raw) == ",".join(str(item) for item in value)
+            return str(raw) == str(value)
+
+        def _seed_matrix_policy_extra(extra_key: str, env_name: str) -> None:
+            raw = _getenv(env_name, None)
+            if raw is None:
+                return
+            existing = matrix_config.extra.get(extra_key)
+            if extra_key in matrix_config.extra and _matrix_extra_matches_env(existing, raw):
+                return
+            matrix_config.extra[extra_key] = raw
+
+        matrix_policy_env = (
+            ("require_mention", "MATRIX_REQUIRE_MENTION"),
+            ("thread_require_mention", "MATRIX_THREAD_REQUIRE_MENTION"),
+            ("free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS"),
+            ("allowed_rooms", "MATRIX_ALLOWED_ROOMS"),
+            ("auto_thread", "MATRIX_AUTO_THREAD"),
+            ("dm_auto_thread", "MATRIX_DM_AUTO_THREAD"),
+            ("dm_mention_threads", "MATRIX_DM_MENTION_THREADS"),
+            ("session_scope", "MATRIX_SESSION_SCOPE"),
+            ("process_notices", "MATRIX_PROCESS_NOTICES"),
+            ("approval_require_sender", "MATRIX_APPROVAL_REQUIRE_SENDER"),
+            ("allowed_users", "MATRIX_ALLOWED_USERS"),
+            ("ignore_user_patterns", "MATRIX_IGNORE_USER_PATTERNS"),
+        )
+        for extra_key, env_name in matrix_policy_env:
+            _seed_matrix_policy_extra(extra_key, env_name)
+        allow_all_raw = _getenv("MATRIX_ALLOW_ALL_USERS", None)
+        if allow_all_raw is not None:
+            if not (
+                "allow_all_users" in matrix_config.extra
+                and _matrix_extra_matches_env(
+                    matrix_config.extra.get("allow_all_users"), allow_all_raw
+                )
+            ):
+                matrix_config.extra["allow_all_users"] = allow_all_raw
+        elif "allow_all_users" not in matrix_config.extra:
+            allow_all_raw = _getenv("GATEWAY_ALLOW_ALL_USERS", None)
+            if allow_all_raw is not None:
+                matrix_config.extra["allow_all_users"] = allow_all_raw
     matrix_home = getenv("MATRIX_HOME_ROOM")
     if matrix_home and Platform.MATRIX in config.platforms:
         config.platforms[Platform.MATRIX].home_channel = HomeChannel(
