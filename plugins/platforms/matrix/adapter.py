@@ -119,7 +119,7 @@ except ImportError:
 
     TrustState = _TrustStateStub  # type: ignore[misc,assignment]
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -429,28 +429,13 @@ _MATRIX_CAPABILITIES: Dict[str, str] = {
     "diagnostics": "yes",
 }
 
-_MATRIX_RUNTIME_AUTHORITY_KEY = "_hermes_runtime_authority"
-_MATRIX_RUNTIME_AUTHORITY_PROFILE_CONFIG = "profile_config"
+_MATRIX_BOOL_TRUE = frozenset({"true", "1", "yes", "on"})
+_MATRIX_BOOL_FALSE = frozenset({"false", "0", "no", "off"})
 
 
 def get_matrix_capabilities() -> Dict[str, str]:
     """Return Matrix gateway capabilities for docs and release checks."""
     return dict(_MATRIX_CAPABILITIES)
-
-
-def _truthy(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        raw = value.strip().lower()
-        if raw in {"true", "1", "yes", "on"}:
-            return True
-        if raw in {"false", "0", "no", "off"}:
-            return False
-        return default
-    return bool(value)
 
 
 def _csv_set(value: Any) -> Set[str]:
@@ -474,8 +459,7 @@ class _MatrixPolicy:
         extra = getattr(config, "extra", None)
         self.extra = extra if isinstance(extra, dict) else {}
         self.profile_scoped = (
-            self.extra.get(_MATRIX_RUNTIME_AUTHORITY_KEY)
-            == _MATRIX_RUNTIME_AUTHORITY_PROFILE_CONFIG
+            getattr(config, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, False) is True
         )
 
     def value(self, key: str, env: str, default: Any = None) -> Any:
@@ -487,7 +471,30 @@ class _MatrixPolicy:
         return default if raw is None else raw
 
     def bool(self, key: str, env: str, default: bool) -> bool:
-        return _truthy(self.value(key, env, default), default=default)
+        if key in self.extra:
+            value = self.extra.get(key)
+        elif self.profile_scoped:
+            return default
+        else:
+            raw = os.getenv(env)
+            if raw is None:
+                return default
+            value = raw
+
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in _MATRIX_BOOL_TRUE:
+                return True
+            if token in _MATRIX_BOOL_FALSE:
+                return False
+
+        logger.warning(
+            "Matrix: ignoring malformed boolean policy field %s; using default",
+            key,
+        )
+        return default
 
     def csv_set(self, key: str, env: str) -> Set[str]:
         return _csv_set(self.value(key, env, ""))

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, PlatformConfig
 
 # The matrix adapter module is importable without mautrix installed
 # (module-level imports use try/except with stubs).  No need for
@@ -30,6 +30,8 @@ def _make_adapter(tmp_path=None, *, extra=None):
         token="syt_test_token",
         extra=cfg_extra,
     )
+    if cfg_extra.pop("_test_profile_scoped", False):
+        setattr(config, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, True)
     adapter = MatrixAdapter(config)
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
     adapter.handle_message = AsyncMock()
@@ -442,7 +444,7 @@ async def test_profile_scoped_matrix_ignores_poisoned_process_free_response_room
 
     adapter = _make_adapter(
         extra={
-            "_hermes_runtime_authority": "profile_config",
+            "_test_profile_scoped": True,
             "require_mention": True,
             "auto_thread": False,
         }
@@ -466,6 +468,46 @@ async def test_legacy_direct_matrix_adapter_honors_free_response_env(monkeypatch
     await adapter._on_room_message(event)
 
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_profile_scoped_malformed_falsey_require_mention_keeps_safe_default(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+    caplog.set_level("WARNING", logger="plugins.platforms.matrix.adapter")
+
+    adapter = _make_adapter(
+        extra={
+            "_test_profile_scoped": True,
+            "require_mention": [],
+            "auto_thread": False,
+        }
+    )
+    event = _make_event("hello without mention")
+
+    await adapter._on_room_message(event)
+
+    assert adapter._matrix_profile_scoped is True
+    assert adapter._require_mention is True
+    assert "malformed boolean policy field require_mention" in caplog.text
+    assert "[]" not in caplog.text
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_user_extra_runtime_authority_key_does_not_activate_profile_scoped_mode(
+    monkeypatch,
+):
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+
+    adapter = _make_adapter(
+        extra={"_hermes_runtime_authority": "profile_config"}
+    )
+
+    assert adapter._matrix_profile_scoped is False
+    assert adapter._require_mention is False
 
 
 @pytest.mark.asyncio

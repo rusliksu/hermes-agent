@@ -812,6 +812,8 @@ PLATFORM_TOKEN_ENV_NAMES: dict["Platform", str] = {
     Platform.WEIXIN: "WEIXIN_TOKEN",
 }
 
+MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR = "_hermes_matrix_profile_config_authority"
+
 
 @dataclass
 class PlatformConfig:

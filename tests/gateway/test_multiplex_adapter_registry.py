@@ -4,6 +4,7 @@ import logging
 import pytest
 
 from gateway.run import GatewayRunner
+from gateway.config import MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR
 
 
 class _FakeAdapter:
@@ -356,6 +357,9 @@ class TestSecondaryProfileConfigHandling:
             def set_topic_recovery_fn(self, handler):
                 self.topic_recovery_fn = handler
 
+            def set_ingress_guard(self, handler):
+                self.ingress_guard = handler
+
             def set_authorization_check(self, handler):
                 self.authorization_check = handler
 
@@ -428,6 +432,9 @@ class TestSecondaryProfileConfigHandling:
                 pass
 
             def set_topic_recovery_fn(self, handler):
+                pass
+
+            def set_ingress_guard(self, handler):
                 pass
 
             def set_authorization_check(self, handler):
@@ -536,6 +543,72 @@ class TestSecondaryProfileConfigHandling:
         ):
             assert p in _PORT_BINDING_PLATFORM_VALUES
 
+
+class TestMatrixRuntimeAuthorityStamp:
+    def test_multiplex_matrix_factory_gets_internal_copy_without_extra_key(
+        self,
+        monkeypatch,
+    ):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        original = PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"homeserver": "https://matrix.example.org"},
+        )
+        original_extra = original.extra
+        captured = {}
+
+        class _Registry:
+            def is_registered(self, name):
+                return name == "matrix"
+
+            def create_adapter(self, name, config):
+                captured["config"] = config
+                return _FakeAdapter(config=config)
+
+        monkeypatch.setattr("gateway.platform_registry.platform_registry", _Registry())
+
+        adapter = runner._create_adapter(Platform.MATRIX, original)
+
+        assert adapter is not None
+        stamped = captured["config"]
+        assert stamped is not original
+        assert stamped.extra is not original_extra
+        assert getattr(stamped, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR) is True
+        assert "_hermes_runtime_authority" not in stamped.extra
+        assert "_hermes_runtime_authority" not in original.extra
+        assert original.extra == {"homeserver": "https://matrix.example.org"}
+
+    def test_multiplex_non_matrix_factory_is_not_authority_stamped(
+        self,
+        monkeypatch,
+    ):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        original = PlatformConfig(enabled=True, token="tok", extra={})
+        captured = {}
+
+        class _Registry:
+            def is_registered(self, name):
+                return name == "telegram"
+
+            def create_adapter(self, name, config):
+                captured["config"] = config
+                return _FakeAdapter(config=config)
+
+        monkeypatch.setattr("gateway.platform_registry.platform_registry", _Registry())
+
+        adapter = runner._create_adapter(Platform.TELEGRAM, original)
+
+        assert adapter is not None
+        assert captured["config"] is original
+        assert not hasattr(original, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR)
+        assert "_hermes_runtime_authority" not in original.extra
 
 
 class TestFeishuPortBindingConditional:

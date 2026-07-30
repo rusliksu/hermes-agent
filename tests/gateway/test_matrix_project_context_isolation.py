@@ -337,6 +337,12 @@ def _make_runner(current_source: SessionSource, entries: list[SessionEntry]):
     runner.session_store.get_or_create_session.return_value = current
     runner.session_store.switch_session.return_value = current
     runner.session_store.load_transcript.return_value = [{"role": "user", "content": "hello"}]
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.get_or_create_session = AsyncMock(return_value=current)
+    runner._async_session_store.switch_session = AsyncMock(return_value=current)
+    runner._async_session_store.load_transcript = AsyncMock(
+        return_value=[{"role": "user", "content": "hello"}]
+    )
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner._pending_messages = {}

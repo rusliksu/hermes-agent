@@ -115,8 +115,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
 )
-
-
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
@@ -1949,6 +1947,7 @@ from gateway.config import (
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
     HomeChannel,
+    MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR,
     PlatformConfig,
     load_gateway_config,
 )
@@ -9478,6 +9477,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         through to the built-in if/elif chain for core platforms.
         """
         if hasattr(config, "extra") and isinstance(config.extra, dict):
+            if (
+                platform == Platform.MATRIX
+                and getattr(self.config, "multiplex_profiles", False)
+            ):
+                config = dataclasses.replace(config, extra=dict(config.extra))
+                setattr(config, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, True)
             config.extra.setdefault(
                 "group_sessions_per_user",
                 self.config.group_sessions_per_user,
@@ -9486,11 +9491,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_sessions_per_user",
                 getattr(self.config, "thread_sessions_per_user", False),
             )
-            if getattr(self.config, "multiplex_profiles", False):
-                # Internal runtime authority metadata: adapters created by the
-                # multiplexer must treat PlatformConfig.extra as server-bound
-                # policy and ignore process-global env for request authority.
-                config.extra["_hermes_runtime_authority"] = "profile_config"
 
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
