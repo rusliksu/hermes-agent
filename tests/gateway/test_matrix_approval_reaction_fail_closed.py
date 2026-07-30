@@ -6,12 +6,12 @@ Mirrors the Telegram _is_callback_user_authorized fix (commit 89d32052e,
 PR #28494).
 """
 
-import asyncio
 import sys
 import types
+import os
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -65,6 +65,7 @@ def _stub_mautrix():
 _stub_mautrix()
 
 from plugins.platforms.matrix.adapter import MatrixAdapter, _MatrixApprovalPrompt  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,10 @@ def _make_adapter(allowed_user_ids=None):
     adapter._approval_prompt_by_session = {}
     adapter._processed_events = deque(maxlen=512)
     adapter._processed_events_set = set()
+    adapter._allow_all_users = (
+        os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+    )
+    adapter._approval_require_sender = True
     return adapter
 
 
@@ -99,6 +104,8 @@ def _make_prompt(chat_id="!testroom:matrix.org"):
         session_key="session-abc",
         chat_id=chat_id,
         message_id="$prompt-event-1",
+        approval_request_id="request-abc",
+        allowed_choices=["once", "deny"],
     )
 
 
@@ -110,11 +117,37 @@ def _run(adapter, event):
     adapter._redact_bot_approval_reactions = AsyncMock()
 
     fake_approval = types.ModuleType("tools.approval")
-    fake_approval.resolve_gateway_approval = lambda session_key, choice: 1
+    fake_approval.resolve_gateway_approval = (
+        lambda session_key, choice, **kwargs: 1
+    )
     with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+        import asyncio
+
         asyncio.run(adapter._on_reaction(event))
 
     return prompt.resolved
+
+
+def _make_profile_scoped_adapter():
+    adapter = MatrixAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="syt_test",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:matrix.org",
+                "_hermes_runtime_authority": "profile_config",
+                "allowed_users": [],
+                "approval_require_sender": True,
+            },
+        )
+    )
+    adapter._processed_events = deque(maxlen=512)
+    adapter._processed_events_set = set()
+    adapter._client = None
+    adapter._redact_bot_approval_reactions = AsyncMock()
+    adapter.send = AsyncMock()
+    return adapter
 
 
 # ---------------------------------------------------------------------------
@@ -153,3 +186,22 @@ class TestApprovalReactionFailClosed:
         adapter = _make_adapter(allowed_user_ids=["@alice:matrix.org"])
         event = _make_event("@mallory:matrix.org", "$prompt-event-1")
         assert _run(adapter, event) is False
+
+    def test_profile_scoped_reaction_ignores_poisoned_process_allow_all(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = _make_profile_scoped_adapter()
+        prompt = _make_prompt()
+        adapter._approval_prompts_by_event["$prompt-event-1"] = prompt
+        adapter._approval_prompt_by_session[prompt.session_key] = "$prompt-event-1"
+        event = _make_event("@mallory:matrix.org", "$prompt-event-1")
+        resolver = Mock(return_value=1)
+        fake_approval = types.ModuleType("tools.approval")
+        fake_approval.resolve_gateway_approval = resolver
+
+        with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+            import asyncio
+
+            asyncio.run(adapter._on_reaction(event))
+
+        resolver.assert_not_called()
+        assert prompt.resolved is False

@@ -9486,6 +9486,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_sessions_per_user",
                 getattr(self.config, "thread_sessions_per_user", False),
             )
+            if getattr(self.config, "multiplex_profiles", False):
+                # Internal runtime authority metadata: adapters created by the
+                # multiplexer must treat PlatformConfig.extra as server-bound
+                # policy and ignore process-global env for request authority.
+                config.extra["_hermes_runtime_authority"] = "profile_config"
 
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
