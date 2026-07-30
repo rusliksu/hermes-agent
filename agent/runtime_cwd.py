@@ -73,7 +73,13 @@ def _bound_profile_home() -> Path | None:
         return None
     try:
         from gateway.access_registry import ResolvedAccessContext
-        from hermes_cli.profiles import get_profile_dir
+        from hermes_cli.profiles import (
+            _get_profiles_root,
+            get_profile_dir,
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
     except Exception as exc:
         raise ValueError("resolved access profile unavailable") from exc
     if not isinstance(context, ResolvedAccessContext):
@@ -81,12 +87,29 @@ def _bound_profile_home() -> Path | None:
     profile_id = context.profile_id
     if not isinstance(profile_id, str) or not profile_id.strip():
         raise ValueError("malformed resolved access profile")
-    home = get_profile_dir(profile_id)
+    try:
+        canonical = normalize_profile_name(profile_id)
+        validate_profile_name(canonical)
+    except Exception as exc:
+        raise ValueError("malformed resolved access profile") from exc
+    if (
+        canonical != profile_id
+        or canonical == "default"
+        or canonical in _CWD_PLACEHOLDERS
+        or not profile_exists(canonical)
+    ):
+        raise ValueError("malformed resolved access profile")
+    home = get_profile_dir(canonical)
     try:
         resolved = home.resolve()
+        profiles_root = _get_profiles_root().resolve()
     except Exception as exc:
         raise ValueError("resolved access profile home unavailable") from exc
-    if not resolved.is_dir():
+    if (
+        not resolved.is_dir()
+        or resolved == profiles_root
+        or not _relative_to(resolved, profiles_root)
+    ):
         raise ValueError("resolved access profile home unavailable")
     return resolved
 
@@ -105,29 +128,43 @@ def bound_profile_terminal_config() -> dict[str, Any] | None:
 
         config_path = home / "config.yaml"
         if not config_path.exists():
-            return {}
+            raise ValueError("typed terminal config unavailable")
         with open(config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception:
-        return {}
+            cfg = yaml.safe_load(f)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("typed terminal config unavailable") from exc
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError("typed terminal config malformed")
     terminal_cfg = cfg.get("terminal") if isinstance(cfg, dict) else None
-    return dict(terminal_cfg) if isinstance(terminal_cfg, dict) else {}
+    if terminal_cfg is None:
+        return {}
+    if not isinstance(terminal_cfg, dict):
+        raise ValueError("typed terminal config malformed")
+    return dict(terminal_cfg)
 
 
-def _strict_existing_absolute_dir(raw: Any) -> Path | None:
+def _strict_existing_absolute_dir(raw: Any, *, home: Path, label: str) -> Path | None:
     if not isinstance(raw, str):
-        return None
+        raise ValueError(f"typed {label} cwd malformed")
     value = raw.strip()
-    if value.lower() in _CWD_PLACEHOLDERS:
-        return None
+    if value.lower() in _CWD_PLACEHOLDERS or "\x00" in value:
+        raise ValueError(f"typed {label} cwd malformed")
     try:
         p = Path(value)
         if not p.is_absolute():
-            return None
+            raise ValueError(f"typed {label} cwd malformed")
         resolved = p.resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return resolved if resolved.is_dir() else None
+        if not resolved.is_dir() or not _relative_to(resolved, home):
+            raise ValueError(f"typed {label} cwd outside profile")
+        return resolved
+    except ValueError:
+        raise
+    except (OSError, RuntimeError):
+        raise ValueError(f"typed {label} cwd malformed")
 
 
 def _relative_to(path: Path, root: Path) -> bool:
@@ -142,26 +179,31 @@ def resolve_bound_profile_cwd(candidate: str | None = None) -> Path | None:
     """Return the typed profile cwd, or None on legacy/no-context paths.
 
     The server-bound profile config may name an absolute existing
-    ``terminal.cwd``. Missing, placeholder, relative, NUL, file, or nonexistent
-    values fall closed to the profile home. A caller-supplied candidate
-    (session cwd record or explicit workdir) is accepted only when it stays
-    inside that server-selected base.
+    ``terminal.cwd`` inside the resolved profile home. Missing cwd uses the
+    profile home as the base; malformed configured/candidate cwd values fail
+    closed instead of falling back to process env, owner/default, or local cwd.
     """
     home = _bound_profile_home()
     if home is None:
         return None
     terminal_cfg = bound_profile_terminal_config() or {}
-    base = _strict_existing_absolute_dir(terminal_cfg.get("cwd")) or home
+    base = home
+    if "cwd" in terminal_cfg and terminal_cfg.get("cwd") is not None:
+        base = _strict_existing_absolute_dir(
+            terminal_cfg.get("cwd"),
+            home=home,
+            label="configured",
+        ) or home
 
-    if isinstance(candidate, str) and candidate.strip():
-        text = candidate.strip()
-        try:
-            p = Path(text)
-            resolved = (p if p.is_absolute() else base / p).resolve()
-            if resolved.is_dir() and _relative_to(resolved, base):
-                return resolved
-        except (OSError, RuntimeError, ValueError):
-            pass
+    if candidate is not None and str(candidate).strip():
+        resolved = _strict_existing_absolute_dir(
+            candidate,
+            home=home,
+            label="candidate",
+        )
+        if not _relative_to(resolved, base):
+            raise ValueError("typed candidate cwd outside configured cwd")
+        return resolved
     return base
 
 

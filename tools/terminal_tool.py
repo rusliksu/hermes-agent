@@ -1274,6 +1274,7 @@ def _safe_getcwd() -> str:
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+_TERMINAL_BACKENDS = frozenset({"local", "ssh"}) | _CONTAINER_BACKENDS
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1376,6 +1377,13 @@ def _typed_terminal_env() -> dict[str, str] | None:
     except Exception:
         return None
 
+    backend = terminal_cfg.get("backend")
+    if not isinstance(backend, str) or not backend.strip():
+        raise ValueError("typed terminal backend missing")
+    backend = backend.strip().lower()
+    if backend not in _TERMINAL_BACKENDS:
+        raise ValueError("typed terminal backend unknown")
+
     env: dict[str, str] = {}
     try:
         from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
@@ -1417,6 +1425,8 @@ def _typed_terminal_env() -> dict[str, str] | None:
     for key, value in terminal_cfg.items():
         if key == "cwd":
             continue
+        if key == "backend":
+            value = backend
         env_var = TERMINAL_CONFIG_ENV_MAP.get(key)
         if env_var and value is not None:
             env[env_var] = _terminal_env_value(value)
@@ -1438,7 +1448,9 @@ def _get_env_config() -> Dict[str, Any]:
             return typed_env.get(name, default)
         return os.getenv(name, default)
 
-    env_type = _env_get("TERMINAL_ENV", "local")
+    env_type = _env_get("TERMINAL_ENV", "local").strip().lower()
+    if typed_env is not None and env_type not in _TERMINAL_BACKENDS:
+        raise ValueError("typed terminal backend unknown")
     
     mount_docker_cwd = _env_get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
@@ -2259,6 +2271,15 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if workdir:
+            try:
+                from agent.runtime_cwd import resolve_bound_profile_cwd
+
+                resolve_bound_profile_cwd(workdir)
+            except ValueError:
+                raise
+            except Exception:
+                pass
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -3020,6 +3041,14 @@ def terminal_tool(
 
             return json.dumps(result_dict, ensure_ascii=False)
 
+    except ValueError as e:
+        logger.warning("terminal_tool rejected request-path authority: %s", e)
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Failed to execute command: {str(e)}",
+            "status": "error",
+        }, ensure_ascii=False)
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()

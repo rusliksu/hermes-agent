@@ -273,8 +273,8 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
         from tools.terminal_tool import resolve_task_overrides
 
         overrides = resolve_task_overrides(task_id)
-    except Exception:
-        return None
+    except Exception as exc:
+        return str(exc) or "typed file profile boundary unavailable"
 
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
@@ -749,6 +749,32 @@ def _typed_cross_profile_override_error(cross_profile: bool) -> str | None:
         return "cross_profile denied for typed access context"
     if isinstance(context, ResolvedAccessContext):
         return "cross_profile denied for typed access context"
+    return None
+
+
+def _typed_profile_write_boundary_error(filepath: str, task_id: str = "default") -> str | None:
+    try:
+        from agent.runtime_cwd import _bound_profile_home
+
+        home = _bound_profile_home()
+    except ValueError as exc:
+        return str(exc)
+    except Exception:
+        return None
+    if home is None:
+        return None
+    if not isinstance(filepath, str) or not filepath.strip() or "\x00" in filepath:
+        return "typed file path malformed"
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+    except Exception as exc:
+        return str(exc)
+    if isinstance(resolved, PurePosixPath) and not isinstance(resolved, Path):
+        return "typed file path requires host profile boundary"
+    try:
+        Path(resolved).relative_to(home)
+    except ValueError:
+        return "typed file path outside profile boundary"
     return None
 
 
@@ -1616,6 +1642,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     typed_override_err = _typed_cross_profile_override_error(cross_profile)
     if typed_override_err:
         return tool_error(typed_override_err)
+    boundary_err = _typed_profile_write_boundary_error(path, task_id)
+    if boundary_err:
+        return tool_error(boundary_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1747,6 +1776,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        boundary_err = _typed_profile_write_boundary_error(_p, task_id)
+        if boundary_err:
+            return tool_error(boundary_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

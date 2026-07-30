@@ -1206,7 +1206,15 @@ def execute_code(
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
+    try:
+        _env_config = _get_env_config()
+    except ValueError as exc:
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
     env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
