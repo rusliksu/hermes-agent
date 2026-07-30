@@ -6,11 +6,13 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
+from agent import runtime_browser
 from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.session_context import bind_resolved_access_context, reset_session_vars
 from tools import browser_camofox, browser_camofox_state, browser_tool, code_execution_tool, file_tools, terminal_tool
@@ -565,14 +567,21 @@ def test_typed_browser_denies_private_urls_before_browser(monkeypatch, tmp_path,
 def test_typed_browser_public_navigation_uses_profile_config_not_env(monkeypatch, tmp_path):
     home = _browser_profile(monkeypatch, tmp_path, {"engine": "chrome"})
     owner = tmp_path / "owner"
+    owner_win = r"C:\Users\Owner"
     foreign_args = "--user-data-dir=/tmp/owner-browser"
     owner.mkdir()
     monkeypatch.setenv("HOME", str(owner))
+    monkeypatch.setenv("USERPROFILE", owner_win)
+    monkeypatch.setenv("LOCALAPPDATA", owner_win + r"\AppData\Local")
+    monkeypatch.setenv("APPDATA", owner_win + r"\AppData\Roaming")
+    monkeypatch.setenv("HOMEDRIVE", "C:")
+    monkeypatch.setenv("HOMEPATH", r"\Users\Owner")
     monkeypatch.setenv("HERMES_REAL_HOME", str(owner))
     monkeypatch.setenv("XDG_CACHE_HOME", str(owner / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(owner / "config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(owner / "data"))
     monkeypatch.setenv("TMPDIR", str(owner / "tmp"))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(owner / "bin"), "/usr/bin"]))
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
     monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
     monkeypatch.setenv("BROWSER_USE_API_KEY", "synthetic-browser-key")
@@ -621,10 +630,15 @@ def test_typed_browser_public_navigation_uses_profile_config_not_env(monkeypatch
     assert captured["cmd"][captured["cmd"].index("--engine") + 1] == "chrome"
     assert captured["env"]["HERMES_HOME"] == str(home)
     assert captured["env"]["HOME"] == str(home)
+    assert captured["env"]["USERPROFILE"] == str(home)
+    assert captured["env"]["LOCALAPPDATA"] == str(home / "AppData" / "Local")
+    assert captured["env"]["APPDATA"] == str(home / "AppData" / "Roaming")
     assert captured["env"]["XDG_CACHE_HOME"] == str(home / ".cache")
     assert captured["env"]["XDG_CONFIG_HOME"] == str(home / ".config")
     assert captured["env"]["XDG_DATA_HOME"] == str(home / ".local" / "share")
     assert captured["env"]["TMPDIR"] == str(home / "tmp")
+    assert "HOMEDRIVE" not in captured["env"]
+    assert "HOMEPATH" not in captured["env"]
     assert captured["env"].get("AGENT_BROWSER_ARGS") != foreign_args
     for key in (
         "BROWSER_CDP_URL",
@@ -637,6 +651,88 @@ def test_typed_browser_public_navigation_uses_profile_config_not_env(monkeypatch
         assert key not in captured["env"]
     for value in captured["env"].values():
         assert str(owner) not in str(value)
+        assert owner_win not in str(value)
+
+
+def test_typed_browser_env_denies_symlinked_profile_subdir_before_outside_mkdir(
+    monkeypatch,
+    tmp_path,
+):
+    home = _browser_profile(monkeypatch, tmp_path, {"engine": "chrome"})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = home / ".local"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("filesystem does not support directory symlinks")
+
+    with bind_resolved_access_context(
+        _ctx(role_id="family_sandbox", capabilities=frozenset({"browser"}))
+    ):
+        authority = runtime_browser.browser_request_authority()
+        assert authority is not None
+        with pytest.raises(ValueError):
+            runtime_browser.sanitize_browser_env_for_typed({}, authority)
+
+    assert not (outside / "share").exists()
+
+
+def test_typed_windows_chromium_discovery_uses_profile_local_paths(
+    monkeypatch,
+    tmp_path,
+):
+    home = _browser_profile(monkeypatch, tmp_path, {"engine": "chrome"})
+    owner_win = r"C:\Users\Owner"
+    profile_chromium = home / "AppData" / "Local" / "ms-playwright" / "chromium-123"
+    profile_chromium.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", owner_win)
+    monkeypatch.setenv("LOCALAPPDATA", owner_win + r"\AppData\Local")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(browser_tool.shutil, "which", lambda *_args, **_kwargs: None)
+    browser_tool._cached_chromium_installed = None
+
+    with bind_resolved_access_context(
+        _ctx(role_id="family_sandbox", capabilities=frozenset({"browser"}))
+    ):
+        roots = browser_tool._chromium_search_roots()
+        assert browser_tool._chromium_installed() is True
+
+    joined = "\n".join(roots)
+    assert owner_win not in joined
+    assert str(home / "AppData" / "Local" / "ms-playwright") in roots
+
+
+def test_typed_browser_discovery_skips_process_path_owner_locations(
+    monkeypatch,
+    tmp_path,
+):
+    _browser_profile(monkeypatch, tmp_path, {"engine": "chrome"})
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    owner_browser = str(owner / "agent-browser")
+    calls = []
+
+    def fake_which(name, path=None):
+        calls.append((name, path))
+        if path is None and name in {"agent-browser", "npx"}:
+            return owner_browser
+        return None
+
+    monkeypatch.setenv("PATH", str(owner))
+    monkeypatch.setattr(browser_tool.shutil, "which", fake_which)
+    monkeypatch.setattr(browser_tool, "_cached_agent_browser", owner_browser)
+    monkeypatch.setattr(browser_tool, "_agent_browser_resolved", True)
+
+    with bind_resolved_access_context(
+        _ctx(role_id="family_sandbox", capabilities=frozenset({"browser"}))
+    ):
+        with pytest.raises(FileNotFoundError):
+            browser_tool._find_agent_browser(validate=False)
+
+    assert calls
+    assert all(path is not None for _name, path in calls)
+    assert all(str(owner) not in str(path) for _name, path in calls)
 
 
 def test_typed_browser_session_keys_partition_same_task_id(monkeypatch, tmp_path):

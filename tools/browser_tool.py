@@ -74,6 +74,7 @@ from agent.runtime_browser import (
     browser_request_authority,
     browser_scope_fingerprint,
     browser_scoped_task_key,
+    _contained_profile_path,
     sanitize_browser_env_for_typed,
     typed_browser_home,
 )
@@ -223,6 +224,19 @@ def _merge_browser_path(existing_path: str = "") -> str:
             prefix_parts.append(part)
 
     return os.pathsep.join(prefix_parts + path_parts)
+
+
+def _browser_subprocess_path(existing_path: str = "") -> str:
+    if browser_request_authority() is not None:
+        return _merge_browser_path("")
+    return _merge_browser_path(existing_path)
+
+
+def _npx_browser_executable() -> str:
+    if browser_request_authority() is not None:
+        typed_path = _merge_browser_path("")
+        return shutil.which("npx", path=typed_path) or "npx"
+    return shutil.which("npx") or "npx"
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -1077,7 +1091,7 @@ def _run_chrome_fallback_command(
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = _npx_browser_executable()
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -1087,7 +1101,7 @@ def _run_chrome_fallback_command(
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
-    browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+    browser_env["PATH"] = _browser_subprocess_path(browser_env.get("PATH", ""))
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
@@ -2176,7 +2190,9 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         FileNotFoundError: If agent-browser is not installed
     """
     global _cached_agent_browser, _agent_browser_resolved
-    if _agent_browser_resolved:
+    authority = browser_request_authority()
+    use_global_cache = authority is None
+    if use_global_cache and _agent_browser_resolved:
         if _cached_agent_browser is None:
             raise FileNotFoundError(
                 "agent-browser CLI not found (cached). Install it with: "
@@ -2199,16 +2215,17 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     # the next working resolution (extended PATH → local .bin → npx) instead of
     # caching the broken one and silently killing every browser tool.
 
-    # Check if it's in PATH (global install)
-    which_result = shutil.which("agent-browser")
-    if which_result and (
-        agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
-    ):
-        if not validate:
+    if authority is None:
+        # Check if it's in PATH (global install)
+        which_result = shutil.which("agent-browser")
+        if which_result and (
+            agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+        ):
+            if not validate:
+                return which_result
+            _cached_agent_browser = which_result
+            _agent_browser_resolved = True
             return which_result
-        _cached_agent_browser = which_result
-        _agent_browser_resolved = True
-        return which_result
 
     # Build an extended search PATH including Hermes-managed Node, macOS
     # versioned Homebrew installs, and fallback system dirs like Termux.
@@ -2220,8 +2237,9 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return which_result
-            _cached_agent_browser = which_result
-            _agent_browser_resolved = True
+            if use_global_cache:
+                _cached_agent_browser = which_result
+                _agent_browser_resolved = True
             return which_result
 
     # Check local node_modules/.bin/ (npm install in repo root).
@@ -2241,20 +2259,22 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return local_which
-            _cached_agent_browser = local_which
-            _agent_browser_resolved = True
-            return _cached_agent_browser
+            if use_global_cache:
+                _cached_agent_browser = local_which
+                _agent_browser_resolved = True
+            return local_which
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
+    npx_path = shutil.which("npx") if authority is None else None
     if not npx_path and extended_path:
         npx_path = shutil.which("npx", path=extended_path)
     if npx_path:
         if not validate:
             return "npx agent-browser"
-        _cached_agent_browser = "npx agent-browser"
-        _agent_browser_resolved = True
-        return _cached_agent_browser
+        if use_global_cache:
+            _cached_agent_browser = "npx agent-browser"
+            _agent_browser_resolved = True
+        return "npx agent-browser"
 
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")
@@ -2265,7 +2285,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         if ensure_dependency("browser"):
             browser_home = typed_browser_home() or get_hermes_home()
             candidates = [
-                shutil.which("agent-browser"),
+                shutil.which("agent-browser") if authority is None else None,
                 shutil.which("agent-browser", path=extended_path) if extended_path else None,
                 shutil.which("agent-browser", path=str(browser_home / "node_modules" / ".bin")),
                 shutil.which("agent-browser", path=str(browser_home / "node" / "bin")),
@@ -2273,13 +2293,15 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             ]
             for recheck in candidates:
                 if recheck and agent_browser_runnable(recheck):
-                    _cached_agent_browser = recheck
-                    _agent_browser_resolved = True
+                    if use_global_cache:
+                        _cached_agent_browser = recheck
+                        _agent_browser_resolved = True
                     return recheck
     except Exception:
         pass
 
-    _agent_browser_resolved = True
+    if use_global_cache:
+        _agent_browser_resolved = True
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: "
         f"{_browser_install_hint()}\n"
@@ -2408,7 +2430,7 @@ def _run_browser_command(
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = _npx_browser_executable()
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -2437,7 +2459,7 @@ def _run_browser_command(
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
-        browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+        browser_env["PATH"] = _browser_subprocess_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
         # Tell the agent-browser daemon to self-terminate after being idle
@@ -4613,9 +4635,12 @@ def _chromium_search_roots() -> List[str]:
     if sys.platform == "darwin":
         roots.append(os.path.join(home, "Library", "Caches", "ms-playwright"))
     if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA") or os.path.join(
-            home, "AppData", "Local"
-        )
+        if authority is None:
+            local = os.environ.get("LOCALAPPDATA") or os.path.join(
+                home, "AppData", "Local"
+            )
+        else:
+            local = str(_contained_profile_path(authority.profile_home, "AppData", "Local"))
         roots.append(os.path.join(local, "ms-playwright"))
     return roots
 
@@ -4728,7 +4753,7 @@ def _maybe_autoinstall_chromium() -> bool:
         return False
 
     if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+        install_cmd = [_npx_browser_executable(), "-y", "agent-browser", "install"]
     else:
         install_cmd = [browser_cmd, "install"]
 

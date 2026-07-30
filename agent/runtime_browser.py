@@ -101,9 +101,14 @@ def sanitize_browser_env_for_typed(
     config_home = _contained_profile_subdir(profile_home, ".config")
     data_home = _contained_profile_subdir(profile_home, ".local", "share")
     tmp_home = _contained_profile_subdir(profile_home, "tmp")
+    local_appdata = _contained_profile_subdir(profile_home, "AppData", "Local")
+    roaming_appdata = _contained_profile_subdir(profile_home, "AppData", "Roaming")
 
     sanitized["HERMES_HOME"] = str(profile_home)
     sanitized["HOME"] = str(profile_home)
+    sanitized["USERPROFILE"] = str(profile_home)
+    sanitized["LOCALAPPDATA"] = str(local_appdata)
+    sanitized["APPDATA"] = str(roaming_appdata)
     sanitized["XDG_CACHE_HOME"] = str(cache_home)
     sanitized["XDG_CONFIG_HOME"] = str(config_home)
     sanitized["XDG_DATA_HOME"] = str(data_home)
@@ -173,14 +178,41 @@ def _browser_scope_fingerprint(context: Any, profile_home: Path) -> str:
 
 
 def _contained_profile_subdir(profile_home: Path, *parts: str) -> Path:
-    path = profile_home.joinpath(*parts)
+    path = _contained_profile_path(profile_home, *parts)
     path.mkdir(parents=True, exist_ok=True)
     try:
-        resolved = path.resolve()
+        resolved = path.resolve(strict=False)
     except Exception as exc:
         raise ValueError("typed browser profile path unavailable") from exc
     if not _relative_to(resolved, profile_home):
         raise ValueError("typed browser profile path outside profile")
+    return resolved
+
+
+def _contained_profile_path(profile_home: Path, *parts: str) -> Path:
+    try:
+        root = profile_home.resolve(strict=True)
+    except Exception as exc:
+        raise ValueError("typed browser profile path unavailable") from exc
+    candidate = root.joinpath(*parts)
+    try:
+        resolved = candidate.resolve(strict=False)
+    except Exception as exc:
+        raise ValueError("typed browser profile path unavailable") from exc
+    if not _relative_to(resolved, root):
+        raise ValueError("typed browser profile path outside profile")
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            if current.exists() or current.is_symlink():
+                current_resolved = current.resolve(strict=False)
+            else:
+                continue
+        except Exception as exc:
+            raise ValueError("typed browser profile path unavailable") from exc
+        if not _relative_to(current_resolved, root):
+            raise ValueError("typed browser profile path outside profile")
     return resolved
 
 
@@ -236,6 +268,11 @@ _TYPED_BROWSER_ENV_BLOCKLIST = frozenset({
     "FIRECRAWL_API_URL",
     "FIRECRAWL_BROWSER_TTL",
     "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "HERMES_REAL_HOME",
     "HERMES_ALLOW_PRIVATE_URLS",
     "PLAYWRIGHT_BROWSERS_PATH",
