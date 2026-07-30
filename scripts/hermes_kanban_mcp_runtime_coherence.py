@@ -38,11 +38,14 @@ except ModuleNotFoundError:
     )
 
 
-WRAPPER_CONTRACT = "source-cwd-v1"
+LEGACY_WRAPPER_CONTRACT = "source-cwd-v1"
+WRAPPER_CONTRACT = "source-cwd-nofile-v2"
+NOFILE_SOFT_LIMIT = 4096
 PREFLIGHT_CONTRACT = "bwrap-import-origin-v1"
 REQUIRED_WRITE_TOOL = "kanban_sync_external_task"
 _SHEBANG = "#!/bin/bash"
 _SET_LINE = "set -euo pipefail"
+_NOFILE_LINE = f"ulimit -S -n {NOFILE_SOFT_LIMIT}"
 _EXPORT_ORDER = (
     "HERMES_HOME",
     "HERMES_QUIET",
@@ -64,6 +67,8 @@ class WrapperGrammar:
     runtime: Path
     venv_dirname: str
     canonical: bool
+    contract: str | None
+    soft_nofile: int | None
 
 
 @dataclass(frozen=True)
@@ -166,7 +171,11 @@ def _validate_header(lines: list[str]) -> tuple[str, ...]:
 
 
 def parse_rollout_wrapper(
-    data: bytes, runtime: Path, venv_dirname: str
+    data: bytes,
+    runtime: Path,
+    venv_dirname: str,
+    *,
+    expected_contract: str | None = None,
 ) -> WrapperGrammar:
     if venv_dirname not in {".venv", "venv"}:
         raise RolloutError("venv dirname must be exactly .venv or venv")
@@ -183,20 +192,32 @@ def parse_rollout_wrapper(
     if lines[-1] != exec_line:
         raise RolloutError("wrapper must end with one exact exec command")
     canonical = len(lines) >= 2 and lines[-2] == _cd_line(runtime)
-    header_lines = lines[:-2] if canonical else lines[:-1]
+    if canonical and len(lines) >= 3 and lines[-3] == _NOFILE_LINE:
+        contract = WRAPPER_CONTRACT
+        header_lines = lines[:-3]
+    elif canonical:
+        contract = LEGACY_WRAPPER_CONTRACT
+        header_lines = lines[:-2]
+    else:
+        contract = None
+        header_lines = lines[:-1]
     header = _validate_header(header_lines)
+    if expected_contract is not None and contract != expected_contract:
+        raise RolloutError(
+            f"wrapper does not match expected contract {expected_contract}"
+        )
     if text.count(str(runtime)) != (2 if canonical else 1):
         raise RolloutError("wrapper has ambiguous runtime path evidence")
-    return WrapperGrammar(header, runtime, venv_dirname, canonical)
+    soft_nofile = int(lines[-3].split()[-1]) if contract == WRAPPER_CONTRACT else None
+    return WrapperGrammar(header, runtime, venv_dirname, canonical, contract, soft_nofile)
 
 
 def validate_schema_v2_rollout_wrapper(
     data: bytes, runtime: Path, venv_dirname: str
-) -> None:
+) -> tuple[str, ...]:
     strict_error: RolloutError | None = None
     try:
-        parse_rollout_wrapper(data, runtime, venv_dirname)
-        return
+        return parse_rollout_wrapper(data, runtime, venv_dirname).header
     except RolloutError as exc:
         strict_error = exc
     try:
@@ -227,6 +248,10 @@ def validate_schema_v2_rollout_wrapper(
         raise RolloutError(
             "schema v2 wrapper does not match an accepted exact template"
         ) from strict_error
+    defaults = tuple(
+        f"export {name}={_EXACT_EXPORT_VALUES[name]}" for name in _EXPORT_ORDER[1:]
+    )
+    return (_SHEBANG, _SET_LINE, f"export HERMES_HOME={home}", *defaults)
 
 
 def canonical_rollout_wrapper(
@@ -236,19 +261,56 @@ def canonical_rollout_wrapper(
     header: tuple[str, ...],
 ) -> bytes:
     _validate_header(list(header))
-    return (
-        "\n".join((*header, _cd_line(runtime), _exec_line(runtime, venv_dirname)))
-        + "\n"
-    ).encode()
+    lines = (*header, _NOFILE_LINE, _cd_line(runtime), _exec_line(runtime, venv_dirname))
+    return ("\n".join(lines) + "\n").encode()
 
 
 def rewrite_rollout_wrapper(
     data: bytes, before_runtime: Path, after_runtime: Path, venv_dirname: str
 ) -> bytes:
-    grammar = parse_rollout_wrapper(data, before_runtime, venv_dirname)
+    try:
+        header = parse_rollout_wrapper(data, before_runtime, venv_dirname).header
+    except RolloutError:
+        header = validate_schema_v2_rollout_wrapper(data, before_runtime, venv_dirname)
     return canonical_rollout_wrapper(
-        after_runtime, venv_dirname, header=grammar.header
+        after_runtime, venv_dirname, header=header
     )
+
+
+def validate_rollout_wrapper_transition(
+    before: bytes,
+    after: bytes,
+    before_runtime: Path,
+    after_runtime: Path,
+    venv_dirname: str,
+    contract: str,
+) -> None:
+    if contract == WRAPPER_CONTRACT:
+        expected = rewrite_rollout_wrapper(
+            before, before_runtime, after_runtime, venv_dirname
+        )
+    elif contract == LEGACY_WRAPPER_CONTRACT:
+        grammar = parse_rollout_wrapper(before, before_runtime, venv_dirname)
+        expected = (
+            "\n".join(
+                (
+                    *grammar.header,
+                    _cd_line(after_runtime),
+                    _exec_line(after_runtime, venv_dirname),
+                )
+            )
+            + "\n"
+        ).encode()
+    else:
+        raise RolloutError("unsupported wrapper contract")
+    parse_rollout_wrapper(
+        after,
+        after_runtime,
+        venv_dirname,
+        expected_contract=contract,
+    )
+    if after != expected:
+        raise RolloutError("wrapper.after is not the exact guarded transformation")
 
 
 _IMPORT_PREFLIGHT_CODE = r"""

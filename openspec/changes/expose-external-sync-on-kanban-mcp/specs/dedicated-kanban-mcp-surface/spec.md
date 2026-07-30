@@ -320,6 +320,12 @@ handlers, FastMCP registration, instructions и mode gating, но MUST NOT
 только явные абсолютные source/runtime/state/wrapper paths, полные
 current/candidate Git SHA и ожидаемые SHA-256 evidence; он MUST NOT читать
 `.env`, credentials, tokens, sessions, live DB или неуказанный Hermes state.
+Dry-run `bootstrap-prepare`, `prepare` и `switch` MUST вычислять и сообщать
+exact generated `wrapper.after` SHA-256 без требования expected after hash.
+Соответствующие `--apply` MUST требовать
+`--expected-wrapper-after-sha256` и MUST завершаться при missing/mismatch до
+первого managed write, candidate preflight и `os.replace`. `rollback` CLI
+MUST остаться без этого аргумента.
 
 #### Scenario: Bootstrap dry-run планирует переход из export в baseline
 
@@ -352,6 +358,17 @@ current/candidate Git SHA и ожидаемые SHA-256 evidence; он MUST NOT 
 - **THEN** helper завершается до создания state root
 - **AND** dry-run без этого аргумента остаётся разрешённым для получения
   наблюдаемого хэша
+
+#### Scenario: Apply-команды требуют approved wrapper.after hash
+
+- **WHEN** `bootstrap-prepare --apply`, `prepare --apply` или
+  `switch --apply` вызван без `--expected-wrapper-after-sha256`
+- **OR** переданный hash не совпадает с actual canonical/snapshot
+  `wrapper.after` bytes
+- **THEN** helper завершается fail-closed до первого managed write,
+  candidate preflight и `os.replace`
+- **AND** dry-run той же команды только сообщает observed/planned after hash
+- **AND** `rollback` сохраняет прежний CLI и snapshot-only guards
 
 #### Scenario: Экспортный манифест разбирается как строки `key=value`
 
@@ -433,25 +450,33 @@ current/candidate Git SHA и ожидаемые SHA-256 evidence; он MUST NOT 
   либо неожиданный существующий candidate
 - **THEN** helper отклоняет план до любого примитива записи
 
-### Requirement: Snapshot schema различает export bootstrap и обычный rollout
+### Requirement: Fresh bootstrap и rollout используют единый schema-v3 contract
 
-Bootstrap snapshot MUST использовать `schema_version=2`, закреплять export
-manifest path/byte SHA-256 и `source_commit`. Уже существующие ordinary
-rollout snapshots schema v2 MUST оставаться readable только для
-snapshot-only rollback. Новый ordinary `prepare` MUST создавать
-`schema_version=3` с Git before/after runtimes и runtime-coherence evidence;
-новый switch-to-target по schema v2 MUST быть запрещён. Обратная совместимость
-schema v1 MUST NOT добавляться. Существующий schema v1 artifact MUST закрывать
-bootstrap apply без migration или cleanup.
+Fresh bootstrap и ordinary rollout snapshots MUST использовать только
+`schema_version=3`, exact `snapshot_kind=bootstrap|rollout` и
+`wrapper_contract=source-cwd-nofile-v2`. Fresh bootstrap MUST закреплять
+export manifest path/byte SHA-256 и `source_commit`, а его `wrapper.after`
+MUST строиться тем же canonical generator, что ordinary rollout. Manifest
+shape MUST не расширяться ради planned soft limit или отдельного plan digest:
+planned soft limit MUST быть производным от parsed wrapper, а after SHA-256
+плюс exact code-level contract/limit validation являются достаточной связью.
 
-#### Scenario: Bootstrap manifest закрепляет оба runtime identity
+Любой `schema_version!=3`, а также historical schema-v3
+`wrapper_contract=source-cwd-v1`, MUST быть запрещён для switch до candidate
+preflight, первого managed write и `os.replace`. Такие artifacts MUST
+оставаться отдельным snapshot-only exact bytes/mode rollback input.
+In-place migration, rewrite или cleanup snapshot MUST NOT выполняться.
+
+#### Scenario: Fresh bootstrap manifest закрепляет оба runtime identity
 
 - **WHEN** `bootstrap-prepare --apply` завершён во временном дереве
-- **THEN** manifest имеет `schema_version=2` и
+- **THEN** manifest имеет `schema_version=3` и
   `snapshot_kind=bootstrap`
+- **AND** manifest имеет `wrapper_contract=source-cwd-nofile-v2`
 - **AND** before runtime имеет kind `export`, pinned manifest path/hash и
   `source_commit`
 - **AND** after runtime имеет kind `git`, exact baseline path и тот же commit
+- **AND** `wrapper.after` построен единственным canonical generator
 - **AND** wrapper replacement count равен ровно одному
 
 #### Scenario: Обычный prepare создаёт rollout manifest schema v3
@@ -460,7 +485,7 @@ bootstrap apply без migration или cleanup.
 - **THEN** manifest имеет `schema_version=3` и `snapshot_kind=rollout`
 - **AND** before/after runtimes имеют kind `git` и разные exact commit SHA
 - **AND** export manifest fields равны JSON `null`
-- **AND** manifest содержит `wrapper_contract=source-cwd-v1` и проверенное
+- **AND** manifest содержит `wrapper_contract=source-cwd-nofile-v2` и проверенное
   доказательство происхождения импортов
 
 #### Scenario: Полный consumer проверяет bootstrap switch
@@ -472,15 +497,24 @@ bootstrap apply без migration или cleanup.
 - **AND** общий atomic transition primitive выбирает `wrapper.after`
 - **AND** отдельная bootstrap atomic policy не существует
 
+#### Scenario: Switch отклоняет historical schema/contract до preflight
+
+- **WHEN** switch loader получает `schema_version!=3`
+- **OR** получает schema v3 с historical `wrapper_contract=source-cwd-v1`
+- **THEN** switch завершается fail-closed до candidate preflight, первого
+  managed write и `os.replace`
+- **AND** snapshot не мигрируется и не переписывается
+
 #### Scenario: Snapshot-only rollback не проверяет runtime
 
-- **WHEN** `rollback` читает schema v2 или v3 snapshot
+- **WHEN** `rollback` читает поддерживаемый historical snapshot
 - **THEN** отдельный snapshot-only loader проверяет exact manifest/snapshot
   bytes, modes и hashes, snapshot ID, stable-wrapper path, current-wrapper
   guard и exact `wrapper.before`/`wrapper.after`
 - **AND** loader не требует source repo, export manifest, candidate/baseline
   runtime, Git cleanliness, venv, interpreter или imports
 - **AND** тот же atomic transition primitive выбирает `wrapper.before`
+- **AND** loader не делает snapshot switch-eligible и не выполняет migration
 
 #### Scenario: Unified root остаётся exact-contained
 
@@ -493,9 +527,11 @@ bootstrap apply без migration или cleanup.
 
 ### Requirement: Rollout runtime coherence доказывает imports из target source
 
-Новые ordinary rollout snapshots MUST использовать `schema_version=3` и
-`wrapper_contract=source-cwd-v1`. Новый `wrapper.after` MUST явно выполнять
-`cd --` в exact target runtime непосредственно перед `exec`
+Fresh bootstrap и ordinary rollout snapshots MUST использовать
+`schema_version=3`, exact `snapshot_kind=bootstrap|rollout` и
+`wrapper_contract=source-cwd-nofile-v2`. Новый `wrapper.after` MUST
+устанавливать exact `ulimit -S -n 4096`, затем явно выполнять `cd --` в
+exact target runtime непосредственно перед `exec`
 `<target>/<venv>/bin/python -m hermes_cli.main`, чтобы copied venv
 `site-packages` не затенял target checkout. Helper MUST NOT использовать
 network, `pip`, editable install или `.pth` files для исправления imports.
@@ -506,6 +542,11 @@ primitives MUST иметь отдельного единственного commo
 импортировать их непосредственно, а forwarding re-export façade MUST
 отсутствовать. `runtime_coherence.py` MUST содержать не более 900 физических
 строк, то есть иметь минимум 100 строк запаса до hard limit 1000.
+Поскольку текущий файл уже имеет `897/900` строк, новая schema/CLI/hash policy
+MUST принадлежать rollout state/orchestration owners; coherence MAY получить
+только неизбежную минимальную правку generator/parser. Нужная extraction MAY
+идти только в существующий substantive common owner и MUST NOT создавать
+  тонкую обёртку.
 
 Перед созданием schema v3 snapshot `prepare --apply` MUST выполнить
 import-origin preflight exact candidate interpreter с `-I -S -B` только
@@ -585,24 +626,35 @@ guards и MUST NOT запускать candidate либо зависеть от �
 среды выполнения кандидата, виртуального окружения, интерпретатора или
 импортов.
 
-#### Scenario: Legacy wrapper превращается в canonical source-cwd wrapper
+#### Scenario: Legacy wrapper превращается в canonical NOFILE wrapper
 
 - **WHEN** ordinary `prepare --apply` строит target из baseline, а текущий
   wrapper является legacy schema v2 wrapper
 - **THEN** helper создаёт schema v3 snapshot
 - **AND** `wrapper.before` сохраняет exact legacy bytes/mode
-- **AND** `wrapper.after` содержит canonical `source-cwd-v1` контракт с
-  `cd --` в exact target runtime перед `exec` target interpreter
+- **AND** `wrapper.after` содержит canonical `source-cwd-nofile-v2` контракт
+  с exact `ulimit -S -n 4096` и `cd --` в exact target runtime перед
+  запуском целевого интерпретатора через `exec`
 - **AND** stable wrapper не меняется до отдельного `switch --apply`
 
 #### Scenario: Canonical wrapper остаётся canonical при следующем rollout
 
 - **WHEN** ordinary `prepare --apply` строит следующий target из runtime,
-  уже использующего `source-cwd-v1`
+  уже использующего `source-cwd-nofile-v2`
 - **THEN** helper создаёт детерминированный schema v3 `wrapper.after`
-- **AND** новый wrapper сохраняет `cd --` в exact new target runtime перед
-  запуском нового target interpreter через `exec`
+- **AND** новый wrapper сохраняет exact `ulimit -S -n 4096` и `cd --` в
+  exact new target runtime перед запуском нового target interpreter через
+  `exec`
 - **AND** wrapper не содержит path baseline/export как active runtime path
+
+#### Scenario: Fresh bootstrap использует canonical generator
+
+- **WHEN** `bootstrap-prepare --apply` строит fresh export→Git snapshot
+- **THEN** snapshot имеет schema v3, `snapshot_kind=bootstrap` и
+  `wrapper_contract=source-cwd-nofile-v2`
+- **AND** `wrapper.after` построен тем же canonical generator, что ordinary
+  rollout
+- **AND** отдельная bootstrap path-rewrite grammar отсутствует
 
 #### Scenario: Затенение старым site-packages отклоняется до snapshot
 
@@ -779,8 +831,8 @@ guards и MUST NOT запускать candidate либо зависеть от �
 - **WHEN** parser проверяет legacy или canonical wrapper
 - **THEN** он принимает только allow-listed template с корректным shebang,
   ожидаемым `set`, exact exports и единственным `exec` с exact argv
-- **AND** canonical template требует `cd --` в exact runtime непосредственно
-  перед `exec`
+- **AND** canonical template требует exact `ulimit -S -n 4096`, затем
+  `cd --` в exact runtime непосредственно перед `exec`
 - **AND** comments-only совпадение, missing `exec`, extra commands, redirects,
   pipes/backgrounding/command substitution/control operators, лишние argv или
   смешанные runtime/interpreter paths отклоняются до примитивов записи
@@ -794,6 +846,8 @@ Automated tests helper MUST находиться в
 `tests/scripts/test_hermes_kanban_mcp_bootstrap.py` и
 `tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py` и отдельном
 `tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py`, MUST использовать
+`tests/scripts/test_hermes_kanban_mcp_rollout_state.py` как отдельный
+schema/loader regression module и MUST использовать
 только временный Git repo/export/runtime/state/wrapper и MUST запускаться
 через `scripts/run_tests.sh`. Общий Git/layout/oracle harness MUST
 содержательно принадлежать существующему
@@ -884,24 +938,34 @@ secrets или изменять DB/services.
   substitutions, а не production helper для expected bytes
 - **AND** она отклоняет comments-only wrapper, missing `exec`, extra commands,
   redirects и shell control operators
-- **AND** все четыре helper test modules проходят, rollout test имеет
+- **AND** все пять helper test modules проходят, rollout test имеет
   `<=850` строк, reusable support `<400`, каждый source/test file остаётся
   меньше 1000 строк, `runtime_coherence.py` остаётся не больше 900 строк, а
   forwarding façade отсутствует
 
+#### Scenario: RLIMIT tests не зависят от ambient limit
+
+- **WHEN** suite проверяет child soft `4096` и hard `<4096`
+- **THEN** отдельный child Python trampoline сам задаёт контролируемые
+  finite soft/hard limits и запускает exact wrapper
+- **AND** тест не зависит от ambient hard limit или infinity
+- **AND** `preexec_fn` не используется
+
 #### Scenario: Независимая validation имеет write-доступ только к evidence
 
-- **WHEN** независимый reviewer запускает focused four-suite validation
+- **WHEN** независимый reviewer запускает focused five-module validation
 - **THEN** review sandbox имеет `workspace-write`, чтобы runner/tests могли
   писать только temp/cache/evidence
 - **AND** review policy остаётся source-read-only и запрещает изменения
   source, tests, fixtures и OpenSpec
 - **AND** pre/post source diff не меняется
-- **AND** одна exact four-suite команда успешно завершается два раза подряд
+- **AND** одна exact команда с bootstrap, rollout, runtime coherence, runtime
+  sandbox и rollout state успешно завершается два раза подряд с
+  `HERMES_TEST_FILE_RETRIES=0`
+- **AND** retry и `FLAKY` отсутствуют, pre/post fingerprints обоих запусков
+  идентичны
 - **AND** run без collection, environment blocker либо единственный
   успешный run не закрывает acceptance
-- **AND** если support extraction не добавляет test module, exact
-  four-module command остаётся неизменной
 
 ### Requirement: Изменение не требует DB migration и отделено от live rollout
 
@@ -966,10 +1030,10 @@ approval.
 - **AND** следующий independent review остаётся source-read-only, получая
   `workspace-write` только для temp/cache/evidence
 
-#### Scenario: Bootstrap-helper PR не выполняет rollout
+#### Scenario: Исторический bootstrap-helper PR не выполнял rollout
 
-- **WHEN** bootstrap capability, schema v2 и temp-only tests реализованы и
-  проверены
+- **WHEN** рассматривается уже завершённый historical bootstrap-helper PR со
+  schema v2 и temp-only tests
 - **THEN** diff не содержит production module/script/test changes вне exact
   областей helper/test/OpenSpec
 - **AND** действующий корень состояния, базовая среда, целевая среда, снимок, переключение `wrapper`,
@@ -993,6 +1057,17 @@ approval.
   DB actions всё ещё запрещены
 - **AND** каждое такое действие требует отдельного exact разрешения и не
   выводится из planning approval, review, commit, push, PR или merge
+
+#### Scenario: BLOCK дельты 26.x требует нового baseline approval
+
+- **WHEN** independent review не принимает implementation evidence
+  26.3–26.5 и sibling run `128 passed`
+- **THEN** это evidence сохраняется только как historical, superseded и не
+  является текущей acceptance
+- **AND** до нового exact approval разрешено изменить только артефакты
+  планирования базовой линии исправления
+- **AND** valid red, implementation, tests/fixtures, commit/push/PR и
+  live-действия остаются запрещёнными
 
 ### Requirement: Sealed acquisition имеет предварительный bounded inventory
 
@@ -1143,3 +1218,74 @@ maximum и SHALL проверяться до memfd/invocation с учётом pl
   ошибкой
 - **THEN** structured result сохраняет primary cause и отдельно сообщает
   cleanup failure без FD leak и continuation
+
+### Requirement: Новый canonical wrapper задаёт finite NOFILE до Python
+
+Новый canonical grammar `source-cwd-nofile-v2` SHALL устанавливать
+process-local soft `RLIMIT_NOFILE` ровно в `4096` exact строкой
+`ulimit -S -n 4096` после exact `set -euo pipefail` и allow-listed exports,
+но до `cd --` и `exec` Python. Он MUST NOT повышать hard limit, использовать
+`unlimited` либо зависеть от root, systemd, `prlimit` или внешнего launcher.
+Resource planner MUST сохранить существующую проверку фактического finite
+soft limit и fail-closed semantics.
+
+#### Scenario: Generated canonical wrapper задаёт exact limit
+
+- **WHEN** generator строит новый canonical `wrapper.after`
+- **THEN** wrapper содержит ровно одну строку `ulimit -S -n 4096`
+- **AND** строка находится после `set -euo pipefail` и exports, но до
+  `cd --` и `exec` Python
+- **AND** запущенный дочерний Python наблюдает soft `RLIMIT_NOFILE=4096`
+  при неизменном hard limit
+
+#### Scenario: Hard limit ниже 4096 завершает wrapper до Python
+
+- **GIVEN** wrapper запущен с hard `RLIMIT_NOFILE` ниже `4096`
+- **WHEN** bash выполняет `ulimit -S -n 4096`
+- **THEN** wrapper MUST завершиться nonzero из-за `set -e`
+- **AND** fake Python и marker MUST не выполняться и не создаваться
+
+#### Scenario: Новый grammar отклоняет неканонический NOFILE
+
+- **WHEN** строка `ulimit` отсутствует, malformed, duplicated, имеет значение
+  не `4096`, использует `unlimited` либо находится не на exact позиции
+- **THEN** parser нового canonical grammar MUST завершиться fail-closed
+- **AND** Python и wrapper mutation MUST не выполняться
+
+#### Scenario: Исторические wrappers остаются rollback-only
+
+- **GIVEN** snapshot содержит принятый `source-cwd-v1` или historical
+  обёртку schema-v2
+- **WHEN** helper читает snapshot для rollback
+- **THEN** старый grammar MUST оставаться readable только для rollback
+- **AND** rollback MUST восстановить exact historical bytes и mode
+- **AND** generator MUST не выпускать старый grammar для нового rollout
+
+#### Scenario: Dry-run сообщает limit/hash и ничего не изменяет
+
+- **WHEN** выполняется `prepare` или `switch` dry-run нового rollout
+- **THEN** plan MUST содержать grammar kind `source-cwd-nofile-v2`, planned
+  soft limit `4096` и SHA-256 exact generated wrapper
+- **AND** planned soft limit MUST быть получен из parsed wrapper, а не из
+  отдельной константы plan
+- **AND** отдельный plan digest и новые manifest fields MUST не добавляться
+- **AND** stable wrapper, snapshot, runtime, process, MCP, DB и service state
+  MUST остаться неизменными
+
+#### Scenario: Exact loader повторно связывает manifest и bytes
+
+- **WHEN** fresh schema-v3 snapshot загружается для switch
+- **THEN** загрузчик MUST повторно проверить точный `snapshot_kind`,
+  `wrapper_contract=source-cwd-nofile-v2`, разобранный `ulimit=4096`, хеш
+  манифеста и фактические байты/хеш `wrapper.after`
+- **AND** mismatch MUST завершиться до candidate preflight, managed write и
+  `os.replace`
+- **AND** after SHA-256 плюс exact code-level contract/limit validation MUST
+  быть единственным plan-to-apply binding без отдельного plan digest
+
+#### Scenario: Repository lifecycle не является live authorization
+
+- **WHEN** implementation, review, commit, PR или merge завершены
+- **THEN** ни один из этих шагов MUST NOT автоматически выполнять live
+  prepare/switch, замену wrapper, замену process, smoke-проверку MCP,
+  restart, DB, systemd, deploy или network action

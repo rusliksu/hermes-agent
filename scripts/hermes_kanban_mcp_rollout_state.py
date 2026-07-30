@@ -77,8 +77,22 @@ MANIFEST_KEYS_V3 = MANIFEST_KEYS_V2 | set(
     hermes_cli_main_origin kanban_server_origin write_tools""".split()
 )
 WRAPPER_CONTRACT = coherence.WRAPPER_CONTRACT
+LEGACY_WRAPPER_CONTRACT = coherence.LEGACY_WRAPPER_CONTRACT
+NOFILE_SOFT_LIMIT = coherence.NOFILE_SOFT_LIMIT
 PREFLIGHT_CONTRACT = coherence.PREFLIGHT_CONTRACT
 REQUIRED_WRITE_TOOL = coherence.REQUIRED_WRITE_TOOL
+
+
+def parsed_soft_nofile(data: bytes, runtime: Path, venv_dirname: str) -> int:
+    grammar = coherence.parse_rollout_wrapper(
+        data,
+        runtime,
+        venv_dirname,
+        expected_contract=WRAPPER_CONTRACT,
+    )
+    if grammar.soft_nofile != NOFILE_SOFT_LIMIT:
+        raise RolloutError("wrapper has an invalid planned soft NOFILE limit")
+    return grammar.soft_nofile
 
 
 class ReplacementAppliedError(RolloutError):
@@ -215,8 +229,8 @@ def make_manifest(
         "runtime_path_replacements": runtime_path_replacements,
     }
     if schema_version == 3:
-        if snapshot_kind != "rollout" or import_evidence is None:
-            raise RolloutError("schema v3 requires rollout import evidence")
+        if snapshot_kind not in {"bootstrap", "rollout"} or import_evidence is None:
+            raise RolloutError("schema v3 requires import evidence")
         manifest.update(import_evidence.manifest_fields())
         manifest.update(
             wrapper_contract=WRAPPER_CONTRACT,
@@ -386,8 +400,8 @@ def _load_manifest(snapshot_path: Path) -> dict[str, Any]:
     )
     if schema_version == 3:
         if (
-            value["snapshot_kind"] != "rollout"
-            or value["wrapper_contract"] != WRAPPER_CONTRACT
+            value["wrapper_contract"]
+            not in {LEGACY_WRAPPER_CONTRACT, WRAPPER_CONTRACT}
             or value["preflight_contract"] != PREFLIGHT_CONTRACT
         ):
             raise RolloutError("manifest schema v3 contract is invalid")
@@ -595,11 +609,13 @@ def load_rollback_snapshot_context(
     ):
         raise RolloutError("snapshot wrapper hash does not match manifest")
     if manifest["schema_version"] == 3:
-        expected_after = coherence.rewrite_rollout_wrapper(
+        coherence.validate_rollout_wrapper_transition(
             wrapper_before,
+            wrapper_after,
             before_runtime,
             after_runtime,
             manifest["venv_dirname"],
+            manifest["wrapper_contract"],
         )
     else:
         before_text = validate_wrapper_contract(wrapper_before)
@@ -615,7 +631,7 @@ def load_rollback_snapshot_context(
         coherence.validate_schema_v2_rollout_wrapper(
             wrapper_after, after_runtime, manifest["venv_dirname"]
         )
-    if wrapper_after != expected_after:
+    if manifest["schema_version"] != 3 and wrapper_after != expected_after:
         raise RolloutError("wrapper.after is not the exact guarded transformation")
 
     return SnapshotContext(
@@ -638,6 +654,15 @@ def load_snapshot_context(
         stable_wrapper_raw=stable_wrapper_raw,
     )
     manifest = context.manifest
+    if manifest["schema_version"] != 3:
+        raise RolloutError("switch requires a schema v3 snapshot")
+    if manifest["wrapper_contract"] != WRAPPER_CONTRACT:
+        raise RolloutError("source-cwd-v1 snapshots are rollback-only")
+    parsed_soft_nofile(
+        context.wrapper_after,
+        context.after_runtime,
+        manifest["venv_dirname"],
+    )
     source_repo = canonical_path(
         str(context.source_repo), "manifest source repo", must_exist=True
     )
@@ -724,7 +749,13 @@ def _transition_plan(command: str, context: SnapshotContext, apply: bool) -> dic
             "leave runtimes, snapshot, processes and DB unchanged",
         ],
     }
-    if command == "switch" and manifest["schema_version"] == 3:
+    if command == "switch":
+        plan["wrapper_contract"] = manifest["wrapper_contract"]
+        plan["planned_soft_nofile"] = parsed_soft_nofile(
+            context.wrapper_after,
+            context.after_runtime,
+            manifest["venv_dirname"],
+        )
         plan["import_origin"] = {
             key: manifest[key]
             for key in (
@@ -808,9 +839,19 @@ def run_transition(
     stable_wrapper: str,
     expected_current_wrapper_sha256: str,
     apply: bool,
+    expected_wrapper_after_sha256: str | None = None,
 ) -> dict[str, Any]:
     if command not in {"switch", "rollback"}:
         raise RolloutError("unsupported transition command")
+    approved_after_hash: str | None = None
+    if command == "switch" and apply:
+        if expected_wrapper_after_sha256 is None:
+            raise RolloutError("switch apply requires expected wrapper.after SHA-256")
+        approved_after_hash = require_full_sha(
+            expected_wrapper_after_sha256,
+            FULL_SHA256,
+            "expected wrapper.after SHA-256",
+        )
     loader = (
         load_snapshot_context
         if command == "switch"
@@ -828,22 +869,18 @@ def run_transition(
         "expected current wrapper SHA-256",
     )
     manifest = context.manifest
+    if approved_after_hash is not None and (
+        approved_after_hash != manifest["wrapper_after_sha256"]
+        or approved_after_hash != sha256(context.wrapper_after)
+    ):
+        raise RolloutError("expected wrapper.after SHA-256 does not match snapshot")
     if command == "switch":
-        if (
-            manifest["snapshot_kind"] == "rollout"
-            and manifest["schema_version"] != 3
-        ):
-            raise RolloutError("rollout switch requires a schema v3 snapshot")
-        session = (
-            coherence.import_preflight_session(
-                context.after_runtime,
-                manifest["venv_dirname"],
-                expected_pyvenv_cfg_sha256=manifest["pyvenv_cfg_sha256"],
-                expected_site_packages=manifest["site_packages"],
-                expected_stdlib_roots=manifest["stdlib_roots"],
-            )
-            if manifest["schema_version"] == 3
-            else nullcontext(None)
+        session = coherence.import_preflight_session(
+            context.after_runtime,
+            manifest["venv_dirname"],
+            expected_pyvenv_cfg_sha256=manifest["pyvenv_cfg_sha256"],
+            expected_site_packages=manifest["site_packages"],
+            expected_stdlib_roots=manifest["stdlib_roots"],
         )
         required_hash = manifest["wrapper_before_sha256"]
         replacement = context.wrapper_after

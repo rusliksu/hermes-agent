@@ -1,8 +1,10 @@
-> **Статус MATERIAL REMEDIATION DELTA:** exact approval раздела 22.x получено
-> от Руслана 2026-07-30 формулировкой «одобряю material ELF/resource
-> remediation baseline». Разрешены только implementation 22.3–22.6 и
-> авторская проверка только в режимах repo-local/temp-only. Действия в
-> live-среде, commit/push/PR, независимая приёмка и delivery gates не открыты.
+> **Текущий статус REMEDIATION BASELINE ПОСЛЕ BLOCK:** independent review
+> дельты 26.x вернул `BLOCK`. Claims 26.3–26.5 сохранены только как
+> historical implementation evidence, superseded и не приняты как текущая
+> acceptance. Baseline 27.x явно одобрен, valid red и minimal repo-local
+> implementation 27.3–27.4 выполнены; один exact five-module author run дал
+> `180 passed`. Два последовательных run 27.5, independent acceptance,
+> commit/push/PR и live-действия не разрешены.
 
 ## Контекст
 
@@ -438,7 +440,7 @@ Focused tests запускаются через `scripts/run_tests.sh`. Они �
 Тестовое окружение задаёт временные `HERMES_HOME`, `HOME` и
 `HERMES_KANBAN_DB`; live DB path должен быть явно исключён.
 
-### 10. PR #16: один helper и три явные фазы являются rollout baseline
+### 10. Helper сохраняет один CLI и явные rollout phases
 
 Новый файл SHALL быть ровно
 `scripts/hermes_kanban_mcp_rollout.py`. Он использует только Python stdlib и
@@ -459,6 +461,7 @@ python scripts/hermes_kanban_mcp_rollout.py prepare \
   --venv-dirname .venv|venv \
   --stable-wrapper ABS_PATH \
   --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--expected-wrapper-after-sha256 FULL_SHA256] \
   [--apply]
 
 python scripts/hermes_kanban_mcp_rollout.py switch \
@@ -467,6 +470,7 @@ python scripts/hermes_kanban_mcp_rollout.py switch \
   --snapshot-id SNAPSHOT_ID \
   --stable-wrapper ABS_PATH \
   --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--expected-wrapper-after-sha256 FULL_SHA256] \
   [--apply]
 
 python scripts/hermes_kanban_mcp_rollout.py rollback \
@@ -492,17 +496,18 @@ python scripts/hermes_kanban_mcp_rollout.py rollback \
 3. копирует только указанный top-level `.venv` или `venv` из чистого
    текущего immutable runtime в candidate, не копируя `.env`, config, DB,
    sessions, patches или другие runtime files;
-4. строит candidate wrapper заменой точного абсолютного
-   `current-runtime` на точный candidate path в существующем стабильном
-   wrapper, сохраняя остальной byte content и executable mode;
+4. разбирает поддерживаемый current wrapper и строит candidate
+   `wrapper.after` единственным canonical generator как
+   `source-cwd-nofile-v2` для exact candidate path, сохраняя
+   `wrapper.before` byte-identical и executable mode;
 5. создаёт immutable rollback snapshot и завершает работу без переключения
    стабильного wrapper.
 
-Трансформация wrapper разрешена только если он является обычным
-несимвольным executable UTF-8 файлом, содержит текущий runtime path хотя бы
-один раз, не содержит candidate path и содержит запускаемый контракт
-`mcp serve-kanban` с `--allow-write`. Иначе helper завершается fail-closed.
-Это сохраняет существующий standalone launcher без нового шаблонизатора.
+Current wrapper разрешён только если он является обычным несимвольным
+executable UTF-8 файлом и проходит exact allow-listed legacy/canonical
+parser с запускаемым контрактом `mcp serve-kanban --allow-write`. Candidate
+path не должен уже быть active runtime. Иначе helper завершается fail-closed.
+Broad rewrite или отдельный bootstrap/rollout template запрещены.
 
 `switch --apply` повторно проверяет snapshot, оба exact Git SHA, candidate
 venv/interpreter, byte hashes `wrapper.before`/`wrapper.after`, путь wrapper
@@ -529,10 +534,12 @@ guard, и с `wrapper_after_sha256` manifest. После полной повто
 `JSON`-манифеста снимка, хэширования и модульных тестов только во временной
 среде.
 
-### 11. PR #16: schema v1 фиксирует обычный Git-to-Git rollout
+### 11. Исторический PR #16: schema v1 фиксировал Git-to-Git rollout
 
-Snapshot ID SHALL детерминированно иметь вид
-`<CURRENT_FULL_SHA>-to-<CANDIDATE_FULL_SHA>` и создаваться эксклюзивно под
+Этот раздел сохраняет delivery evidence PR #16 и superseded текущим
+creation contract разделов 14/19/29. В PR #16 snapshot ID детерминированно
+имел вид
+`<CURRENT_FULL_SHA>-to-<CANDIDATE_FULL_SHA>` и создавался эксклюзивно под
 `<state-root>/snapshots/<snapshot-id>`. Поэтому dry-run и последующий apply
 формируют один exact path без скрытого clock input. Повторное использование
 существующего ID запрещено. Snapshot содержит только:
@@ -629,6 +636,7 @@ python scripts/hermes_kanban_mcp_rollout.py bootstrap-prepare \
   --expected-venv-interpreter-sha256 FULL_SHA256 \
   --stable-wrapper ABS_EXISTING_FILE \
   --expected-current-wrapper-sha256 FULL_SHA256 \
+  [--expected-wrapper-after-sha256 FULL_SHA256] \
   [--apply]
 ```
 
@@ -666,6 +674,13 @@ export runtime не создаются и не меняются.
 `--apply` обязан получить `--expected-export-manifest-sha256` и сравнить его
 с повторно прочитанными сырыми байтами до записи.
 
+Dry-run вычисляет и сообщает exact canonical `wrapper.after` SHA-256, но не
+требует `--expected-wrapper-after-sha256`. `bootstrap-prepare --apply`,
+`prepare --apply` и `switch --apply` MUST получить этот аргумент и сравнить
+его с actual generated/snapshot bytes до первого managed write, candidate
+preflight и `os.replace`. Missing или mismatch завершается fail-closed.
+`rollback` не получает этот аргумент и сохраняет прежний snapshot-only CLI.
+
 Baseline path детерминирован:
 `<state-root>/hermes-kanban-mcp-<SOURCE_COMMIT>`. Helper создаёт его через
 `git worktree add --detach` и требует exact HEAD и пустой tracked status
@@ -676,27 +691,30 @@ snapshot и повторно проверяется на baseline. Никаки�
 копируются.
 
 Wrapper обязан быть executable regular non-symlink UTF-8 file, совпасть с
-explicit SHA-256, содержать standalone `mcp serve-kanban --allow-write`,
-ровно один раз содержать exact export runtime path и ещё не содержать
-baseline path. `wrapper.after` является единственной byte transformation:
-одна замена exact export path на exact baseline path. Stable wrapper в
-`bootstrap-prepare` не меняется.
+explicit SHA-256, содержать exact allow-listed standalone
+`mcp serve-kanban --allow-write` grammar, ссылаться на exact export runtime
+как active before path и ещё не использовать baseline path.
+`wrapper.before` сохраняется byte-identical, а fresh `wrapper.after` строится
+тем же canonical `source-cwd-nofile-v2` generator для baseline, что и
+ordinary rollout. Stable wrapper в `bootstrap-prepare` не меняется.
 
 Альтернатива: ослабить обычный `prepare`, чтобы он принимал non-Git current
 runtime. Она отвергнута: тогда schema и switch policy перестают отличать
 доказанный export от immutable Git runtime.
 
-### 14. Schema v2 остаётся bootstrap/legacy форматом, schema v3 — ordinary rollout
+### 14. Fresh bootstrap и rollout имеют один schema-v3 contract
 
-Schema v1 из PR #16 недостаточна: она предполагает два разных Git SHA и
-Git-clean current runtime. Bootstrap имеет export и baseline с одним
-`source_commit`, но разными runtime kinds. Bootstrap-helper PR SHALL
-однократно перейти на `schema_version=2`; schema v1 reader/migration не
-добавляется.
+Исторические PR #16/bootstrap-helper последовательно выпускали schema v1 и
+schema v2. Это implementation history, а не действующий creation contract.
+Fresh `bootstrap-prepare --apply` и ordinary `prepare --apply` SHALL
+создавать только `schema_version=3` с exact
+`snapshot_kind=bootstrap|rollout` и
+`wrapper_contract=source-cwd-nofile-v2`.
 
-Исторический bootstrap-helper создаёт schema v2 manifest с общим exact set:
+Схема v3 сохраняет существующую модель сред выполнения «до/после» без
+расширения формы манифеста:
 
-- `schema_version=2`, `snapshot_kind=bootstrap|rollout`, UTC `created_at`;
+- `schema_version=3`, `snapshot_kind=bootstrap|rollout`, UTC `created_at`;
 - `source_repo`, `runtime_root`, `state_root`, `snapshot_id`,
   `stable_wrapper`;
 - `before_runtime_kind=export|git`, `before_runtime_path`,
@@ -704,17 +722,23 @@ Git-clean current runtime. Bootstrap имеет export и baseline с одним
   `before_manifest_sha256`;
 - `after_runtime_kind=git`, `after_runtime_path`, `after_runtime_sha`;
 - `venv_dirname`, `venv_interpreter_sha256`, `venv_interpreter_mode`;
+- `wrapper_contract=source-cwd-nofile-v2`;
 - `wrapper_before_sha256`, `wrapper_after_sha256`, `wrapper_mode`,
-  `runtime_path_replacements`.
+  `runtime_path_replacements`;
+- уже определённое runtime-coherence evidence.
 
-Для `bootstrap` before manifest fields являются non-null absolute path и
-full SHA-256; before/after SHA оба равны source commit; replacement count
-равен ровно `1`. Уже существующие legacy `rollout` schema v2 snapshots
-остаются readable только для snapshot-only rollback: их manifest fields
-равны JSON `null`, before и after являются exact Git commits и различаются.
-Новый ordinary `prepare` MUST создавать только schema v3. Новый
-switch-to-target по schema v2 запрещён. Variant с иными kind/null/hash
-combinations отклоняется.
+Для fresh `bootstrap` before manifest fields являются non-null absolute path
+и full SHA-256; before/after SHA оба равны source commit; replacement count
+равен ровно `1`. Fresh bootstrap `wrapper.after` MUST строиться тем же
+единственным canonical generator, что ordinary rollout, включая exact
+`ulimit -S -n 4096`, `cd --` и `exec`.
+
+Любой `schema_version!=3`, а также historical schema-v3 snapshot с
+`wrapper_contract=source-cwd-v1`, MUST быть отклонён switch loader до
+candidate preflight, первого managed write и `os.replace`. Эти artifacts
+MAY читаться только отдельным snapshot-only rollback loader для exact
+восстановления bytes/mode. In-place migration, rewrite или «upgrade»
+существующего snapshot запрещены.
 
 Snapshot IDs детерминированы:
 
@@ -725,28 +749,30 @@ Snapshot directory остаётся
 `<state-root>/snapshots/<snapshot-id>` с mode `0700` и ровно тремя files
 `manifest.json`, `wrapper.before`, `wrapper.after` mode `0600`.
 
-Live schema migration не нужна и обратная совместимость не добавляется,
-потому что зафиксированный evidence подтверждает отсутствие dedicated state
-root, baseline, target и snapshots. Перед любым будущем live
+Live schema migration не нужна. Перед любым будущим live
 `bootstrap-prepare --apply` оператор обязан отдельно подтвердить, что exact
-state root всё ещё отсутствует; существующий root, включая schema v1
-artifacts, закрывает apply без cleanup или migration.
+state root всё ещё отсутствует; существующий root закрывает apply без cleanup
+или migration.
 
 ### 15. Проверка switch/runtime отделена от rollback только по snapshot
 
-`switch` SHALL использовать полную проверку согласованности runtime: schema,
-хеши и режимы snapshot, exact derived paths, guard текущего wrapper, target
-runtime/venv и, для schema v3, import-origin evidence. Bootstrap switch
-дополнительно повторно проверяет export manifest, source commit, export venv
-и exact baseline runtime. Один atomic replacement primitive и общие
-path/hash primitives сохраняются; отдельная atomic policy запрещена.
+`switch` SHALL использовать полную проверку согласованности runtime только
+для новых снимков schema v3: точный `snapshot_kind`, контракт
+`source-cwd-nofile-v2`, разобранный мягкий лимит `4096`, хеш манифеста,
+фактические байты/хеш `wrapper.after`, точные производные пути, guard текущего
+wrapper, target runtime/venv и import-origin evidence. Bootstrap switch дополнительно
+повторно проверяет export manifest, source commit, export venv и exact
+baseline runtime. Один atomic replacement primitive и общие path/hash
+primitives сохраняются; отдельная atomic policy запрещена.
 
 `rollback` SHALL использовать отдельный snapshot-only loader/validator. Он
 читает только exact `manifest.json`, `wrapper.before`, `wrapper.after`,
-проверяет schema v2/v3, размеры/modes/hashes snapshot, exact snapshot ID и
-stable-wrapper path, явный current-wrapper SHA-256 guard и соответствие
-current wrapper exact `wrapper.after`. Затем тот же atomic primitive
-восстанавливает exact bytes/mode `wrapper.before`.
+проверяет исторически поддерживаемую schema/grammar, размеры/modes/hashes
+snapshot, exact snapshot ID и stable-wrapper path, явный current-wrapper
+SHA-256 guard и соответствие current wrapper exact `wrapper.after`. Затем
+тот же atomic primitive восстанавливает exact bytes/mode `wrapper.before`.
+Rollback loader не мигрирует manifest или wrapper и не делает artifact
+switch-eligible.
 
 Rollback только по snapshot MUST NOT:
 
@@ -808,8 +834,11 @@ file проверяет regression обычного prepare/switch/rollback и s
 wrapper grammar, parent evidence и исторический schema-v2 golden.
 `tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py` отдельно проверяет
 OS containment, bypass attempts и host canaries.
+`tests/scripts/test_hermes_kanban_mcp_rollout_state.py` отдельно владеет
+регрессиями схемы, типа, контракта, хеша и загрузчика и входит в обязательный
+целевой набор.
 
-Все четыре helper test modules используют только временные деревья
+Все пять helper test modules используют только временные деревья
 `Git`/экспорта/среды. Корректный тестовый `manifest.txt` использует фактические
 ключи `source_commit`, `deployed_utc`, `python_version`, `mcp_version`,
 `command` в формате строк `key=value`. Проверки обязаны включать дубликат
@@ -824,6 +853,10 @@ OS containment, bypass attempts и host canaries.
 `switch`/`rollback` для `bootstrap`, обычный переход
 `prepare` от базовой среды к цели при едином корне и лимит строк `<1000`.
 Тесты не читают исходный текст и не обращаются к рабочим путям.
+RLIMIT scenarios запускаются через отдельный child Python trampoline,
+который внутри дочернего процесса устанавливает контролируемые soft/hard
+limits и запускает wrapper. Они не зависят от ambient hard/infinity и не
+используют `preexec_fn`.
 
 ### 17. Bootstrap-helper PR не является разрешением на live-действия
 
@@ -860,13 +893,15 @@ target checkout. Поэтому runtime `WRITE_TOOLS` оставался ста�
 checkout становится каноническим корнем imports через wrapper cwd и preflight
 guards. Это меньше меняет состояние runtime и не требует изменения package.
 
-### 19. Schema v3 и canonical `source-cwd-v1` wrapper
+### 19. Schema v3 и canonical `source-cwd-nofile-v2` wrapper
 
-Новые ordinary rollout snapshots SHALL использовать `schema_version=3`.
-Schema v3 сохраняет общую before/after runtime модель schema v2, но добавляет
-evidence согласованности для imports из target source:
+Все fresh bootstrap и ordinary rollout snapshots SHALL использовать
+`schema_version=3`, `snapshot_kind=bootstrap|rollout` и
+`wrapper_contract=source-cwd-nofile-v2`. Schema v3 сохраняет общую
+before/after runtime модель, но добавляет evidence согласованности для imports
+из target source:
 
-- `wrapper_contract=source-cwd-v1`;
+- `wrapper_contract=source-cwd-nofile-v2`;
 - deterministic `wrapper.after` bytes и SHA-256;
 - exact target runtime cwd, exact target interpreter path и exact module
   origin paths для `hermes_cli.main` и
@@ -876,26 +911,30 @@ evidence согласованности для imports из target source:
 - preflight command/result metadata без environment dump, secrets, DB data
   или wrapper text.
 
-Canonical `source-cwd-v1` wrapper SHALL после switch явно выполнить
+Canonical `source-cwd-nofile-v2` wrapper SHALL установить process-local
+finite soft limit exact строкой `ulimit -S -n 4096`, затем явно выполнить
 `cd -- <EXACT_TARGET_RUNTIME>` непосредственно перед запуском
 `<EXACT_TARGET_RUNTIME>/<venv>/bin/python -m hermes_cli.main ...`. `cd`
 является частью контракта runtime, а не косметикой: он делает target checkout
 первым источником imports для `python -m`, чтобы copied venv `site-packages` не
 затенял source tree.
 
-Legacy schema v2 wrapper допускается как `before` и rollback target. Helper
-MUST сохранять exact `wrapper.before` bytes/mode и MAY rollback schema v2
-snapshots без проверок import-origin candidate. Новый switch на target MUST
-использовать schema v3 snapshot; schema v2 switch-to-target не является
-путём исправления.
+Legacy schema v2 wrapper и historical schema-v3 `source-cwd-v1` допускаются
+как `before` и rollback target. Helper MUST сохранять exact
+`wrapper.before` bytes/mode и MAY rollback такие snapshots без проверок
+import-origin candidate. Switch MUST отклонять любой `schema_version!=3` и
+historical schema-v3 `source-cwd-v1` до preflight/mutation. In-place
+migration отсутствует.
 
 Wrapper parser/generator SHALL быть deterministic и fail-closed и принадлежать
 `scripts/hermes_kanban_mcp_runtime_coherence.py`. Parser принимает только
 явно перечисленные exact legacy/canonical templates: корректный shebang,
 ожидаемый `set`, exact allow-listed exports и единственный исполняемый
 `exec` с exact argv `-m hermes_cli.main mcp serve-kanban --allow-write "$@"`.
-Canonical template дополнительно требует exact `cd -- <runtime>`
-непосредственно перед `exec`.
+Canonical template дополнительно требует exact
+`ulimit -S -n 4096`, затем `cd -- <runtime>` непосредственно перед `exec`.
+Fresh bootstrap `wrapper.after` строится этим же generator, а не отдельной
+path-rewrite веткой.
 
 Parser MUST отклонять comments-only совпадение, отсутствующий `exec`,
 дополнительную команду до или после него, redirects, pipes, backgrounding,
@@ -1098,8 +1137,12 @@ rewrite helper. Test отдельно доказывает, что текущи�
 Automated acceptance MUST оставаться только во временном окружении и точечной.
 Минимальная матрица:
 
+- fresh bootstrap и rollout создают только schema v3 с exact
+  `snapshot_kind=bootstrap|rollout`, canonical
+  `source-cwd-nofile-v2` в `wrapper.after`; bootstrap использует тот же
+  generator;
 - rollout из legacy в canonical: старый wrapper в `wrapper.before`, schema v3
-  snapshot, canonical `source-cwd-v1` в `wrapper.after`;
+  snapshot, canonical `source-cwd-nofile-v2` в `wrapper.after`;
 - rollout из canonical в canonical: следующий target сохраняет canonical
   контракт wrapper;
 - совместимость schema v2 rollback: существующий v2 snapshot может восстановить
@@ -1109,6 +1152,17 @@ Automated acceptance MUST оставаться только во временн�
 - schema v2/v3 rollback при missing/corrupt/dirty candidate восстанавливает
   exact `wrapper.before` либо fail-closed только по snapshot/current-wrapper
   evidence;
+- любой `schema_version!=3` и historical schema-v3 `source-cwd-v1`
+  fail-closed для switch до preflight/mutation, но остаётся отдельным
+  snapshot-only exact bytes/mode rollback input без in-place migration;
+- `bootstrap-prepare --apply`, `prepare --apply` и `switch --apply` требуют
+  `--expected-wrapper-after-sha256`; missing/mismatch завершается до первого
+  managed write/preflight/`os.replace`, dry-run только сообщает hash, а
+  rollback CLI не меняется;
+- exact switch loader повторно проверяет kind, contract, parsed
+  `ulimit=4096`, manifest hash и actual `wrapper.after` bytes; отдельный plan
+  digest отсутствует, planned soft limit выводится из parsed wrapper и
+  форма манифеста не расширяется;
 - snapshot-only rollback не запускает `bwrap`, candidate Python и не зависит
   от source/venv/interpreter/import state;
 - comments-only wrapper, missing `exec`, extra commands, redirects и control
@@ -1153,17 +1207,19 @@ Automated acceptance MUST оставаться только во временн�
 - общий Git/layout/oracle harness содержательно принадлежит существующему
   `hermes_kanban_mcp_test_support.py`, без thin forwarding; rollout test
   `<=850` строк, support `<400`, behavior unchanged;
-- четыре helper test modules входят в focused suite; каждый source/test file
+- пять helper test modules входят в focused suite; каждый source/test file
   остаётся `<1000` строк, `runtime_coherence.py` имеет не менее 100 строк
   запаса, common primitives имеют единственного owner без forwarding façade,
   tests запускаются через `scripts/run_tests.sh`, strict OpenSpec validation
   и independent review обязательны;
+- RLIMIT tests используют hermetic child Python trampoline без зависимости
+  от ambient hard/infinity и без `preexec_fn`;
 - independent review запускается в `workspace-write` sandbox, но остаётся
   source-read-only: tests пишут только temp/cache/evidence, а pre/post source
-  diff неизменен. Одна exact four-suite команда должна успешно завершиться
-  два раза подряд; `0 collected`, environment blocker или один успешный run
-  не являются acceptance. Если support extraction не добавляет test module,
-  exact four-module command остаётся неизменной.
+  diff неизменен. Одна exact five-module команда с
+  `HERMES_TEST_FILE_RETRIES=0` должна успешно завершиться два раза подряд
+  без retry/`FLAKY`; fingerprints обоих запусков идентичны. `0 collected`,
+  environment blocker или один успешный run не являются acceptance.
 
 Гейты доставки после этого material delta:
 
@@ -1180,8 +1236,9 @@ Automated acceptance MUST оставаться только во временн�
    `140 passed, 0 failed`; это evidence, но не independent acceptance.
 5. Live-действия, commit, push или PR этим approval и author evidence не
    разрешены.
-6. Выполнить два последовательных four-suite runs в workspace-write
-   source-read-only review sandbox, strict checks и получить новый
+6. Выполнить два последовательных exact five-module runs с retries `0` в
+   workspace-write source-read-only review sandbox, без `FLAKY`, с
+   идентичными fingerprints; выполнить strict checks и получить новый
    independent review. До accepted review без `BLOCK`
    запрещены commit, push и PR.
 7. Только после accepted review разрешаются commit/push/task-owned PR и
@@ -1266,7 +1323,7 @@ Automated acceptance MUST оставаться только во временн�
   forwarding re-export façade и измерять минимум 100 строк запаса у
   `runtime_coherence.py`.
 - [Copied candidate venv затеняет target source через старый site-packages] →
-  canonical `source-cwd-v1` wrapper, `-I -S -B`, exact environment и guarded
+  canonical `source-cwd-nofile-v2` wrapper, `-I -S -B`, exact environment и guarded
   import-origin preflight до snapshot и повторная проверка на switch; без
   network, `pip`, editable install или `.pth`.
 - [Исправление ломает existing rollback oracle] → schema v2 остаётся readable для
@@ -1311,7 +1368,8 @@ Automated acceptance MUST оставаться только во временн�
   candidate/snapshot, symlink stable wrapper и future parent symlink cases.
 - [Read-only review sandbox не даёт запустить tests] → независимая validation
   использует workspace-write для temp/cache/evidence при source-read-only
-  review и требует два последовательных four-suite run.
+  review и требует два последовательных exact five-module run с retries `0`,
+  без `FLAKY`, с идентичными fingerprints.
 
 ## План доставки
 
@@ -1326,12 +1384,14 @@ Automated acceptance MUST оставаться только во временн�
 4. Tasks 19.4, 19.6, 19.7, 20.2 и 21.2–21.5 закрыты по approval
    2026-07-30 и фактической repo-local реализации; сохранить открытыми 16.7,
    18.8, 19.8, 19.9, 20.7, 20.8 и 21.6–21.8.
-5. Author exact four-suite выполнен два раза подряд: `140 passed, 0 failed`;
-   line/FD/scope/strict gates фиксируются как author evidence, не review.
+5. Исторический author exact four-suite выполнен два раза подряд:
+   `140 passed, 0 failed`; это evidence старого snapshot, не текущая
+   acceptance.
 6. В workspace-write/source-read-only review sandbox два раза подряд
-   запустить exact four-suite команду через `scripts/run_tests.sh`, проверить
-   acceptance/bypass matrix, отсутствие FD leaks, line counts и
-   `runtime_coherence.py <=900`, строгую проверку OpenSpec,
+   запустить exact five-module команду через `scripts/run_tests.sh` с
+   `HERMES_TEST_FILE_RETRIES=0`, проверить отсутствие retry/`FLAKY`,
+   идентичные fingerprints, acceptance/bypass matrix, отсутствие FD leaks,
+   line counts и `runtime_coherence.py <=900`, строгую проверку OpenSpec,
    `git diff --check` и exact область diff.
 7. Получить independent review без `BLOCK`. Только после accepted review
    разрешены commit, push и task-owned PR; затем обычный PR/merge lifecycle.
@@ -1507,3 +1567,122 @@ target должна совпасть с approved `InventoryPlan`; ошибка i
 fail closed. Этот guard остаётся load-bearing для mutation после preflight и
 сохраняет рассчитанный temporary FD peak; общий planner, sealing и final
 handoff не меняются.
+
+### 28. MATERIAL DELTA: versioned canonical wrapper владеет NOFILE capacity
+
+Фактический owner exact wrapper grammar/layout остаётся
+`scripts/hermes_kanban_mcp_runtime_coherence.py`; владельцем rollout
+schema/snapshot/hash/transition state остаётся
+`scripts/hermes_kanban_mcp_rollout_state.py`. Изменять смысл
+`source-cwd-v1` нельзя: этот contract уже записан в исторические schema-v3
+snapshots. Поэтому generator переходит на новый versioned canonical grammar
+kind `source-cwd-nofile-v2`, а `source-cwd-v1` и schema-v2 grammar остаются
+parse/rollback-only и больше не выпускаются generator.
+
+Exact generated layout нового kind:
+
+1. `#!/bin/bash`;
+2. `set -euo pipefail`;
+3. exact allow-listed exports в существующем порядке;
+4. ровно одна строка `ulimit -S -n 4096`;
+5. exact `cd -- <target-runtime>`;
+6. exact `exec <target>/venv/bin/python -m hermes_cli.main ...`.
+
+Таким образом limit задаётся после `set -euo pipefail` и exports, но до
+`cd --` и `exec` Python. Bash `set -e` обеспечивает nonzero
+fail-before-Python, если hard limit ниже `4096`; реализация не добавляет
+helper, не повышает hard limit и никогда не устанавливает soft limit в
+`unlimited`. Parser нового grammar отклоняет missing, malformed, duplicate,
+wrong-value и unlimited `ulimit`, а также любое иное расположение строки.
+Существующая явная диагностика shell достаточна; новый stderr protocol не
+вводится.
+
+Выбранный owner лучше альтернатив:
+
+- Python self-raise отклонён: candidate Python уже запущен, то есть capacity
+  устанавливает слишком поздний слой;
+- systemd/`prlimit`/внешний launcher отклонены: они переносят ownership во
+  внешний live/service слой, добавляют root/service coupling и не являются
+  частью deterministic wrapper snapshot.
+
+Rollback восстанавливает exact historical `wrapper.before` bytes и mode.
+Ни parsing старого `source-cwd-v1`, ни schema-v2 snapshot-only rollback не
+переписывают wrapper и не добавляют NOFILE line. Existing resource planner
+продолжает проверять фактический finite soft limit и fail-closed при
+недостаточной вместимости; `4096` не является обходом planner.
+
+Dry-run строит новый deterministic `wrapper.after`, сообщает grammar kind,
+exact planned soft limit `4096` и planned wrapper SHA-256, но не пишет
+snapshot/runtime/wrapper. Apply и switch повторно связывают те же
+kind/limit/hash evidence перед mutation. Planning, code, review, PR или merge
+не выполняют live action.
+
+### 29. Remediation после BLOCK: единый creation/switch contract и hash gate
+
+Independent review дельты 26.x завершился `BLOCK`; 26.3–26.5 остаются
+historical implementation evidence и superseded текущим design. Новый
+baseline одобрен exact фразой пользователя и реализован только repo-local в
+рамках 27.3–27.4; 27.5+ остаются открытыми.
+
+Новый bootstrap и rollout используют один путь создания:
+
+1. канонический генератор строит `wrapper.after` типа
+   `source-cwd-nofile-v2`;
+2. разобранная обёртка даёт производный запланированный мягкий лимит `4096`;
+3. манифест сохраняет существующую форму с `schema_version=3`,
+   `snapshot_kind=bootstrap|rollout`,
+   `wrapper_contract=source-cwd-nofile-v2` и after SHA-256;
+4. отдельный plan digest не создаётся;
+5. `--expected-wrapper-after-sha256` связывает operator-approved dry-run
+   evidence с каждым apply;
+6. точный загрузчик switch повторно проверяет тип, контракт, разобранный
+   лимит, хеш манифеста и фактические байты непосредственно перед дальнейшим
+   preflight.
+
+Dry-run только сообщает after SHA-256 и planned soft limit. Для
+`bootstrap-prepare --apply`, `prepare --apply` и `switch --apply` missing или
+mismatch expected after SHA MUST завершать вызов до первого managed write,
+candidate preflight и `os.replace`. Rollback CLI и его snapshot-only
+семантика не меняются.
+
+Switch eligibility является строгой: любой `schema_version!=3` и historical
+schema-v3 `source-cwd-v1` отклоняются до preflight/mutation. Отдельный
+rollback loader всё ещё может использовать их только как immutable exact
+bytes/mode input. Переписывать manifest/wrapper на месте или мигрировать
+snapshot запрещено.
+
+Основные владельцы новой policy:
+
+- `scripts/hermes_kanban_mcp_rollout_state.py` — схема/тип/контракт,
+  манифест/хеш и границы точных загрузчиков switch/rollback;
+- `scripts/hermes_kanban_mcp_rollout.py` — CLI guard и порядок dry-run/apply;
+- `scripts/hermes_kanban_mcp_runtime_coherence.py` — только canonical
+  generator/parser и неизбежная exact contract/limit проверка.
+
+`runtime_coherence.py` уже имеет `897/900` строк, поэтому новая state/CLI
+policy туда не добавляется. Если минимальная правка не помещается, extraction
+разрешена только в существующий
+`scripts/hermes_kanban_mcp_rollout_common.py` как substantive owner; новый
+thin wrapper запрещён. Тестовый reusable код аналогично может переходить
+только в существующий `tests/scripts/hermes_kanban_mcp_test_support.py`.
+
+RLIMIT tests не используют состояние runner. Child Python trampoline сам
+задаёт finite soft/hard limits в дочернем процессе, затем запускает exact
+wrapper; ambient hard limit/infinity и `preexec_fn` не участвуют.
+
+Финальная acceptance — одна exact команда с пятью modules, два раза подряд
+на одном final snapshot:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/scripts/test_hermes_kanban_mcp_bootstrap.py \
+  tests/scripts/test_hermes_kanban_mcp_rollout.py \
+  tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py \
+  tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py \
+  tests/scripts/test_hermes_kanban_mcp_rollout_state.py
+```
+
+Оба запуска обязаны пройти без edits/retry/`FLAKY`, с идентичными pre/post
+fingerprints. Только затем выполняются independent source-read-only review и
+non-live PR lifecycle. Live dry-run/apply/process gates остаются прежними
+отдельными approvals.

@@ -137,6 +137,7 @@ class BootstrapLayout:
         *,
         apply: bool = False,
         manifest_sha256: str | None | object = ...,
+        wrapper_after_sha256: str | None | object = ...,
     ) -> list[str]:
         arguments = [
             "bootstrap-prepare",
@@ -165,12 +166,30 @@ class BootstrapLayout:
             arguments.extend(
                 ["--expected-export-manifest-sha256", manifest_sha256]
             )
+        if wrapper_after_sha256 is ... and apply:
+            wrapper_after_sha256 = _hash(
+                rollout.coherence.rewrite_rollout_wrapper(
+                    self.stable_wrapper.read_bytes(),
+                    self.export_runtime,
+                    self.baseline_path,
+                    "venv",
+                )
+            )
+        if isinstance(wrapper_after_sha256, str):
+            arguments.extend(
+                ["--expected-wrapper-after-sha256", wrapper_after_sha256]
+            )
         if apply:
             arguments.append("--apply")
         return arguments
 
     def transition_args(
-        self, command: str, expected_hash: str, *, apply: bool = False
+        self,
+        command: str,
+        expected_hash: str,
+        *,
+        apply: bool = False,
+        wrapper_after_sha256: str | None | object = ...,
     ) -> list[str]:
         arguments = [
             command,
@@ -185,11 +204,27 @@ class BootstrapLayout:
             "--expected-current-wrapper-sha256",
             expected_hash,
         ]
+        if command == "switch" and wrapper_after_sha256 is ... and apply:
+            wrapper_after_sha256 = _hash(
+                (self.snapshot_path / "wrapper.after").read_bytes()
+            )
+        if command == "switch" and isinstance(wrapper_after_sha256, str):
+            arguments.extend(
+                ["--expected-wrapper-after-sha256", wrapper_after_sha256]
+            )
         if apply:
             arguments.append("--apply")
         return arguments
 
     def prepare_target_args(self, wrapper_hash: str) -> list[str]:
+        wrapper_after_hash = _hash(
+            rollout.coherence.rewrite_rollout_wrapper(
+                self.stable_wrapper.read_bytes(),
+                self.baseline_path,
+                self.target_path,
+                "venv",
+            )
+        )
         return [
             "prepare",
             "--source-repo",
@@ -210,6 +245,8 @@ class BootstrapLayout:
             str(self.stable_wrapper),
             "--expected-current-wrapper-sha256",
             wrapper_hash,
+            "--expected-wrapper-after-sha256",
+            wrapper_after_hash,
             "--apply",
         ]
 
@@ -349,7 +386,41 @@ def test_bootstrap_apply_requires_pinned_manifest_hash_before_state_creation(
     assert not layout.state_root.exists()
 
 
-def test_bootstrap_apply_creates_exact_baseline_and_schema_v2_snapshot(
+def test_bootstrap_apply_requires_wrapper_after_hash_before_state_creation(
+    layout: BootstrapLayout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    before = _oracle(layout.root)
+    with monkeypatch.context() as writes:
+        _forbid_writes(writes)
+        assert rollout.main(
+            layout.bootstrap_args(
+                apply=True,
+                wrapper_after_sha256=None,
+            )
+        ) == 2
+    capsys.readouterr()
+    assert _oracle(layout.root) == before
+    assert not layout.state_root.exists()
+
+
+def test_bootstrap_apply_rejects_mismatched_wrapper_after_hash_before_write(
+    layout: BootstrapLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = rollout.build_parser().parse_args(layout.bootstrap_args(apply=True))
+    args.expected_wrapper_after_sha256 = "0" * 64
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("mismatched after hash reached state creation")
+
+    monkeypatch.setattr(rollout, "_create_state_root", forbidden)
+    with pytest.raises(rollout.RolloutError, match="wrapper.after SHA-256"):
+        rollout._run_bootstrap_prepare(args)
+
+
+def test_bootstrap_apply_creates_exact_baseline_and_schema_v3_snapshot(
     layout: BootstrapLayout, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result = _apply_bootstrap(layout, capsys)
@@ -367,8 +438,9 @@ def test_bootstrap_apply_creates_exact_baseline_and_schema_v2_snapshot(
     assert stat.S_IMODE(layout.stable_wrapper.stat().st_mode) == layout.wrapper_mode
 
     manifest = json.loads((layout.snapshot_path / "manifest.json").read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "bootstrap"
+    assert manifest["wrapper_contract"] == "source-cwd-nofile-v2"
     assert manifest["runtime_root"] == manifest["state_root"] == str(layout.state_root)
     assert manifest["before_runtime_kind"] == "export"
     assert manifest["before_runtime_sha"] == manifest["after_runtime_sha"]
@@ -393,10 +465,67 @@ def test_bootstrap_apply_creates_exact_baseline_and_schema_v2_snapshot(
     )
     assert UNKNOWN_VALUE.encode() not in snapshot_bytes
     assert (layout.snapshot_path / "wrapper.before").read_bytes() == layout.wrapper_before
-    expected_after = layout.wrapper_before.replace(
-        str(layout.export_runtime).encode(), str(layout.baseline_path).encode()
+    expected_after = rollout.coherence.rewrite_rollout_wrapper(
+        layout.wrapper_before,
+        layout.export_runtime,
+        layout.baseline_path,
+        "venv",
     )
     assert (layout.snapshot_path / "wrapper.after").read_bytes() == expected_after
+    assert expected_after.count(b"ulimit -S -n 4096\n") == 1
+    assert (
+        f"cd -- {layout.baseline_path}\n"
+        f"exec {layout.baseline_path}/venv/bin/python"
+    ).encode() in expected_after
+
+
+def test_historical_schema_v2_bootstrap_is_rollback_only_before_preflight(
+    layout: BootstrapLayout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _apply_bootstrap(layout, capsys)
+    manifest_path = layout.snapshot_path / "manifest.json"
+    after_path = layout.snapshot_path / "wrapper.after"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    historical_after = layout.wrapper_before.replace(
+        str(layout.export_runtime).encode(), str(layout.baseline_path).encode()
+    )
+    for key in rollout.state.MANIFEST_KEYS_V3 - rollout.state.MANIFEST_KEYS_V2:
+        manifest.pop(key, None)
+    manifest["schema_version"] = 2
+    manifest["wrapper_after_sha256"] = _hash(historical_after)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o600)
+    after_path.write_bytes(historical_after)
+    after_path.chmod(0o600)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("historical bootstrap reached preflight or replace")
+
+    with monkeypatch.context() as switch_guards:
+        switch_guards.setattr(
+            rollout.coherence, "import_preflight_session", forbidden
+        )
+        switch_guards.setattr(rollout.state, "_atomic_replace", forbidden)
+        assert rollout.main(
+            layout.transition_args("switch", layout.wrapper_before_sha256)
+        ) == 2
+    capsys.readouterr()
+
+    layout.stable_wrapper.write_bytes(historical_after)
+    layout.stable_wrapper.chmod(layout.wrapper_mode)
+    assert rollout.main(
+        layout.transition_args(
+            "rollback", _hash(historical_after), apply=True
+        )
+    ) == 0
+    capsys.readouterr()
+    assert layout.stable_wrapper.read_bytes() == layout.wrapper_before
+    assert stat.S_IMODE(layout.stable_wrapper.stat().st_mode) == layout.wrapper_mode
 
 
 @pytest.mark.parametrize(
@@ -651,7 +780,7 @@ def test_bootstrap_switch_rollback_and_followup_prepare_share_one_consumer(
     manifest = json.loads(target_snapshot.read_text())
     assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "rollout"
-    assert manifest["wrapper_contract"] == "source-cwd-v1"
+    assert manifest["wrapper_contract"] == "source-cwd-nofile-v2"
     assert manifest["runtime_root"] == manifest["state_root"] == str(layout.state_root)
     assert _git(layout.target_path, "rev-parse", "HEAD") == layout.target_commit
 

@@ -1,8 +1,11 @@
-> **Статус MATERIAL REMEDIATION DELTA:** exact approval раздела 22.x получено
-> от Руслана 2026-07-30 формулировкой «одобряю material ELF/resource
-> remediation baseline». Разрешены только implementation 22.3–22.6 и
-> авторская проверка только в режимах repo-local/temp-only. Действия в
-> live-среде, commit/push/PR, независимая приёмка и delivery gates не открыты.
+> **Текущий статус REMEDIATION BASELINE ПОСЛЕ BLOCK:** независимое ревью
+> дельты 26.x завершилось `BLOCK`. Реализация 26.3–26.5 и run
+> `128 passed` остаются только historical evidence, superseded и не приняты
+> как текущая acceptance. Baseline 27.x явно одобрен точной фразой
+> «одобряю material remediation baseline 27.x», valid red и минимальная
+> repo-local implementation 27.3–27.4 выполнены. Один exact five-module
+> author run дал `180 passed`; 27.5+, commit/push/PR и live-действия не
+> разрешены.
 
 ## Почему
 
@@ -178,7 +181,7 @@ FD при ошибках `write`/`lseek`/seal и фактическое отсу
   canonical `cd --` находится непосредственно перед `exec`. Comments-only
   match, missing `exec`, дополнительные команды, redirects и shell control
   operators отклоняются.
-- Устранить противоречия schema v2/v3, состава из четырёх helper test modules и
+- Устранить противоречия schema v2/v3, состава focused helper suite и
   dry-run evidence. `prepare` dry-run сообщает только план и доступные до
   candidate evidence; origin evidence появляется на `prepare --apply` и
   повторяется на `switch` dry-run/apply.
@@ -213,15 +216,24 @@ FD при ошибках `write`/`lseek`/seal и фактическое отсу
   восстановлен exact wrapper SHA-256 `17052c7d...` для snapshot
   `6f8738dc...-to-30500cf...`; process/restart/DB/Kanban/smoke не
   выполнялись.
-- Для новых ordinary rollout snapshots перейти на schema v3. Schema v2
-  остаётся readable и пригодной для rollback exact bytes, но новый switch на
-  target должен требовать v3 coherence evidence.
-- Ввести canonical `source-cwd-v1` контракт wrapper: после switch wrapper
-  явно выполняет `cd --` в exact target runtime и только затем `exec`
-  `<target>/venv/bin/python -m hermes_cli.main ...`.
-- Разрешить legacy schema v2 wrapper как `before` и как rollback target:
-  rollback восстанавливает exact bytes/mode и не зависит от исправности
-  импортов candidate.
+- Для всех fresh bootstrap и ordinary rollout snapshots использовать только
+  `schema_version=3`, `snapshot_kind=bootstrap|rollout` и
+  `wrapper_contract=source-cwd-nofile-v2`. Новый bootstrap
+  `wrapper.after` строит тот же canonical generator, что и ordinary rollout.
+- Любой `schema_version!=3`, а также historical schema-v3
+  `source-cwd-v1`, запретить для `switch` до preflight и первого managed
+  write/`os.replace`. Эти artifacts остаются отдельным snapshot-only
+  rollback input, который восстанавливает exact bytes/mode и не зависит от
+  исправности imports candidate. In-place migration отсутствует.
+- Для `bootstrap-prepare --apply`, `prepare --apply` и `switch --apply`
+  потребовать CLI guard `--expected-wrapper-after-sha256`. Dry-run только
+  сообщает вычисленный after SHA-256. Missing/mismatch завершается до первого
+  managed write, preflight и `os.replace`; rollback CLI не меняется.
+- Exact switch loader повторно проверяет `snapshot_kind`,
+  `wrapper_contract`, parsed `ulimit=4096`, hash manifest и actual
+  `wrapper.after` bytes. Отдельный plan digest не добавляется: after SHA-256
+  плюс exact code-level contract/limit validation достаточны. Planned soft
+  limit выводится из разобранного wrapper; manifest shape не расширяется.
 - Новый `prepare` строит deterministic `wrapper.after` и до создания snapshot
   выполняет sanitized no-DB import-origin preflight, доказывающий, что
   `hermes_cli.main` и `agent.transports.hermes_kanban_mcp_server`
@@ -230,18 +242,20 @@ FD при ошибках `write`/`lseek`/seal и фактическое отсу
 - `switch` повторяет точные проверки wrapper/hash/runtime/import-origin перед
   atomic replacement; malformed или ambiguous wrapper завершается
   fail-closed до записи.
-- Приёмка остается только во временном окружении: rollout из legacy в canonical,
-  rollout из canonical в canonical, совместимость v2 rollback, v3 switch/rollback,
-  затенение старым `site-packages`, dry-run без записи, точный список tools,
-  четыре helper test modules, OS-level containment и host-canary oracle,
+- Приёмка остается только во временном окружении: fresh bootstrap и rollout
+  schema v3, rollout из legacy в canonical, rollout из canonical в canonical,
+  совместимость historical rollback, v3 switch/rollback, затенение старым
+  `site-packages`, dry-run без записи, точный список tools,
+  пять helper test modules, OS-level containment и host-canary oracle,
   rollout test `<=850`, support `<400`, source/test files `<1000`, минимум
   100 строк запаса у
   `runtime_coherence.py`, strict OpenSpec и independent review без `BLOCK`.
   Независимая validation выполняется в `workspace-write` sandbox, но review
   остаётся source-read-only: tests могут писать только temp/cache/evidence.
-  Обязательны два последовательных успешных запуска одной exact four-suite
-  команды. Если support extraction не добавляет test module, exact команда
-  сохраняет существующие четыре test modules.
+  Обязательны два последовательных успешных запуска одной exact five-module
+  команды для bootstrap, rollout, runtime coherence, runtime sandbox и
+  rollout state с `HERMES_TEST_FILE_RETRIES=0`, без retry/`FLAKY` и с
+  идентичными pre/post fingerprints.
 - Гейты доставки заново разделены: только после нового явного одобрения
   material sealed-bundle baseline разрешаются implementation/tests и новый
   цикл независимой проверки; `commit`/`push`/`PR`
@@ -273,17 +287,17 @@ FD при ошибках `write`/`lseek`/seal и фактическое отсу
   Также закрепить `SHA-256` и режим интерпретатора, `SHA-256` и режим
   стабильного `wrapper`, а также ровно одну ссылку `wrapper` на
   экспортированную среду.
-- Создать bootstrap snapshot, содержащий только schema v2 manifest,
-  `wrapper.before` и exact `wrapper.after`; stable wrapper, процессы, DB,
-  services и network не менять.
+- Создавать fresh bootstrap snapshot только как schema v3 manifest с
+  `snapshot_kind=bootstrap`, `wrapper_contract=source-cwd-nofile-v2`,
+  `wrapper.before` и exact canonical-generated `wrapper.after`; stable
+  wrapper, процессы, DB, services и network не менять.
 - Исторический bootstrap-helper заменил snapshot schema v1 на schema v2 с
   `snapshot_kind=bootstrap|rollout` и общей моделью before/after runtime;
   новый ordinary rollout использует schema v3, а существующий rollout v2
   остаётся только rollback-readable.
-  Обратную совместимость для schema v1 не добавлять: по входному evidence
-  live state root, baseline, target и snapshots отсутствуют; implementation
-  обязана отдельно проверить отсутствие v1 live snapshots до любого live
-  apply.
+  Любой реально встреченный non-v3 artifact может быть только отдельным
+  snapshot-only exact bytes/mode rollback input; fresh creation и switch
+  запрещены, in-place migration отсутствует.
 - `switch` не получает отдельную bootstrap atomic policy: полная validation
   повторно проверяет export/runtime evidence и использует общий atomic
   primitive. `rollback` использует отдельный snapshot-only loader, но тот же
@@ -314,6 +328,12 @@ FD при ошибках `write`/`lseek`/seal и фактическое отсу
 
 ### Изменённые возможности
 
+- `dedicated-kanban-mcp-surface`: новый canonical wrapper получает
+  process-local finite soft `RLIMIT_NOFILE=4096` до запуска Python. Это
+  observable environment contract только нового wrapper kind; исторические
+  `source-cwd-v1`/schema-v2 wrappers остаются rollback-readable и
+  byte-identical.
+
 Нет отдельных archived capabilities: delta остаётся внутри уже открытого
 change и его существующей capability.
 
@@ -328,11 +348,12 @@ change и его существующей capability.
   `tests/scripts/test_hermes_kanban_mcp_rollout.py`,
   `tests/scripts/test_hermes_kanban_mcp_bootstrap.py` и artifacts этого
   OpenSpec change.
-- После нового approval remediation repair PR может менять только rollout
-  helper, state/runtime-coherence/OS-sandbox helpers, один отдельный common
-  ownership module для path/Git/venv primitives, четыре focused temp-only
-  helper test modules, test support/fixtures и artifacts этого OpenSpec
-  изменения; продуктовые модули,
+- После нового approval remediation repair PR может менять только
+  `scripts/hermes_kanban_mcp_rollout.py`,
+  `scripts/hermes_kanban_mcp_rollout_state.py`, неизбежную минимальную часть
+  `scripts/hermes_kanban_mcp_runtime_coherence.py`, пять focused temp-only
+  helper test modules, существующие test support/common owners и artifacts
+  этого OpenSpec изменения; продуктовые модули,
   dependency metadata, runtime wrapper/state, process, DB и Kanban остаются
   вне scope.
 - Production modules, зависимости, DB schema/migrations, connector config,
@@ -396,3 +417,71 @@ content memfd и сверяет его с approved plan. Сам acquisition не
 и load-bearing часть 24.3 переоткрывались на valid behavioral red и закрыты
 только targeted green. Новый approval не требуется; independent, delivery,
 commit/push/PR и live gates остаются открытыми.
+
+## Материальная дельта 26.x: process-local NOFILE capacity canonical wrapper
+
+Merged PR #18 получил `CODE VERDICT APPROVE`. В review sandbox finite
+`RLIMIT_NOFILE` был `1048576/1048576`, и exact suite дважды завершился
+`163 passed`. Однако read-only probe normal HOSTKEY shell и текущих MCP
+процессов показал finite soft/hard `1024/1048576`, тогда как sealed plan
+требует `1360`; существующий fail-closed при soft `1024` корректен и не
+ослабляется.
+
+Observable environment contract меняется только для нового canonical wrapper
+kind: до `cd --` и `exec` Python wrapper устанавливает process-local finite
+soft limit точной строкой `ulimit -S -n 4096`. Значение `4096` больше
+измеренного требования `1360`, даёт примерно трёхкратный запас, остаётся
+finite и ниже наблюдавшегося hard limit. Hard limit не повышается, unlimited
+не используется; root, systemd, `prlimit` и внешний launcher не требуются.
+Стабильный live wrapper, его bytes/mode и процессы этим planning delta не
+меняются.
+
+Фраза пользователя «Даю апрув» разрешает подготовить и проверить этот
+material delta, но не реализацию. Перед implementation exact baseline
+26.x должен быть показан пользователю и получить ещё одно явное approval по
+глобальному OpenSpec gate. Ни code/PR/merge, ни это planning approval не
+разрешают live prepare/switch, wrapper replacement, process replacement,
+MCP smoke, DB, systemd, restart, deploy или network action.
+
+## Remediation baseline 27.x после независимого `BLOCK`
+
+Independent review не принял дельту 26.x как завершённую. Evidence
+26.3–26.5 сохраняется только исторически: оно не доказало единый fresh
+bootstrap/rollout schema contract, обязательный after-hash CLI guard и
+финальную five-module acceptance. Текущий `128 passed` sibling run не
+является заменой новой exact suite.
+
+Новый baseline ограничивает implementation следующими файлами после
+отдельного approval:
+
+- `scripts/hermes_kanban_mcp_rollout.py`;
+- `scripts/hermes_kanban_mcp_rollout_state.py`;
+- только неизбежная минимальная правка
+  `scripts/hermes_kanban_mcp_runtime_coherence.py`;
+- `tests/scripts/test_hermes_kanban_mcp_bootstrap.py`;
+- `tests/scripts/test_hermes_kanban_mcp_rollout.py`;
+- `tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py`;
+- `tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py`;
+- `tests/scripts/test_hermes_kanban_mcp_rollout_state.py`;
+- при необходимости только существующие
+  `scripts/hermes_kanban_mcp_rollout_common.py` и
+  `tests/scripts/hermes_kanban_mcp_test_support.py` как substantive owners.
+
+`runtime_coherence.py` уже содержит `897/900` строк. Новую state/CLI policy
+нельзя добавлять туда, кроме минимальной правки canonical generator/parser,
+без которой exact code-level validation невозможна. Основная schema,
+loader, hash-guard и CLI orchestration policy принадлежит rollout state и
+rollout owners. Если line cap потребует extraction, разрешён перенос только
+в существующий substantive support/common owner; новый thin wrapper
+запрещён.
+
+RLIMIT tests обязаны быть hermetic: отдельный child Python trampoline сам
+устанавливает контролируемые soft/hard limits и запускает wrapper. Тесты не
+зависят от ambient hard limit или infinity и не используют `preexec_fn`.
+
+Перед code remediation exact baseline должен быть показан пользователю и
+получить новое явное approval. Затем обязательны valid red matrix,
+implementation, два последовательных exact five-module run с retries `0`,
+без `FLAKY` и с идентичными fingerprints, accepted independent review и
+строго non-live PR lifecycle. Прежние `25.7`, `26.6` и `26.7+`, а также все
+live gates остаются открытыми.
