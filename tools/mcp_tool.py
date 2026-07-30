@@ -1180,7 +1180,12 @@ class SamplingHandler:
 
     _STOP_REASON_MAP = {"stop": "endTurn", "length": "maxTokens", "tool_calls": "toolUse"}
 
-    def __init__(self, server_name: str, config: dict):
+    def __init__(
+        self,
+        server_name: str,
+        config: dict,
+        owner: Optional["MCPServerTask"] = None,
+    ):
         self.server_name = server_name
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
@@ -1190,6 +1195,7 @@ class SamplingHandler:
         )
         self.model_override = config.get("model")
         self.allowed_models = config.get("allowed_models", [])
+        self.owner = owner
 
         _log_levels = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
         self.audit_level = _log_levels.get(
@@ -1411,6 +1417,27 @@ class SamplingHandler:
         ``CreateMessageResult``, ``CreateMessageResultWithTools``, or
         ``ErrorData``.
         """
+        captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        try:
+            from agent.secret_scope import is_multiplex_active
+        except Exception:
+            multiplex_active = False
+        else:
+            multiplex_active = is_multiplex_active()
+
+        if multiplex_active:
+            key = (
+                captured.copy().run(_strict_current_mcp_pool_key)
+                if captured is not None
+                else None
+            )
+            if key is None:
+                self.metrics["errors"] += 1
+                return self._error(
+                    "Sampling denied: strict resolved MCP context required "
+                    f"for server '{self.server_name}'"
+                )
+
         # Rate limit
         if not self._check_rate_limit():
             logger.warning(
@@ -1479,7 +1506,7 @@ class SamplingHandler:
         )
 
         # Offload sync LLM call to thread (non-blocking)
-        def _sync_call():
+        def _invoke_call_llm():
             return call_llm(
                 task="mcp",
                 model=resolved_model or None,
@@ -1489,6 +1516,11 @@ class SamplingHandler:
                 tools=call_tools,
                 timeout=self.timeout,
             )
+
+        def _sync_call():
+            if captured is None:
+                return _invoke_call_llm()
+            return captured.copy().run(_invoke_call_llm)
 
         try:
             response = await asyncio.wait_for(
@@ -2874,7 +2906,7 @@ class MCPServerTask:
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
         if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
-            self._sampling = SamplingHandler(self.name, sampling_config)
+            self._sampling = SamplingHandler(self.name, sampling_config, owner=self)
         else:
             self._sampling = None
 
