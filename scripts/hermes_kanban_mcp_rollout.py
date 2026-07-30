@@ -14,28 +14,60 @@ from pathlib import Path
 from typing import Any, Sequence
 
 try:
+    from scripts import hermes_kanban_mcp_runtime_coherence as coherence
     from scripts import hermes_kanban_mcp_rollout_state as state
+    from scripts.hermes_kanban_mcp_rollout_common import (
+        FULL_GIT_SHA,
+        FULL_SHA256,
+        RolloutError,
+        Wrapper,
+        canonical_path as _canonical_path,
+        lexists as _lexists,
+        read_wrapper as _read_wrapper,
+        require_full_sha as _require_full_sha,
+        run_git as _run_git,
+        sha256 as _sha256,
+        strictly_within as _strictly_within,
+        validate_absent_state_root as _validate_absent_state_root,
+        validate_clean_worktree as _validate_clean_worktree,
+        validate_commit as _validate_commit,
+        validate_managed_root as _validate_managed_root,
+        validate_repo_root as _validate_repo_root,
+        validate_roots as _validate_roots,
+        validate_venv as _validate_venv,
+        validate_venv_startup as _validate_venv_startup,
+        validate_wrapper_contract as _validate_wrapper_contract,
+    )
 except ModuleNotFoundError:
+    import hermes_kanban_mcp_runtime_coherence as coherence
     import hermes_kanban_mcp_rollout_state as state
+    from hermes_kanban_mcp_rollout_common import (
+        FULL_GIT_SHA,
+        FULL_SHA256,
+        RolloutError,
+        Wrapper,
+        canonical_path as _canonical_path,
+        lexists as _lexists,
+        read_wrapper as _read_wrapper,
+        require_full_sha as _require_full_sha,
+        run_git as _run_git,
+        sha256 as _sha256,
+        strictly_within as _strictly_within,
+        validate_absent_state_root as _validate_absent_state_root,
+        validate_clean_worktree as _validate_clean_worktree,
+        validate_commit as _validate_commit,
+        validate_managed_root as _validate_managed_root,
+        validate_repo_root as _validate_repo_root,
+        validate_roots as _validate_roots,
+        validate_venv as _validate_venv,
+        validate_venv_startup as _validate_venv_startup,
+        validate_wrapper_contract as _validate_wrapper_contract,
+    )
 
 
-RolloutError = state.RolloutError
 ReplacementAppliedError = state.ReplacementAppliedError
-Wrapper = state.Wrapper
-_canonical_path = state.canonical_path
-_lexists = state.lexists
-_read_wrapper = state.read_wrapper
-_require_full_sha = state.require_full_sha
-_run_git = state.run_git
-_sha256 = state.sha256
-_strictly_within = state.strictly_within
-_validate_clean_worktree = state.validate_clean_worktree
-_validate_commit = state.validate_commit
-_validate_managed_root = state.validate_managed_root
-_validate_repo_root = state.validate_repo_root
-_validate_roots = state.validate_roots
-_validate_venv = state.validate_venv
-_validate_wrapper_contract = state.validate_wrapper_contract
+_rewrite_rollout_wrapper = coherence.rewrite_rollout_wrapper
+_validate_rollout_wrapper = coherence.parse_rollout_wrapper
 _write_snapshot = state.write_snapshot
 
 
@@ -53,6 +85,7 @@ class PrepareContext:
     venv_dirname: str
     interpreter_sha256: str
     interpreter_mode: int
+    pyvenv_cfg_sha256: str
     wrapper: Wrapper
     wrapper_after: bytes
     wrapper_after_sha256: str
@@ -141,17 +174,17 @@ def _prepare_context(args: argparse.Namespace) -> PrepareContext:
     stable_path = _canonical_path(args.stable_wrapper, "stable wrapper", must_exist=True)
     current_sha = _require_full_sha(
         args.expected_current_runtime_sha,
-        state.FULL_GIT_SHA,
+        FULL_GIT_SHA,
         "expected current runtime SHA",
     )
     candidate_sha = _require_full_sha(
-        args.candidate_sha, state.FULL_GIT_SHA, "candidate SHA"
+        args.candidate_sha, FULL_GIT_SHA, "candidate SHA"
     )
     if current_sha == candidate_sha:
         raise RolloutError("candidate SHA must differ from current runtime SHA")
     expected_wrapper_hash = _require_full_sha(
         args.expected_current_wrapper_sha256,
-        state.FULL_SHA256,
+        FULL_SHA256,
         "expected current wrapper SHA-256",
     )
 
@@ -165,6 +198,9 @@ def _prepare_context(args: argparse.Namespace) -> PrepareContext:
     _validate_clean_worktree(current_runtime, current_sha, "current runtime")
     _validate_commit(source_repo, candidate_sha, "candidate SHA")
     interpreter_hash, interpreter_mode = _validate_venv(
+        current_runtime, args.venv_dirname
+    )
+    _pyvenv_cfg, pyvenv_cfg_sha256, _site_packages = _validate_venv_startup(
         current_runtime, args.venv_dirname
     )
 
@@ -185,9 +221,10 @@ def _prepare_context(args: argparse.Namespace) -> PrepareContext:
     wrapper = _read_wrapper(stable_path)
     if wrapper.sha256 != expected_wrapper_hash:
         raise RolloutError("stable wrapper SHA-256 does not match the explicit guard")
-    wrapper_after, replacement_count = _transform_wrapper(
-        wrapper, current_runtime, candidate_path
+    wrapper_after = _rewrite_rollout_wrapper(
+        wrapper.data, current_runtime, candidate_path, args.venv_dirname
     )
+    replacement_count = wrapper.data.decode("utf-8").count(str(current_runtime))
     return PrepareContext(
         source_repo=source_repo,
         runtime_root=runtime_root,
@@ -201,6 +238,7 @@ def _prepare_context(args: argparse.Namespace) -> PrepareContext:
         venv_dirname=args.venv_dirname,
         interpreter_sha256=interpreter_hash,
         interpreter_mode=interpreter_mode,
+        pyvenv_cfg_sha256=pyvenv_cfg_sha256,
         wrapper=wrapper,
         wrapper_after=wrapper_after,
         wrapper_after_sha256=_sha256(wrapper_after),
@@ -220,17 +258,17 @@ def _bootstrap_context(args: argparse.Namespace) -> BootstrapContext:
     stable_path = _canonical_path(args.stable_wrapper, "stable wrapper", must_exist=True)
     source_commit = _require_full_sha(
         args.expected_source_commit,
-        state.FULL_GIT_SHA,
+        FULL_GIT_SHA,
         "expected source commit",
     )
     expected_interpreter_hash = _require_full_sha(
         args.expected_venv_interpreter_sha256,
-        state.FULL_SHA256,
+        FULL_SHA256,
         "expected venv interpreter SHA-256",
     )
     expected_wrapper_hash = _require_full_sha(
         args.expected_current_wrapper_sha256,
-        state.FULL_SHA256,
+        FULL_SHA256,
         "expected current wrapper SHA-256",
     )
     expected_manifest_hash = args.expected_export_manifest_sha256
@@ -241,11 +279,11 @@ def _bootstrap_context(args: argparse.Namespace) -> BootstrapContext:
     if expected_manifest_hash is not None:
         expected_manifest_hash = _require_full_sha(
             expected_manifest_hash,
-            state.FULL_SHA256,
+            FULL_SHA256,
             "expected export manifest SHA-256",
         )
 
-    state.validate_absent_state_root(state_root)
+    _validate_absent_state_root(state_root)
     _validate_managed_root(export_runtime, "export runtime")
     _validate_repo_root(source_repo, "source repo")
     if state_root.is_relative_to(export_runtime) or export_runtime.is_relative_to(
@@ -283,6 +321,7 @@ def _bootstrap_context(args: argparse.Namespace) -> BootstrapContext:
     wrapper = _read_wrapper(stable_path)
     if wrapper.sha256 != expected_wrapper_hash:
         raise RolloutError("stable wrapper SHA-256 does not match the explicit guard")
+    _validate_rollout_wrapper(wrapper.data, export_runtime, args.venv_dirname)
     wrapper_after, replacements = _transform_wrapper(
         wrapper, export_runtime, baseline_path, exact_replacements=1
     )
@@ -305,7 +344,9 @@ def _bootstrap_context(args: argparse.Namespace) -> BootstrapContext:
     )
 
 
-def _prepare_manifest(context: PrepareContext) -> dict[str, Any]:
+def _prepare_manifest(
+    context: PrepareContext, import_evidence: state.ImportEvidence
+) -> dict[str, Any]:
     return state.make_manifest(
         snapshot_kind="rollout",
         source_repo=context.source_repo,
@@ -327,6 +368,8 @@ def _prepare_manifest(context: PrepareContext) -> dict[str, Any]:
         wrapper_after_sha256=context.wrapper_after_sha256,
         wrapper_mode=context.wrapper.mode,
         runtime_path_replacements=context.replacement_count,
+        schema_version=3,
+        import_evidence=import_evidence,
     )
 
 
@@ -369,7 +412,8 @@ def _prepare_plan(context: PrepareContext, apply: bool) -> dict[str, Any]:
             "validate exact Git SHA, tracked cleanliness, paths, venv and wrapper",
             f"git worktree add --detach {context.candidate_path} {context.candidate_sha}",
             f"copy only {context.current_runtime / context.venv_dirname} to candidate",
-            "create exclusive schema v2 rollout snapshot",
+            "run sanitized no-DB target import-origin preflight",
+            "create exclusive schema v3 rollout snapshot",
             "leave stable wrapper unchanged",
         ],
     }
@@ -414,6 +458,7 @@ def _copy_venv(
     dirname: str,
     interpreter_sha256: str,
     interpreter_mode: int,
+    pyvenv_cfg_sha256: str | None = None,
 ) -> None:
     source = source_runtime / dirname
     destination = destination_runtime / dirname
@@ -429,10 +474,16 @@ def _copy_venv(
         expected_sha256=interpreter_sha256,
         expected_mode=interpreter_mode,
     )
+    if pyvenv_cfg_sha256 is not None:
+        _validate_venv_startup(
+            destination_runtime,
+            dirname,
+            expected_pyvenv_cfg_sha256=pyvenv_cfg_sha256,
+        )
 
 
 def _create_state_root(path: Path) -> None:
-    state.validate_absent_state_root(path)
+    _validate_absent_state_root(path)
     try:
         os.mkdir(path, 0o700)
         os.chmod(path, 0o700)
@@ -470,24 +521,31 @@ def _run_prepare(args: argparse.Namespace) -> dict[str, Any]:
         context.venv_dirname,
         context.interpreter_sha256,
         context.interpreter_mode,
+        context.pyvenv_cfg_sha256,
     )
     _validate_clean_worktree(
         context.candidate_path, context.candidate_sha, "candidate runtime"
     )
-    _write_snapshot(
-        context.snapshot_path,
-        _prepare_manifest(context),
-        context.wrapper.data,
-        context.wrapper_after,
-    )
-    loaded = _load_created_snapshot(
-        context.runtime_root, context.state_root, context.snapshot_id, context.wrapper
-    )
-    if (
-        loaded.stable_wrapper.sha256 != context.wrapper.sha256
-        or loaded.stable_wrapper.mode != context.wrapper.mode
-    ):
-        raise RolloutError("prepare changed the stable wrapper")
+    with coherence.import_preflight_session(
+        context.candidate_path,
+        context.venv_dirname,
+        expected_pyvenv_cfg_sha256=context.pyvenv_cfg_sha256,
+    ) as import_evidence:
+        plan["import_origin"] = import_evidence.manifest_fields()
+        _write_snapshot(
+            context.snapshot_path,
+            _prepare_manifest(context, import_evidence),
+            context.wrapper.data,
+            context.wrapper_after,
+        )
+        loaded = _load_created_snapshot(
+            context.runtime_root, context.state_root, context.snapshot_id, context.wrapper
+        )
+        if (
+            loaded.stable_wrapper.sha256 != context.wrapper.sha256
+            or loaded.stable_wrapper.mode != context.wrapper.mode
+        ):
+            raise RolloutError("prepare changed the stable wrapper")
     plan["result"] = "prepared"
     return plan
 
@@ -596,20 +654,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             plan = _run_switch_or_rollback(args)
     except ReplacementAppliedError as exc:
-        print(
-            json.dumps(
-                {
-                    "error": str(exc),
-                    "expected_installed_sha256": exc.expected_sha256,
-                    "replacement_applied": True,
-                    "required_action": "inspect/rollback",
-                },
-                sort_keys=True,
-            ),
-            file=sys.stderr,
-        )
+        failure = {
+            "error": str(exc),
+            "expected_installed_sha256": exc.expected_sha256,
+            "replacement_applied": True,
+            "required_action": "inspect/rollback",
+        }
+        if exc.cleanup_failures:
+            failure["cleanup_failures"] = list(exc.cleanup_failures)
+            failure["primary_failure"] = str(exc.primary_failure)
+        print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 2
-    except (RolloutError, OSError) as exc:
+    except RolloutError as exc:
+        if exc.cleanup_failures:
+            print(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "primary_failure": str(exc.primary_failure),
+                        "cleanup_failures": list(exc.cleanup_failures),
+                        "replacement_applied": exc.replacement_applied,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(plan, indent=2, sort_keys=True))

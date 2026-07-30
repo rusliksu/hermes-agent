@@ -1,18 +1,27 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
 import stat
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
+from tests.scripts.hermes_kanban_mcp_test_support import (
+    RolloutLayout as Layout,
+    assert_exact_rollout_origins as _assert_exact_rollout_origins,
+    build_rollout_layout,
+    content_oracle as _content_oracle,
+    filesystem_oracle as _filesystem_oracle,
+    git as _git,
+    hash_bytes as _hash,
+    install_trusted_bwrap_result,
+    rollout_temporary_paths as _rollout_temporary_paths,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts" / "hermes_kanban_mcp_rollout.py"
@@ -23,229 +32,16 @@ sys.modules[SPEC.name] = rollout
 SPEC.loader.exec_module(rollout)
 
 
-def _git(repo: Path, *arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "--no-optional-locks", "-C", str(repo), *arguments],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return completed.stdout.strip()
-
-
-def _hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _filesystem_oracle(root: Path) -> tuple[tuple[object, ...], ...]:
-    records: list[tuple[object, ...]] = []
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        base = Path(directory)
-        for name in sorted(dirnames + filenames):
-            path = base / name
-            relative = str(path.relative_to(root))
-            info = path.lstat()
-            mode = stat.S_IMODE(info.st_mode)
-            if path.is_symlink():
-                records.append((relative, "symlink", mode, os.readlink(path), info.st_mtime_ns))
-            elif path.is_file():
-                records.append(
-                    (relative, "file", mode, _hash(path.read_bytes()), info.st_mtime_ns)
-                )
-            else:
-                records.append((relative, "directory", mode, info.st_mtime_ns))
-    return tuple(records)
-
-
-def _content_oracle(root: Path) -> dict[str, tuple[object, ...]]:
-    return {str(record[0]): record[1:-1] for record in _filesystem_oracle(root)}
-
-
-def _rollout_temporary_paths(layout: Layout) -> tuple[Path, ...]:
-    return tuple(
-        sorted(
-            layout.stable_wrapper.parent.glob(
-                f".{layout.stable_wrapper.name}.rollout-*"
-            )
-        )
-    )
-
-
-def _is_at_or_below(path: str, root: str) -> bool:
-    return path == root or path.startswith(f"{root}/")
-
-
-def _assert_exact_rollout_origins(
-    before: dict[str, tuple[object, ...]],
-    after: dict[str, tuple[object, ...]],
-    layout: Layout,
-    *,
-    snapshot_expected: bool,
+@pytest.fixture(autouse=True)
+def _trusted_bwrap_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    candidate = str(layout.candidate_path.relative_to(layout.root))
-    snapshot = str(layout.snapshot_path.relative_to(layout.root))
-    snapshots_root = str(layout.snapshot_path.parent.relative_to(layout.root))
-    git_admin = str(
-        (
-            layout.source
-            / ".git"
-            / "worktrees"
-            / layout.candidate_path.name
-        ).relative_to(layout.root)
-    )
-    added = set(after) - set(before)
-    assert set(before) - set(after) == set()
-    assert {
-        path
-        for path in set(before) & set(after)
-        if before[path] != after[path]
-    } == set()
-    allowed = {
-        path
-        for path in added
-        if _is_at_or_below(path, candidate)
-        or _is_at_or_below(path, git_admin)
-        or (
-            snapshot_expected
-            and (
-                path == snapshots_root
-                or _is_at_or_below(path, snapshot)
-            )
-        )
-    }
-    assert added == allowed
-    assert candidate in added
-    assert git_admin in added
-    if snapshot_expected:
-        assert snapshot in added
-
-
-@dataclass
-class Layout:
-    root: Path
-    source: Path
-    runtime_root: Path
-    state_root: Path
-    current_runtime: Path
-    stable_wrapper: Path
-    current_sha: str
-    candidate_sha: str
-    wrapper_before: bytes
-    wrapper_before_hash: str
-    wrapper_mode: int
-
-    @property
-    def candidate_path(self) -> Path:
-        return self.runtime_root / f"hermes-kanban-mcp-{self.candidate_sha}"
-
-    @property
-    def snapshot_id(self) -> str:
-        return f"{self.current_sha}-to-{self.candidate_sha}"
-
-    @property
-    def snapshot_path(self) -> Path:
-        return self.state_root / "snapshots" / self.snapshot_id
-
-    def prepare_args(self, *, apply: bool = False) -> list[str]:
-        result = [
-            "prepare",
-            "--source-repo",
-            str(self.source),
-            "--runtime-root",
-            str(self.runtime_root),
-            "--state-root",
-            str(self.state_root),
-            "--current-runtime",
-            str(self.current_runtime),
-            "--expected-current-runtime-sha",
-            self.current_sha,
-            "--candidate-sha",
-            self.candidate_sha,
-            "--venv-dirname",
-            ".venv",
-            "--stable-wrapper",
-            str(self.stable_wrapper),
-            "--expected-current-wrapper-sha256",
-            self.wrapper_before_hash,
-        ]
-        if apply:
-            result.append("--apply")
-        return result
-
-    def transition_args(
-        self, command: str, expected_hash: str, *, apply: bool = False
-    ) -> list[str]:
-        result = [
-            command,
-            "--runtime-root",
-            str(self.runtime_root),
-            "--state-root",
-            str(self.state_root),
-            "--snapshot-id",
-            self.snapshot_id,
-            "--stable-wrapper",
-            str(self.stable_wrapper),
-            "--expected-current-wrapper-sha256",
-            expected_hash,
-        ]
-        if apply:
-            result.append("--apply")
-        return result
+    install_trusted_bwrap_result(monkeypatch, rollout, tmp_path)
 
 
 @pytest.fixture
 def layout(tmp_path: Path) -> Layout:
-    source = tmp_path / "source"
-    runtime_root = tmp_path / "runtimes"
-    state_root = tmp_path / "rollout-state"
-    stable_wrapper = tmp_path / "bin" / "hermes-kanban-mcp"
-    source.mkdir()
-    runtime_root.mkdir()
-    state_root.mkdir()
-    stable_wrapper.parent.mkdir()
-
-    _git(source, "init")
-    _git(source, "config", "user.email", "tests@example.invalid")
-    _git(source, "config", "user.name", "Hermes rollout tests")
-    payload = source / "payload.txt"
-    payload.write_text("current\n", encoding="utf-8")
-    _git(source, "add", "payload.txt")
-    _git(source, "commit", "-m", "current")
-    current_sha = _git(source, "rev-parse", "HEAD")
-    current_runtime = runtime_root / f"hermes-kanban-mcp-{current_sha}"
-    payload.write_text("candidate\n", encoding="utf-8")
-    _git(source, "commit", "-am", "candidate")
-    candidate_sha = _git(source, "rev-parse", "HEAD")
-    _git(source, "worktree", "add", "--detach", str(current_runtime), current_sha)
-
-    interpreter = current_runtime / ".venv" / "bin" / "python"
-    interpreter.parent.mkdir(parents=True)
-    interpreter.write_bytes(b"#!/bin/sh\nexit 0\n")
-    interpreter.chmod(0o700)
-    (current_runtime / "do-not-copy.txt").write_text("untracked runtime data\n", encoding="utf-8")
-
-    wrapper_before = (
-        b"#!/bin/sh\nexec "
-        + str(interpreter).encode()
-        + b" -m hermes_cli.main mcp serve-kanban --allow-write \"$@\"\n"
-    )
-    wrapper_mode = 0o750
-    stable_wrapper.write_bytes(wrapper_before)
-    stable_wrapper.chmod(wrapper_mode)
-    return Layout(
-        root=tmp_path,
-        source=source,
-        runtime_root=runtime_root,
-        state_root=state_root,
-        current_runtime=current_runtime,
-        stable_wrapper=stable_wrapper,
-        current_sha=current_sha,
-        candidate_sha=candidate_sha,
-        wrapper_before=wrapper_before,
-        wrapper_before_hash=_hash(wrapper_before),
-        wrapper_mode=wrapper_mode,
-    )
+    return build_rollout_layout(tmp_path)
 
 
 def _forbid_write_primitives(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,8 +139,13 @@ def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible
         "stable_wrapper",
     ):
         assert Path(manifest[key]).is_relative_to(layout.root)
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "rollout"
+    assert manifest["wrapper_contract"] == "source-cwd-v1"
+    assert manifest["write_tools"] == [
+        "kanban_enqueue",
+        "kanban_sync_external_task",
+    ]
     assert manifest["before_manifest_path"] is None
     assert manifest["before_manifest_sha256"] is None
     assert (layout.snapshot_path / "wrapper.before").read_bytes() == layout.wrapper_before
@@ -463,75 +264,66 @@ def test_prepare_guards_fail_before_writes(
     assert layout.stable_wrapper.read_bytes() == layout.wrapper_before
 
 
+def _assert_prepare_rejected_without_side_effects(
+    layout: Layout, capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    before = _filesystem_oracle(layout.root)
+    assert rollout.main(arguments) == 2
+    capsys.readouterr()
+    assert _filesystem_oracle(layout.root) == before
+    assert layout.stable_wrapper.read_bytes() == layout.wrapper_before
+
+def test_existing_candidate_blocks_prepare_without_snapshot_side_effect(
+    layout: Layout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    layout.candidate_path.mkdir()
+    _assert_prepare_rejected_without_side_effects(
+        layout, capsys, layout.prepare_args(apply=True)
+    )
+    assert not layout.snapshot_path.exists()
+
+def test_existing_snapshot_blocks_prepare_without_candidate_side_effect(
+    layout: Layout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    layout.snapshot_path.mkdir(parents=True)
+    _assert_prepare_rejected_without_side_effects(
+        layout, capsys, layout.prepare_args(apply=True)
+    )
+    assert not layout.candidate_path.exists()
+
+def test_symlink_stable_wrapper_blocks_prepare_without_managed_writes(
+    layout: Layout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wrapper_link = layout.root / "bin" / "symlink-wrapper"
+    wrapper_link.symlink_to(layout.stable_wrapper)
+    arguments = _replace_option(
+        layout.prepare_args(apply=True), "--stable-wrapper", str(wrapper_link)
+    )
+    _assert_prepare_rejected_without_side_effects(layout, capsys, arguments)
+
+@pytest.mark.parametrize("target", ["candidate-parent", "snapshot-parent"])
+def test_future_candidate_or_snapshot_parent_symlink_blocks_prepare_writes(
+    layout: Layout, capsys: pytest.CaptureFixture[str], target: str
+) -> None:
+    if target == "candidate-parent":
+        real_root = layout.root / "real-runtimes"
+        layout.runtime_root.rename(real_root)
+        layout.runtime_root.symlink_to(real_root, target_is_directory=True)
+    else:
+        outside = layout.root / "outside-snapshots"
+        outside.mkdir()
+        (layout.state_root / "snapshots").symlink_to(
+            outside, target_is_directory=True
+        )
+    _assert_prepare_rejected_without_side_effects(
+        layout, capsys, layout.prepare_args(apply=True)
+    )
+
+
 def _replace_option(arguments: list[str], option: str, value: str) -> list[str]:
     changed = list(arguments)
     changed[changed.index(option) + 1] = value
     return changed
-
-
-def test_existing_candidate_and_symlink_wrapper_fail_closed(
-    layout: Layout, capsys: pytest.CaptureFixture[str]
-) -> None:
-    layout.candidate_path.mkdir()
-    before = layout.stable_wrapper.read_bytes()
-    assert rollout.main(layout.prepare_args(apply=True)) == 2
-    capsys.readouterr()
-    assert layout.stable_wrapper.read_bytes() == before
-    assert not layout.snapshot_path.exists()
-
-    symlink_wrapper = layout.root / "bin" / "symlink-wrapper"
-    symlink_wrapper.symlink_to(layout.stable_wrapper)
-    arguments = _replace_option(
-        layout.prepare_args(apply=True), "--stable-wrapper", str(symlink_wrapper)
-    )
-    assert rollout.main(arguments) == 2
-    capsys.readouterr()
-    assert layout.stable_wrapper.read_bytes() == before
-
-
-def test_existing_snapshot_and_symlink_managed_paths_fail_closed(
-    layout: Layout, capsys: pytest.CaptureFixture[str]
-) -> None:
-    layout.snapshot_path.mkdir(parents=True)
-    before = _filesystem_oracle(layout.root)
-    assert rollout.main(layout.prepare_args(apply=True)) == 2
-    capsys.readouterr()
-    assert _filesystem_oracle(layout.root) == before
-
-    runtime_link = layout.root / "runtime-link"
-    runtime_link.symlink_to(layout.runtime_root, target_is_directory=True)
-    arguments = _replace_option(
-        layout.prepare_args(apply=True), "--runtime-root", str(runtime_link)
-    )
-    before = _filesystem_oracle(layout.root)
-    assert rollout.main(arguments) == 2
-    capsys.readouterr()
-    assert _filesystem_oracle(layout.root) == before
-
-
-@pytest.mark.parametrize("target", ["candidate-parent", "snapshot-parent"])
-def test_future_candidate_and_snapshot_parent_symlinks_fail_before_writes(
-    layout: Layout,
-    capsys: pytest.CaptureFixture[str],
-    target: str,
-) -> None:
-    if target == "candidate-parent":
-        real_runtime_root = layout.root / "real-runtimes"
-        layout.runtime_root.rename(real_runtime_root)
-        layout.runtime_root.symlink_to(real_runtime_root, target_is_directory=True)
-    else:
-        outside_snapshots = layout.root / "outside-snapshots"
-        outside_snapshots.mkdir()
-        (layout.state_root / "snapshots").symlink_to(
-            outside_snapshots, target_is_directory=True
-        )
-    before = _filesystem_oracle(layout.root)
-    assert rollout.main(layout.prepare_args(apply=True)) == 2
-    capsys.readouterr()
-    assert _filesystem_oracle(layout.root) == before
-    assert layout.stable_wrapper.read_bytes() == layout.wrapper_before
-    assert not os.path.lexists(layout.candidate_path)
-    assert _rollout_temporary_paths(layout) == ()
 
 
 def _replace_manifest_with_symlink(layout: Layout) -> None:
@@ -919,7 +711,7 @@ def test_post_replace_failures_report_applied_state_and_expected_hash(
     assert _rollout_temporary_paths(layout) == ()
 
 
-def test_unified_root_rollout_uses_schema_v2_and_remains_reversible(
+def test_unified_root_rollout_uses_schema_v3_and_remains_reversible(
     layout: Layout, capsys: pytest.CaptureFixture[str]
 ) -> None:
     layout.state_root.rmdir()
@@ -927,7 +719,7 @@ def test_unified_root_rollout_uses_schema_v2_and_remains_reversible(
     assert rollout.main(layout.prepare_args(apply=True)) == 0
     capsys.readouterr()
     manifest = json.loads((layout.snapshot_path / "manifest.json").read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "rollout"
     assert manifest["runtime_root"] == manifest["state_root"] == str(layout.runtime_root)
     wrapper_after = (layout.snapshot_path / "wrapper.after").read_bytes()

@@ -431,17 +431,18 @@ current/candidate Git SHA и ожидаемые SHA-256 evidence; он MUST NOT 
 - **WHEN** managed root, candidate, snapshot или stable wrapper использует
   relative path, `..`, symlink, broad target, path вне явно разрешённого root
   либо неожиданный существующий candidate
-- **THEN** helper отклоняет план до любого write primitive
+- **THEN** helper отклоняет план до любого примитива записи
 
 ### Requirement: Snapshot schema различает export bootstrap и обычный rollout
 
-Helper MUST использовать только `schema_version=2` с
-`snapshot_kind=bootstrap|rollout` и общей before/after runtime model.
-Bootstrap snapshot MUST закреплять export manifest path/byte SHA-256 и
-`source_commit`; rollout snapshot MUST иметь Git before/after runtimes.
-Schema v1 backward compatibility MUST NOT добавляться, пока dedicated live
-state root и snapshots отсутствуют. Существующий state root или schema v1
-artifact MUST закрывать bootstrap apply без migration или cleanup.
+Bootstrap snapshot MUST использовать `schema_version=2`, закреплять export
+manifest path/byte SHA-256 и `source_commit`. Уже существующие ordinary
+rollout snapshots schema v2 MUST оставаться readable только для
+snapshot-only rollback. Новый ordinary `prepare` MUST создавать
+`schema_version=3` с Git before/after runtimes и runtime-coherence evidence;
+новый switch-to-target по schema v2 MUST быть запрещён. Обратная совместимость
+schema v1 MUST NOT добавляться. Существующий schema v1 artifact MUST закрывать
+bootstrap apply без migration или cleanup.
 
 #### Scenario: Bootstrap manifest закрепляет оба runtime identity
 
@@ -453,22 +454,33 @@ artifact MUST закрывать bootstrap apply без migration или cleanup
 - **AND** after runtime имеет kind `git`, exact baseline path и тот же commit
 - **AND** wrapper replacement count равен ровно одному
 
-#### Scenario: Обычный prepare создаёт rollout manifest schema v2
+#### Scenario: Обычный prepare создаёт rollout manifest schema v3
 
 - **WHEN** обычный `prepare --apply` строит target из exact Git baseline
-- **THEN** manifest имеет `snapshot_kind=rollout`
+- **THEN** manifest имеет `schema_version=3` и `snapshot_kind=rollout`
 - **AND** before/after runtimes имеют kind `git` и разные exact commit SHA
 - **AND** export manifest fields равны JSON `null`
+- **AND** manifest содержит `wrapper_contract=source-cwd-v1` и проверенное
+  доказательство происхождения импортов
 
-#### Scenario: Один consumer проверяет bootstrap switch
+#### Scenario: Полный consumer проверяет bootstrap switch
 
-- **WHEN** `switch` или `rollback` читает bootstrap snapshot
-- **THEN** общий snapshot validator повторно проверяет export manifest
+- **WHEN** `switch` читает bootstrap snapshot
+- **THEN** runtime snapshot validator повторно проверяет export manifest
   хэш/`source_commit`, `venv` экспорта, точный `Git HEAD` базовой среды и `tracked`
   cleanliness и baseline venv
-- **AND** общий atomic transition primitive выбирает `wrapper.after` для
-  switch или `wrapper.before` для rollback
-- **AND** отдельная bootstrap switch/rollback policy не существует
+- **AND** общий atomic transition primitive выбирает `wrapper.after`
+- **AND** отдельная bootstrap atomic policy не существует
+
+#### Scenario: Snapshot-only rollback не проверяет runtime
+
+- **WHEN** `rollback` читает schema v2 или v3 snapshot
+- **THEN** отдельный snapshot-only loader проверяет exact manifest/snapshot
+  bytes, modes и hashes, snapshot ID, stable-wrapper path, current-wrapper
+  guard и exact `wrapper.before`/`wrapper.after`
+- **AND** loader не требует source repo, export manifest, candidate/baseline
+  runtime, Git cleanliness, venv, interpreter или imports
+- **AND** тот же atomic transition primitive выбирает `wrapper.before`
 
 #### Scenario: Unified root остаётся exact-contained
 
@@ -479,24 +491,331 @@ artifact MUST закрывать bootstrap apply без migration или cleanup
 - **AND** snapshots выводятся только как `snapshots/<VALID_SNAPSHOT_ID>`
 - **AND** разные nested runtime/state roots по-прежнему отклоняются
 
+### Requirement: Rollout runtime coherence доказывает imports из target source
+
+Новые ordinary rollout snapshots MUST использовать `schema_version=3` и
+`wrapper_contract=source-cwd-v1`. Новый `wrapper.after` MUST явно выполнять
+`cd --` в exact target runtime непосредственно перед `exec`
+`<target>/<venv>/bin/python -m hermes_cli.main`, чтобы copied venv
+`site-packages` не затенял target checkout. Helper MUST NOT использовать
+network, `pip`, editable install или `.pth` files для исправления imports.
+Exact wrapper grammar и isolated import-origin policy MUST принадлежать
+отдельному `scripts/hermes_kanban_mcp_runtime_coherence.py`; state module MUST
+оставаться границей schema/snapshot/transition. Общие path/Git/venv
+primitives MUST иметь отдельного единственного common owner; consumers MUST
+импортировать их непосредственно, а forwarding re-export façade MUST
+отсутствовать. `runtime_coherence.py` MUST содержать не более 900 физических
+строк, то есть иметь минимум 100 строк запаса до hard limit 1000.
+
+Перед созданием schema v3 snapshot `prepare --apply` MUST выполнить
+import-origin preflight exact candidate interpreter с `-I -S -B` только
+внутри OS-level containment, установленного **до** candidate `exec` sealed
+captured `bwrap` image. Exact `/usr/bin/bwrap` является allow-listed capture
+source и MUST NOT повторно открываться как executable после anchor
+construction. Отсутствующий, подменённый или неработоспособный `bwrap` либо
+невозможность sealed execution его required loader closure MUST завершать
+preflight fail-closed; резервный путь только через Python или повторное
+открытие по пути MUST NOT
+существовать. Отдельный capability probe MUST считаться только baseline
+проверкой executable и базовых namespaces/mounts. Он MUST NOT заявлять
+проверку полного candidate-specific профиля. Authoritative проверкой полного
+профиля MUST быть реальный production invocation со всем sealed content/data
+bundle и exact candidate argv; любая его ошибка MUST завершать операцию
+fail-closed.
+
+Sandbox MUST начинаться с пустого mount namespace; получать обычные файлы
+кандидата и среды выполнения, точный интерпретатор, необходимую доверенную
+стандартную библиотеку, замыкание загрузчика и разделяемых библиотек, а также
+`bwrap` только из sealed content bundle;
+создавать directory/symlink topology из полного manifest и MUST NOT bind
+mutable candidate, `/usr`, `/lib*` или другой backing directory;
+предоставлять раздельные tmpfs для `HOME`, `HERMES_HOME` и temp; использовать
+`--clearenv` и точный allowlist; создавать свежий `/proc` и минимальный
+`/dev`; отделять user/PID/IPC/UTS/cgroup/network namespaces насколько они
+поддержаны; использовать `--new-session` и `--die-with-parent`; не
+пробрасывать host sockets. Создание daemon, root/deploy/service dependency
+MUST NOT требоваться.
+
+Security contract preflight MUST обещать отсутствие host-visible side
+effects, а не запрет каждого внутреннего syscall. Candidate MAY попытаться
+создать внутренний subprocess либо вызвать native syscall, но mount/PID/
+network и остальные namespaces MUST не дать воздействовать на host.
+Существующие Python audit/sticky denial и monkeypatch guards MUST оставаться
+вторым слоем и диагностическим evidence, но MUST NOT считаться security
+boundary.
+
+Во время построения anchors доверенный parent MUST descriptor-relative и с
+`O_NOFOLLOW` построить полный манифест топологии каталогов, символических
+ссылок и обычных файлов. Каждый исполняемый или импортируемый обычный файл из
+дерева
+исходного кода кандидата, точного интерпретатора, `pyvenv.cfg`, необходимой
+доверенной стандартной библиотеки, замыкания загрузчика и разделяемых
+библиотек, доверенного тестового каркаса и `bwrap` MUST быть полностью
+прочитан в отдельный memfd/data object, повторно хэширован из него и sealed от
+write/grow/shrink/future mutation. Anchors и digests MUST строиться только из
+этих sealed captured bytes. Incomplete manifest, unsupported file type,
+escape/ambiguous symlink, изменение объекта во время capture или неполный
+runtime closure MUST завершать операцию fail-closed.
+
+Контракт MUST обещать exact captured verified bytes от успешного anchor
+construction до `exec`/import и MUST NOT обещать защиту исторических bytes до
+capture. Bubblewrap MUST получать только sealed regular-file bundle и
+созданную из manifest topology; mutable backing directory MUST NOT
+bind-монтироваться.
+
+Каждый успешный `open`/`memfd_create` MUST регистрироваться немедленно.
+`_data_fd` MUST закрывать current FD при ошибке write/lseek/readback/hash/seal
+до handoff. При любой ошибке partial bundle owner MUST закрывать все ранее
+приобретённые FDs. Cleanup failure MUST возвращаться как structured
+fail-closed error вместе с primary failure и `replacement_applied` state,
+MUST NOT скрываться и MUST запрещать snapshot/switch continuation.
+
+Child MUST вернуть evidence, точно совпадающее с manifest/digests sealed
+bundle; child self-report MUST NOT быть исходным trust anchor. Любая
+symlink/TOCTOU/nested in-place подмена либо forged evidence MUST приводить
+только к исполнению sealed captured bytes или к fail-closed. Preflight MUST
+определять origin `hermes_cli.main` через
+`find_spec` без top-level import, затем импортировать dedicated server после
+Python guards и доказать target origins и наличие
+`kanban_sync_external_task` в `WRITE_TOOLS`, не отражая arbitrary subprocess
+stderr. `switch` MUST повторить точные проверки wrapper/hash/runtime/
+import-origin на dry-run и перед atomic replacement. Rollback MUST
+восстанавливать exact previous wrapper bytes/mode только по snapshot-owned
+guards и MUST NOT запускать candidate либо зависеть от исходного репозитория,
+среды выполнения кандидата, виртуального окружения, интерпретатора или
+импортов.
+
+#### Scenario: Legacy wrapper превращается в canonical source-cwd wrapper
+
+- **WHEN** ordinary `prepare --apply` строит target из baseline, а текущий
+  wrapper является legacy schema v2 wrapper
+- **THEN** helper создаёт schema v3 snapshot
+- **AND** `wrapper.before` сохраняет exact legacy bytes/mode
+- **AND** `wrapper.after` содержит canonical `source-cwd-v1` контракт с
+  `cd --` в exact target runtime перед `exec` target interpreter
+- **AND** stable wrapper не меняется до отдельного `switch --apply`
+
+#### Scenario: Canonical wrapper остаётся canonical при следующем rollout
+
+- **WHEN** ordinary `prepare --apply` строит следующий target из runtime,
+  уже использующего `source-cwd-v1`
+- **THEN** helper создаёт детерминированный schema v3 `wrapper.after`
+- **AND** новый wrapper сохраняет `cd --` в exact new target runtime перед
+  запуском нового target interpreter через `exec`
+- **AND** wrapper не содержит path baseline/export как active runtime path
+
+#### Scenario: Затенение старым site-packages отклоняется до snapshot
+
+- **WHEN** copied candidate venv содержит старый installed package в
+  `site-packages`
+- **AND** запуск без source cwd импортировал бы `hermes_cli.main` или
+  `agent.transports.hermes_kanban_mcp_server` из старого package
+- **THEN** preflight для schema v3 запускает exact candidate interpreter с
+  `-I -S -B` только через exact `/usr/bin/bwrap`, cwd exact target runtime и
+  точно разрешённое окружение
+- **AND** принимает только module origins внутри exact target checkout
+- **AND** отклоняет origin из `venv/lib/python*/site-packages`, рабочего дерева
+  baseline/export или любого другого path до создания snapshot
+- **AND** ни один `.pth` не исполняется
+
+#### Scenario: Bubblewrap отсутствует или не создаёт containment
+
+- **WHEN** exact `/usr/bin/bwrap` отсутствует, не является ожидаемым
+  executable либо baseline capability probe не может создать базовые
+  пространства имён `mount`/`PID`/`network`/`user`/`IPC`/`UTS`/`cgroup`
+- **THEN** `prepare --apply`, `switch` dry-run и `switch --apply` завершаются
+  fail-closed до запуска candidate interpreter
+- **AND** Python-only, unsandboxed или частично sandboxed fallback не
+  выполняется
+
+#### Scenario: Полный профиль доказывает production invocation
+
+- **WHEN** baseline capability probe успешен
+- **AND** полный production invocation не поддерживает либо отклоняет любой
+  обязательный `bind` запечатанного содержимого или данных, элемент топологии
+  манифеста, флаг пространства имён
+  или exact candidate argv
+- **THEN** preflight завершается fail-closed
+- **AND** baseline probe не переименовывается и не учитывается как
+  доказательство полного production profile
+- **AND** snapshot или switch replacement не выполняется
+
+#### Scenario: Candidate не получает host-visible side effects
+
+- **WHEN** candidate import graph пытается выполнить direct
+  `subprocess._fork_exec`, `ctypes` либо native file/network call, послать
+  signal host process или вызвать `resource.prlimit` для host PID
+- **THEN** host canary files, sockets, processes, signals и resource limits
+  остаются неизменными
+- **AND** попытка MAY существовать как внутренний sandbox syscall, но не
+  воздействует на host
+- **AND** Python audit/sticky denial сохраняет диагностическое evidence и не
+  является единственной причиной containment
+
+#### Scenario: Sealed anchors предшествуют candidate exec
+
+- **WHEN** trusted parent готовит preflight
+- **THEN** descriptor-relative `O_NOFOLLOW` capture строит полный манифест
+  топологии каталогов, символических ссылок и обычных файлов
+- **AND** до `exec` кандидата каждый исполняемый или импортируемый обычный файл
+  исходного кода кандидата, точного интерпретатора, `pyvenv.cfg`, необходимой
+  доверенной стандартной библиотеки и среды выполнения, а также `bwrap`
+  материализован в отдельный объект данных `memfd`, повторно хэширован и
+  запечатан
+- **AND** trusted stdlib roots происходят из trusted parent/system
+  interpreter, а не впервые из child self-report
+- **AND** anchors/digests построены из тех же sealed captured bytes
+- **AND** `bwrap` получает только sealed bundle и созданную из manifest
+  topology без bind mutable backing directory
+- **AND** child evidence точно совпадает с manifest/digests sealed bundle
+- **AND** exact captured verified bytes неизменны от anchor construction до
+  `exec`/import
+
+#### Scenario: Подмена interpreter и forged evidence отклоняются
+
+- **WHEN** symlink chain, interpreter, `pyvenv.cfg`, source либо venv
+  изменяются во время capture или после него
+- **OR** child подделывает resolved path, stdlib roots или digest
+- **THEN** preflight использует только sealed captured bytes либо завершается
+  fail-closed, и schema v3 snapshot либо switch на tampered bytes не
+  выполняется
+- **AND** даже успевший запуститься подменённый code остаётся внутри
+  OS-level containment и не меняет host canaries
+
+#### Scenario: Nested in-place mutate с matching forged evidence не проходит
+
+- **WHEN** после sealed capture вложенный candidate regular file изменяется
+  in-place
+- **AND** подменённые bytes пытаются выполнить import/effect и затем
+  восстанавливаются
+- **AND** child возвращает JSON, полностью совпадающий с expected evidence
+- **THEN** sandbox выполняет только sealed original captured bytes либо
+  operation завершается fail-closed до import/effect
+- **AND** forged matching JSON не заменяет parent sealed-byte anchors
+- **AND** host side-effect отсутствует
+
+#### Scenario: Stdlib и executable bytes используют тот же sealed contract
+
+- **WHEN** после capture in-place изменяется required trusted stdlib regular
+  file
+- **OR** там, где platform даёт reproducible behavioral oracle, изменяются
+  exact interpreter или `bwrap` bytes
+- **THEN** production invocation использует только sealed captured bytes либо
+  завершается fail-closed
+- **AND** восстановление backing bytes и matching forged child evidence не
+  меняют выбранный content
+- **AND** host side-effect отсутствует
+
+#### Scenario: Ошибка acquisition не оставляет FD
+
+- **WHEN** failure injection срабатывает на любом `open`, `memfd_create`,
+  чтении исходника, записи `memfd`, `lseek`, повторном чтении/хэшировании,
+  запечатывании, передаче манифеста, передаче вызова или последующей проверке
+- **THEN** current FD и все ранее зарегистрированные FDs закрываются
+- **AND** leaked FDs отсутствуют
+- **AND** cleanup failure возвращается как structured fail-closed error
+  вместе с primary failure и не скрывается
+- **AND** snapshot/switch continuation отсутствует
+
+#### Scenario: WRITE_TOOLS содержит external sync в target runtime
+
+- **WHEN** preflight импортирует dedicated Kanban MCP server из target source
+- **THEN** он проверяет exact `WRITE_TOOLS`
+- **AND** `kanban_sync_external_task` присутствует в поверхности режима записи
+- **AND** отсутствие этого tool завершает `prepare` или `switch` fail-closed до
+  примитива записи
+
+#### Scenario: Switch повторяет проверки import-origin
+
+- **WHEN** schema v3 snapshot подготовлен, но target checkout, venv или
+  wrapper evidence изменились до `switch` dry-run или `switch --apply`
+- **THEN** `switch` в обоих режимах повторно проверяет wrapper SHA, target runtime SHA,
+  interpreter evidence, module origins и `WRITE_TOOLS`
+- **AND** stale или tampered state отклоняется до atomic replacement
+
+#### Scenario: Prepare dry-run не обещает origin до candidate
+
+- **WHEN** оператор вызывает ordinary `prepare` без `--apply`
+- **THEN** plan содержит только deterministic paths, wrapper и hash evidence,
+  доступные без создания candidate
+- **AND** plan не содержит и не обещает import-origin evidence
+- **AND** первое import-origin evidence появляется на `prepare --apply` после
+  создания candidate и до snapshot
+
+#### Scenario: Schema v2 snapshot остаётся rollback-compatible
+
+- **WHEN** existing schema v2 snapshot нужен для rollback
+- **AND** source repo или candidate missing, corrupt либо dirty
+- **THEN** snapshot-only rollback может прочитать snapshot и восстановить exact
+  `wrapper.before` bytes/mode по rollback preconditions
+- **AND** rollback не требует source repo, candidate runtime/venv/imports или
+  исправного состояния package в candidate
+- **AND** rollback не запускает `/usr/bin/bwrap`, candidate interpreter или
+  предварительную проверку импорта
+- **AND** новый switch на target требует schema v3 snapshot вместо schema v2
+
+#### Scenario: Исторический schema-v2 golden независим от production helper
+
+- **WHEN** suite проверяет существующий schema-v2 rollback contract
+- **THEN** она читает статические sanitized `manifest.json`,
+  `wrapper.before` и `wrapper.after` из исторического snapshot
+- **AND** fixture хранит provenance snapshot
+  `6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f`,
+  исходные SHA-256 `83db7f0c4cd2a3239e5d52402f6b8b88e1a66ca46ba1daa5677249fcac4a196f`,
+  `17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9`,
+  `5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53`
+  и исчерпывающий список sanitization substitutions
+- **AND** ни `manifest.json`, ни `wrapper.before`, ни `wrapper.after`, ни
+  `provenance.json` не содержит raw `/home/openclaw`
+- **AND** каждая substitution содержит `file/field`, source class, SHA-256
+  source literal, literal replacement, count и reason без raw source value
+- **AND** sanitized payload bytes/hashes трёх payload files остаются
+  неизменными
+- **AND** expected bytes не создаются schema-v3 flow, production wrapper
+  generator или production rewrite helper
+
+#### Scenario: Wrapper принимает только exact supported templates
+
+- **WHEN** parser проверяет legacy или canonical wrapper
+- **THEN** он принимает только allow-listed template с корректным shebang,
+  ожидаемым `set`, exact exports и единственным `exec` с exact argv
+- **AND** canonical template требует `cd --` в exact runtime непосредственно
+  перед `exec`
+- **AND** comments-only совпадение, missing `exec`, extra commands, redirects,
+  pipes/backgrounding/command substitution/control operators, лишние argv или
+  смешанные runtime/interpreter paths отклоняются до примитивов записи
+- **AND** helper не пытается исправлять wrapper через broad rewrite,
+  template guessing, delete, `pip` или `.pth`
+
 ### Requirement: Helper проверяется только во временном окружении
 
 Automated tests helper MUST находиться в
 `tests/scripts/test_hermes_kanban_mcp_rollout.py` и отдельном
-`tests/scripts/test_hermes_kanban_mcp_bootstrap.py`, MUST использовать только
-временный Git repo/export/runtime/state/wrapper и MUST запускаться через
-`scripts/run_tests.sh`. Tests MUST проверять поведение helper вызовом его
-Python API/CLI, а не чтением source text. Каждый source/test file MUST
-содержать меньше 1000 строк. Automated suite MUST NOT выполнять live apply,
-обращаться к live/staging/Hermes paths, запускать MCP/Hermes/Gurra process,
-читать secrets или изменять DB/services.
+`tests/scripts/test_hermes_kanban_mcp_bootstrap.py` и
+`tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py` и отдельном
+`tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py`, MUST использовать
+только временный Git repo/export/runtime/state/wrapper и MUST запускаться
+через `scripts/run_tests.sh`. Общий Git/layout/oracle harness MUST
+содержательно принадлежать существующему
+`tests/scripts/hermes_kanban_mcp_test_support.py`, а не thin forwarding
+façade. Rollout test MUST содержать не более 850 строк, support — менее 400,
+behavior MUST остаться неизменным. Runtime-coherence tests
+MUST использовать реальные target modules либо faithful fixture, synthetic
+HOME и outside-root oracle; sandbox tests MUST проверять host canaries и
+bypass attempts. Tests MUST проверять поведение helper вызовом его Python
+API/CLI, а не чтением source text. Каждый source/test file MUST содержать
+меньше 1000 строк; `runtime_coherence.py` MUST содержать не более 900 строк,
+а common path/Git/venv primitives MUST иметь единственного owner без
+forwarding re-export façade. Automated suite MUST NOT выполнять live apply, обращаться
+к live/staging/Hermes paths, запускать MCP/Hermes/Gurra process, читать
+secrets или изменять DB/services.
 
 #### Scenario: Dry-run oracle доказывает отсутствие записи
 
 - **WHEN** temp-only suite выполняет `bootstrap-prepare`, `prepare`, `switch`
   и `rollback` без `--apply`
 - **THEN** полный filesystem oracle до/после каждой команды идентичен
-- **AND** ни один write primitive не вызывается
+- **AND** ни один примитив записи не вызывается
 
 #### Scenario: Apply и rollback проверяются end-to-end во временном дереве
 
@@ -528,10 +847,61 @@ Python API/CLI, а не чтением source text. Каждый source/test fil
 
 #### Scenario: Тесты не используют live targets
 
-- **WHEN** focused helper tests завершены
+- **WHEN** точечные helper tests завершены
 - **THEN** все созданные candidate/snapshot/wrapper artifacts находятся под
   временным каталогом теста
 - **AND** suite не требует secrets, network, services, processes или live DB
+
+#### Scenario: Repair tests покрывают runtime coherence
+
+- **WHEN** focused repair suite запускается во временном Git/runtime дереве
+- **THEN** она покрывает rollout из legacy в canonical, rollout из canonical в
+  canonical, совместимость schema v2 rollback, schema v3 switch/rollback,
+  rollback при missing/corrupt/dirty candidate, затенение старым
+  `site-packages`, dry-run evidence contract и точный список tools
+- **AND** она доказывает real HOME isolation, неисполнение `.pth`, запрет
+  host-visible network/file/process/DB effects, sanitization stderr и
+  проверку отсутствия записи за пределами корня
+- **AND** она пытается обойти policy через direct `subprocess._fork_exec`,
+  `ctypes`/native write/network, signal и `resource.prlimit`, проверяет
+  подмены через символические ссылки/TOCTOU и вложенную последовательность
+  изменения на месте → импорт/эффект кандидата → восстановление после
+  запечатанного захвата с полностью совпадающими поддельными свидетельствами
+  дочернего процесса и отсутствующим или неисправным `bwrap`, после чего все
+  контрольные объекты хоста
+  остаются неизменными
+- **AND** аналогичный behavioral oracle покрывает trusted stdlib regular file
+  и, где практично, exact interpreter/`bwrap` bytes
+- **AND** failure injection на каждой acquisition/capture/handoff стадии
+  подтверждает отсутствие leaked FDs и structured cleanup errors
+- **AND** focused suite сохраняет regressions для existing candidate,
+  existing snapshot, symlink stable wrapper и future candidate/snapshot
+  сценарий с родительской символической ссылкой
+- **AND** snapshot-only rollback проходит без запуска candidate и независимо
+  от source/venv/interpreter/import state
+- **AND** schema-v2 compatibility использует статический sanitized
+  historical golden с provenance, исходными SHA-256 и исчерпывающим списком
+  substitutions, а не production helper для expected bytes
+- **AND** она отклоняет comments-only wrapper, missing `exec`, extra commands,
+  redirects и shell control operators
+- **AND** все четыре helper test modules проходят, rollout test имеет
+  `<=850` строк, reusable support `<400`, каждый source/test file остаётся
+  меньше 1000 строк, `runtime_coherence.py` остаётся не больше 900 строк, а
+  forwarding façade отсутствует
+
+#### Scenario: Независимая validation имеет write-доступ только к evidence
+
+- **WHEN** независимый reviewer запускает focused four-suite validation
+- **THEN** review sandbox имеет `workspace-write`, чтобы runner/tests могли
+  писать только temp/cache/evidence
+- **AND** review policy остаётся source-read-only и запрещает изменения
+  source, tests, fixtures и OpenSpec
+- **AND** pre/post source diff не меняется
+- **AND** одна exact four-suite команда успешно завершается два раза подряд
+- **AND** run без collection, environment blocker либо единственный
+  успешный run не закрывает acceptance
+- **AND** если support extraction не добавляет test module, exact
+  four-module command остаётся неизменной
 
 ### Requirement: Изменение не требует DB migration и отделено от live rollout
 
@@ -545,11 +915,56 @@ approval.
 
 #### Scenario: Изменения проверяются до PR
 
-- **WHEN** implementation и focused tests завершены
+- **WHEN** implementation и точечные tests завершены
 - **THEN** diff не содержит DB migration, live connector, Windows config,
   live MCP wrapper/config, service или immutable runtime изменений
 - **AND** diff не добавляет зависимостей
-- **AND** task-owned PR является первым delivery step
+- **AND** новый independent review принят без `BLOCK`
+- **AND** только после accepted review разрешены commit, push и task-owned PR
+
+#### Scenario: OS-sandbox approval не открывает delivery или live gate
+
+- **WHEN** пользователь явно одобряет material delta после третьего `BLOCK`
+  формулировкой «material OS-sandbox delta без live rollout»
+- **THEN** разрешаются implementation и repo-local/temp-only verification
+- **AND** accepted independent review и delivery tasks остаются pending
+- **AND** planning approval не разрешает commit, push, PR или live-действия
+
+#### Scenario: Новый remediation baseline требует нового approval
+
+- **WHEN** независимый запуск
+  `20260729T192126Z-kanban-os-sandbox-independent-review` возвращает `BLOCK`
+- **THEN** tasks 19.4–19.7 переоткрываются, а 16.7, 18.8, 19.8 и 19.9
+  остаются открытыми
+- **AND** набор доверенных дескрипторов, выделение общего владельца,
+  provenance sanitization, возвращённые regressions и probe contract
+  оформляются отдельными незавершёнными remediation tasks
+- **AND** предыдущее OS-sandbox approval не разрешает их implementation
+- **AND** перед implementation требуется новое явное approval
+
+#### Scenario: Sealed-content baseline требует ещё одного approval
+
+- **WHEN** независимый запуск
+  `20260729T224514Z-kanban-remediation-independent-review` два раза успешно
+  выполняет точную команду для четырёх наборов тестов, но возвращает `BLOCK`
+- **THEN** зелёные runs сохраняются как evidence и не закрывают acceptance
+- **AND** tasks 19.4, 19.6, 19.7 и 20.2 вместе со связанными completion
+  claims переоткрываются
+- **AND** 16.7, 18.8, 19.8, 19.9, 20.7 и 20.8 остаются открытыми
+- **AND** запечатанный пакет содержимого, безопасное при исключениях управление
+  ресурсами, повторно используемый тестовый каркас и новые состязательные тесты
+  оформляются в отдельном разделе 21.x
+- **AND** до нового явного approval запрещены implementation,
+  scripts/tests/fixtures changes и implementation test runs
+
+#### Scenario: Reviewer-only source deviation не является acceptance
+
+- **WHEN** reviewer временно изменил source для probe, затем побайтово
+  восстановил его и pre/post fingerprints совпали
+- **THEN** deviation фиксируется честно, но исключается из mandatory evidence
+- **AND** он не считается implementation change
+- **AND** следующий independent review остаётся source-read-only, получая
+  `workspace-write` только для temp/cache/evidence
 
 #### Scenario: Bootstrap-helper PR не выполняет rollout
 
@@ -570,3 +985,161 @@ approval.
   `dry-run`-плана
 - **AND** глобальный Hermes symlink, Hermes/Gurra restart и dirty Telegram
   patch остаются вне scope
+
+#### Scenario: Live scope требует отдельного exact разрешения
+
+- **WHEN** OS-sandbox implementation проверена, review принят и PR слит
+- **THEN** live rollout, wrapper replacement, restart, process replacement и
+  DB actions всё ещё запрещены
+- **AND** каждое такое действие требует отдельного exact разрешения и не
+  выводится из planning approval, review, commit, push, PR или merge
+
+### Requirement: Sealed acquisition имеет предварительный bounded inventory
+
+Система SHALL до создания content memfd выполнить descriptor-relative
+bounded inventory с `O_NOFOLLOW`, построить topology, identities, digests и
+exact ELF dependency plan, затем проверить resource budgets. Только после
+успешных проверок система SHALL вторым проходом захватить sealed bytes и
+повторно сверить topology, identity и digest. Любое расхождение MUST
+завершать операцию fail-closed до invocation со structured cleanup.
+
+#### Scenario: Budget failure предшествует partial acquisition
+
+- **WHEN** inventory требует больше FD или serialized arguments, чем
+  разрешает рассчитанный budget
+- **THEN** система возвращает structured fail-closed error до создания
+  первого content memfd и до invocation
+
+#### Scenario: Canonical invocation одинаков для budget и execution
+
+- **GIVEN** bounded inventory содержит directories, regular files, symlinks,
+  permissions и exact ELF closure
+- **WHEN** parent планирует probe и production до sealed acquisition
+- **THEN** один immutable canonical spec MUST включать полную topology,
+  harness/anchors, loader/preload argv и все FD roles
+- **AND** symbolic render MUST использовать worst-case legal decimal width из
+  finite `RLIMIT_NOFILE`
+- **AND** actual render того же spec MUST быть не больше prevalidated bound и
+  повторно проходить args/exec/current+peak FD/pass_fds checks перед
+  соответствующим args memfd/subprocess
+- **AND** directory/symlink-heavy cap failure происходит до первого content
+  memfd
+- **AND** отдельный acquisition temporary reserve MUST учитывать
+  `MAX_DIRECTORY_DEPTH + 1` одновременно удерживаемых directory FD, source FD
+  и создаваемый sealed memfd
+
+#### Scenario: Exact role order является canonical contract
+
+- **GIVEN** canonical inventory и ELF closure
+- **WHEN** строится probe role map
+- **THEN** exact order MUST быть `loader`, `library:0..N`, `bwrap`,
+  `probe_args`
+- **WHEN** строится production role map
+- **THEN** exact order MUST быть ordered `file:<destination>`, `harness`,
+  `anchors`, `loader`, `library:0..N`, `bwrap`, `production_args`
+- **AND** missing, extra или reordered role map MUST завершаться
+  `ResourceBudgetError` до render и subprocess
+
+#### Scenario: Объект изменён между проходами
+
+- **WHEN** topology, identity или digest объекта во втором проходе отличается
+  от inventory
+- **THEN** система не использует изменённые bytes, закрывает все приобретённые
+  ресурсы и завершает операцию fail-closed
+
+#### Scenario: Topology углублена между inventory и acquisition
+
+- **GIVEN** approved `InventoryPlan` построен для topology в пределах
+  canonical `MAX_DIRECTORY_DEPTH`
+- **WHEN** до acquisition добавлена ветка глубже этого предела, а в snapshot
+  существует лексически более ранний regular file
+- **THEN** повторный canonical inventory preflight MUST завершиться
+  structured fail-closed до первого content memfd
+- **AND** все временные descriptor resources MUST быть закрыты
+
+#### Scenario: Mutation после topology preflight ограничена acquisition guard
+
+- **WHEN** topology становится глубже `MAX_DIRECTORY_DEPTH` после успешного
+  preflight, но до обхода изменённой ветки
+- **THEN** acquisition traversal MUST применить тот же canonical предел
+  независимо
+- **AND** ошибка MUST произойти до открытия directory, source либо content
+  memfd на запрещённой глубине, без превышения temporary FD bound и без leak
+
+### Requirement: ELF closure следует exact GNU/Linux loader semantics
+
+Система SHALL раздельно хранить `DT_RPATH` и `DT_RUNPATH`, моделировать их
+GNU/Linux precedence и inheritance, включая superseding `RUNPATH` для
+defining object и legacy inheritance `RPATH`. `$ORIGIN`, `$LIB` и
+`$PLATFORM` SHALL раскрываться только детерминированно из exact
+runtime/platform либо MUST быть отклонены до capture. Relative, empty,
+unsafe и escaping entries MUST отклоняться. Dynamic segment MUST быть
+bounded, кратен entry size и содержать `DT_NULL` внутри segment; string
+offsets и terminators MUST быть bounded. `DT_NEEDED` MUST быть safe soname
+без slash, `NUL` и escape.
+
+#### Scenario: External ELF symlink не покидает trusted roots
+
+- **GIVEN** initial external ELF path находится внутри injectable trusted root
+- **WHEN** любой absolute или relative symlink hop направляет оставшийся path
+  наружу, в dangling target либо cycle
+- **THEN** inventory MUST завершиться fail-closed после этого hop
+- **AND** production roots `/usr`, `/lib`, `/lib64` не изменяются тестом
+
+#### Scenario: RUNPATH и RPATH дают разные closure
+
+- **WHEN** вручную созданная ELF-фикстура различает прямой `RUNPATH` и
+  унаследованный устаревший `RPATH`
+- **THEN** dependency plan совпадает с независимым GNU/Linux oracle и не
+  объединяет эти поля
+
+#### Scenario: Malformed dynamic metadata отклонена
+
+- **WHEN** dynamic segment имеет некратный размер, не содержит bounded
+  `DT_NULL`, ссылается за string table либо содержит unsafe `DT_NEEDED`
+- **THEN** система завершает plan fail-closed до sealed acquisition
+
+#### Scenario: Неразрешимый token не уходит в defaults
+
+- **WHEN** `$LIB`, `$PLATFORM` или иной token нельзя точно определить из
+  среды выполнения и платформы
+- **THEN** система отклоняет closure до capture и не ищет dependency в
+  каталогах по умолчанию
+
+### Requirement: Resource planner доказывает вместимость полного invocation
+
+Система SHALL до sealed acquisition и invocation детерминированно считать
+current open FDs, все content entries, manifest, loader, `bwrap`, libraries,
+harness, anchors, probe/prod args FDs и явный subprocess/`bwrap` reserve и
+сравнивать сумму с finite `RLIMIT_NOFILE`. Система SHALL считать bytes
+полного exec `argv` и environment относительно `SC_ARG_MAX` с именованным
+safety margin. Serialized payload `bwrap --args` SHALL иметь отдельный явный
+maximum и SHALL проверяться до memfd/invocation с учётом platform,
+`pass_fds` и `bwrap` constraints.
+
+#### Scenario: Низкий FD limit или занятые FD
+
+- **WHEN** текущие open FDs и полный рассчитанный набор с reserve не
+  помещаются в finite `RLIMIT_NOFILE`
+- **THEN** система fail-closed до partial sealed acquisition и subprocess
+
+#### Scenario: Late FD pressure блокирует final handoff
+
+- **WHEN** дополнительное FD pressure возникает после ранней проверки, но
+  после создания args/harness/anchors memfd и до subprocess
+- **THEN** authoritative final check MUST проверить exact final `pass_fds`,
+  uniqueness, open state, current count и subprocess/bwrap peak reserve
+- **AND** structured fail-closed error возвращается без вызова subprocess
+
+#### Scenario: Превышен argv или args payload
+
+- **WHEN** exec `argv` + environment превышает `SC_ARG_MAX` за вычетом margin
+  либо serialized `bwrap --args` превышает отдельный maximum
+- **THEN** система fail-closed до создания args/content memfd и invocation
+
+#### Scenario: Cleanup не маскирует primary failure
+
+- **WHEN** после acquisition failure дополнительный cleanup также завершается
+  ошибкой
+- **THEN** structured result сохраняет primary cause и отдельно сообщает
+  cleanup failure без FD leak и continuation

@@ -1,72 +1,104 @@
-"""Schema v2, snapshot validation, and atomic transitions for Kanban MCP rollout."""
+"""Snapshot validation and atomic transitions for Kanban MCP rollout."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import stat
-import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
+
+try:
+    from scripts import hermes_kanban_mcp_runtime_coherence as coherence
+    from scripts.hermes_kanban_mcp_rollout_common import (
+        FULL_GIT_SHA,
+        FULL_SHA256,
+        SHELL_PATH_CHARS,
+        RolloutError,
+        Wrapper,
+        canonical_path,
+        lexists,
+        read_wrapper,
+        require_full_sha,
+        sha256,
+        strictly_within,
+        validate_clean_worktree,
+        validate_commit,
+        validate_repo_root,
+        validate_roots,
+        validate_venv,
+        validate_wrapper_contract,
+    )
+except ModuleNotFoundError:
+    import hermes_kanban_mcp_runtime_coherence as coherence
+    from hermes_kanban_mcp_rollout_common import (
+        FULL_GIT_SHA,
+        FULL_SHA256,
+        SHELL_PATH_CHARS,
+        RolloutError,
+        Wrapper,
+        canonical_path,
+        lexists,
+        read_wrapper,
+        require_full_sha,
+        sha256,
+        strictly_within,
+        validate_clean_worktree,
+        validate_commit,
+        validate_repo_root,
+        validate_roots,
+        validate_venv,
+        validate_wrapper_contract,
+    )
 
 
-FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ROLLOUT_SNAPSHOT_ID = re.compile(r"^([0-9a-f]{40})-to-([0-9a-f]{40})$")
 BOOTSTRAP_SNAPSHOT_ID = re.compile(r"^bootstrap-([0-9a-f]{40})$")
 MANIFEST_FILES = {"manifest.json", "wrapper.before", "wrapper.after"}
-MANIFEST_KEYS = {
-    "schema_version",
-    "snapshot_kind",
-    "created_at",
-    "source_repo",
-    "runtime_root",
-    "state_root",
-    "snapshot_id",
-    "stable_wrapper",
-    "before_runtime_kind",
-    "before_runtime_path",
-    "before_runtime_sha",
-    "before_manifest_path",
-    "before_manifest_sha256",
-    "after_runtime_kind",
-    "after_runtime_path",
-    "after_runtime_sha",
-    "venv_dirname",
-    "venv_interpreter_sha256",
-    "venv_interpreter_mode",
-    "wrapper_before_sha256",
-    "wrapper_after_sha256",
-    "wrapper_mode",
-    "runtime_path_replacements",
-}
-SHELL_PATH_CHARS = frozenset("~$*?[]{}")
-
-
-class RolloutError(RuntimeError):
-    """A precondition or guarded operation failed."""
+MANIFEST_KEYS_V2 = set(
+    """schema_version snapshot_kind created_at source_repo runtime_root state_root
+    snapshot_id stable_wrapper before_runtime_kind before_runtime_path
+    before_runtime_sha before_manifest_path before_manifest_sha256
+    after_runtime_kind after_runtime_path after_runtime_sha venv_dirname
+    venv_interpreter_sha256 venv_interpreter_mode wrapper_before_sha256
+    wrapper_after_sha256 wrapper_mode runtime_path_replacements""".split()
+)
+MANIFEST_KEYS_V3 = MANIFEST_KEYS_V2 | set(
+    """wrapper_contract preflight_contract source_cwd target_interpreter
+    resolved_interpreter interpreter_symlink_chain pyvenv_cfg
+    pyvenv_cfg_sha256 pyvenv_cfg_home site_packages trusted_interpreter
+    stdlib_roots candidate_digest source_digest venv_digest bwrap_sha256
+    hermes_cli_main_origin kanban_server_origin write_tools""".split()
+)
+WRAPPER_CONTRACT = coherence.WRAPPER_CONTRACT
+PREFLIGHT_CONTRACT = coherence.PREFLIGHT_CONTRACT
+REQUIRED_WRITE_TOOL = coherence.REQUIRED_WRITE_TOOL
 
 
 class ReplacementAppliedError(RolloutError):
     """The wrapper was replaced, but a post-replacement check failed."""
 
-    def __init__(self, expected_sha256: str, detail: str) -> None:
-        super().__init__(detail)
+    def __init__(
+        self,
+        expected_sha256: str,
+        detail: str,
+        *,
+        primary_failure: BaseException | None = None,
+        cleanup_failures: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(
+            detail,
+            primary_failure=primary_failure,
+            cleanup_failures=cleanup_failures,
+            replacement_applied=True,
+        )
         self.expected_sha256 = expected_sha256
-
-
-@dataclass(frozen=True)
-class Wrapper:
-    path: Path
-    data: bytes
-    mode: int
-    sha256: str
 
 
 @dataclass(frozen=True)
@@ -88,200 +120,6 @@ class SnapshotContext:
     stable_wrapper: Wrapper
     wrapper_before: bytes
     wrapper_after: bytes
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def require_full_sha(value: str, pattern: re.Pattern[str], label: str) -> str:
-    if not pattern.fullmatch(value):
-        raise RolloutError(f"{label} must be a lowercase full-length hash")
-    return value
-
-
-def lexists(path: Path) -> bool:
-    return os.path.lexists(path)
-
-
-def _reject_symlink_components(path: Path, label: str) -> None:
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        if lexists(current) and current.is_symlink():
-            raise RolloutError(f"{label} contains a symlink component: {current}")
-
-
-def canonical_path(raw: str, label: str, *, must_exist: bool) -> Path:
-    if "\x00" in raw:
-        raise RolloutError(f"{label} contains NUL")
-    if any(char in raw for char in SHELL_PATH_CHARS):
-        raise RolloutError(f"{label} contains shell expansion characters")
-    path = Path(raw)
-    if not path.is_absolute():
-        raise RolloutError(f"{label} must be absolute")
-    if ".." in path.parts or os.path.normpath(raw) != raw:
-        raise RolloutError(f"{label} must be lexically canonical")
-    _reject_symlink_components(path, label)
-    if must_exist and not lexists(path):
-        raise RolloutError(f"{label} does not exist: {path}")
-    try:
-        resolved = path.resolve(strict=must_exist)
-    except OSError as exc:
-        raise RolloutError(f"cannot resolve {label}: {exc}") from exc
-    if resolved != path:
-        raise RolloutError(f"{label} must be canonical: {path}")
-    return path
-
-
-def _home_directory() -> Path:
-    try:
-        import pwd
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-    except (ImportError, KeyError, OSError):
-        return Path.home().resolve(strict=True)
-
-
-def _validate_managed_target(path: Path, label: str) -> None:
-    if path == Path(path.anchor) or path == _home_directory() or len(path.parts) < 3:
-        raise RolloutError(f"{label} is too broad: {path}")
-
-
-def validate_managed_root(path: Path, label: str) -> None:
-    if not path.is_dir():
-        raise RolloutError(f"{label} must be an existing directory")
-    _validate_managed_target(path, label)
-
-
-def validate_absent_state_root(path: Path) -> None:
-    _validate_managed_target(path, "state root")
-    if lexists(path):
-        raise RolloutError(f"state root must not exist: {path}")
-    parent = canonical_path(str(path.parent), "state root parent", must_exist=True)
-    if not parent.is_dir():
-        raise RolloutError("state root parent must be an existing directory")
-
-
-def strictly_within(path: Path, root: Path, label: str) -> None:
-    if path == root or not path.is_relative_to(root):
-        raise RolloutError(f"{label} must be strictly inside {root}")
-
-
-def validate_roots(runtime_root: Path, state_root: Path) -> None:
-    validate_managed_root(runtime_root, "runtime root")
-    validate_managed_root(state_root, "state root")
-    if runtime_root != state_root and (
-        runtime_root.is_relative_to(state_root)
-        or state_root.is_relative_to(runtime_root)
-    ):
-        raise RolloutError(
-            "different runtime and state roots must not be nested"
-        )
-
-
-def run_git(repo: Path, arguments: Sequence[str]) -> str:
-    command = ["git", "--no-optional-locks", "-C", str(repo), *arguments]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except OSError as exc:
-        raise RolloutError(f"git execution failed: {exc}") from exc
-    if completed.returncode:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RolloutError(f"git command failed ({' '.join(arguments)}): {detail}")
-    return completed.stdout.strip()
-
-
-def validate_repo_root(repo: Path, label: str) -> None:
-    if not repo.is_dir():
-        raise RolloutError(f"{label} must be a directory")
-    top = canonical_path(run_git(repo, ["rev-parse", "--show-toplevel"]), label, must_exist=True)
-    if top != repo:
-        raise RolloutError(f"{label} must be the Git worktree root")
-
-
-def git_head(repo: Path, label: str) -> str:
-    head = run_git(repo, ["rev-parse", "--verify", "HEAD"])
-    return require_full_sha(head, FULL_GIT_SHA, f"{label} HEAD")
-
-
-def validate_clean_worktree(repo: Path, expected_sha: str, label: str) -> None:
-    validate_repo_root(repo, label)
-    if git_head(repo, label) != expected_sha:
-        raise RolloutError(f"{label} HEAD does not match expected full SHA")
-    status_text = run_git(repo, ["status", "--porcelain=v1", "--untracked-files=no"])
-    if status_text:
-        raise RolloutError(f"{label} has dirty tracked files")
-
-
-def validate_commit(repo: Path, sha: str, label: str = "commit SHA") -> None:
-    resolved = run_git(repo, ["rev-parse", "--verify", f"{sha}^{{commit}}"])
-    if resolved != sha:
-        raise RolloutError(f"{label} does not name that exact commit object")
-
-
-def validate_venv(
-    runtime: Path,
-    dirname: str,
-    *,
-    expected_sha256: str | None = None,
-    expected_mode: int | None = None,
-) -> tuple[str, int]:
-    if dirname not in {".venv", "venv"}:
-        raise RolloutError("venv dirname must be exactly .venv or venv")
-    venv = runtime / dirname
-    if not lexists(venv) or venv.is_symlink() or not venv.is_dir():
-        raise RolloutError(f"expected top-level venv directory is missing: {venv}")
-    interpreter = venv / "bin" / "python"
-    if not interpreter.exists() or not interpreter.is_file() or not os.access(interpreter, os.X_OK):
-        raise RolloutError(f"venv interpreter is missing or not executable: {interpreter}")
-    try:
-        data = interpreter.read_bytes()
-        mode = stat.S_IMODE(interpreter.stat().st_mode)
-    except OSError as exc:
-        raise RolloutError(f"cannot validate venv interpreter: {exc}") from exc
-    digest = sha256(data)
-    if mode & ~0o777:
-        raise RolloutError("venv interpreter has unsupported special mode bits")
-    if expected_sha256 is not None and digest != expected_sha256:
-        raise RolloutError("venv interpreter SHA-256 does not match expected evidence")
-    if expected_mode is not None and mode != expected_mode:
-        raise RolloutError("venv interpreter mode does not match expected evidence")
-    return digest, mode
-
-
-def read_wrapper(path: Path) -> Wrapper:
-    if path.is_symlink() or not path.is_file():
-        raise RolloutError("stable wrapper must be a regular non-symlink file")
-    try:
-        info = path.stat()
-        data = path.read_bytes()
-        data.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RolloutError(f"cannot read executable UTF-8 stable wrapper: {exc}") from exc
-    mode = stat.S_IMODE(info.st_mode)
-    if not mode & 0o111:
-        raise RolloutError("stable wrapper must be executable")
-    if mode & ~0o777:
-        raise RolloutError("stable wrapper has unsupported special mode bits")
-    return Wrapper(path=path, data=data, mode=mode, sha256=sha256(data))
-
-
-def validate_wrapper_contract(data: bytes) -> str:
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RolloutError("wrapper snapshot is not UTF-8") from exc
-    if re.search(r"\bmcp\s+serve-kanban\b", text) is None or "--allow-write" not in text:
-        raise RolloutError("wrapper does not contain the standalone write-mode Kanban MCP contract")
-    return text
-
 
 def read_export_manifest(
     path: Path,
@@ -346,9 +184,11 @@ def make_manifest(
     wrapper_after_sha256: str,
     wrapper_mode: int,
     runtime_path_replacements: int,
+    schema_version: int = 2,
+    import_evidence: coherence.ImportEvidence | None = None,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": 2,
+    manifest = {
+        "schema_version": schema_version,
         "snapshot_kind": snapshot_kind,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_repo": str(source_repo),
@@ -374,6 +214,17 @@ def make_manifest(
         "wrapper_mode": wrapper_mode,
         "runtime_path_replacements": runtime_path_replacements,
     }
+    if schema_version == 3:
+        if snapshot_kind != "rollout" or import_evidence is None:
+            raise RolloutError("schema v3 requires rollout import evidence")
+        manifest.update(import_evidence.manifest_fields())
+        manifest.update(
+            wrapper_contract=WRAPPER_CONTRACT,
+            preflight_contract=PREFLIGHT_CONTRACT,
+        )
+    elif schema_version != 2:
+        raise RolloutError("unsupported manifest schema version")
+    return manifest
 
 
 def _write_exclusive_file(path: Path, data: bytes) -> None:
@@ -458,9 +309,17 @@ def _load_manifest(snapshot_path: Path) -> dict[str, Any]:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RolloutError(f"cannot read manifest: {exc}") from exc
-    if not isinstance(value, dict) or set(value) != MANIFEST_KEYS:
+    if not isinstance(value, dict):
         raise RolloutError("manifest has an unexpected schema")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 2:
+    schema_version = value.get("schema_version")
+    expected_keys = (
+        MANIFEST_KEYS_V2
+        if schema_version == 2
+        else MANIFEST_KEYS_V3
+        if schema_version == 3
+        else set()
+    )
+    if type(schema_version) is not int or set(value) != expected_keys:
         raise RolloutError("unsupported manifest schema version")
     try:
         created_at = datetime.fromisoformat(value["created_at"])
@@ -482,7 +341,9 @@ def _load_manifest(snapshot_path: Path) -> dict[str, Any]:
     if value["runtime_path_replacements"] < 1:
         raise RolloutError("manifest replacement count is invalid")
     nullable = {"before_manifest_path", "before_manifest_sha256"}
-    string_fields = MANIFEST_KEYS - integer_fields - nullable - {"schema_version"}
+    string_fields = (
+        MANIFEST_KEYS_V2 - integer_fields - nullable - {"schema_version"}
+    )
     if any(not isinstance(value[field], str) or not value[field] for field in string_fields):
         raise RolloutError("manifest string fields must be non-empty")
     if value["snapshot_kind"] == "bootstrap":
@@ -523,6 +384,72 @@ def _load_manifest(snapshot_path: Path) -> dict[str, Any]:
     require_full_sha(
         value["wrapper_after_sha256"], FULL_SHA256, "manifest wrapper after SHA-256"
     )
+    if schema_version == 3:
+        if (
+            value["snapshot_kind"] != "rollout"
+            or value["wrapper_contract"] != WRAPPER_CONTRACT
+            or value["preflight_contract"] != PREFLIGHT_CONTRACT
+        ):
+            raise RolloutError("manifest schema v3 contract is invalid")
+        for field in (
+            "source_cwd",
+            "target_interpreter",
+            "resolved_interpreter",
+            "pyvenv_cfg",
+            "pyvenv_cfg_home",
+            "site_packages",
+            "trusted_interpreter",
+            "hermes_cli_main_origin",
+            "kanban_server_origin",
+        ):
+            if not isinstance(value[field], str) or not value[field]:
+                raise RolloutError("manifest schema v3 path evidence is invalid")
+        require_full_sha(
+            value["pyvenv_cfg_sha256"],
+            FULL_SHA256,
+            "manifest pyvenv.cfg SHA-256",
+        )
+        for field in (
+            "candidate_digest",
+            "source_digest",
+            "venv_digest",
+            "bwrap_sha256",
+        ):
+            require_full_sha(value[field], FULL_SHA256, f"manifest {field}")
+        chain = value["interpreter_symlink_chain"]
+        if (
+            not isinstance(chain, list)
+            or not chain
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"path", "mode", "device", "inode", "size", "target"}
+                or not isinstance(item["path"], str)
+                or not item["path"]
+                or type(item["mode"]) is not int
+                or type(item["device"]) is not int
+                or type(item["inode"]) is not int
+                or type(item["size"]) is not int
+                or (item["target"] is not None and not isinstance(item["target"], str))
+                for item in chain
+            )
+        ):
+            raise RolloutError("manifest interpreter symlink-chain evidence is invalid")
+        stdlib_roots = value["stdlib_roots"]
+        if (
+            not isinstance(stdlib_roots, list)
+            or not stdlib_roots
+            or any(not isinstance(path, str) or not path for path in stdlib_roots)
+            or len(set(stdlib_roots)) != len(stdlib_roots)
+        ):
+            raise RolloutError("manifest schema v3 stdlib evidence is invalid")
+        tools = value["write_tools"]
+        if (
+            not isinstance(tools, list)
+            or any(not isinstance(tool, str) or not tool for tool in tools)
+            or len(set(tools)) != len(tools)
+            or REQUIRED_WRITE_TOOL not in tools
+        ):
+            raise RolloutError("manifest schema v3 WRITE_TOOLS evidence is invalid")
     return value
 
 
@@ -536,7 +463,21 @@ def _snapshot_identity(snapshot_id: str) -> tuple[str, str, str]:
     raise RolloutError("snapshot ID must be bootstrap-SHA or SHA-to-SHA")
 
 
-def load_snapshot_context(
+def _manifest_path(raw: Any, label: str) -> Path:
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise RolloutError(f"{label} must be an absolute canonical path")
+    path = Path(raw)
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or os.path.normpath(raw) != raw
+        or any(char in raw for char in SHELL_PATH_CHARS)
+    ):
+        raise RolloutError(f"{label} must be an absolute canonical path")
+    return path
+
+
+def load_rollback_snapshot_context(
     *,
     runtime_root_raw: str,
     state_root_raw: str,
@@ -579,55 +520,72 @@ def load_snapshot_context(
         if manifest[key] != expected_value:
             raise RolloutError(f"manifest {key} does not match the requested transition")
 
-    source_repo = canonical_path(
-        manifest["source_repo"], "manifest source repo", must_exist=True
+    source_repo = _manifest_path(manifest["source_repo"], "manifest source repo")
+    before_runtime = _manifest_path(
+        manifest["before_runtime_path"], "manifest before runtime"
     )
-    before_runtime = canonical_path(
-        manifest["before_runtime_path"], "manifest before runtime", must_exist=True
+    after_runtime = _manifest_path(
+        manifest["after_runtime_path"], "manifest after runtime"
     )
-    after_runtime = canonical_path(
-        manifest["after_runtime_path"], "manifest after runtime", must_exist=True
-    )
-    validate_repo_root(source_repo, "manifest source repo")
     if source_repo in {runtime_root, state_root}:
         raise RolloutError("managed roots must not be the source repo root")
     strictly_within(after_runtime, runtime_root, "manifest after runtime")
     if after_runtime != runtime_root / f"hermes-kanban-mcp-{after_sha}":
         raise RolloutError("manifest after runtime is not the exact derived path")
-    validate_commit(source_repo, after_sha, "manifest after SHA")
-    validate_clean_worktree(after_runtime, after_sha, "after runtime")
-
-    interpreter_hash = manifest["venv_interpreter_sha256"]
-    if requested_kind == "bootstrap":
-        export_manifest_path = canonical_path(
-            manifest["before_manifest_path"],
-            "manifest export manifest",
-            must_exist=True,
-        )
-        read_export_manifest(
-            export_manifest_path,
-            before_runtime,
-            before_sha,
-            manifest["before_manifest_sha256"],
-        )
-    else:
+    if requested_kind == "rollout":
         strictly_within(before_runtime, runtime_root, "manifest before runtime")
         if before_runtime != runtime_root / f"hermes-kanban-mcp-{before_sha}":
             raise RolloutError("manifest before runtime is not the exact derived path")
-        validate_commit(source_repo, before_sha, "manifest before SHA")
-        validate_clean_worktree(before_runtime, before_sha, "before runtime")
-    validate_venv(
-        before_runtime,
-        manifest["venv_dirname"],
-        expected_sha256=interpreter_hash,
-        expected_mode=manifest["venv_interpreter_mode"],
-    )
-    validate_venv(
-        after_runtime,
-        manifest["venv_dirname"],
-        expected_sha256=interpreter_hash,
-        expected_mode=manifest["venv_interpreter_mode"],
-    )
+    if manifest["schema_version"] == 3:
+        site_packages = _manifest_path(
+            manifest["site_packages"], "manifest site-packages"
+        )
+        strictly_within(
+            site_packages,
+            after_runtime / manifest["venv_dirname"],
+            "manifest site-packages",
+        )
+        site_relative = site_packages.relative_to(
+            after_runtime / manifest["venv_dirname"]
+        )
+        if (
+            len(site_relative.parts) != 3
+            or site_relative.parts[0] != "lib"
+            or re.fullmatch(r"python[0-9]+\.[0-9]+", site_relative.parts[1]) is None
+            or site_relative.parts[2] != "site-packages"
+        ):
+            raise RolloutError("manifest site-packages is not exact target evidence")
+        for raw in manifest["stdlib_roots"]:
+            _manifest_path(raw, "manifest trusted interpreter stdlib root")
+        for field in (
+            "resolved_interpreter",
+            "pyvenv_cfg_home",
+            "trusted_interpreter",
+        ):
+            _manifest_path(manifest[field], f"manifest {field}")
+        chain = manifest["interpreter_symlink_chain"]
+        for item in chain:
+            _manifest_path(item["path"], "manifest interpreter symlink-chain path")
+        if (
+            chain[0]["path"] != manifest["target_interpreter"]
+            or chain[-1]["path"] != manifest["resolved_interpreter"]
+            or chain[-1]["target"] is not None
+        ):
+            raise RolloutError("manifest interpreter symlink chain is inconsistent")
+        expected_evidence = {
+            "source_cwd": str(after_runtime),
+            "target_interpreter": str(after_runtime / manifest["venv_dirname"]
+                                      / "bin" / "python"),
+            "pyvenv_cfg": str(after_runtime / manifest["venv_dirname"]
+                              / "pyvenv.cfg"),
+            "site_packages": str(site_packages),
+            "hermes_cli_main_origin": str(after_runtime / "hermes_cli" / "main.py"),
+            "kanban_server_origin": str(after_runtime / "agent" / "transports"
+                                        / "hermes_kanban_mcp_server.py"),
+        }
+        for key, expected_value in expected_evidence.items():
+            if manifest[key] != expected_value:
+                raise RolloutError(f"manifest {key} is not exact target evidence")
 
     wrapper_before = _read_snapshot_file(snapshot_path, "wrapper.before")
     wrapper_after = _read_snapshot_file(snapshot_path, "wrapper.after")
@@ -636,35 +594,118 @@ def load_snapshot_context(
         or sha256(wrapper_after) != manifest["wrapper_after_sha256"]
     ):
         raise RolloutError("snapshot wrapper hash does not match manifest")
-    before_text = validate_wrapper_contract(wrapper_before)
-    validate_wrapper_contract(wrapper_after)
-    replacements = before_text.count(str(before_runtime))
-    if replacements != manifest["runtime_path_replacements"] or replacements < 1:
-        raise RolloutError("manifest runtime replacement count is invalid")
-    expected_after = wrapper_before.replace(
-        str(before_runtime).encode(), str(after_runtime).encode()
-    )
+    if manifest["schema_version"] == 3:
+        expected_after = coherence.rewrite_rollout_wrapper(
+            wrapper_before,
+            before_runtime,
+            after_runtime,
+            manifest["venv_dirname"],
+        )
+    else:
+        before_text = validate_wrapper_contract(wrapper_before)
+        replacements = before_text.count(str(before_runtime))
+        if replacements != manifest["runtime_path_replacements"] or replacements < 1:
+            raise RolloutError("manifest runtime replacement count is invalid")
+        expected_after = wrapper_before.replace(
+            str(before_runtime).encode(), str(after_runtime).encode()
+        )
+        coherence.validate_schema_v2_rollout_wrapper(
+            wrapper_before, before_runtime, manifest["venv_dirname"]
+        )
+        coherence.validate_schema_v2_rollout_wrapper(
+            wrapper_after, after_runtime, manifest["venv_dirname"]
+        )
     if wrapper_after != expected_after:
         raise RolloutError("wrapper.after is not the exact guarded transformation")
 
     return SnapshotContext(
-        manifest=manifest,
-        snapshot_path=snapshot_path,
-        source_repo=source_repo,
-        runtime_root=runtime_root,
-        state_root=state_root,
-        before_runtime=before_runtime,
-        after_runtime=after_runtime,
-        stable_wrapper=read_wrapper(stable_path),
-        wrapper_before=wrapper_before,
-        wrapper_after=wrapper_after,
+        manifest, snapshot_path, source_repo, runtime_root, state_root,
+        before_runtime, after_runtime, read_wrapper(stable_path),
+        wrapper_before, wrapper_after)
+
+
+def load_snapshot_context(
+    *,
+    runtime_root_raw: str,
+    state_root_raw: str,
+    snapshot_id: str,
+    stable_wrapper_raw: str,
+) -> SnapshotContext:
+    context = load_rollback_snapshot_context(
+        runtime_root_raw=runtime_root_raw,
+        state_root_raw=state_root_raw,
+        snapshot_id=snapshot_id,
+        stable_wrapper_raw=stable_wrapper_raw,
+    )
+    manifest = context.manifest
+    source_repo = canonical_path(
+        str(context.source_repo), "manifest source repo", must_exist=True
+    )
+    before_runtime = canonical_path(
+        str(context.before_runtime), "manifest before runtime", must_exist=True
+    )
+    after_runtime = canonical_path(
+        str(context.after_runtime), "manifest after runtime", must_exist=True
+    )
+    validate_repo_root(source_repo, "manifest source repo")
+    validate_commit(source_repo, manifest["after_runtime_sha"], "manifest after SHA")
+    validate_clean_worktree(
+        after_runtime, manifest["after_runtime_sha"], "after runtime"
+    )
+    interpreter_hash = manifest["venv_interpreter_sha256"]
+    if manifest["snapshot_kind"] == "bootstrap":
+        export_manifest_path = canonical_path(
+            manifest["before_manifest_path"],
+            "manifest export manifest",
+            must_exist=True,
+        )
+        read_export_manifest(
+            export_manifest_path,
+            before_runtime,
+            manifest["before_runtime_sha"],
+            manifest["before_manifest_sha256"],
+        )
+    else:
+        validate_commit(
+            source_repo, manifest["before_runtime_sha"], "manifest before SHA"
+        )
+        validate_clean_worktree(
+            before_runtime, manifest["before_runtime_sha"], "before runtime"
+        )
+    for runtime in (before_runtime, after_runtime):
+        validate_venv(
+            runtime,
+            manifest["venv_dirname"],
+            expected_sha256=interpreter_hash,
+            expected_mode=manifest["venv_interpreter_mode"],
+        )
+    return SnapshotContext(
+        manifest,
+        context.snapshot_path,
+        source_repo,
+        context.runtime_root,
+        context.state_root,
+        before_runtime,
+        after_runtime,
+        context.stable_wrapper,
+        context.wrapper_before,
+        context.wrapper_after,
     )
 
 
 def _transition_plan(command: str, context: SnapshotContext, apply: bool) -> dict[str, Any]:
     manifest = context.manifest
     source_name = "wrapper.after" if command == "switch" else "wrapper.before"
-    return {
+    validation = (
+        f"revalidate schema v{manifest['schema_version']}, snapshot hashes, "
+        "runtime evidence, venv and import origins"
+        if command == "switch"
+        else (
+            f"revalidate schema v{manifest['schema_version']}, exact snapshot "
+            "bytes, modes, hashes and current wrapper guard"
+        )
+    )
+    plan = {
         "command": command,
         "mode": "apply" if apply else "dry-run",
         "snapshot_kind": manifest["snapshot_kind"],
@@ -675,7 +716,7 @@ def _transition_plan(command: str, context: SnapshotContext, apply: bool) -> dic
         "wrapper_before_sha256": manifest["wrapper_before_sha256"],
         "wrapper_after_sha256": manifest["wrapper_after_sha256"],
         "operations": [
-            "revalidate schema v2, snapshot hashes, runtime evidence and venv",
+            validation,
             f"write same-directory temporary file from {source_name}",
             "fsync temporary file and preserve executable mode",
             "replace stable wrapper with one os.replace",
@@ -683,6 +724,18 @@ def _transition_plan(command: str, context: SnapshotContext, apply: bool) -> dic
             "leave runtimes, snapshot, processes and DB unchanged",
         ],
     }
+    if command == "switch" and manifest["schema_version"] == 3:
+        plan["import_origin"] = {
+            key: manifest[key]
+            for key in (
+                "source_cwd",
+                "target_interpreter",
+                "hermes_cli_main_origin",
+                "kanban_server_origin",
+                "write_tools",
+            )
+        }
+    return plan
 
 
 def _atomic_replace(
@@ -756,7 +809,14 @@ def run_transition(
     expected_current_wrapper_sha256: str,
     apply: bool,
 ) -> dict[str, Any]:
-    context = load_snapshot_context(
+    if command not in {"switch", "rollback"}:
+        raise RolloutError("unsupported transition command")
+    loader = (
+        load_snapshot_context
+        if command == "switch"
+        else load_rollback_snapshot_context
+    )
+    context = loader(
         runtime_root_raw=runtime_root,
         state_root_raw=state_root,
         snapshot_id=snapshot_id,
@@ -769,39 +829,81 @@ def run_transition(
     )
     manifest = context.manifest
     if command == "switch":
+        if (
+            manifest["snapshot_kind"] == "rollout"
+            and manifest["schema_version"] != 3
+        ):
+            raise RolloutError("rollout switch requires a schema v3 snapshot")
+        session = (
+            coherence.import_preflight_session(
+                context.after_runtime,
+                manifest["venv_dirname"],
+                expected_pyvenv_cfg_sha256=manifest["pyvenv_cfg_sha256"],
+                expected_site_packages=manifest["site_packages"],
+                expected_stdlib_roots=manifest["stdlib_roots"],
+            )
+            if manifest["schema_version"] == 3
+            else nullcontext(None)
+        )
         required_hash = manifest["wrapper_before_sha256"]
         replacement = context.wrapper_after
     elif command == "rollback":
+        session = nullcontext(None)
         required_hash = manifest["wrapper_after_sha256"]
         replacement = context.wrapper_before
-    else:
-        raise RolloutError("unsupported transition command")
-    if explicit_hash != required_hash or context.stable_wrapper.sha256 != required_hash:
-        raise RolloutError("stable wrapper SHA-256 does not match command and manifest guards")
-    if context.stable_wrapper.mode != manifest["wrapper_mode"]:
-        raise RolloutError("stable wrapper mode does not match manifest")
-    plan = _transition_plan(command, context, apply)
-    if not apply:
-        return plan
-    _atomic_replace(
-        context.stable_wrapper.path,
-        replacement,
-        manifest["wrapper_mode"],
-        required_hash,
-    )
     expected_installed = (
         manifest["wrapper_after_sha256"]
         if command == "switch"
         else manifest["wrapper_before_sha256"]
     )
+    replacement_applied = False
     try:
-        installed = read_wrapper(context.stable_wrapper.path)
-        if installed.sha256 != expected_installed or installed.mode != manifest["wrapper_mode"]:
-            raise RolloutError("installed wrapper does not match the snapshot")
+        with session as evidence:
+            if evidence is not None:
+                observed = evidence.manifest_fields()
+                if any(manifest[key] != value for key, value in observed.items()):
+                    raise RolloutError("target import evidence changed since prepare")
+            if (
+                explicit_hash != required_hash
+                or context.stable_wrapper.sha256 != required_hash
+            ):
+                raise RolloutError(
+                    "stable wrapper SHA-256 does not match command and manifest guards"
+                )
+            if context.stable_wrapper.mode != manifest["wrapper_mode"]:
+                raise RolloutError("stable wrapper mode does not match manifest")
+            plan = _transition_plan(command, context, apply)
+            if not apply:
+                return plan
+            _atomic_replace(
+                context.stable_wrapper.path,
+                replacement,
+                manifest["wrapper_mode"],
+                required_hash,
+            )
+            replacement_applied = True
+            try:
+                installed = read_wrapper(context.stable_wrapper.path)
+                if (
+                    installed.sha256 != expected_installed
+                    or installed.mode != manifest["wrapper_mode"]
+                ):
+                    raise RolloutError("installed wrapper does not match the snapshot")
+            except (RolloutError, OSError) as exc:
+                raise ReplacementAppliedError(
+                    expected_installed,
+                    f"post-install wrapper verification failed: {exc}",
+                ) from exc
+    except ReplacementAppliedError:
+        raise
     except (RolloutError, OSError) as exc:
+        if not replacement_applied:
+            raise
         raise ReplacementAppliedError(
             expected_installed,
-            f"post-install wrapper verification failed: {exc}",
+            f"post-replacement trust or wrapper verification failed: {exc}",
+            primary_failure=getattr(exc, "primary_failure", exc),
+            cleanup_failures=getattr(exc, "cleanup_failures", ()),
         ) from exc
     plan["result"] = "switched" if command == "switch" else "rolled-back"
     return plan

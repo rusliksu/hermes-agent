@@ -1,0 +1,139 @@
+{
+  "safe_inventory_run_id": "20260729T185628Z-kanban-v2-golden-inventory",
+  "source_snapshot_id": "6f8738dc308f909bf1735883344f2fcc12f3cbcd-to-30500cf973a40bb0918d33eb0476c1025e08ac0f",
+  "source_snapshot_path_sha256": "52608295633bda125705005be40a660b7b0b1ded3981cf4fa52ad345d9c4a604",
+  "inventory": {
+    "runtime_path_replacements": 1,
+    "sensitive_term_matches": 0
+  },
+  "artifacts": {
+    "manifest.json": {
+      "original": {
+        "sha256": "83db7f0c4cd2a3239e5d52402f6b8b88e1a66ca46ba1daa5677249fcac4a196f",
+        "size": 1406,
+        "mode": "0600"
+      },
+      "sanitized": {
+        "sha256": "73c1ff3fa33e8888a8cfb9184f6adf7aef654f54e3a1d314cea25333de681cfd",
+        "size": 1311,
+        "mode": "0600"
+      }
+    },
+    "wrapper.before": {
+      "original": {
+        "sha256": "17052c7d51307f47f9d3d6826a584114d26a1e57c0a272bc48179fed662c1ab9",
+        "size": 286,
+        "mode": "0600"
+      },
+      "sanitized": {
+        "sha256": "95e89250e68e46e80b7a3891ee327b9d3558a949685b295129fabf4c8cef9684",
+        "size": 277,
+        "mode": "0600"
+      }
+    },
+    "wrapper.after": {
+      "original": {
+        "sha256": "5e03752f40af19fca3151e6ccb5da182521c7860d6c9ebded8f796ce327aad53",
+        "size": 286,
+        "mode": "0600"
+      },
+      "sanitized": {
+        "sha256": "f5ed7ba0aa765c964cd7920fd57ebc05e3dd1c751df95b078d3a3df98d1e00ca",
+        "size": 277,
+        "mode": "0600"
+      }
+    }
+  },
+  "ordered_substitutions": [
+    {
+      "order": 1,
+      "file": "manifest.json",
+      "field": "source_repo",
+      "source_class": "host_absolute_path",
+      "source_sha256": "5ecd322a8f2b347cbb16e3ba278e486c689c7ec61d1486ee8c66dd84a04a53ab",
+      "replacement": "/__schema_v2_golden__/source",
+      "count": 1,
+      "reason": "remove the host-specific source checkout path"
+    },
+    {
+      "order": 2,
+      "file": "manifest.json",
+      "field": "after_runtime_path,before_runtime_path,runtime_root,state_root",
+      "source_class": "host_absolute_path",
+      "source_sha256": "113c196425278ff823e24aae3c9ca0a5dd81defd7daee04a0ca316419464f68a",
+      "replacement": "/__schema_v2_golden__/state",
+      "count": 4,
+      "reason": "remove the host-specific rollout state root"
+    },
+    {
+      "order": 3,
+      "file": "wrapper.before",
+      "field": "exec.interpreter",
+      "source_class": "host_absolute_path",
+      "source_sha256": "113c196425278ff823e24aae3c9ca0a5dd81defd7daee04a0ca316419464f68a",
+      "replacement": "/__schema_v2_golden__/state",
+      "count": 1,
+      "reason": "remove the host-specific baseline runtime root"
+    },
+    {
+      "order": 4,
+      "file": "wrapper.after",
+      "field": "exec.interpreter",
+      "source_class": "host_absolute_path",
+      "source_sha256": "113c196425278ff823e24aae3c9ca0a5dd81defd7daee04a0ca316419464f68a",
+      "replacement": "/__schema_v2_golden__/state",
+      "count": 1,
+      "reason": "remove the host-specific candidate runtime root"
+    },
+    {
+      "order": 5,
+      "file": "manifest.json",
+      "field": "stable_wrapper",
+      "source_class": "host_absolute_path",
+      "source_sha256": "bd283008daf40cb634c12b225ec311fd816096e5cf4028a826a4c1c3aa69082f",
+      "replacement": "/__schema_v2_golden__/stable/run.sh",
+      "count": 1,
+      "reason": "remove the host-specific stable wrapper path"
+    },
+    {
+      "order": 6,
+      "file": "wrapper.before",
+      "field": "export.HERMES_HOME",
+      "source_class": "host_absolute_path",
+      "source_sha256": "347b2a331466fad4d76120391a94bcb9c7d09717c971ca8bb0603bbe2483ef41",
+      "replacement": "/__schema_v2_golden__/home",
+      "count": 1,
+      "reason": "remove the host-specific Hermes home"
+    },
+    {
+      "order": 7,
+      "file": "wrapper.after",
+      "field": "export.HERMES_HOME",
+      "source_class": "host_absolute_path",
+      "source_sha256": "347b2a331466fad4d76120391a94bcb9c7d09717c971ca8bb0603bbe2483ef41",
+      "replacement": "/__schema_v2_golden__/home",
+      "count": 1,
+      "reason": "remove the host-specific Hermes home"
+    },
+    {
+      "order": 8,
+      "file": "manifest.json",
+      "field": "wrapper_before_sha256",
+      "source_class": "derived_payload_sha256",
+      "source_sha256": "767621b3403baadcf45cea6ce126bb361b341d90941a1868f25182ca9185da9b",
+      "replacement": "95e89250e68e46e80b7a3891ee327b9d3558a949685b295129fabf4c8cef9684",
+      "count": 1,
+      "reason": "record the sanitized wrapper.before payload digest"
+    },
+    {
+      "order": 9,
+      "file": "manifest.json",
+      "field": "wrapper_after_sha256",
+      "source_class": "derived_payload_sha256",
+      "source_sha256": "df49908224d45e8f53e9c4d6a015392ac924916619872f3cdc854eeec0a8f982",
+      "replacement": "f5ed7ba0aa765c964cd7920fd57ebc05e3dd1c751df95b078d3a3df98d1e00ca",
+      "count": 1,
+      "reason": "record the sanitized wrapper.after payload digest"
+    }
+  ]
+}

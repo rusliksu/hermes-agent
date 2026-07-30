@@ -1,18 +1,90 @@
 # expose-external-sync-on-kanban-mcp
 
-PR #15 доставил dedicated Kanban MCP surface, PR #16 — guarded rollout helper.
-Текущий material delta планирует отдельный bootstrap-helper PR: non-Git export
-runtime преобразуется в exact immutable Git baseline до обычного `prepare`.
+PR #15 доставил dedicated Kanban MCP surface, PR #16 — guarded rollout
+helper, а bootstrap-helper — schema v2 baseline из non-Git export runtime.
+Новые ordinary rollout snapshots используют schema v3 и `source-cwd-v1`;
+schema v2 остаётся readable только для snapshot-only rollback.
 
-Bootstrap-helper PR ограничен capability, schema v2 и temp-only tests. Его
-merge не разрешает live state root/baseline/snapshot, wrapper switch,
-prepare, процессы, DB, services, network или smoke; для live действий нужен
-отдельно одобренный exact dry-run plan.
+Новый independent thermo review sealed-content реализации завершился
+verdict `BLOCK`. Два author exact four-suite run по
+`140 passed, 0 failed` сохранены только как historical evidence.
 
-Входной экспортный `manifest.txt` — обычный файл без символьных ссылок строго
-внутри экспортированной среды, а не `JSON`: он использует непустые строки
-`key=value` в `UTF-8`, уникальные непустые ключи и обязательный единственный
-`source_commit`, равный явно переданному полному `Git SHA`. Неизвестные ключи
-разрешены без вывода или копирования их значений. Точный `SHA-256` сырых байтов
-остаётся защитой доверия: пробный запуск печатает наблюдаемый хэш, а `--apply`
-требует ожидаемый.
+Новый MATERIAL REMEDIATION DELTA требует двухфазный bounded inventory →
+sealed acquisition, exact GNU/Linux ELF closure с раздельными
+`DT_RPATH`/`DT_RUNPATH`, deterministic resource planning относительно
+`RLIMIT_NOFILE`, `SC_ARG_MAX` и отдельного cap `bwrap --args`, а также
+independent literal handcrafted ELF oracles и low-limit/mutation/cleanup
+tests.
+
+Текущий material planning baseline требует:
+
+- материализовать каждый исполняемый или импортируемый regular file
+  candidate source tree, exact interpreter, необходимого trusted
+  stdlib/runtime closure и bytes `bwrap` в sealed immutable memfd/data
+  binding;
+- строить anchors и digests из тех же captured bytes и передавать `bwrap`
+  только sealed bundle плюс созданную из manifest directory/symlink
+  topology, не bind mutable backing directory;
+- строить manifest descriptor-relative с `O_NOFOLLOW`, fail-closed при
+  неполном или изменившемся capture и обещать только exact captured verified
+  bytes от anchor construction до `exec`/import, без недостижимой гарантии до
+  capture;
+- сделать FD ownership exception-safe: немедленная регистрация каждого
+  `open`/`memfd`, закрытие current FD при ошибке `_data_fd`, полный cleanup
+  partial bundle и отдельная structured fail-closed ошибка при cleanup
+  failure;
+- вынести общий Git/layout/oracle harness в существующий
+  `tests/scripts/hermes_kanban_mcp_test_support.py` как содержательного owner:
+  rollout test `<=850` строк, support `<400`, каждый source/test `<1000`,
+  behavior unchanged;
+- добавить adversarial nested in-place mutation tests для candidate import,
+  stdlib regular file и, где практично, interpreter/`bwrap` bytes: исполняются
+  только sealed original bytes либо операция завершается fail-closed, а host
+  side effect отсутствует.
+
+Approval material baseline 21.x и его author runs остаются historical
+evidence. Exact approval раздела 22.x получено от Руслана 2026-07-30
+формулировкой «одобряю material ELF/resource remediation baseline» только
+для implementation 22.3–22.6 и repo-local/temp-only author verification.
+Tasks 19.4, 19.6, 19.7, 20.2, 21.2, 21.5–21.8 и delivery/live остаются
+открытыми до author/independent gates.
+
+Новый independent review после baseline вернул historical `BLOCK` по трём
+несоответствиям существующим requirements: post-symlink trusted-root
+containment, probe actual exec budget и placeholder pre-acquisition plan.
+Minor remediation 23.x/25 выполняется в рамках approval 2026-07-30:
+единственный canonical invocation spec используется budget и execution,
+symbolic FD-width даёт консервативный pre-acquisition bound. Новый
+independent verdict, delivery и live truth остаются открытыми.
+
+Latest independent review снова вернул historical `BLOCK` по implementation
+gaps уже существующих требований: acquisition peak недосчитывал recursive
+directory lifecycle, final subprocess handoff не перепроверялся после args
+memfd, invocation ownership оставался продублирован, exact role order и
+полная symlink matrix не были закреплены. Minor remediation 24.x устраняет
+эти gaps без material scope change и без нового approval; author,
+independent, delivery и live gates сохраняют прежний truth state.
+
+Последующий independent review обнаружил ещё один P1 implementation gap:
+между inventory и acquisition могла появиться topology глубже canonical
+`MAX_DIRECTORY_DEPTH`, а второй проход не применял depth policy. Historical
+minor remediation 25.x добавляет повторный canonical inventory preflight до
+первого content memfd и независимый acquisition depth guard. Claims 22.3,
+22.5, 24.2 и load-bearing часть 24.3 были временно переоткрыты на valid red и
+закрыты только после targeted green. Independent 22.8, 22.9, 23.5, 24.5,
+delivery и live gates остаются открытыми.
+
+Reviewer-only deviation зафиксирован честно: временная source mutation была
+побайтово восстановлена, pre/post fingerprints совпали, но этот probe
+исключён из mandatory acceptance evidence. Он не является implementation
+change.
+
+Следующая independent validation снова использует `workspace-write` только
+для temp/cache/evidence при source-read-only policy и два последовательных
+запуска exact four-suite команды. Если extraction support не добавляет
+отдельный test module, команда остаётся ровно из существующих четырёх
+модулей.
+
+Live rollout, wrapper/process replacement, restart, MCP/DB/systemd/deploy и
+network actions запрещены без отдельного exact разрешения. Commit/push/PR
+остаются закрыты до accepted independent review без `BLOCK`.
