@@ -7555,25 +7555,27 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def _telegram_ignored_threads(self) -> set[int]:
-        raw = self.config.extra.get("ignored_threads")
-        if raw is None:
-            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+        values, _malformed = self._telegram_ignored_threads_policy()
+        return values
 
-        if isinstance(raw, list):
-            values = raw
-        else:
-            values = str(raw).split(",")
+    def _telegram_ignored_threads_policy(self) -> tuple[set[int], bool]:
+        values, malformed = self._telegram_policy_string_set(
+            "ignored_threads",
+            "TELEGRAM_IGNORED_THREADS",
+        )
+        if malformed:
+            return set(), True
 
+        strict = self._telegram_access_registry_policy_active()
         ignored: set[int] = set()
         for value in values:
-            text = str(value).strip()
-            if not text:
-                continue
             try:
-                ignored.add(int(text))
+                ignored.add(int(value))
             except (TypeError, ValueError):
+                if strict:
+                    return set(), True
                 logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
-        return ignored
+        return ignored, False
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
@@ -7876,9 +7878,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if topic_id not in allowed_topics:
                 return False
 
+        ignored_threads, malformed_ignored_threads = self._telegram_ignored_threads_policy()
+        if malformed_ignored_threads:
+            return False
         if thread_id is not None:
             try:
-                if int(thread_id) in self._telegram_ignored_threads():
+                if int(thread_id) in ignored_threads:
                     return False
             except (TypeError, ValueError):
                 return False
@@ -8405,9 +8410,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
         # Check ignored_threads first — applies to both groups and DM topics
+        ignored_threads, malformed_ignored_threads = self._telegram_ignored_threads_policy()
+        if malformed_ignored_threads:
+            return False
         if thread_id is not None:
             try:
-                if int(thread_id) in self._telegram_ignored_threads():
+                if int(thread_id) in ignored_threads:
                     return False
             except (TypeError, ValueError):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)

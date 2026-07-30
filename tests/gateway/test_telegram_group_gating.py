@@ -418,6 +418,110 @@ def test_access_registry_configured_free_response_room_policy_works():
     assert adapter._should_observe_unmentioned_group_message(other_room) is True
 
 
+def test_access_registry_free_response_ignores_process_env_ignored_threads(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_IGNORED_THREADS", "7")
+
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    message = _group_message(
+        "ambient",
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=7,
+        is_forum=True,
+    )
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_access_registry_observation_ignores_process_env_ignored_threads(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_IGNORED_THREADS", "7")
+
+    adapter = _make_adapter(
+        require_mention=True,
+        observe_unmentioned_group_messages=True,
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    message = _group_message(
+        "ambient",
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=7,
+        is_forum=True,
+    )
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is True
+
+
+def test_access_registry_configured_ignored_thread_denies():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        ignored_threads=[7],
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    message = _group_message(
+        "ambient",
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=7,
+        is_forum=True,
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_access_registry_malformed_ignored_threads_denies_fail_closed():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        ignored_threads=[{"thread": 7}],
+        account="bot-a",
+    )
+    _attach_access_registry(
+        adapter,
+        _shared_access_registry(room_ids=("-100",), account="bot-a", member_id="111"),
+    )
+
+    message = _group_message(
+        "ambient",
+        chat_id=-100,
+        from_user_id=111,
+        thread_id=8,
+        is_forum=True,
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_legacy_no_registry_env_ignored_thread_still_denies(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_IGNORED_THREADS", "7")
+
+    adapter = _make_adapter(require_mention=False)
+    message = _group_message("ambient", chat_id=-100, thread_id=7, is_forum=True)
+
+    assert adapter._should_process_message(message) is False
+
+
 def test_access_registry_missing_policy_requires_mention_and_disables_passive(monkeypatch):
     monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_CHATS", "-100")
     monkeypatch.setenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
