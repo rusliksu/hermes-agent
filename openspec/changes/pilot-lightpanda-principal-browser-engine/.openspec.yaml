@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-30
+goal: Подготовить planning-only OpenSpec baseline для синтетического Lightpanda
+  пилота после introduce-gurra-principal-role-isolation.
