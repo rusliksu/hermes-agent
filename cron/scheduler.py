@@ -1311,10 +1311,17 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
     """
-    _enforce_persisted_cron_context(job)
+    context = _enforce_persisted_cron_context(job)
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
+    if context is not None and deliver == "origin":
+        delivery_target = context.delivery_target
+        return [{
+            "platform": delivery_target.platform,
+            "chat_id": str(delivery_target.chat_id),
+            "thread_id": delivery_target.thread_id,
+        }]
 
     raw_parts = [p.strip() for p in deliver.split(",") if p.strip()]
 
@@ -1332,6 +1339,21 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
+    if context is not None:
+        delivery_target = context.delivery_target
+        expected = (
+            delivery_target.platform.lower(),
+            str(delivery_target.chat_id),
+            None if delivery_target.thread_id is None else str(delivery_target.thread_id),
+        )
+        for target in targets:
+            resolved = (
+                str(target["platform"]).lower(),
+                str(target["chat_id"]),
+                None if target.get("thread_id") is None else str(target["thread_id"]),
+            )
+            if resolved != expected:
+                raise RuntimeError("delivery target does not match resolved access context")
     return targets
 
 

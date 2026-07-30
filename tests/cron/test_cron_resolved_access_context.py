@@ -436,6 +436,62 @@ def test_scheduler_denies_family_persisted_non_origin_delivery_before_script(mon
     assert script_calls == []
 
 
+def test_scheduler_uses_owner_persisted_delivery_target_before_home_fallback(monkeypatch):
+    from cron.scheduler import _resolve_delivery_targets
+
+    owner = _ctx(
+        "owner",
+        "owner",
+        chat_id="owner-chat",
+        capabilities=frozenset({"cron"}),
+    )
+    home_lookups = []
+
+    def get_home_target_chat_id(platform_name):
+        home_lookups.append(platform_name)
+        return "owner-default"
+
+    monkeypatch.setattr(
+        "cron.scheduler._get_home_target_chat_id",
+        get_home_target_chat_id,
+    )
+    job = {
+        "id": "owner-origin",
+        "name": "owner-origin",
+        "deliver": "origin",
+        "resolved_access_context": serialize_resolved_access_context(owner),
+    }
+
+    assert _resolve_delivery_targets(job) == [
+        {
+            "platform": "telegram",
+            "chat_id": "owner-chat",
+            "thread_id": "thread-1",
+        }
+    ]
+    assert home_lookups == []
+
+
+def test_scheduler_denies_owner_explicit_foreign_delivery_target():
+    from cron.scheduler import _resolve_delivery_targets
+
+    owner = _ctx(
+        "owner",
+        "owner",
+        chat_id="owner-chat",
+        capabilities=frozenset({"cron"}),
+    )
+    job = {
+        "id": "owner-foreign",
+        "name": "owner-foreign",
+        "deliver": "telegram:foreign-chat",
+        "resolved_access_context": serialize_resolved_access_context(owner),
+    }
+
+    with pytest.raises(RuntimeError, match="resolved access context"):
+        _resolve_delivery_targets(job)
+
+
 @pytest.mark.parametrize(
     ("context", "message"),
     [
