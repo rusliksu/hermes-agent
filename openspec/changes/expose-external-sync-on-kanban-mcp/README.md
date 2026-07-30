@@ -1,13 +1,27 @@
 # expose-external-sync-on-kanban-mcp
 
 PR #15 доставил dedicated Kanban MCP surface, PR #16 — guarded rollout
-helper, а bootstrap-helper — schema v2 baseline из non-Git export runtime.
-Новые ordinary rollout snapshots используют schema v3 и `source-cwd-v1`;
-schema v2 остаётся readable только для snapshot-only rollback.
+helper, а исторический bootstrap-helper — schema v2 baseline из non-Git
+export runtime. Этот старый bootstrap/rollout contract теперь superseded:
+fresh `bootstrap` и `rollout` создают только `schema_version=3`,
+`snapshot_kind=bootstrap|rollout` и
+`wrapper_contract=source-cwd-nofile-v2`; fresh bootstrap `wrapper.after`
+строит единственный canonical generator.
+
+Любой `schema_version!=3`, а также исторический schema-v3
+`source-cwd-v1`, разрешён только отдельному snapshot-only rollback loader
+для восстановления exact bytes/mode. Он запрещён для `switch` до preflight
+и любой mutation; in-place migration snapshot не существует.
 
 Новый independent thermo review sealed-content реализации завершился
 verdict `BLOCK`. Два author exact four-suite run по
 `140 passed, 0 failed` сохранены только как historical evidence.
+
+Последующий independent review дельты 26.x снова завершился `BLOCK`.
+Исторические implementation evidence 26.3–26.5 и sibling run
+`128 passed` не приняты как текущая acceptance. Remediation baseline 27.x
+явно одобрен и реализован repo-local; один exact five-module author run
+завершился `180 passed`, но 27.5+ и independent acceptance остаются открыты.
 
 Новый MATERIAL REMEDIATION DELTA требует двухфазный bounded inventory →
 sealed acquisition, exact GNU/Linux ELF closure с раздельными
@@ -81,9 +95,10 @@ change.
 
 Следующая independent validation снова использует `workspace-write` только
 для temp/cache/evidence при source-read-only policy и два последовательных
-запуска exact four-suite команды. Если extraction support не добавляет
-отдельный test module, команда остаётся ровно из существующих четырёх
-модулей.
+запуска exact five-module команды с
+`HERMES_TEST_FILE_RETRIES=0`: bootstrap, rollout, runtime coherence,
+runtime sandbox и новый rollout state. Оба запуска обязаны завершиться без
+retry/`FLAKY` и с идентичными pre/post fingerprints.
 
 Live rollout, wrapper/process replacement, restart, MCP/DB/systemd/deploy и
 network actions запрещены без отдельного exact разрешения. Commit/push/PR

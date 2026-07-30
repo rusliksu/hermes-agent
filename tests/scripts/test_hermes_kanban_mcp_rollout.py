@@ -82,6 +82,63 @@ def _assert_dry_run(
     return output
 
 
+def test_prepare_apply_requires_wrapper_after_hash_before_managed_write(
+    layout: Layout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    before = _filesystem_oracle(layout.root)
+    with monkeypatch.context() as writes:
+        _forbid_write_primitives(writes)
+        assert rollout.main(
+            layout.prepare_args(apply=True, wrapper_after_sha256=None)
+        ) == 2
+    capsys.readouterr()
+    assert _filesystem_oracle(layout.root) == before
+
+
+def test_prepare_apply_rejects_mismatched_wrapper_after_hash_before_write(
+    layout: Layout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = rollout.build_parser().parse_args(layout.prepare_args(apply=True))
+    args.expected_wrapper_after_sha256 = "0" * 64
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("mismatched after hash reached a managed write")
+
+    monkeypatch.setattr(rollout, "_create_candidate", forbidden)
+    with pytest.raises(rollout.RolloutError, match="wrapper.after SHA-256"):
+        rollout._run_prepare(args)
+
+
+def test_switch_apply_requires_wrapper_after_hash_before_preflight_or_replace(
+    layout: Layout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert rollout.main(layout.prepare_args(apply=True)) == 0
+    capsys.readouterr()
+    before = _filesystem_oracle(layout.root)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("missing after hash reached preflight or replacement")
+
+    with monkeypatch.context() as mutation:
+        mutation.setattr(rollout.coherence, "import_preflight_session", forbidden)
+        mutation.setattr(rollout.state, "_atomic_replace", forbidden)
+        assert rollout.main(
+            layout.transition_args(
+                "switch",
+                layout.wrapper_before_hash,
+                apply=True,
+                wrapper_after_sha256=None,
+            )
+        ) == 2
+    capsys.readouterr()
+    assert _filesystem_oracle(layout.root) == before
+
+
 def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible(
     layout: Layout,
     monkeypatch: pytest.MonkeyPatch,
@@ -141,7 +198,7 @@ def test_default_dry_runs_are_full_no_write_oracles_and_happy_path_is_reversible
         assert Path(manifest[key]).is_relative_to(layout.root)
     assert manifest["schema_version"] == 3
     assert manifest["snapshot_kind"] == "rollout"
-    assert manifest["wrapper_contract"] == "source-cwd-v1"
+    assert manifest["wrapper_contract"] == "source-cwd-nofile-v2"
     assert manifest["write_tools"] == [
         "kanban_enqueue",
         "kanban_sync_external_task",

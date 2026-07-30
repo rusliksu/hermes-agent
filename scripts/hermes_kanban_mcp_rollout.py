@@ -36,7 +36,6 @@ try:
         validate_roots as _validate_roots,
         validate_venv as _validate_venv,
         validate_venv_startup as _validate_venv_startup,
-        validate_wrapper_contract as _validate_wrapper_contract,
     )
 except ModuleNotFoundError:
     import hermes_kanban_mcp_runtime_coherence as coherence
@@ -61,13 +60,11 @@ except ModuleNotFoundError:
         validate_roots as _validate_roots,
         validate_venv as _validate_venv,
         validate_venv_startup as _validate_venv_startup,
-        validate_wrapper_contract as _validate_wrapper_contract,
     )
 
 
 ReplacementAppliedError = state.ReplacementAppliedError
 _rewrite_rollout_wrapper = coherence.rewrite_rollout_wrapper
-_validate_rollout_wrapper = coherence.parse_rollout_wrapper
 _write_snapshot = state.write_snapshot
 
 
@@ -135,33 +132,6 @@ def _validate_new_runtime_and_snapshot(
         snapshots_root.is_symlink() or not snapshots_root.is_dir()
     ):
         raise RolloutError("snapshots root exists but is not a directory")
-
-
-def _transform_wrapper(
-    wrapper: Wrapper,
-    before_runtime: Path,
-    after_runtime: Path,
-    *,
-    exact_replacements: int | None = None,
-) -> tuple[bytes, int]:
-    text = _validate_wrapper_contract(wrapper.data)
-    before_text = str(before_runtime)
-    after_text = str(after_runtime)
-    if after_text in text:
-        raise RolloutError("stable wrapper already contains the candidate path")
-    replacements = text.count(before_text)
-    if replacements < 1 or (
-        exact_replacements is not None and replacements != exact_replacements
-    ):
-        expected = (
-            f"exactly {exact_replacements}"
-            if exact_replacements is not None
-            else "at least one"
-        )
-        raise RolloutError(
-            f"stable wrapper must contain {expected} exact current runtime path"
-        )
-    return wrapper.data.replace(before_text.encode(), after_text.encode()), replacements
 
 
 def _prepare_context(args: argparse.Namespace) -> PrepareContext:
@@ -321,11 +291,12 @@ def _bootstrap_context(args: argparse.Namespace) -> BootstrapContext:
     wrapper = _read_wrapper(stable_path)
     if wrapper.sha256 != expected_wrapper_hash:
         raise RolloutError("stable wrapper SHA-256 does not match the explicit guard")
-    _validate_rollout_wrapper(wrapper.data, export_runtime, args.venv_dirname)
-    wrapper_after, replacements = _transform_wrapper(
-        wrapper, export_runtime, baseline_path, exact_replacements=1
+    wrapper_after = _rewrite_rollout_wrapper(
+        wrapper.data,
+        export_runtime,
+        baseline_path,
+        args.venv_dirname,
     )
-    assert replacements == 1
     return BootstrapContext(
         source_repo=source_repo,
         state_root=state_root,
@@ -373,7 +344,9 @@ def _prepare_manifest(
     )
 
 
-def _bootstrap_manifest(context: BootstrapContext) -> dict[str, Any]:
+def _bootstrap_manifest(
+    context: BootstrapContext, import_evidence: state.ImportEvidence
+) -> dict[str, Any]:
     return state.make_manifest(
         snapshot_kind="bootstrap",
         source_repo=context.source_repo,
@@ -395,6 +368,8 @@ def _bootstrap_manifest(context: BootstrapContext) -> dict[str, Any]:
         wrapper_after_sha256=context.wrapper_after_sha256,
         wrapper_mode=context.wrapper.mode,
         runtime_path_replacements=1,
+        schema_version=3,
+        import_evidence=import_evidence,
     )
 
 
@@ -408,6 +383,12 @@ def _prepare_plan(context: PrepareContext, apply: bool) -> dict[str, Any]:
         "stable_wrapper": str(context.wrapper.path),
         "wrapper_before_sha256": context.wrapper.sha256,
         "wrapper_after_sha256": context.wrapper_after_sha256,
+        "wrapper_contract": coherence.WRAPPER_CONTRACT,
+        "planned_soft_nofile": state.parsed_soft_nofile(
+            context.wrapper_after,
+            context.candidate_path,
+            context.venv_dirname,
+        ),
         "operations": [
             "validate exact Git SHA, tracked cleanliness, paths, venv and wrapper",
             f"git worktree add --detach {context.candidate_path} {context.candidate_sha}",
@@ -434,15 +415,39 @@ def _bootstrap_plan(context: BootstrapContext, apply: bool) -> dict[str, Any]:
         "stable_wrapper": str(context.wrapper.path),
         "wrapper_before_sha256": context.wrapper.sha256,
         "wrapper_after_sha256": context.wrapper_after_sha256,
+        "wrapper_contract": coherence.WRAPPER_CONTRACT,
+        "planned_soft_nofile": state.parsed_soft_nofile(
+            context.wrapper_after,
+            context.baseline_path,
+            context.venv_dirname,
+        ),
         "operations": [
             "validate absent state root, export manifest, venv and wrapper evidence",
             f"create exact state root {context.state_root} mode 0700",
             f"git worktree add --detach {context.baseline_path} {context.source_commit}",
             f"copy only {context.export_runtime / context.venv_dirname} to baseline",
-            "create exclusive schema v2 bootstrap snapshot",
+            "run sanitized no-DB target import-origin preflight",
+            "create exclusive schema v3 bootstrap snapshot",
             "leave export runtime and stable wrapper unchanged",
         ],
     }
+
+
+def _require_approved_wrapper_after(
+    args: argparse.Namespace, observed_sha256: str
+) -> None:
+    if not args.apply:
+        return
+    expected = getattr(args, "expected_wrapper_after_sha256", None)
+    if expected is None:
+        raise RolloutError(f"{args.command} apply requires expected wrapper.after SHA-256")
+    approved = _require_full_sha(
+        expected,
+        FULL_SHA256,
+        "expected wrapper.after SHA-256",
+    )
+    if approved != observed_sha256:
+        raise RolloutError("expected wrapper.after SHA-256 does not match generated bytes")
 
 
 def _create_candidate(
@@ -506,6 +511,7 @@ def _load_created_snapshot(
 
 def _run_prepare(args: argparse.Namespace) -> dict[str, Any]:
     context = _prepare_context(args)
+    _require_approved_wrapper_after(args, context.wrapper_after_sha256)
     plan = _prepare_plan(context, args.apply)
     if not args.apply:
         return plan
@@ -552,6 +558,7 @@ def _run_prepare(args: argparse.Namespace) -> dict[str, Any]:
 
 def _run_bootstrap_prepare(args: argparse.Namespace) -> dict[str, Any]:
     context = _bootstrap_context(args)
+    _require_approved_wrapper_after(args, context.wrapper_after_sha256)
     plan = _bootstrap_plan(context, args.apply)
     if not args.apply:
         return plan
@@ -572,20 +579,28 @@ def _run_bootstrap_prepare(args: argparse.Namespace) -> dict[str, Any]:
     _validate_clean_worktree(
         context.baseline_path, context.source_commit, "baseline runtime"
     )
-    _write_snapshot(
-        context.snapshot_path,
-        _bootstrap_manifest(context),
-        context.wrapper.data,
-        context.wrapper_after,
-    )
-    loaded = _load_created_snapshot(
-        context.state_root, context.state_root, context.snapshot_id, context.wrapper
-    )
-    if (
-        loaded.stable_wrapper.sha256 != context.wrapper.sha256
-        or loaded.stable_wrapper.mode != context.wrapper.mode
-    ):
-        raise RolloutError("bootstrap prepare changed the stable wrapper")
+    with coherence.import_preflight_session(
+        context.baseline_path,
+        context.venv_dirname,
+    ) as import_evidence:
+        plan["import_origin"] = import_evidence.manifest_fields()
+        _write_snapshot(
+            context.snapshot_path,
+            _bootstrap_manifest(context, import_evidence),
+            context.wrapper.data,
+            context.wrapper_after,
+        )
+        loaded = _load_created_snapshot(
+            context.state_root,
+            context.state_root,
+            context.snapshot_id,
+            context.wrapper,
+        )
+        if (
+            loaded.stable_wrapper.sha256 != context.wrapper.sha256
+            or loaded.stable_wrapper.mode != context.wrapper.mode
+        ):
+            raise RolloutError("bootstrap prepare changed the stable wrapper")
     plan["result"] = "prepared"
     return plan
 
@@ -599,6 +614,9 @@ def _run_switch_or_rollback(args: argparse.Namespace) -> dict[str, Any]:
         stable_wrapper=args.stable_wrapper,
         expected_current_wrapper_sha256=args.expected_current_wrapper_sha256,
         apply=args.apply,
+        expected_wrapper_after_sha256=getattr(
+            args, "expected_wrapper_after_sha256", None
+        ),
     )
 
 
@@ -619,6 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--expected-venv-interpreter-sha256", required=True)
     bootstrap.add_argument("--stable-wrapper", required=True)
     bootstrap.add_argument("--expected-current-wrapper-sha256", required=True)
+    bootstrap.add_argument("--expected-wrapper-after-sha256")
     bootstrap.add_argument("--apply", action="store_true")
 
     prepare = commands.add_parser("prepare", help="plan or prepare candidate and snapshot")
@@ -631,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--venv-dirname", choices=(".venv", "venv"), required=True)
     prepare.add_argument("--stable-wrapper", required=True)
     prepare.add_argument("--expected-current-wrapper-sha256", required=True)
+    prepare.add_argument("--expected-wrapper-after-sha256")
     prepare.add_argument("--apply", action="store_true")
 
     for name in ("switch", "rollback"):
@@ -640,6 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--snapshot-id", required=True)
         command.add_argument("--stable-wrapper", required=True)
         command.add_argument("--expected-current-wrapper-sha256", required=True)
+        if name == "switch":
+            command.add_argument("--expected-wrapper-after-sha256")
         command.add_argument("--apply", action="store_true")
     return parser
 

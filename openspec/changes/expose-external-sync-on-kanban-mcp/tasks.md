@@ -1159,3 +1159,226 @@ line/fixture/provenance/scope gates прошли. Raw diff fingerprint до и �
 Это superseding acceptance для закрытых non-live truth-задач выше. Task 25.7
 остаётся открытым: normal HOSTKEY/current MCP soft limit `1024` меньше required
 `1360`, а material approval изменения environment capacity не получен.
+
+## 26. MATERIAL DELTA: process-local NOFILE для нового canonical wrapper
+
+- [x] 26.1 Подготовить material proposal/spec/design/tasks delta по входному
+  «Даю апрув», не меняя implementation, tests, fixtures или live paths.
+  Зафиксировать evidence: merged PR #18 `CODE VERDICT APPROVE`; normal
+  HOSTKEY/current MCP finite soft/hard `1024/1048576`; required `1360` и
+  корректный fail-closed; review sandbox `1048576/1048576`, exact suite
+  `163 passed` дважды. Task 25.7 оставить открытым и связать с 26.x.
+- [x] 26.2 Показать пользователю exact baseline 26.x и получить ещё одно
+  явное approval до implementation. Текущее «Даю апрув» разрешает только
+  подготовку material delta; глобальный OpenSpec gate не переносит прежние
+  approvals на новое observable environment contract.
+  Exact approval получено от пользователя формулировкой:
+  «одобряю material RLIMIT_NOFILE=4096 baseline». Оно разрешает только
+  implementation 26.3–26.5 и repo-local/temp-only author verification;
+  25.7, 26.6+, commit, push, PR и live scope остаются открытыми.
+- [x] 26.3 После approval реализовать новый canonical grammar kind
+  `source-cwd-nofile-v2` в
+  `scripts/hermes_kanban_mcp_runtime_coherence.py`: generator выпускает exact
+  `ulimit -S -n 4096` после `set`/exports и до `cd`/`exec`; parser отклоняет
+  missing/malformed/duplicate/wrong/unlimited line. Старые `source-cwd-v1`
+  и schema-v2 остаются parse/rollback-only; generator их не выпускает.
+  Выполнено: единственный canonical generator выпускает ровно одну exact
+  NOFILE-строку в требуемой позиции; version-aware parser принимает новый
+  contract только при exact match и сохраняет legacy grammar для validation
+  rollback. Behavioral shell test подтверждает soft `4096`, неизменный hard
+  и nonzero fail-before-fake-Python/marker при hard `4095`.
+  **Historical implementation evidence:** новый independent `BLOCK`
+  superseded этот completion claim; реализация не принята как текущая
+  приёмка исправления.
+- [x] 26.4 После approval обновить только необходимый rollout
+  state/orchestration contract в
+  `scripts/hermes_kanban_mcp_rollout_state.py` и, только если прямой consumer
+  требует, `scripts/hermes_kanban_mcp_rollout.py`: versioned kind,
+  dry-run/planned limit `4096`, exact wrapper SHA-256 и повторная
+  revalidation. Не добавлять Python self-raise, helper, systemd, `prlimit`,
+  hard-limit raise или unlimited.
+  Выполнено минимально в существующих owners: schema v3 принимает оба
+  versioned kinds для snapshot-only validation, но `source-cwd-v1` switch
+  fail-closed как rollback-only; новый prepare/switch plan сообщает
+  `source-cwd-nofile-v2`, `planned_soft_nofile=4096` и exact wrapper hash.
+  Dry-run filesystem oracle совпадает до/после; внешние capacity/runtime
+  механизмы не добавлены.
+  **Historical implementation evidence:** новый independent `BLOCK`
+  superseded этот completion claim; state/CLI contract должен быть повторно
+  принят только по разделу 27.x.
+- [x] 26.5 После approval добавить targeted valid red→green только в exact
+  целевые тесты:
+  `tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py`,
+  `tests/scripts/test_hermes_kanban_mcp_rollout_state.py` и при
+  наличии подтверждений оркестрации
+  `tests/scripts/test_hermes_kanban_mcp_rollout.py`. Проверить exact generated
+  line/order, child soft `4096`, hard `<4096` nonzero до fake Python/marker,
+  malformed matrix, old grammar/schema-v2 byte-identical rollback и dry-run
+  dry-run-подтверждение отсутствия мутаций, hash и limit.
+  Добавлен новый целевой модуль состояния/грамматики: корректный поведенческий
+  красный прогон — `10 failed`; целевой зелёный прогон — `10 passed`. Целевая
+  регрессионная проверка четырёх затронутых модулей — `128 passed, 0 failed`
+  без retry/FLAKY;
+  historical schema-v2 golden и новый source-cwd-v1 rollback-only exact
+  bytes/mode regression зелёные.
+  **Historical test evidence:** `128 passed` не является final
+  five-module acceptance и не закрывает 26.6 либо 27.x.
+- [ ] 26.6 Выполнить targeted red→green, затем exact full five-module suite
+  два раза
+  подряд без edits/retry/FLAKY. Выполнить Russian consistency, strict
+  OpenSpec, `git diff --check`, exact scope и independent source-read-only
+  review с pre/post fingerprints. Сохранить caps: rollout test `<=850`,
+  support `<400`, каждый source/test `<1000`, `runtime_coherence.py <=900`.
+  Exact suite обязана включать bootstrap, rollout, runtime coherence,
+  runtime sandbox и rollout state с `HERMES_TEST_FILE_RETRIES=0`;
+  fingerprints обоих запусков идентичны. Текущий sibling run
+  `128 passed` не является этим evidence. Tasks отмечать выполненными только
+  по фактическому evidence.
+- [ ] 26.7 Только после accepted independent review разрешить task-owned
+  commit/push/PR и обычный merge lifecycle. PR остаётся строго non-live:
+  никаких wrapper/runtime/process/MCP/DB/systemd/network изменений.
+- [ ] 26.8 После merge получить новое exact approval на live
+  `prepare` dry-run, отдельно `prepare --apply`, `switch` dry-run и отдельно
+  `switch --apply` нового wrapper. Каждый следующий gate показывается по
+  exact plan/hash/limit evidence; merge сам ничего не разрешает.
+- [ ] 26.9 После отдельного approval на process replacement заменить только
+  dedicated MCP process и выполнить bounded MCP smoke. Не выполнять DB
+  writes, systemd mutation или restart. Rollback восстанавливает exact
+  historical wrapper bytes/mode и предыдущий process только по отдельному
+  точному gate.
+
+Tasks 25.7 и 26.6–26.9 остаются открытыми. Change не архивировать;
+implementation/review/delivery/live truth сейчас не закрывать.
+
+## 27. REMEDIATION BASELINE после независимого `BLOCK`
+
+- [x] 27.1 Зафиксировать independent `BLOCK` и подготовить только русский
+  planning delta без code/tests/fixtures/live changes. Исторические
+  implementation evidence 26.3–26.5 и sibling run `128 passed` объявить
+  superseded/not accepted, не снимая их как historical record. Нормативно
+  закрепить единый fresh contract:
+  `schema_version=3`, `snapshot_kind=bootstrap|rollout`,
+  `wrapper_contract=source-cwd-nofile-v2`, новый bootstrap с канонически
+  сгенерированным `wrapper.after`; любой `schema_version!=3` и historical
+  schema-v3 `source-cwd-v1` — только отдельный snapshot-only exact
+  bytes/mode rollback input, запрещённый для switch до preflight/mutation,
+  без in-place migration.
+  Planning delta затрагивает только `README.md`, `proposal.md`, `design.md`,
+  capability `spec.md` и `tasks.md` этого change.
+- [x] 27.2 Показать пользователю exact remediation baseline и получить новое
+  явное approval до valid red или implementation. До approval запрещены
+  scripts/tests/fixtures changes и implementation test runs; commit, push,
+  PR и live scope также закрыты.
+  Exact approval получено от пользователя формулировкой:
+  «одобряю material remediation baseline 27.x». Оно разрешает только
+  implementation 27.3–27.4 и repo-local/temp-only author verification;
+  25.7, 26.6+, 27.5+, commit, push, PR и live scope остаются открытыми.
+- [x] 27.3 После approval получить valid red matrix на exact новых
+  требованиях: fresh bootstrap schema v3/canonical generator; запрет
+  non-v3 и historical v3/`source-cwd-v1` switch до preflight/mutation;
+  mandatory `--expected-wrapper-after-sha256` для
+  `bootstrap-prepare --apply`, `prepare --apply`, `switch --apply`;
+  missing/mismatch до первого managed write/preflight/`os.replace`; exact
+  точные проверки загрузчиком типа/контракта/разобранного `4096`/хеша
+  манифеста/фактических байтов; CLI отката без изменений; без отдельного
+  дайджеста плана; запланированный лимит выводится из разобранной обёртки.
+  RLIMIT red tests запускать hermetic child Python trampoline без
+  ambient hard/infinity и без `preexec_fn`.
+  Выполнено после exact approval. Корректная targeted команда с retries `0`
+  на bootstrap, rollout и rollout-state завершилась `82 passed, 9 failed`.
+  Exact failures: fresh bootstrap оставался schema v2; missing/mismatched
+  approved after SHA доходил до state creation/managed write/preflight;
+  `run_transition` не принимал approved after SHA; historical schema-v2
+  bootstrap оставался switch-eligible; plan вернул monkeypatched `17` вместо
+  разобранного `4096`. Hermetic success/failure RLIMIT trampoline tests
+  прошли уже в red run; `preexec_fn` и ambient hard/infinity не использованы.
+  Дополнительный accepted-review P1 red выполнен exact targeted командой
+  rollout-state с `-k literal_schema_v2`, retries `0`: `4 failed`.
+  Relocated literal golden `wrapper.before` был отклонён настоящим
+  `prepare --apply` в текущем rewrite path как содержащий blank lines; три
+  соседних malformed variants также не доходили до mutation, но возвращали
+  broad modern-parser error вместо exact historical-template rejection.
+- [x] 27.4 После valid red выполнить минимальную implementation только в
+  `scripts/hermes_kanban_mcp_rollout.py`,
+  `scripts/hermes_kanban_mcp_rollout_state.py` и неизбежной минимальной части
+  `scripts/hermes_kanban_mcp_runtime_coherence.py`; тесты менять только в
+  пяти focused modules. `runtime_coherence.py` уже `897/900`: новую
+  state/CLI policy туда не добавлять. При необходимости extraction разрешена
+  только в существующие substantive owners
+  `scripts/hermes_kanban_mcp_rollout_common.py` и
+  `tests/scripts/hermes_kanban_mcp_test_support.py`, без нового thin wrapper.
+  Manifest shape не расширять.
+  Выполнено минимально в существующих owners. Fresh bootstrap/rollout
+  выпускают schema v3 и canonical `source-cwd-nofile-v2`; apply hash guards
+  завершаются до mutation/preflight/replace; switch loader строго проверяет
+  schema/kind/contract, actual bytes/hash и parsed `4096`; rollback остаётся
+  snapshot-only exact bytes/mode без migration. Targeted green той же
+  трёхмодульной команды: `91 passed, 0 failed`. После исправления focused
+  runtime-coherence helper: `44 passed, 0 failed`. Один запрошенный exact
+  five-module run: `180 passed, 0 failed`, retries `0`, без `FLAKY`.
+  На момент этого historical evidence одного запуска было недостаточно для
+  закрытия 27.5.
+  Дополнительный P1 green той же exact targeted команды: `4 passed,
+  0 failed`, retries `0`. Exact historical schema-v2 validator возвращает
+  нормализованный allow-listed header только после полного literal match;
+  общий rewrite и transition используют единственный canonical generator.
+  Настоящий `prepare --apply` сохраняет literal `wrapper.before` bytes,
+  snapshot mode `0600` и stable mode, создаёт exact
+  `source-cwd-nofile-v2` after с `4096`, а switch→rollback восстанавливает
+  исходные bytes/mode. Три neighboring variants завершаются до mutation.
+  `runtime_coherence.py` после локального упрощения имеет `896/900` строк.
+  Один exact five-module author run после P1 remediation завершён:
+  `184 passed, 0 failed`, retries `0`, без `FLAKY`. На момент этого
+  historical evidence это был один запуск, поэтому 27.5 ещё оставалась
+  открытой.
+  **Remediation evidence:** accepted final-review `BLOCK` установил, что
+  literal historical schema-v2 `wrapper.before` был покрыт только как
+  snapshot-only rollback input, но не как вход настоящего creation path
+  `prepare`/`bootstrap-prepare`. Поэтому для этого exact P1 добавлено
+  отдельное behavioral red→green evidence выше; само по себе на тот момент
+  оно не закрывало 27.5+.
+- [x] 27.5 На одном final snapshot дважды подряд без edits выполнить exact
+  five-module acceptance с retries `0`:
+
+  ```bash
+  HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+    tests/scripts/test_hermes_kanban_mcp_bootstrap.py \
+    tests/scripts/test_hermes_kanban_mcp_rollout.py \
+    tests/scripts/test_hermes_kanban_mcp_runtime_coherence.py \
+    tests/scripts/test_hermes_kanban_mcp_runtime_sandbox.py \
+    tests/scripts/test_hermes_kanban_mcp_rollout_state.py
+  ```
+
+  Оба запуска обязаны быть без retry/`FLAKY` и с идентичными pre/post
+  fingerprints. Затем выполнить Russian consistency, strict OpenSpec,
+  `git diff --check`, exact scope/ownership/line caps. Текущие `128 passed`
+  не являются evidence этой задачи.
+  Выполнено на exact final snapshot: два последовательных five-module run
+  завершились `184 passed, 0 failed` за `220.4s` и `220.8s` при
+  `HERMES_TEST_FILE_RETRIES=0`, без retry/`FLAKY`. Binary diff SHA-256:
+  `4006670520cb65797f38b308ac895726025c09de5506fe53b9f77c6c96d88405`;
+  pre/post fingerprints равны. Strict OpenSpec, diff, Russian consistency,
+  caps и fixture gates остались неизменными.
+- [x] 27.6 Выполнить независимую source-read-only validation/review в
+  `workspace-write` только для temp/cache/evidence: независимо перепроверить
+  evidence exact двух five-module run с retries `0`, без `FLAKY`, равенство
+  fingerprints и strict OpenSpec/diff/scope/line gates. Получить accepted
+  verdict без `BLOCK`.
+  Выполнено независимое source-read-only rereview: verdict `APPROVE`, без
+  `P0`/`P1`/`P2`; все прошлые `P1` закрыты. Tests в review повторно не
+  запускались; fingerprints остались неизменными.
+- [ ] 27.7 Только после accepted independent review пройти task-owned
+  commit/push/PR и обычный merge lifecycle. PR строго non-live и не меняет
+  состояние wrapper/runtime/process/MCP/DB/systemd/network.
+- [ ] 27.8 После merge вернуться к прежним отдельным live gates 26.8:
+  получить exact approval последовательно на `prepare` dry-run,
+  `prepare --apply`, `switch` dry-run и `switch --apply`, каждый раз показывая
+  plan/hash/parsed-limit evidence. Merge ничего не разрешает автоматически.
+- [ ] 27.9 Только после отдельного approval выполнить прежний process gate
+  26.9: заменить dedicated MCP process и провести bounded smoke без DB writes,
+  systemd mutation или restart; rollback остаётся отдельным exact gate.
+
+Tasks 25.7, 26.6–26.9 и 27.7–27.9 остаются открытыми. В 27.x фактически
+выполнены planning 27.1, exact approval 27.2, valid red 27.3, minimal
+implementation/author verification 27.4, два последовательных acceptance
+run 27.5 и независимое rereview 27.6; delivery и live scope не заявлены.

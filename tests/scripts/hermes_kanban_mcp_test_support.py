@@ -29,13 +29,15 @@ def hash_bytes(data: bytes) -> str:
 
 
 def wrapper_bytes(runtime: Path, *, canonical: bool) -> bytes:
-    cd = f"cd -- {runtime}\n" if canonical else ""
+    canonical_lines = (
+        f"ulimit -S -n 4096\ncd -- {runtime}\n" if canonical else ""
+    )
     return (
         f"#!/bin/bash\nset -euo pipefail\n"
         f"export HERMES_HOME={runtime.parent}/hermes-home\n"
         "export HERMES_QUIET=1\n"
         "export HERMES_REDACT_SECRETS=true\n"
-        f"export PYTHONDONTWRITEBYTECODE=1\n{cd}"
+        f"export PYTHONDONTWRITEBYTECODE=1\n{canonical_lines}"
         f"exec {runtime}/.venv/bin/python"
         ' -m hermes_cli.main mcp serve-kanban --allow-write "$@"\n'
     ).encode()
@@ -155,7 +157,12 @@ class RolloutLayout:
     def snapshot_path(self) -> Path:
         return self.state_root / "snapshots" / self.snapshot_id
 
-    def prepare_args(self, *, apply: bool = False) -> list[str]:
+    def prepare_args(
+        self,
+        *,
+        apply: bool = False,
+        wrapper_after_sha256: str | None | object = ...,
+    ) -> list[str]:
         result = [
             "prepare",
             "--source-repo", str(self.source),
@@ -168,10 +175,23 @@ class RolloutLayout:
             "--stable-wrapper", str(self.stable_wrapper),
             "--expected-current-wrapper-sha256", self.wrapper_before_hash,
         ]
+        if wrapper_after_sha256 is ... and apply:
+            wrapper_after_sha256 = hash_bytes(
+                wrapper_bytes(self.candidate_path, canonical=True)
+            )
+        if isinstance(wrapper_after_sha256, str):
+            result.extend(
+                ["--expected-wrapper-after-sha256", wrapper_after_sha256]
+            )
         return [*result, "--apply"] if apply else result
 
     def transition_args(
-        self, command: str, expected_hash: str, *, apply: bool = False
+        self,
+        command: str,
+        expected_hash: str,
+        *,
+        apply: bool = False,
+        wrapper_after_sha256: str | None | object = ...,
     ) -> list[str]:
         result = [
             command,
@@ -181,6 +201,14 @@ class RolloutLayout:
             "--stable-wrapper", str(self.stable_wrapper),
             "--expected-current-wrapper-sha256", expected_hash,
         ]
+        if command == "switch" and wrapper_after_sha256 is ... and apply:
+            wrapper_after_sha256 = hash_bytes(
+                (self.snapshot_path / "wrapper.after").read_bytes()
+            )
+        if command == "switch" and isinstance(wrapper_after_sha256, str):
+            result.extend(
+                ["--expected-wrapper-after-sha256", wrapper_after_sha256]
+            )
         return [*result, "--apply"] if apply else result
 
 

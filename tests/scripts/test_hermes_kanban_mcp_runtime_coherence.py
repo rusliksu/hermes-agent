@@ -151,6 +151,7 @@ def _wrapper_bytes(runtime: Path, *, canonical: bool) -> bytes:
         "export PYTHONDONTWRITEBYTECODE=1",
     ]
     if canonical:
+        lines.append("ulimit -S -n 4096")
         lines.append(f"cd -- {runtime}")
     lines.append(
         f"exec {runtime}/.venv/bin/python"
@@ -223,6 +224,9 @@ class Layout:
             "--stable-wrapper", str(self.wrapper),
             "--expected-current-wrapper-sha256", wrapper_hash,
         ]
+        if apply:
+            generated = _wrapper_bytes(self.runtime(candidate_sha), canonical=True)
+            args += ["--expected-wrapper-after-sha256", _hash(generated)]
         return [*args, "--apply"] if apply else args
 
     def transition(
@@ -235,6 +239,9 @@ class Layout:
             "--stable-wrapper", str(self.wrapper),
             "--expected-current-wrapper-sha256", wrapper_hash,
         ]
+        if apply and command == "switch":
+            generated = self.snapshot(before, after) / "wrapper.after"
+            args += ["--expected-wrapper-after-sha256", _hash(generated.read_bytes())]
         return [*args, "--apply"] if apply else args
 
 
@@ -311,7 +318,7 @@ def test_legacy_to_canonical_v3_shadowing_dry_run_switch_and_rollback(
     manifest = _manifest(layout, layout.current_sha, layout.candidate_sha)
     wrapper_after = (snapshot / "wrapper.after").read_bytes()
     assert manifest["schema_version"] == 3
-    assert manifest["wrapper_contract"] == "source-cwd-v1"
+    assert manifest["wrapper_contract"] == "source-cwd-nofile-v2"
     assert manifest["write_tools"] == [
         "kanban_enqueue", "kanban_sync_external_task"
     ]
@@ -346,7 +353,7 @@ def test_legacy_to_canonical_v3_shadowing_dry_run_switch_and_rollback(
     switch_dry_run = json.loads(capsys.readouterr().out)
     assert switch_dry_run["import_origin"]["source_cwd"] == str(candidate)
     assert _oracle(layout.root) == oracle
-    assert rollout.main([*switch_args, "--apply"]) == 0
+    assert rollout.main([*switch_args, "--expected-wrapper-after-sha256", _hash(wrapper_after), "--apply"]) == 0
     switch_apply = json.loads(capsys.readouterr().out)
     assert switch_apply["import_origin"] == switch_dry_run["import_origin"]
     assert layout.wrapper.read_bytes() == wrapper_after
