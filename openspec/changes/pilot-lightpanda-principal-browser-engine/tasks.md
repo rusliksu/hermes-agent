@@ -1,14 +1,20 @@
 ## 0. Утверждение исходного плана
 
-- [ ] 0.1 Зафиксировать approval исходного OpenSpec-плана для `pilot-lightpanda-principal-browser-engine` до начала реализации.
+- [x] 0.1 Зафиксировать approval исходного OpenSpec-плана для `pilot-lightpanda-principal-browser-engine` до начала реализации.
+  - 2026-07-30: текущий user `@best-step` явно разрешил planning/preflight docs-only apply packet без реализации кода, зависимостей, binary install, browser execution, fetch/push/live/config/services/secrets/env values/private data; baseline требований не менялся.
 
 ## 1. Зависимость и предварительная проверка
 
 - [ ] 1.1 Подтвердить, что `introduce-gurra-principal-role-isolation` merged до начала работ по реализации.
-- [ ] 1.2 Подтвердить, что ветка реализации основана на HEAD зависимости `bd9d688297fce5a07b317a61e6147b6e00b109f2` или его merged equivalent.
-- [ ] 1.3 Перед реализацией перечитать применимые `AGENTS.md`, текущий код полномочий браузера и specs зависимости.
-- [ ] 1.4 Подтвердить, что не добавляется новый MCP, новый видимый модели browser tool, новая runtime-зависимость или общий long-running MCP/CDP server.
+  - 2026-07-30: оставлено open. Evidence: `/home/openclaw/.local/bin/openspec instructions apply --change introduce-gurra-principal-role-isolation --json` показывает progress 12/74 complete, 62 remaining; локальные `main`/`origin/main` refs не содержат commit `bd9d688297fce5a07b317a61e6147b6e00b109f2`; change directory `openspec/changes/introduce-gurra-principal-role-isolation` остается active, а не archived/complete реализацией.
+- [x] 1.2 Подтвердить, что ветка реализации основана на HEAD зависимости `bd9d688297fce5a07b317a61e6147b6e00b109f2` или его merged equivalent.
+  - 2026-07-30: `git merge-base --is-ancestor bd9d688297fce5a07b317a61e6147b6e00b109f2 HEAD` завершился code 0 на branch `codex/pilot-lightpanda-principal-browser-engine`, HEAD `7663a2630d143b173853f18c0de55525857a6df9`.
+- [x] 1.3 Перед реализацией перечитать применимые `AGENTS.md`, текущий код полномочий браузера и specs зависимости.
+  - 2026-07-30: прочитан repo `AGENTS.md`; applicable nested AGENTS для touched paths отсутствуют (`rg --files -g 'AGENTS.md'` нашел только root и `apps/desktop/AGENTS.md`, desktop вне scope). Прочитаны `agent/runtime_browser.py`, engine/fallback участки `tools/browser_tool.py`, dependency `openspec/changes/introduce-gurra-principal-role-isolation/{design.md,tasks.md,specs/*.md}` и contextFiles текущего change.
+- [x] 1.4 Подтвердить, что не добавляется новый MCP, новый видимый модели browser tool, новая runtime-зависимость или общий long-running MCP/CDP server.
+  - 2026-07-30: `git diff --name-status bd9d688297fce5a07b317a61e6147b6e00b109f2...HEAD` показывает только добавление planning files под `openspec/changes/pilot-lightpanda-principal-browser-engine/*`; source/dependency inventory не содержит изменений в `tools/`, `toolsets.py`, `model_tools.py`, `pyproject.toml`, lockfiles, MCP/server code или browser runtime files.
 - [ ] 1.5 Определить typed policy contract для выбора `lightpanda`, `chrome` или отказа из серверных полномочий role/profile/backend.
+  - 2026-07-30: оставлено open. Доказанный текущий contract: `ResolvedAccessContext` имеет ровно шесть authority-полей `principal_id`, `role_id`, `profile_id`, `conversation_scope`, `capabilities`, `delivery_target`; `AccessRegistry.effective_capabilities()` вычисляет role/scope/backend capability intersection. Текущий browser engine code пока читает typed `browser.engine` из profile-local `config.yaml` через `agent/runtime_browser.py::BrowserRequestAuthority.browser_engine()` и `tools/browser_tool.py::_get_browser_engine()`, а не из явно доказанной typed role/scope/backend engine policy. Точное расположение policy key для engine opt-in остается архитектурным blocker из `design.md`; требования не расширялись и 6-field `ResolvedAccessContext` не менялся.
 
 ## 2. Тесты и полномочия
 

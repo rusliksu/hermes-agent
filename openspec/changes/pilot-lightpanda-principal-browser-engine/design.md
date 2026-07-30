@@ -80,5 +80,5 @@
 
 - Точный source и pinning format для Lightpanda artifact: release version, commit SHA, checksum source, SBOM и license note.
 - Точный список синтетических workloads и output schema измерительного harness.
-- Точное расположение policy key для engine opt-in внутри typed profile/role/backend policy.
+- Точное расположение policy key для engine opt-in внутри typed profile/role/backend policy. Preflight finding 2026-07-30: текущий код доказывает только чтение profile-local `browser.engine` через `agent/runtime_browser.py::BrowserRequestAuthority.browser_engine()` и `tools/browser_tool.py::_get_browser_engine()` после разрешения шестипольного `ResolvedAccessContext`; он еще не доказывает расположение typed role/scope/backend engine policy, поэтому реализация MUST NOT угадывать этот key или расширять `ResolvedAccessContext`.
 - Должен ли резервный переход к Chrome быть разрешен для синтетического canary владельца по умолчанию или требовать отдельный capability flag.
