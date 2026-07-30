@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -51,6 +52,34 @@ def _make_event(platform: Platform, user_id: str, chat_id: str) -> MessageEvent:
             chat_id=chat_id,
             user_name="tester",
             chat_type="dm",
+        ),
+    )
+
+
+def _make_typed_telegram_event(user_id: str = "typed-stranger") -> MessageEvent:
+    return MessageEvent(
+        text="hello",
+        message_id="m1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            chat_id=user_id,
+            user_name="typed",
+            chat_type="dm",
+            profile="family-synthetic",
+            resolved_access_context=ResolvedAccessContext(
+                principal_id="principal-family",
+                role_id="family_standard",
+                profile_id="family-synthetic",
+                conversation_scope="private",
+                capabilities=frozenset({"chat"}),
+                delivery_target=DeliveryTarget(
+                    platform=Platform.TELEGRAM.value,
+                    account="bot-family",
+                    peer_kind="dm",
+                    chat_id=user_id,
+                ),
+            ),
         ),
     )
 
@@ -813,6 +842,37 @@ async def test_global_allowlist_ignores_unauthorized_dm(monkeypatch):
     assert result is None
     runner.pairing_store.generate_code.assert_not_called()
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_typed_unauthorized_dm_behavior_ignores_process_allowlist(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "owner-global-user")
+
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+    )
+    runner, adapter = _make_runner(Platform.TELEGRAM, config)
+    runner._profile_adapters = {"family-synthetic": {Platform.TELEGRAM: adapter}}
+    runner.pairing_store.generate_code.return_value = "TYPED123"
+
+    token = set_secret_scope({})
+    try:
+        result = await runner._handle_message_after_ingress(_make_typed_telegram_event())
+    finally:
+        reset_secret_scope(token)
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_called_once_with(
+        "telegram",
+        "typed-stranger",
+        "typed",
+    )
+    adapter.send.assert_awaited_once()
+    assert "TYPED123" in adapter.send.await_args.args[1]
 
 
 @pytest.mark.asyncio

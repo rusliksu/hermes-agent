@@ -707,6 +707,7 @@ class GatewayAuthorizationMixin:
         platform: Optional[Platform],
         *,
         profile: Optional[str] = None,
+        source: Optional[SessionSource] = None,
     ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
@@ -727,6 +728,11 @@ class GatewayAuthorizationMixin:
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
+        auth_env_scoped = (
+            getattr(source, "resolved_access_context", None) is not None
+            if source is not None
+            else False
+        )
 
         # Check for an explicit per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
@@ -753,10 +759,14 @@ class GatewayAuthorizationMixin:
         # so unauthorized DMs should be dropped silently rather than answered
         # with a pairing code. An explicit pairing policy opts back into codes.
         # Prefer the profile-scoped live adapter's resolved policy in multiplex
-        # mode; fall back to the default profile's config.extra.
+        # mode. Legacy no-source callers may still fall back to config.extra.
         if platform:
-            dm_policy = self._adapter_dm_policy(platform, profile=profile)
-            if not dm_policy and config and hasattr(config, "platforms"):
+            if auth_env_scoped and source is not None:
+                adapter = self._adapter_for_source(source)
+                dm_policy = str(getattr(adapter, "_dm_policy", "") or "").strip().lower()
+            else:
+                dm_policy = self._adapter_dm_policy(platform, profile=profile)
+            if not auth_env_scoped and not dm_policy and config and hasattr(config, "platforms"):
                 platform_cfg = config.platforms.get(platform)
                 extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
                 if isinstance(extra, dict):
@@ -796,13 +806,16 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if _auth_env(
+                platform_env_map.get(platform, ""),
+                scoped=auth_env_scoped,
+            ):
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if _auth_env(env_key, scoped=auth_env_scoped):
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS", scoped=auth_env_scoped):
             return "ignore"
 
         return "pair"
