@@ -844,12 +844,14 @@ async def test_global_allowlist_ignores_unauthorized_dm(monkeypatch):
     adapter.send.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_typed_unauthorized_dm_behavior_ignores_process_allowlist(monkeypatch):
+async def _assert_typed_unauthorized_dm_pairs_with_poisoned_env(
+    monkeypatch,
+    env_key: str,
+) -> None:
     from agent.secret_scope import reset_secret_scope, set_secret_scope
 
     _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "owner-global-user")
+    monkeypatch.setenv(env_key, "owner-process-allowlist")
 
     config = GatewayConfig(
         multiplex_profiles=True,
@@ -873,6 +875,30 @@ async def test_typed_unauthorized_dm_behavior_ignores_process_allowlist(monkeypa
     )
     adapter.send.assert_awaited_once()
     assert "TYPED123" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_typed_unauthorized_dm_behavior_ignores_process_allowlist(monkeypatch):
+    await _assert_typed_unauthorized_dm_pairs_with_poisoned_env(
+        monkeypatch,
+        "GATEWAY_ALLOWED_USERS",
+    )
+
+
+@pytest.mark.parametrize(
+    "env_key",
+    [
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+    ],
+)
+@pytest.mark.asyncio
+async def test_typed_unauthorized_dm_behavior_ignores_platform_process_allowlists(
+    monkeypatch,
+    env_key,
+):
+    await _assert_typed_unauthorized_dm_pairs_with_poisoned_env(monkeypatch, env_key)
 
 
 @pytest.mark.asyncio
