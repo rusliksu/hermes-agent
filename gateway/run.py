@@ -6212,6 +6212,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
+        registry = getattr(self, "access_registry", None)
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
@@ -6230,7 +6231,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source is None:
                 source = self._get_cached_session_source(session_key)
 
-            registry = getattr(self, "access_registry", None)
             chat_type = None
             if registry is not None:
                 try:
@@ -6284,7 +6284,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                adapter = (
+                    self._adapter_for_source(source)
+                    if registry is not None
+                    else self.adapters.get(platform)
+                )
                 if not adapter:
                     continue
 
@@ -6341,6 +6345,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+            return
+
+        if registry is not None:
+            logger.debug(
+                "Skipping unbound home-channel shutdown notifications under access registry"
+            )
             return
 
         # Suppress ONLY the home-channel broadcast when the drain that is ending
