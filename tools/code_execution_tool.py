@@ -733,7 +733,16 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        raw_cwd = overrides.get("cwd") or config["cwd"]
+        try:
+            from agent.runtime_cwd import resolve_bound_profile_cwd
+
+            typed_cwd = resolve_bound_profile_cwd(raw_cwd)
+        except ValueError:
+            raise
+        except Exception:
+            typed_cwd = None
+        cwd = str(typed_cwd) if typed_cwd is not None else raw_cwd
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona"}:
@@ -1810,6 +1819,8 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
     """
     if mode != "project":
         return staging_dir
+    recorded = None
+    session_cwd = None
     if task_id:
         # 1. The session's cwd record — IS the session's `cd` state.
         try:
@@ -1818,8 +1829,6 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             recorded = get_session_cwd(task_id)
         except Exception:
             recorded = None
-        if recorded and os.path.isdir(recorded):
-            return recorded
         # 2. Registered workspace override (session.cwd.set → gateway/TUI/ACP).
         try:
             from tools.file_tools import _registered_task_cwd_override
@@ -1827,6 +1836,19 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = _registered_task_cwd_override(task_id)
         except Exception:
             session_cwd = None
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        typed = resolve_bound_profile_cwd(recorded or session_cwd)
+    except ValueError:
+        raise
+    except Exception:
+        typed = None
+    if typed is not None:
+        return str(typed)
+    if task_id:
+        if recorded and os.path.isdir(recorded):
+            return recorded
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
     raw = os.environ.get("TERMINAL_CWD", "").strip()

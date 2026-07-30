@@ -247,6 +247,16 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        typed = resolve_bound_profile_cwd()
+    except ValueError:
+        raise
+    except Exception:
+        typed = None
+    if typed is not None:
+        return str(typed)
     return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
@@ -295,9 +305,19 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
         recorded = get_session_cwd(task_id)
     except Exception:
         recorded = None
+    registered = _registered_task_cwd_override(task_id)
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        typed = resolve_bound_profile_cwd(recorded or registered)
+    except ValueError:
+        raise
+    except Exception:
+        typed = None
+    if typed is not None:
+        return str(typed)
     if recorded:
         return recorded
-    registered = _registered_task_cwd_override(task_id)
     if registered:
         return registered
     return _configured_terminal_cwd()
