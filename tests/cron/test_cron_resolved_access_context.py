@@ -1,5 +1,10 @@
+import asyncio
 import json
+from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 import pytest
 
@@ -53,6 +58,48 @@ def _bind(context: ResolvedAccessContext):
         chat_id=context.delivery_target.chat_id,
         thread_id=context.delivery_target.thread_id or "",
         resolved_access_context=context,
+    )
+
+
+def _cron_live_loop():
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    return loop
+
+
+def _run_scheduled_coroutine(coro, _loop):
+    future = Future()
+    try:
+        future.set_result(asyncio.run(coro))
+    except BaseException as exc:  # noqa: BLE001
+        future.set_exception(exc)
+    return future
+
+
+def _live_adapter(account: str):
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=MagicMock(success=True, raw_response=None)),
+        send_voice=AsyncMock(return_value=MagicMock(success=True, raw_response=None)),
+        send_image_file=AsyncMock(return_value=MagicMock(success=True, raw_response=None)),
+        send_video=AsyncMock(return_value=MagicMock(success=True, raw_response=None)),
+        send_document=AsyncMock(return_value=MagicMock(success=True, raw_response=None)),
+        supports_inchannel_continuable=False,
+        splits_long_messages=True,
+        config=SimpleNamespace(enabled=True, extra={"account": account}),
+        _profile_route_account_label=lambda: account,
+    )
+    return adapter
+
+
+def _gateway_config_without_local_platforms():
+    return SimpleNamespace(platforms={})
+
+
+def _gateway_config_with_telegram():
+    from gateway.config import Platform
+
+    return SimpleNamespace(
+        platforms={Platform.TELEGRAM: SimpleNamespace(enabled=True, extra={})}
     )
 
 
@@ -659,6 +706,165 @@ def test_scheduler_denies_unknown_role_and_owner_without_cron_before_script(
     with pytest.raises(RuntimeError, match=message):
         run_job(job)
     assert script_calls == []
+
+
+def test_typed_cron_delivery_uses_unique_exact_live_adapter_without_local_config(monkeypatch):
+    """Production break guarded: isolated typed cron must not fail just because
+    its profile lacks a duplicate platform config when a unique exact live
+    adapter exists in the gateway runner.
+    """
+    from cron.scheduler import _deliver_result
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    context = _ctx("family-2", chat_id="chat-2", capabilities=frozenset({"self_reminder"}))
+    primary = _live_adapter("bot-main")
+    secondary = _live_adapter("bot-main-secondary")
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {"family-2": {Platform.TELEGRAM: secondary}}
+    job = {
+        "id": "typed-live",
+        "name": "typed-live",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "chat-2", "thread_id": "thread-1"},
+        "resolved_access_context": serialize_resolved_access_context(
+            ResolvedAccessContext(
+                principal_id=context.principal_id,
+                role_id=context.role_id,
+                profile_id=context.profile_id,
+                conversation_scope=context.conversation_scope,
+                capabilities=context.capabilities,
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account="bot-main-secondary",
+                    peer_kind="dm",
+                    chat_id="chat-2",
+                    thread_id="thread-1",
+                ),
+            )
+        ),
+    }
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config_without_local_platforms()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("asyncio.run_coroutine_threadsafe", side_effect=_run_scheduled_coroutine),
+        patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send,
+    ):
+        result = _deliver_result(
+            job,
+            "typed content",
+            adapters=runner._cron_adapter_view(),
+            loop=_cron_live_loop(),
+        )
+
+    assert result is None
+    secondary.send.assert_awaited_once()
+    primary.send.assert_not_awaited()
+    standalone_send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("adapters", [None, {}])
+def test_typed_cron_delivery_without_resolver_never_calls_standalone(adapters):
+    """Production break guarded: typed cron with no runner-bound resolver must
+    fail closed instead of using standalone platform credentials.
+    """
+    from cron.scheduler import _deliver_result
+
+    family = _ctx("family-1")
+    job = {
+        "id": "typed-no-resolver",
+        "name": "typed-no-resolver",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "thread-1"},
+        "resolved_access_context": serialize_resolved_access_context(family),
+    }
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config_with_telegram()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send,
+    ):
+        result = _deliver_result(job, "typed content", adapters=adapters, loop=None)
+
+    assert "live adapter resolver" in result
+    standalone_send.assert_not_awaited()
+
+
+def test_typed_cron_delivery_no_exact_account_never_calls_standalone():
+    """Production break guarded: typed cron must not fall back to platform-only
+    delivery when the live gateway has no unique exact account match.
+    """
+    from cron.scheduler import _deliver_result
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    family = _ctx("family-1")
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: _live_adapter("bot-other")}
+    runner._profile_adapters = {}
+    job = {
+        "id": "typed-no-match",
+        "name": "typed-no-match",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "thread-1"},
+        "resolved_access_context": serialize_resolved_access_context(family),
+    }
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config_with_telegram()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send,
+    ):
+        result = _deliver_result(
+            job,
+            "typed content",
+            adapters=runner._cron_adapter_view(),
+            loop=None,
+        )
+
+    assert "unique live adapter" in result
+    standalone_send.assert_not_awaited()
+
+
+def test_legacy_cron_delivery_still_uses_primary_platform_adapter():
+    """Production break guarded: account-aware typed routing must not change
+    legacy platform-only cron delivery.
+    """
+    from cron.scheduler import _deliver_result
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    primary = _live_adapter("bot-primary")
+    secondary = _live_adapter("bot-secondary")
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {"family": {Platform.TELEGRAM: secondary}}
+    job = {
+        "id": "legacy-live",
+        "name": "legacy-live",
+        "deliver": "origin",
+        "origin": {"platform": "telegram", "chat_id": "chat-1"},
+    }
+
+    with (
+        patch("gateway.config.load_gateway_config", return_value=_gateway_config_with_telegram()),
+        patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+        patch("asyncio.run_coroutine_threadsafe", side_effect=_run_scheduled_coroutine),
+        patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send,
+    ):
+        result = _deliver_result(
+            job,
+            "legacy content",
+            adapters=runner._cron_adapter_view(),
+            loop=_cron_live_loop(),
+        )
+
+    assert result is None
+    primary.send.assert_awaited_once()
+    secondary.send.assert_not_awaited()
+    standalone_send.assert_not_awaited()
 
 
 def test_scheduler_restores_resolved_context_inside_agent_run(monkeypatch, tmp_path):

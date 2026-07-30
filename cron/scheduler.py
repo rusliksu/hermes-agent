@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -1533,6 +1534,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    typed_context = _persisted_resolved_access_context(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -1648,16 +1650,38 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        if typed_context is not None:
+            resolver = getattr(adapters, "resolve", None) if adapters is not None else None
+            if not callable(resolver):
+                msg = "typed cron delivery requires live adapter resolver"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            runtime_adapter = resolver(platform, typed_context.delivery_target.account)
+            if runtime_adapter is None:
+                msg = "typed cron delivery requires a unique live adapter for the resolved account"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            route_adapters = {platform: runtime_adapter}
+        else:
+            # Prefer the live adapter when the gateway is running — this supports E2EE
+            # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
+            runtime_adapter = (adapters or {}).get(platform)
+            route_adapters = adapters
+
         pconfig = config.platforms.get(platform)
         if not pconfig or not pconfig.enabled:
-            msg = f"platform '{platform_name}' not configured/enabled"
-            logger.warning("Job '%s': %s", job["id"], msg)
-            delivery_errors.append(msg)
-            continue
-
-        # Prefer the live adapter when the gateway is running — this supports E2EE
-        # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
-        runtime_adapter = (adapters or {}).get(platform)
+            if typed_context is not None:
+                pconfig = getattr(runtime_adapter, "config", None) or SimpleNamespace(
+                    enabled=True,
+                    extra={},
+                )
+            else:
+                msg = f"platform '{platform_name}' not configured/enabled"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
         delivered = False
         target_errors = []
 
@@ -1810,7 +1834,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(config, route_adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -2000,12 +2024,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                logger.warning(
-                    "Job '%s': %s, falling back to standalone",
-                    job["id"], err_msg,
-                )
+                if typed_context is not None:
+                    logger.warning(
+                        "Job '%s': %s; typed cron delivery has no standalone fallback",
+                        job["id"], err_msg,
+                    )
+                else:
+                    logger.warning(
+                        "Job '%s': %s, falling back to standalone",
+                        job["id"], err_msg,
+                    )
 
         if not delivered:
+            if typed_context is not None:
+                if not target_errors:
+                    target_errors.append(
+                        "typed cron delivery requires confirmed live adapter delivery"
+                    )
+                delivery_errors.extend(target_errors)
+                continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures

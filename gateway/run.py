@@ -3003,6 +3003,81 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+def _cron_route_account_label(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+class _GatewayCronAdapterView:
+    """Live dict-like view over a runner's primary adapters plus exact accounts."""
+
+    def __init__(self, runner: "GatewayRunner"):
+        self._runner = runner
+
+    def _primary(self) -> Dict[Platform, BasePlatformAdapter]:
+        return getattr(self._runner, "adapters", None) or {}
+
+    def get(self, platform, default=None):
+        return self._primary().get(platform, default)
+
+    def items(self):
+        return self._primary().items()
+
+    def values(self):
+        return self._primary().values()
+
+    def keys(self):
+        return self._primary().keys()
+
+    def __iter__(self):
+        return iter(self._primary())
+
+    def __len__(self):
+        return len(self._primary())
+
+    def __contains__(self, platform):
+        return platform in self._primary()
+
+    def __getitem__(self, platform):
+        return self._primary()[platform]
+
+    @staticmethod
+    def _adapter_for_platform(adapter_map, platform):
+        if not isinstance(adapter_map, dict):
+            return None
+        candidate = adapter_map.get(platform)
+        if candidate is not None:
+            return candidate
+        expected = getattr(platform, "value", platform)
+        for key, value in adapter_map.items():
+            if getattr(key, "value", key) == expected:
+                return value
+        return None
+
+    def resolve(self, platform, account: str):
+        expected = _cron_route_account_label(account)
+        if not expected:
+            return None
+        matches = []
+        seen_ids = set()
+
+        def consider(adapter):
+            if adapter is None or id(adapter) in seen_ids:
+                return
+            seen_ids.add(id(adapter))
+            label_fn = getattr(adapter, "_profile_route_account_label", None)
+            if not callable(label_fn):
+                return
+            if _cron_route_account_label(label_fn()) == expected:
+                matches.append(adapter)
+
+        consider(self._adapter_for_platform(self._primary(), platform))
+        for profile_map in (getattr(self._runner, "_profile_adapters", None) or {}).values():
+            consider(self._adapter_for_platform(profile_map, platform))
+        return matches[0] if len(matches) == 1 else None
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -3066,6 +3141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._cron_adapter_view_cache = _GatewayCronAdapterView(self)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -9222,6 +9298,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    def _cron_adapter_view(self):
+        view = getattr(self, "_cron_adapter_view_cache", None)
+        if view is None:
+            view = _GatewayCronAdapterView(self)
+            self._cron_adapter_view_cache = view
+        return view
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
@@ -22765,7 +22848,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    cron_start_kwargs = {"adapters": runner._cron_adapter_view(), "loop": asyncio.get_running_loop()}
     # External cron providers own their remote scheduling contract. Only the
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.
