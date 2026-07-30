@@ -4680,11 +4680,16 @@ def _chromium_installed() -> bool:
                 return True
 
     # 2. System Chrome/Chromium in PATH (common names)
+    which_kwargs = (
+        {}
+        if authority is None
+        else {"path": _browser_subprocess_path("")}
+    )
     system_chrome = (
-        shutil.which("google-chrome")
-        or shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("chrome")
+        shutil.which("google-chrome", **which_kwargs)
+        or shutil.which("chromium", **which_kwargs)
+        or shutil.which("chromium-browser", **which_kwargs)
+        or shutil.which("chrome", **which_kwargs)
     )
     if system_chrome:
         if use_global_cache:

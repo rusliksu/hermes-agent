@@ -703,6 +703,59 @@ def test_typed_windows_chromium_discovery_uses_profile_local_paths(
     assert str(home / "AppData" / "Local" / "ms-playwright") in roots
 
 
+def test_typed_chromium_discovery_ignores_poisoned_process_path(
+    monkeypatch,
+    tmp_path,
+):
+    _browser_profile(monkeypatch, tmp_path, {"engine": "chrome"})
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    owner_chrome = str(owner / "chrome")
+    calls = []
+
+    def fake_which(name, path=None):
+        calls.append((name, path))
+        if path is None and name == "chrome":
+            return owner_chrome
+        return None
+
+    monkeypatch.setenv("PATH", str(owner))
+    monkeypatch.setattr(browser_tool.shutil, "which", fake_which)
+    browser_tool._cached_chromium_installed = None
+
+    with bind_resolved_access_context(
+        _ctx(role_id="family_sandbox", capabilities=frozenset({"browser"}))
+    ):
+        assert browser_tool._chromium_installed() is False
+
+    chrome_names = {"google-chrome", "chromium", "chromium-browser", "chrome"}
+    chrome_calls = [(name, path) for name, path in calls if name in chrome_names]
+    assert chrome_calls
+    assert all(path is not None for _name, path in chrome_calls)
+    assert all(str(owner) not in str(path) for _name, path in chrome_calls)
+
+
+def test_legacy_chromium_discovery_uses_process_path(monkeypatch, tmp_path):
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    owner_chrome = str(owner / "chrome")
+    calls = []
+
+    def fake_which(name, path=None):
+        calls.append((name, path))
+        if path is None and name == "chrome":
+            return owner_chrome
+        return None
+
+    monkeypatch.setenv("PATH", str(owner))
+    monkeypatch.setattr(browser_tool.shutil, "which", fake_which)
+    browser_tool._cached_chromium_installed = None
+
+    assert browser_tool._chromium_installed() is True
+
+    assert ("chrome", None) in calls
+
+
 def test_typed_browser_discovery_skips_process_path_owner_locations(
     monkeypatch,
     tmp_path,
