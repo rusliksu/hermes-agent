@@ -118,10 +118,10 @@
 
 ## 6. Только non-live PR
 
-- [ ] 6.1 После зелёной acceptance и accepted review получить отдельное
+- [x] 6.1 После зелёной acceptance и accepted review получить отдельное
   разрешение delivery и создать task-owned non-live PR только с launcher,
   focused tests и этим OpenSpec change.
-- [ ] 6.2 В PR явно указать, что merge не разрешает deploy, restart,
+- [x] 6.2 В PR явно указать, что merge не разрешает deploy, restart,
   `prepare`, `switch`, wrapper/runtime/DB/service/process mutation или
   Kanban-карточки.
 
