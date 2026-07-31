@@ -347,6 +347,95 @@ def test_init_env_args_never_forwards_blank_secret(monkeypatch):
 # ── docker_env tests ──────────────────────────────────────────────
 
 
+def test_docker_env_filters_provider_internal_and_force_prefixed_keys(monkeypatch):
+    """direct docker_env must not bypass provider/internal secret filtering."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={
+        "OPENAI_API_KEY": "provider-secret",
+        "_HERMES_FORCE_OPENAI_API_KEY": "forced-provider-secret",
+        "AUXILIARY_WEB_API_KEY": "aux-secret",
+        "GATEWAY_RELAY_DELIVERY_KEY": "relay-secret",
+        "DATABASE_URL": "postgres://example",
+        "MY_KEY": "safe-value",
+        "SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.sock",
+    })
+
+    env_values = _env_values_from_args(_run_args_from_calls(calls))
+
+    assert "OPENAI_API_KEY" not in env_values
+    assert "_HERMES_FORCE_OPENAI_API_KEY" not in env_values
+    assert "AUXILIARY_WEB_API_KEY" not in env_values
+    assert "GATEWAY_RELAY_DELIVERY_KEY" not in env_values
+    assert env_values["DATABASE_URL"] == "postgres://example"
+    assert env_values["MY_KEY"] == "safe-value"
+    assert env_values["SSH_AUTH_SOCK"] == "/run/user/1000/ssh-agent.sock"
+
+
+def test_init_env_args_filters_explicit_forward_provider_key(monkeypatch):
+    """Explicit docker_forward_env cannot opt provider secrets into Docker."""
+    env = _make_execute_only_env(forward_env=["OPENAI_API_KEY", "DATABASE_URL"])
+
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    env_values = _env_values_from_args(env._build_init_env_args())
+
+    assert "OPENAI_API_KEY" not in env_values
+    assert env_values["DATABASE_URL"] == "postgres://example"
+
+
+def test_init_env_args_filters_provider_key_loaded_from_hermes_dotenv(monkeypatch):
+    """Hermes dotenv fallback must not reintroduce provider secrets."""
+    env = _make_execute_only_env(forward_env=["OPENAI_API_KEY", "DATABASE_URL"])
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {
+        "OPENAI_API_KEY": "provider-secret",
+        "DATABASE_URL": "postgres://example",
+    })
+
+    env_values = _env_values_from_args(env._build_init_env_args())
+
+    assert "OPENAI_API_KEY" not in env_values
+    assert env_values["DATABASE_URL"] == "postgres://example"
+
+
+def test_init_env_args_filters_dynamic_internal_auth_but_keeps_safe_vars(monkeypatch):
+    """Dynamic AUXILIARY/GATEWAY_RELAY auth is stripped; safe custom vars remain."""
+    env = _make_execute_only_env(forward_env=[
+        "AUXILIARY_VISION_API_KEY",
+        "AUXILIARY_VISION_BASE_URL",
+        "GATEWAY_RELAY_ROOM_SECRET",
+        "GATEWAY_RELAY_SESSION_TOKEN",
+        "GATEWAY_RELAY_URL",
+        "MY_KEY",
+        "SSH_AUTH_SOCK",
+    ])
+
+    monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "aux-key")
+    monkeypatch.setenv("AUXILIARY_VISION_BASE_URL", "https://aux.example")
+    monkeypatch.setenv("GATEWAY_RELAY_ROOM_SECRET", "relay-secret")
+    monkeypatch.setenv("GATEWAY_RELAY_SESSION_TOKEN", "relay-token")
+    monkeypatch.setenv("GATEWAY_RELAY_URL", "https://relay.example")
+    monkeypatch.setenv("MY_KEY", "safe-value")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/user/1000/ssh-agent.sock")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    env_values = _env_values_from_args(env._build_init_env_args())
+
+    assert "AUXILIARY_VISION_API_KEY" not in env_values
+    assert "AUXILIARY_VISION_BASE_URL" not in env_values
+    assert "GATEWAY_RELAY_ROOM_SECRET" not in env_values
+    assert "GATEWAY_RELAY_SESSION_TOKEN" not in env_values
+    assert env_values["GATEWAY_RELAY_URL"] == "https://relay.example"
+    assert env_values["MY_KEY"] == "safe-value"
+    assert env_values["SSH_AUTH_SOCK"] == "/run/user/1000/ssh-agent.sock"
+
+
 def test_docker_env_appears_in_run_command(monkeypatch):
     """Explicit docker_env values should be passed via -e at docker run time."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
@@ -585,6 +674,15 @@ def _run_args_from_calls(calls):
     ]
     assert run_calls, "docker run should have been called"
     return run_calls[0][0]
+
+
+def _env_values_from_args(args):
+    """Return env assignments passed as ``-e KEY=VALUE``."""
+    return {
+        args[i + 1].split("=", 1)[0]: args[i + 1].split("=", 1)[1]
+        for i, flag in enumerate(args[:-1])
+        if flag == "-e" and "=" in args[i + 1]
+    }
 
 
 def _labels_in_run_args(run_args):

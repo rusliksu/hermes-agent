@@ -18,6 +18,7 @@ from typing import Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
+    _HERMES_PROVIDER_ENV_FORCE_PREFIX,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
 )
@@ -63,6 +64,15 @@ def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
     return normalized
 
 
+def _is_blocked_docker_env_name(key: str) -> bool:
+    """True when Docker env injection must not expose this variable."""
+    return (
+        key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+        or _is_hermes_internal_secret(key)
+        or key in _HERMES_PROVIDER_ENV_BLOCKLIST
+    )
+
+
 def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     """Validate and normalize a docker_env dict to {str: str}.
 
@@ -80,6 +90,8 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
             logger.warning("Ignoring invalid docker_env key: %r", key)
             continue
         key = key.strip()
+        if _is_blocked_docker_env_name(key):
+            continue
         if not isinstance(value, str):
             # Coerce simple scalar types (int, bool, float) to string;
             # reject complex types.
@@ -1023,7 +1035,11 @@ class DockerEnvironment(BaseEnvironment):
         These are used once during init_session() so that export -p captures
         them into the snapshot.  Subsequent execute() calls don't need -e flags.
         """
-        exec_env: dict[str, str] = dict(self._env)
+        exec_env: dict[str, str] = {
+            key: value
+            for key, value in self._env.items()
+            if not _is_blocked_docker_env_name(key)
+        }
 
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
@@ -1032,15 +1048,11 @@ class DockerEnvironment(BaseEnvironment):
             passthrough_keys = set(get_all_passthrough())
         except Exception:
             pass
-        # Explicit docker_forward_env entries are an intentional opt-in and must
-        # win over the generic Hermes secret blocklist. Only implicit passthrough
-        # keys are filtered. Also strip Hermes-internal dynamic secrets
-        # (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth) that the
-        # name-based blocklist doesn't cover — see _is_hermes_internal_secret.
-        _implicit_forward = {
-            k for k in passthrough_keys if not _is_hermes_internal_secret(k)
+        forward_keys = {
+            key
+            for key in explicit_forward_keys | passthrough_keys
+            if not _is_blocked_docker_env_name(key)
         }
-        forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         for key in sorted(forward_keys):
             value = os.getenv(key)
