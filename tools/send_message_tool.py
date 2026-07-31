@@ -1291,6 +1291,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
                     if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
+                        denial = _deny_if_resolved_delivery_target_mismatch("telegram", chat_id, None)
+                        if denial:
+                            return denial
                         logger.warning(
                             "Thread %s not found in _send_telegram, retrying without message_thread_id",
                             text_kwargs.get("message_thread_id"),
@@ -1387,6 +1390,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             )
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
+                            denial = _deny_if_resolved_delivery_target_mismatch("telegram", chat_id, None)
+                            if denial:
+                                return denial
                             # Thread not found for media — retry without
                             # message_thread_id (issue #27012).
                             logger.warning(
