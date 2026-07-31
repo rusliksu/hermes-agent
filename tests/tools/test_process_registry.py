@@ -1348,6 +1348,24 @@ class TestKillProcess:
 # =========================================================================
 
 class TestProcessToolHandler:
+    def _install_registry(self, monkeypatch, sessions, current_session_key=""):
+        from tools import process_registry as pr
+        import tools.approval as approval
+
+        reg = ProcessRegistry()
+        for session in sessions:
+            if session.exited:
+                reg._finished[session.id] = session
+            else:
+                reg._running[session.id] = session
+        monkeypatch.setattr(pr, "process_registry", reg)
+        monkeypatch.setattr(
+            approval,
+            "get_current_session_key",
+            lambda default="": current_session_key or default,
+        )
+        return pr, reg
+
     def test_list_action(self):
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "list"}))
@@ -1362,6 +1380,168 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
+
+    def test_defect_foreign_process_log_is_denied_without_output(self, monkeypatch):
+        """Privacy defect: model args must not read another task's process log."""
+        foreign = _make_session(
+            sid="proc_foreign_log_guard",
+            task_id="task_foreign_log_owner",
+            exited=True,
+            exit_code=0,
+            output="FOREIGN_LOG_SENTINEL_VISIBLE",
+        )
+        foreign.session_key = "session_foreign_log_owner"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_log_reader",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "log", "session_id": foreign.id},
+            task_id="task_current_log_reader",
+        ))
+
+        assert result["status"] == "not_found"
+        assert "output" not in result
+        assert "FOREIGN_LOG_SENTINEL_VISIBLE" not in json.dumps(result)
+
+    def test_defect_foreign_process_wait_does_not_consume_completion(self, monkeypatch):
+        """Denied wait must not mark a foreign completion as consumed."""
+        foreign = _make_session(
+            sid="proc_foreign_wait_guard",
+            task_id="task_foreign_wait_owner",
+            exited=True,
+            exit_code=0,
+            output="FOREIGN_WAIT_COMPLETION_SENTINEL",
+        )
+        foreign.session_key = "session_foreign_wait_owner"
+        pr, reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_waiter",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "wait", "session_id": foreign.id, "timeout": 1},
+            task_id="task_current_waiter",
+        ))
+
+        assert result["status"] == "not_found"
+        assert reg.is_completion_consumed(foreign.id) is False
+        assert "FOREIGN_WAIT_COMPLETION_SENTINEL" not in json.dumps(result)
+
+    def test_defect_foreign_process_kill_is_denied_and_target_unchanged(self, monkeypatch):
+        """Denied kill must not terminate or reclassify a foreign process."""
+        class _RecordingPty:
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self, force=False):
+                self.terminated = force
+
+        foreign = _make_session(
+            sid="proc_foreign_kill_guard",
+            task_id="task_foreign_kill_owner",
+            output="FOREIGN_KILL_OUTPUT_UNREAD",
+        )
+        foreign.session_key = "session_foreign_kill_owner"
+        foreign._pty = _RecordingPty()
+        pr, reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_killer",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "kill", "session_id": foreign.id},
+            task_id="task_current_killer",
+        ))
+
+        assert result["status"] == "not_found"
+        assert foreign._pty.terminated is False
+        assert foreign.exited is False
+        assert reg._running[foreign.id] is foreign
+        assert reg.is_completion_consumed(foreign.id) is False
+
+    def test_defect_foreign_process_write_is_denied_and_target_unchanged(self, monkeypatch):
+        """Denied stdin write must not send bytes into a foreign process."""
+        class _RecordingPty:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+        foreign = _make_session(
+            sid="proc_foreign_write_guard",
+            task_id="task_foreign_write_owner",
+            output="FOREIGN_WRITE_BUFFER_UNREAD",
+        )
+        foreign.session_key = "session_foreign_write_owner"
+        foreign._pty = _RecordingPty()
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_writer",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "write", "session_id": foreign.id, "data": "answer 42"},
+            task_id="task_current_writer",
+        ))
+
+        assert result["status"] == "not_found"
+        assert foreign._pty.writes == []
+        assert foreign.output_buffer == "FOREIGN_WRITE_BUFFER_UNREAD"
+
+    def test_defect_same_session_key_process_remains_allowed_cross_task(self, monkeypatch):
+        """Same gateway session-key processes remain accessible across task ids."""
+        shared = _make_session(
+            sid="proc_same_session_key_guard",
+            task_id="task_previous_same_session",
+            exited=True,
+            exit_code=0,
+            output="SAME_SESSION_KEY_ALLOWED_LINE",
+        )
+        shared.session_key = "session_shared_process_guard"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [shared],
+            current_session_key="session_shared_process_guard",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "log", "session_id": shared.id},
+            task_id="task_current_same_session",
+        ))
+
+        assert result["status"] == "exited"
+        assert result["output"] == "SAME_SESSION_KEY_ALLOWED_LINE"
+
+    def test_defect_process_list_scope_is_unchanged(self, monkeypatch):
+        """List still shows current task plus same-session-key forgotten jobs."""
+        current = _make_session(sid="proc_list_current_guard", task_id="task_list_current")
+        current.session_key = "session_list_shared"
+        forgotten = _make_session(sid="proc_list_forgotten_guard", task_id="task_list_previous")
+        forgotten.session_key = "session_list_shared"
+        unrelated = _make_session(sid="proc_list_unrelated_guard", task_id="task_list_other")
+        unrelated.session_key = "session_list_other"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [current, forgotten, unrelated],
+            current_session_key="session_list_shared",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "list"},
+            task_id="task_list_current",
+        ))
+        by_id = {row["session_id"]: row for row in result["processes"]}
+
+        assert set(by_id) == {"proc_list_current_guard", "proc_list_forgotten_guard"}
+        assert by_id["proc_list_forgotten_guard"].get("session_scoped") is True
+        assert "session_scoped" not in by_id["proc_list_current_guard"]
 
 
 # =========================================================================
@@ -2386,7 +2566,10 @@ class TestHandleProcessRedaction:
             monkeypatch, "printenv",
             "MY_SERVICE_TOKEN=abc123randomopaquetokenvalue999\nHOME=/home/u",
         )
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "log", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "abc123randomopaquetokenvalue999" not in out["output"]
         assert "HOME=/home/u" in out["output"]
 
@@ -2395,7 +2578,10 @@ class TestHandleProcessRedaction:
             monkeypatch, "python app.py",
             "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
         )
-        out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "poll", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "abc123def456" not in out["output_preview"]
 
     def test_disabled_passes_through(self, monkeypatch):
@@ -2409,5 +2595,8 @@ class TestHandleProcessRedaction:
         sess.exit_code = 0
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "log", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "zzzopaque1234567890abcdef" in out["output"]

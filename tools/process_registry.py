@@ -2409,6 +2409,40 @@ def _redact_process_result(result: dict) -> dict:
     return result
 
 
+def _current_process_session_key() -> str:
+    try:
+        from tools.approval import get_current_session_key
+        return get_current_session_key(default="") or ""
+    except Exception:
+        return ""
+
+
+def _process_not_found_result(session_id: str) -> dict:
+    return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+
+def _lookup_process_record(session_id: str) -> Optional[ProcessSession]:
+    with process_registry._lock:
+        return process_registry._running.get(session_id) or process_registry._finished.get(session_id)
+
+
+def _process_record_visible_to_current_context(
+    session: Optional[ProcessSession],
+    *,
+    task_id: Any,
+    session_key: str,
+) -> bool:
+    if session is None:
+        return False
+
+    current_task_id = str(task_id or "")
+    current_session_key = str(session_key or "")
+    return (
+        bool(current_task_id and session.task_id == current_task_id)
+        or bool(current_session_key and session.session_key == current_session_key)
+    )
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2419,11 +2453,7 @@ def _handle_process(args, **kw):
         # Surface session-scoped background processes (e.g. a forgotten
         # preview server) in addition to this task's own — they share the
         # gateway session_key and can block session reset (#29177).
-        try:
-            from tools.approval import get_current_session_key
-            session_key = get_current_session_key(default="") or ""
-        except Exception:
-            session_key = ""
+        session_key = _current_process_session_key()
         return json.dumps(
             {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
             ensure_ascii=False,
@@ -2431,6 +2461,14 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        session_key = _current_process_session_key()
+        target = _lookup_process_record(session_id)
+        if not _process_record_visible_to_current_context(
+            target,
+            task_id=task_id,
+            session_key=session_key,
+        ):
+            return json.dumps(_process_not_found_result(session_id), ensure_ascii=False)
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
