@@ -118,6 +118,27 @@ def _run_coro_inline(coro_or_factory, timeout=30):
     return asyncio.run(coro)
 
 
+class _ListToolsSession:
+    def __init__(self, tools, observed):
+        self.tools = list(tools)
+        self.observed = observed
+        self.calls = 0
+
+    async def list_tools(self, cursor=None):
+        from gateway.session_context import get_resolved_access_context
+        from tools import mcp_tool
+
+        self.calls += 1
+        context = get_resolved_access_context(None)
+        self.observed.append(
+            (
+                getattr(context, "profile_id", None),
+                mcp_tool._current_mcp_pool(create=False),
+            )
+        )
+        return SimpleNamespace(tools=list(self.tools), nextCursor=None)
+
+
 def _install_server(context, server):
     from gateway.session_context import bind_resolved_access_context
     from tools import mcp_tool
@@ -260,6 +281,103 @@ async def test_bound_multiplex_discovery_passes_and_stores_exact_pool(monkeypatc
     assert server._pool is pool
     assert pool.servers["demo"] is server
     assert registered == ["mcp__demo__echo"]
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_uses_captured_context_and_pool_despite_ambient_profile():
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    observed = []
+
+    with bind_resolved_access_context(ctx_a):
+        pool_a = mcp_tool._current_mcp_pool()
+        assert pool_a is not None
+        server = mcp_tool.MCPServerTask("demo")
+        server._pool = pool_a
+        server._config = {
+            "tools": {"include": ["fresh"], "resources": False, "prompts": False}
+        }
+        server.session = _ListToolsSession([_tool("fresh", "Fresh")], observed)
+        server._capture_resolved_access_context()
+        pool_a.servers["demo"] = server
+
+    with bind_resolved_access_context(ctx_b):
+        pool_b = mcp_tool._current_mcp_pool()
+        assert pool_b is not None
+        await server._refresh_tools_task()
+
+    tool_name = mcp_tool.mcp_prefixed_tool_name("demo", "fresh")
+    assert observed == [("profile-a", pool_a)]
+    assert server._pool is pool_a
+    assert server._registered_tool_names == [tool_name]
+    assert tool_name in pool_a.tool_definitions
+    assert pool_b.tool_definitions == {}
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_restores_serialized_context_after_pool_reset():
+    from agent.secret_scope import set_multiplex_active
+    from gateway.access_registry import (
+        deserialize_resolved_access_context,
+        serialize_resolved_access_context,
+    )
+    from gateway.session_context import bind_resolved_access_context, reset_session_vars
+    from tools import mcp_tool
+
+    set_multiplex_active(True)
+    ctx_a = _ctx("profile-a", "dm:a")
+    ctx_b = _ctx("profile-b", "dm:b")
+    observed = []
+
+    with bind_resolved_access_context(ctx_a):
+        pool_a = mcp_tool._current_mcp_pool()
+        assert pool_a is not None
+        server = mcp_tool.MCPServerTask("demo")
+        server._pool = pool_a
+        server._capture_resolved_access_context()
+        captured = json.loads(json.dumps(server._captured_resolved_access_context))
+
+    mcp_tool._profile_pools.clear()
+    reset_session_vars()
+
+    server._pool = None
+    server._config = {
+        "tools": {"include": ["fresh"], "resources": False, "prompts": False}
+    }
+    server.session = _ListToolsSession([_tool("fresh", "Fresh")], observed)
+    server._captured_resolved_access_context = serialize_resolved_access_context(
+        deserialize_resolved_access_context(captured)
+    )
+
+    with bind_resolved_access_context(ctx_b):
+        await server._refresh_tools_task()
+
+    expected_key = mcp_tool.MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    assert set(mcp_tool._profile_pools) == {expected_key}
+    reopened_pool = mcp_tool._profile_pools[expected_key]
+    assert observed == [("profile-a", reopened_pool)]
+    assert server._pool is reopened_pool
+    assert reopened_pool.servers["demo"] is server
+    assert mcp_tool._legacy_pool.tool_definitions == {}
+    assert all(key.profile_id != "profile-b" for key in mcp_tool._profile_pools)
+
+
+@pytest.mark.asyncio
+async def test_malformed_captured_context_fails_closed_before_server_task_spawn():
+    from gateway.session_context import bind_resolved_access_context
+    from tools import mcp_tool
+
+    server = mcp_tool.MCPServerTask("demo")
+    with bind_resolved_access_context({"profile_id": "profile-a"}):
+        with pytest.raises(ValueError):
+            await server.start({"command": "never-spawned"})
+
+    assert server._task is None
 
 
 def test_breaker_and_parallel_safe_state_are_profile_pool_local(monkeypatch):

@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -1773,6 +1774,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_captured_resolved_access_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1819,6 +1821,7 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._captured_resolved_access_context: Optional[dict[str, Any]] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -1912,10 +1915,65 @@ class MCPServerTask:
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
+    def _capture_resolved_access_context(self) -> None:
+        """Capture the canonical server-owned context before task startup."""
+        from gateway.session_context import get_resolved_access_context
+
+        raw_context = get_resolved_access_context(None)
+        if raw_context is None:
+            if _is_mcp_multiplex_active():
+                raise ValueError("profile-bound-mcp-context-missing")
+            self._captured_resolved_access_context = None
+            return
+
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+
+        serialized = serialize_resolved_access_context(raw_context)
+        resolved = deserialize_resolved_access_context(serialized)
+        canonical = serialize_resolved_access_context(resolved)
+        if canonical != serialized:
+            raise ValueError("noncanonical_resolved_access_context")
+        pool = _server_pool(self)
+        if pool is not None and pool.key is not None and (
+            pool.key.profile_id != resolved.profile_id
+            or pool.key.conversation_scope != resolved.conversation_scope
+        ):
+            raise ValueError("profile-bound-mcp-context-mismatch")
+        self._captured_resolved_access_context = canonical
+
+    @contextmanager
+    def _bound_captured_resolved_access_context(self):
+        captured = self._captured_resolved_access_context
+        if captured is None:
+            yield
+            return
+
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+        from gateway.session_context import bind_resolved_access_context
+
+        resolved = deserialize_resolved_access_context(captured)
+        if serialize_resolved_access_context(resolved) != captured:
+            raise ValueError("noncanonical_resolved_access_context")
+        with bind_resolved_access_context(resolved):
+            pool = _current_mcp_pool()
+            if pool is None or pool.key is None:
+                raise ValueError("profile-bound-mcp-runtime-pool-missing")
+            self._pool = pool
+            with _lock:
+                pool.servers[self.name] = self
+            yield
+
     async def _refresh_tools_task(self):
         """Run a dynamic tool refresh and log failures from background tasks."""
         try:
-            await self._refresh_tools()
+            with self._bound_captured_resolved_access_context():
+                await self._refresh_tools()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3166,6 +3224,7 @@ class MCPServerTask:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
+        self._capture_resolved_access_context()
         self._task = asyncio.ensure_future(self.run(config))
         try:
             await self._ready.wait()
