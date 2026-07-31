@@ -104,11 +104,13 @@ class ReplacementAppliedError(RolloutError):
         detail: str,
         *,
         primary_failure: BaseException | None = None,
+        secondary_failures: tuple[str, ...] = (),
         cleanup_failures: tuple[str, ...] = (),
     ) -> None:
         super().__init__(
             detail,
             primary_failure=primary_failure,
+            secondary_failures=secondary_failures,
             cleanup_failures=cleanup_failures,
             replacement_applied=True,
         )
@@ -803,6 +805,7 @@ def _atomic_replace(
             raise ReplacementAppliedError(
                 expected_installed_hash,
                 f"stable wrapper directory fsync failed after replacement: {exc}",
+                primary_failure=exc,
             ) from exc
         raise RolloutError(f"atomic wrapper replacement failed: {exc}") from exc
     finally:
@@ -930,6 +933,9 @@ def run_transition(
                 raise ReplacementAppliedError(
                     expected_installed,
                     f"post-install wrapper verification failed: {exc}",
+                    primary_failure=getattr(exc, "primary_failure", exc),
+                    secondary_failures=getattr(exc, "secondary_failures", ()),
+                    cleanup_failures=getattr(exc, "cleanup_failures", ()),
                 ) from exc
     except ReplacementAppliedError:
         raise
@@ -940,6 +946,7 @@ def run_transition(
             expected_installed,
             f"post-replacement trust or wrapper verification failed: {exc}",
             primary_failure=getattr(exc, "primary_failure", exc),
+            secondary_failures=getattr(exc, "secondary_failures", ()),
             cleanup_failures=getattr(exc, "cleanup_failures", ()),
         ) from exc
     plan["result"] = "switched" if command == "switch" else "rolled-back"

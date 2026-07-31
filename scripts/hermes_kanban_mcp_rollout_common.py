@@ -25,11 +25,13 @@ class RolloutError(RuntimeError):
         message: str,
         *,
         primary_failure: BaseException | None = None,
+        secondary_failures: Sequence[str] = (),
         cleanup_failures: Sequence[str] = (),
         replacement_applied: bool = False,
     ) -> None:
         super().__init__(message)
         self.primary_failure = primary_failure
+        self.secondary_failures = tuple(secondary_failures)
         self.cleanup_failures = tuple(cleanup_failures)
         self.replacement_applied = replacement_applied
 

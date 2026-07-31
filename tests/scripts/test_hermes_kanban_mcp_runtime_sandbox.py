@@ -21,7 +21,6 @@ from tests.scripts.hermes_kanban_mcp_resource_test_support import (
     assert_deep_mutation_rejected_before_content_memfd,
     assert_post_preflight_depth_cap,
 )
-
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts" / "hermes_kanban_mcp_rollout.py"
 SPEC = importlib.util.spec_from_file_location("runtime_sandbox_rollout", HELPER)
@@ -35,7 +34,6 @@ sealed = os_sandbox.sealed
 invocation = os_sandbox.invocation
 elf = sys.modules[sealed.parse_elf.__module__]
 inventory = sys.modules[sealed.InventoryBuilder.__module__]
-
 
 def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -197,6 +195,7 @@ def test_resource_planner_counts_open_fds_and_named_size_caps() -> None:
         + 3
         + 67
         + planner.FD_FIXED_DATA_OBJECTS
+        + planner.FD_EXECUTABLE_HANDOFF
         + planner.FD_SUBPROCESS_RESERVE
         + planner.FD_BWRAP_RESERVE
     )
@@ -313,13 +312,18 @@ def _anchors(runtime: Path) -> object:
 
 @pytest.fixture
 def nested_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The outer Codex seccomp blocks bwrap's loopback setup, not other namespaces."""
+    """Use a mapped-owner bypass only for legacy nested namespace integration."""
     original = os_sandbox.invocation._base_args
 
-    def supported_profile() -> list[str]:
-        return [argument for argument in original() if argument != "--unshare-net"]
+    def supported_profile() -> list[str]: return [arg for arg in original() if arg != "--unshare-net"]
 
     monkeypatch.setattr(os_sandbox.invocation, "_base_args", supported_profile)
+    def mapped_handoff(bundle: object) -> os_sandbox._BwrapHandoff:
+        descriptor = os.open(invocation.BWRAP, os.O_RDONLY)
+        return os_sandbox._BwrapHandoff(descriptor, os_sandbox._BwrapAnchor(bundle.bwrap_sha256, 1, 2, 0, 0, 0o755, 3))
+
+    monkeypatch.setattr(os_sandbox, "_open_bwrap_handoff", mapped_handoff)
+    monkeypatch.setattr(os_sandbox, "_verify_bwrap", lambda _handoff: None)
 
 
 def test_baseline_namespace_profile_and_clearenv_are_exact() -> None:
@@ -340,17 +344,15 @@ def test_baseline_namespace_profile_and_clearenv_are_exact() -> None:
     assert "--bind" not in args and "--dev-bind" not in args
 
 
-def test_baseline_bwrap_capability_probe_fails_closed(tmp_path: Path) -> None:
+def test_canonical_bwrap_probe_succeeds_with_nested_supported_profile(
+    tmp_path: Path, nested_bwrap: None
+) -> None:
     runtime = _runtime(
         tmp_path, 'WRITE_TOOLS = ("kanban_sync_external_task",)\n'
     )
     bundle = coherence._parent_trust_bundle(runtime, ".venv")
     try:
-        with pytest.raises(
-            os_sandbox.SandboxError,
-            match="bubblewrap cannot create the required namespace profile",
-        ):
-            os_sandbox._probe(bundle.content)
+        assert os_sandbox._probe(bundle.content) is None
     finally:
         bundle.close()
 
@@ -364,24 +366,24 @@ def test_full_sealed_content_invocation_has_no_mutable_directory_bind_bug(
     bundle = coherence._parent_trust_bundle(runtime, ".venv")
     observed_command: list[str] = []
     observed_args: list[str] = []
-    bwrap_target: list[str] = []
 
-    def rejected(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+    def rejected(
+        content: object, available: dict[str, int], phase: str, _timeout: int
+    ) -> subprocess.CompletedProcess:
+        assert phase == "production"
+        roles = os_sandbox._phase_roles(content, {**available, "executable": 99}, phase)
+        command = content.invocation.render_production(roles)[1]
         observed_command[:] = command
-        args_fd = int(command[command.index("--args") + 1])
+        args_fd = available["production_args"]
         observed_args[:] = [
             item.decode()
             for item in os_sandbox._read_all(args_fd).split(b"\0")
             if item
         ]
-        bwrap_target.append(os.readlink(f"/proc/self/fd/{bundle.content.bwrap_fd}"))
-        assert _hash(os_sandbox._read_all(bundle.content.bwrap_fd)) == (
-            bundle.content.bwrap_sha256
-        )
         return subprocess.CompletedProcess(command, 23, stdout=b"", stderr=b"ignored")
 
     monkeypatch.setattr(os_sandbox, "_probe", lambda _bundle: None)
-    monkeypatch.setattr(os_sandbox.subprocess, "run", rejected)
+    monkeypatch.setattr(os_sandbox, "_launch_bwrap", rejected)
     try:
         with pytest.raises(
             os_sandbox.SandboxError,
@@ -405,7 +407,7 @@ def test_full_sealed_content_invocation_has_no_mutable_directory_bind_bug(
         "-I", "-S", "-B", "/sandbox/preflight.py",
         str(invocation.SANDBOX_RUNTIME), ".venv",
     ]
-    assert bwrap_target == ["/memfd:kanban-bwrap (deleted)"]
+    assert observed_command[:2] == [str(invocation.BWRAP), "--args"]
 
 
 def test_full_profile_native_network_is_isolated_or_fails_before_exec(
@@ -487,7 +489,7 @@ WRITE_TOOLS = ("kanban_enqueue", "kanban_sync_external_task")
         runtime / "agent/transports/hermes_kanban_mcp_server.py"
     )
     assert evidence.write_tools[-1] == "kanban_sync_external_task"
-    assert evidence.bwrap_sha256 == os_sandbox.identity()[0]
+    assert evidence.bwrap_sha256 == _hash(invocation.BWRAP.read_bytes())
     assert not marker.exists()
     assert _oracle(tmp_path) == before
 
@@ -956,20 +958,19 @@ def test_sealed_exec_handoff_failure_closes_bundle_without_fd_leak_bug(
     calls = 0
 
     def fail_production(
-        command: list[str], **_kwargs: object
+        _bundle: object, _available: dict[str, int], phase: str, _timeout: int
     ) -> subprocess.CompletedProcess:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
-        raise OSError("injected exec handoff failure")
+            return subprocess.CompletedProcess((), 0, stdout=b"", stderr=b"")
+        raise os_sandbox.SandboxError("bwrap_execution_failed", primary=RuntimeError("bwrap_execution_failed"))
 
     baseline = _fd_oracle()
-    monkeypatch.setattr(os_sandbox.subprocess, "run", fail_production)
+    monkeypatch.setattr(os_sandbox, "_launch_bwrap", fail_production)
     with pytest.raises(rollout.RolloutError) as raised:
         coherence.run_import_preflight(runtime, ".venv")
-    assert isinstance(raised.value.primary_failure, OSError)
-    assert "exec handoff" in str(raised.value.primary_failure)
+    assert str(raised.value.primary_failure) == "bwrap_execution_failed"
     assert calls == 2
     assert _fd_oracle() == baseline
 

@@ -164,12 +164,27 @@ def assert_late_probe_pressure_rejected(
     before = sandbox.resources.open_fd_count()
     soft = (
         before
-        + 1
+        + 2
         + sandbox.resources.FD_SUBPROCESS_RESERVE
         + sandbox.resources.FD_BWRAP_RESERVE
     )
     spec = sandbox.invocation.CanonicalInvocationSpec(
-        (), (), (), (), (), len(str(soft - 1)), 1, 1, 1, 1, soft
+        (),
+        (),
+        (
+            sandbox.invocation.FDHandoff("executable"),
+            str(sandbox.invocation.BWRAP),
+            "--args",
+            sandbox.invocation.FDArg("probe_args"),
+        ),
+        (),
+        (),
+        len(str(soft - 1)),
+        1,
+        1,
+        1_000,
+        1,
+        soft,
     )
 
     def late_add_data(_name: str, _data: bytes) -> int:
@@ -183,8 +198,7 @@ def assert_late_probe_pressure_rejected(
     class Bundle:
         invocation = spec
         entries = ()
-        loader_fd, bwrap_fd = owned
-        bwrap_library_fds = ()
+
         def add_data(self, name: str, data: bytes) -> int:
             return late_add_data(name, data)
 
@@ -193,10 +207,18 @@ def assert_late_probe_pressure_rejected(
             return tuple(owned)
 
     monkeypatch.setattr(
-        sandbox.subprocess,
-        "run",
+        sandbox,
+        "_open_bwrap_handoff",
+        lambda _bundle: sandbox._BwrapHandoff(
+            sandbox.os.open("/dev/null", sandbox.os.O_RDONLY),
+            sandbox._BwrapAnchor("", 0, 0, 0, 0, 0, 0),
+        ),
+    )
+    monkeypatch.setattr(
+        sandbox,
+        "_run_bwrap",
         lambda *_args, **_kwargs: pytest.fail(
-            "subprocess reached after late FD pressure"
+            "direct bwrap subprocess reached after late FD pressure"
         ),
     )
     try:

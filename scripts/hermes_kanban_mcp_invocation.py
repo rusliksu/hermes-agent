@@ -34,12 +34,13 @@ class FDArg:
 
 
 @dataclass(frozen=True)
-class FDListArg:
-    roles: tuple[str, ...]
-    prefix: str = ""
+class FDHandoff:
+    """A required inherited descriptor that is deliberately absent from argv."""
+
+    role: str
 
 
-Argument = str | FDArg | FDListArg
+Argument = str | FDArg | FDHandoff
 
 
 def _base_args() -> tuple[str, ...]:
@@ -87,10 +88,8 @@ def _render(arguments: Sequence[Argument], roles: Mapping[str, int | str]) -> tu
     for argument in arguments:
         if isinstance(argument, FDArg):
             result.append(argument.prefix + str(roles[argument.role]))
-        elif isinstance(argument, FDListArg):
-            result.append(
-                ":".join(argument.prefix + str(roles[role]) for role in argument.roles)
-            )
+        elif isinstance(argument, FDHandoff):
+            continue
         else:
             result.append(argument)
     return tuple(result)
@@ -101,9 +100,7 @@ def _role_order(arguments: Sequence[Argument]) -> tuple[str, ...]:
     for argument in arguments:
         found = (
             (argument.role,)
-            if isinstance(argument, FDArg)
-            else argument.roles
-            if isinstance(argument, FDListArg)
+            if isinstance(argument, (FDArg, FDHandoff))
             else ()
         )
         for role in found:
@@ -112,23 +109,8 @@ def _role_order(arguments: Sequence[Argument]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _launcher(library_roles: tuple[str, ...], args_role: str) -> tuple[Argument, ...]:
-    result: list[Argument] = [
-        FDArg("loader", "/proc/self/fd/"),
-        "--inhibit-cache",
-    ]
-    if library_roles:
-        result.extend(
-            ("--preload", FDListArg(library_roles, "/proc/self/fd/"))
-        )
-    result.extend(
-        (
-            FDArg("bwrap", "/proc/self/fd/"),
-            "--args",
-            FDArg(args_role),
-        )
-    )
-    return tuple(result)
+def _launcher(args_role: str) -> tuple[Argument, ...]:
+    return (FDHandoff("executable"), str(BWRAP), "--args", FDArg(args_role))
 
 
 @dataclass(frozen=True)
@@ -209,6 +191,7 @@ def build(
     current_open_fds: int | None = None,
     nofile_soft: int | None = None,
 ) -> tuple[CanonicalInvocationSpec, resources.ResourcePlan]:
+    _ = elf_dependencies, bwrap_path
     soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0] if nofile_soft is None else nofile_soft
     if soft == resource.RLIM_INFINITY or not isinstance(soft, int) or soft <= 0:
         raise resources.ResourceBudgetError("RLIMIT_NOFILE must have a finite soft limit")
@@ -216,25 +199,6 @@ def build(
     symbolic = "9" * fd_width
     files = tuple(entry for entry in entries if entry.kind == "file")
     content_roles = tuple(file_role(entry.destination) for entry in files)
-    direct = dict(elf_dependencies)
-    closure = []
-    seen = {bwrap_path}
-    queue = list(direct.get(bwrap_path, ()))
-    while queue:
-        path = queue.pop(0)
-        if path in seen:
-            continue
-        seen.add(path)
-        closure.append(path)
-        queue.extend(direct.get(path, ()))
-    loader = next(
-        (path for path in closure if path.name.startswith("ld-") or "ld-linux" in path.name),
-        None,
-    )
-    if loader is None:
-        raise resources.ResourceBudgetError("canonical invocation has no ELF loader role")
-    libraries = tuple(path for path in closure if path != loader)
-    library_roles = tuple(f"library:{index}" for index in range(len(libraries)))
     probe_arguments: tuple[Argument, ...] = _base_args()[1:]
     production: list[Argument] = list(_production_base()[1:])
     directories = sorted(
@@ -261,11 +225,11 @@ def build(
         )
     )
     probe_exec = (
-        *_launcher(library_roles, "probe_args"),
+        *_launcher("probe_args"),
         "--", "/usr/bin/true",
     )
     production_exec = (
-        *_launcher(library_roles, "production_args"),
+        *_launcher("production_args"),
         "--", str(SANDBOX_RUNTIME / venv_dirname / "bin" / "python"),
         "-I", "-S", "-B", "/sandbox/preflight.py",
         str(SANDBOX_RUNTIME), venv_dirname,
@@ -273,8 +237,8 @@ def build(
     symbolic_roles = {
         role: symbolic
         for role in (
-            *content_roles, "loader", "bwrap", *library_roles,
-            "harness", "anchors", "probe_args", "production_args",
+            *content_roles,
+            "harness", "anchors", "probe_args", "production_args", "executable",
         )
     }
     rendered_probe_args = _render(probe_arguments, symbolic_roles)
@@ -296,7 +260,7 @@ def build(
         production_arguments=rendered_production_args,
         exec_argv=rendered_probe_exec,
         exec_env={},
-        pass_fd_count=len(files) + 1,
+        pass_fd_count=len(files) + 3 + resources.FD_EXECUTABLE_HANDOFF,
         current_open_fds=current_open_fds,
         nofile_soft=soft,
         args_max=resources.BWRAP_ARGS_MAX_BYTES,
