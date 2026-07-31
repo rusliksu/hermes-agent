@@ -47,6 +47,27 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class ProfileRoutingError(PermissionError):
+    """Typed fail-closed routing denial with redacted categorical reason."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"profile routing denied: {reason}")
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _identity_field_error(*values: Any) -> Optional[str]:
+    for value in values:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "missing_exact_telegram_dm_identity"
+        if not isinstance(value, str):
+            return "malformed_exact_telegram_dm_identity"
+    return None
+
+
 @dataclass(frozen=True)
 class ProfileRoute:
     """A single routing rule that maps a platform scope to a profile."""
@@ -57,6 +78,9 @@ class ProfileRoute:
     guild_id: Optional[str] = None
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
+    account: Optional[str] = None
+    peer_kind: Optional[str] = None
+    user_id: Optional[str] = None
     enabled: bool = True
 
     @property
@@ -69,7 +93,23 @@ class ProfileRoute:
             s += 4
         if self.thread_id:
             s += 8
+        if self.account:
+            s += 16
+        if self.peer_kind:
+            s += 32
+        if self.user_id:
+            s += 64
         return s
+
+    @property
+    def is_exact_telegram_dm(self) -> bool:
+        return (
+            self.enabled
+            and self.platform == "telegram"
+            and _nonempty_str(self.account)
+            and self.peer_kind == "dm"
+            and _nonempty_str(self.user_id)
+        )
 
     def matches(
         self,
@@ -78,6 +118,9 @@ class ProfileRoute:
         chat_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
+        account: Optional[str] = None,
+        peer_kind: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> bool:
         """Return True if this route matches the given source fields.
 
@@ -92,6 +135,12 @@ class ProfileRoute:
         if not self.enabled:
             return False
         if self.platform != platform:
+            return False
+        if self.account and self.account != account:
+            return False
+        if self.peer_kind and self.peer_kind != peer_kind:
+            return False
+        if self.user_id and self.user_id != user_id:
             return False
         if self.thread_id and self.thread_id != thread_id:
             return False
@@ -142,6 +191,9 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 guild_id=entry.get("guild_id"),
                 chat_id=entry.get("chat_id"),
                 thread_id=entry.get("thread_id"),
+                account=entry.get("account"),
+                peer_kind=entry.get("peer_kind"),
+                user_id=entry.get("user_id"),
                 enabled=entry.get("enabled", True),
             )
         )
@@ -158,9 +210,96 @@ def match_profile_route(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     parent_chat_id: Optional[str] = None,
+    account: Optional[str] = None,
+    peer_kind: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
     """Return the best-matching route, or None for no match."""
+    exact_telegram_dm_routes = [route for route in routes if route.is_exact_telegram_dm]
+    if exact_telegram_dm_routes and platform == "telegram":
+        if peer_kind != "dm":
+            if peer_kind is None or (isinstance(peer_kind, str) and not peer_kind.strip()):
+                raise ProfileRoutingError("missing_exact_telegram_dm_identity")
+            if not isinstance(peer_kind, str):
+                raise ProfileRoutingError("malformed_exact_telegram_dm_identity")
+            if peer_kind not in {"group", "supergroup", "channel", "thread", "forum"}:
+                raise ProfileRoutingError("malformed_exact_telegram_dm_identity")
+            return _match_legacy_profile_route(
+                routes,
+                platform,
+                guild_id=guild_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                parent_chat_id=parent_chat_id,
+                account=account,
+                peer_kind=peer_kind,
+                user_id=user_id,
+            )
+        seen = set()
+        for route in exact_telegram_dm_routes:
+            key = (route.platform, route.account, route.peer_kind, route.user_id)
+            if key in seen:
+                raise ProfileRoutingError("duplicate_exact_telegram_dm_route")
+            seen.add(key)
+        identity_error = _identity_field_error(account, user_id, chat_id)
+        if identity_error:
+            raise ProfileRoutingError(identity_error)
+        if user_id != chat_id:
+            raise ProfileRoutingError("mismatched_telegram_dm_identity")
+        matches = [
+            route
+            for route in exact_telegram_dm_routes
+            if route.matches(
+                platform,
+                guild_id=guild_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                parent_chat_id=parent_chat_id,
+                account=account,
+                peer_kind=peer_kind,
+                user_id=user_id,
+            )
+        ]
+        if len(matches) > 1:
+            raise ProfileRoutingError("ambiguous_exact_telegram_dm_route")
+        if not matches:
+            raise ProfileRoutingError("unknown_exact_telegram_dm_route")
+        return matches[0]
+
+    return _match_legacy_profile_route(
+        routes,
+        platform,
+        guild_id=guild_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        parent_chat_id=parent_chat_id,
+        account=account,
+        peer_kind=peer_kind,
+        user_id=user_id,
+    )
+
+
+def _match_legacy_profile_route(
+    routes: List[ProfileRoute],
+    platform: str,
+    guild_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    parent_chat_id: Optional[str] = None,
+    account: Optional[str] = None,
+    peer_kind: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[ProfileRoute]:
     for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+        if route.matches(
+            platform,
+            guild_id=guild_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            parent_chat_id=parent_chat_id,
+            account=account,
+            peer_kind=peer_kind,
+            user_id=user_id,
+        ):
             return route
     return None

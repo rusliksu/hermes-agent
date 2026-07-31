@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -46,6 +47,16 @@ def make_async_session_db(sync_mock=None):
     from hermes_state import AsyncSessionDB
     sync_mock = sync_mock if sync_mock is not None else MagicMock()
     return AsyncSessionDB(sync_mock), sync_mock
+
+
+@pytest.fixture
+def inline_asyncio_to_thread(monkeypatch):
+    """Run asyncio.to_thread calls inline for gateway tests with non-threading oracles."""
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
 
 
 def _ensure_telegram_mock() -> None:
@@ -464,4 +475,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

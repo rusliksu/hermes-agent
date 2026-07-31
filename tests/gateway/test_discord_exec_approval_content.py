@@ -33,6 +33,7 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
         command=command,
         session_key="discord:555",
         description="script execution via -c flag",
+        metadata={"approval_request_id": "request-1"},
     )
 
     assert result.success is True
@@ -46,6 +47,24 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
     assert command in prompt_text
     assert "Reason" in prompt_text
     assert "script execution via -c flag" in prompt_text
+    assert sent["view"].approval_request_id == "request-1"
+    assert sent["view"].allowed_choices == ["once", "session", "always", "deny"]
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_missing_request_id_fails_closed_without_send():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_exec_approval(
+        chat_id="555",
+        command="make deploy",
+        session_key="discord:555",
+    )
+
+    assert result.success is False
+    assert result.error == "approval request id missing"
+    assert sent == {}
 
 
 @pytest.mark.asyncio
@@ -59,6 +78,7 @@ async def test_exec_approval_prompt_truncates_long_command_in_content():
         command=long_command,
         session_key="discord:555",
         description="long generated shell command",
+        metadata={"approval_request_id": "request-2"},
     )
 
     assert result.success is True

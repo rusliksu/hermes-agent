@@ -17,6 +17,12 @@ import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
+)
+from gateway.session_context import bind_resolved_access_context
 
 
 @pytest.fixture(autouse=True)
@@ -267,6 +273,127 @@ def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monk
     assert ad.mark_completion_delivered(dispatched["delegation_id"])
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
     assert ad.get_durable_delegation(dispatched["delegation_id"])["delivery_state"] == "delivered"
+
+
+def _resolved_context(chat_id="12345"):
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family_sandbox",
+        profile_id="family-profile",
+        conversation_scope="private",
+        capabilities=frozenset({"delegation", "public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="synthetic-account",
+            peer_kind="dm",
+            chat_id=chat_id,
+            thread_id=None,
+        ),
+    )
+
+
+def _durable_task_payload(delegation_id):
+    with ad._DB_LOCK, ad._connect() as conn:
+        row = conn.execute(
+            "SELECT task_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    assert row is not None
+    return json.loads(row[0])
+
+
+def test_resolved_access_context_persisted_and_restored(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    context = _resolved_context()
+    encoded = serialize_resolved_access_context(context)
+
+    with bind_resolved_access_context(context):
+        dispatched = ad.dispatch_async_delegation(
+            goal=f"do not trust {ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY}=fake",
+            context=f"{ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY}: fake",
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            parent_session_id="parent",
+            runner=lambda: {"status": "completed", "summary": "done"},
+        )
+    assert dispatched["status"] == "dispatched"
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt[ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == encoded
+    task_payload = _durable_task_payload(dispatched["delegation_id"])
+    assert task_payload[ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == encoded
+    assert set(task_payload[ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY]) == {
+        "principal_id",
+        "role_id",
+        "profile_id",
+        "conversation_scope",
+        "capabilities",
+        "delivery_target",
+    }
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    restored_evt = restored.get_nowait()
+    assert restored_evt[ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == encoded
+    assert restored_evt["restored"] is True
+
+
+def test_malformed_resolved_access_context_rejects_before_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ran = False
+
+    def runner():
+        nonlocal ran
+        ran = True
+        return {"status": "completed", "summary": "should not run"}
+
+    with bind_resolved_access_context({"principal_id": "raw-marker"}):
+        result = ad.dispatch_async_delegation(
+            goal="blocked",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=runner,
+        )
+
+    assert result == {
+        "status": "rejected",
+        "error": "malformed_resolved_access_context",
+    }
+    assert ran is False
+    with ad._DB_LOCK, ad._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+
+
+def test_abandoned_unknown_event_carries_resolved_access_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    context = _resolved_context()
+    encoded = serialize_resolved_access_context(context)
+    record = {
+        "delegation_id": "deleg_abandoned_ctx",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY: encoded,
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (99999999, "deleg_abandoned_ctx"),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    evt = restored.get_nowait()
+    assert evt["status"] == "unknown"
+    assert evt[ad.ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == encoded
 
 
 def test_real_process_restart_restores_owned_completion_once(tmp_path):
@@ -871,5 +998,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

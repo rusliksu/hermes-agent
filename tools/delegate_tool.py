@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextvars
 import json
 import logging
 
@@ -32,6 +33,8 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from gateway.access_registry import ResolvedAccessContext
+from gateway.session_context import get_resolved_access_context
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -659,6 +662,31 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _validate_delegation_access_context() -> Optional[str]:
+    """Return a categorical denial reason for resolved-context delegation."""
+    access_context = get_resolved_access_context()
+    if access_context is None:
+        return None
+    if not isinstance(access_context, ResolvedAccessContext):
+        return "malformed_access_context"
+    if access_context.role_id not in {"owner", "family_sandbox"}:
+        return "delegation_not_permitted"
+    if "delegation" not in access_context.capabilities:
+        return "delegation_not_permitted"
+    return None
+
+
+def _can_inherit_ambient_workspace_state() -> bool:
+    """Whether delegation may inherit parent/global cwd hints."""
+    access_context = get_resolved_access_context()
+    if access_context is None:
+        return True
+    return (
+        isinstance(access_context, ResolvedAccessContext)
+        and access_context.role_id == "owner"
+    )
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -744,6 +772,9 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    if not _can_inherit_ambient_workspace_state():
+        return None
+
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(
@@ -1957,12 +1988,13 @@ def _run_single_child(
         # starting directory while keeping the child's subsequent `cd`s
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
-        try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
+        if _can_inherit_ambient_workspace_state():
+            try:
+                from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
-        except Exception as e:
-            logger.debug("Child cwd seed failed: %s", e)
+                record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            except Exception as e:
+                logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
@@ -2008,7 +2040,10 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_context = contextvars.copy_context()
+        _child_future = _timeout_executor.submit(
+            _child_context.run, _run_with_thread_capture
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2449,6 +2484,13 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    access_denial = _validate_delegation_access_context()
+    if access_denial is not None:
+        return tool_error(
+            "Delegation is not permitted for this access context.",
+            code=access_denial,
+        )
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -2626,7 +2668,9 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    submit_context = contextvars.copy_context()
                     future = executor.submit(
+                        submit_context.run,
                         _run_single_child,
                         task_index=i,
                         goal=t["goal"],

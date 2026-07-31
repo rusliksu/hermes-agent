@@ -1,11 +1,24 @@
 import json
+import os
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from gateway.session_context import _UNSET, _VAR_MAP
 from tools import tts_tool
+
+
+_PATH_MARKER = "/tmp/hermes-tts-ffmpeg-path-marker"
+_CONTROLLED_SECRET_ENV = {
+    "PATH": _PATH_MARKER,
+    "OPENAI_API_KEY": "provider-secret",
+    "FIRECRAWL_API_KEY": "tool-secret",
+    "TELEGRAM_BOT_TOKEN": "gateway-secret",
+    "GATEWAY_RELAY_SECRET": "relay-secret",
+    "AUXILIARY_TTS_API_KEY": "dynamic-secret",
+}
+_SECRET_ENV_NAMES = tuple(k for k in _CONTROLLED_SECRET_ENV if k != "PATH")
 
 
 def _reset_session_context() -> None:
@@ -24,6 +37,30 @@ def _clean_session_platform(monkeypatch):
 async def _write_edge_output(_text: str, output_path: str, _tts_config: dict) -> str:
     Path(output_path).write_bytes(b"mp3")
     return output_path
+
+
+def test_ffmpeg_conversion_gets_sanitized_explicit_env(tmp_path, monkeypatch):
+    captured = {}
+    mp3 = tmp_path / "speech.mp3"
+    mp3.write_bytes(b"mp3")
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        Path(cmd[-2]).write_bytes(b"ogg")
+        return Mock(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(tts_tool, "_has_ffmpeg", lambda: True)
+    monkeypatch.setattr(tts_tool.subprocess, "run", fake_run)
+
+    with patch.dict(os.environ, _CONTROLLED_SECRET_ENV, clear=True):
+        result = tts_tool._convert_to_opus(str(mp3))
+
+    assert result == str(tmp_path / "speech.ogg")
+    env = captured["env"]
+    assert env is not None
+    for name in _SECRET_ENV_NAMES:
+        assert name not in env
+    assert _PATH_MARKER in env.get("PATH", "")
 
 
 def test_edge_cli_preserves_native_mp3(tmp_path, monkeypatch):

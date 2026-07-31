@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.access_registry import AccessRegistry, DeliveryTarget, PrincipalBinding, RolePolicy, TransportIdentity
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageType
 
 
@@ -71,6 +72,46 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
     )
 
 
+def _access_registry_for_user(user_id: str) -> AccessRegistry:
+    identity = TransportIdentity(
+        platform="telegram",
+        account="bot-a",
+        peer_kind="dm",
+        user_id=user_id,
+        chat_id=user_id,
+    )
+    return AccessRegistry(
+        roles={"family": RolePolicy("family", frozenset({"chat"}))},
+        profiles=frozenset({"family-profile"}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id="principal-family",
+                role_id="family",
+                profile_id="family-profile",
+                transport_identity=identity,
+                conversation_scope="private",
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account="bot-a",
+                    peer_kind="dm",
+                    chat_id=user_id,
+                ),
+            ),
+        ),
+        scope_capabilities={"private": frozenset({"chat"})},
+        backend_capabilities=frozenset({"chat"}),
+    )
+
+
+def _access_registry_runner(registry):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.access_registry = registry
+    return runner
+
+
 @pytest.mark.asyncio
 async def test_unauthorized_user_blocked_before_event_building():
     """Unauthorized user's message should be blocked before _build_message_event."""
@@ -98,9 +139,125 @@ async def test_unauthorized_user_blocked_before_event_building():
 
 
 @pytest.mark.asyncio
+async def test_registry_message_prefilter_denies_before_process_env_and_event_build(
+    monkeypatch,
+):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(_access_registry_for_user("222"))
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    def fail_build(*_args, **_kwargs):
+        raise AssertionError("registry-denied message reached event build")
+
+    adapter._build_message_event = fail_build
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(from_user_id=111, chat_id=111, chat_type="private"),
+        effective_message=None,
+    )
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+
+def test_registry_message_prefilter_registry_error_ignores_process_env(monkeypatch):
+    class BrokenRegistry:
+        def resolve(self, _identity):
+            raise RuntimeError("synthetic registry failure")
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(BrokenRegistry())
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    msg = _make_message(from_user_id=111, chat_id=111, chat_type="private")
+
+    assert adapter._is_user_authorized_from_message(msg) is False
+
+
+def test_registry_callback_denial_ignores_process_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(_access_registry_for_user("222"))
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    assert (
+        adapter._is_callback_user_authorized(
+            "111",
+            chat_id="111",
+            chat_type="private",
+        )
+        is False
+    )
+
+
+def test_registry_callback_error_ignores_process_env(monkeypatch):
+    class BrokenRegistry:
+        def resolve(self, _identity):
+            raise RuntimeError("synthetic registry failure")
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(BrokenRegistry())
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    assert (
+        adapter._is_callback_user_authorized(
+            "111",
+            chat_id="111",
+            chat_type="private",
+        )
+        is False
+    )
+
+
+def test_registry_callback_runner_deny_ignores_process_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(_access_registry_for_user("111"))
+    runner._is_user_authorized = lambda _source: False
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    assert (
+        adapter._is_callback_user_authorized(
+            "111",
+            chat_id="111",
+            chat_type="private",
+        )
+        is False
+    )
+
+
+def test_registry_callback_runner_error_ignores_process_env(monkeypatch):
+    def explode(_source):
+        raise RuntimeError("synthetic scoped auth failure")
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _access_registry_runner(_access_registry_for_user("111"))
+    runner._is_user_authorized = explode
+    adapter = _make_adapter(account="bot-a")
+    adapter._message_handler = runner._handle_message
+
+    assert (
+        adapter._is_callback_user_authorized(
+            "111",
+            chat_id="111",
+            chat_type="private",
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_authorized_user_processed_normally():
     """Authorized user's message should pass the auth check and build an event."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
 
     build_called = False
     original_build = adapter._build_message_event
@@ -126,7 +283,7 @@ async def test_authorized_user_processed_normally():
 @pytest.mark.asyncio
 async def test_channel_post_passes_auth():
     """Messages with no from_user (channel posts) should pass user-level auth."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
 
     build_called = False
     original_build = adapter._build_message_event
@@ -172,7 +329,7 @@ async def test_command_from_unauthorized_user_blocked():
 @pytest.mark.asyncio
 async def test_command_from_authorized_user_processed():
     """Commands from authorized users should be processed."""
-    adapter = _make_adapter(allow_from=["111"])
+    adapter = _make_adapter(allow_from=["111"], require_mention=False, allowed_topics=[])
     adapter.handle_message = AsyncMock()
 
     update = SimpleNamespace(

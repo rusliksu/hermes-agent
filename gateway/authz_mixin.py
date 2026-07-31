@@ -28,10 +28,20 @@ from gateway.whatsapp_identity import (
 )
 
 
-def _auth_env(name: str, default: str = "") -> str:
+def _auth_env(name: str, default: str = "", *, scoped: bool = False) -> str:
     """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
         return default
+    if scoped:
+        try:
+            from agent.secret_scope import current_secret_scope, get_secret
+
+            if current_secret_scope() is None:
+                return default
+            val = get_secret(name, default)
+            return str(val or default).strip()
+        except Exception:
+            return default
     try:
         from agent.secret_scope import get_secret
 
@@ -79,9 +89,25 @@ class GatewayAuthorizationMixin:
             return None
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
+        profile = getattr(source, "profile", None)
+        resolved_access_context = getattr(source, "resolved_access_context", None)
+        if resolved_access_context is not None:
+            context_profile = getattr(resolved_access_context, "profile_id", None)
+            if not isinstance(context_profile, str):
+                return None
+            context_profile = context_profile.strip()
+            if not context_profile or context_profile == "default":
+                return None
+            if profile is not None:
+                if not isinstance(profile, str):
+                    return None
+                source_profile = profile.strip()
+                if source_profile and source_profile != context_profile:
+                    return None
+            profile = context_profile
         return self._authorization_adapter(
             getattr(source, "platform", None),
-            getattr(source, "profile", None),
+            profile,
         )
 
     def _adapter_authorization_is_upstream(
@@ -106,6 +132,13 @@ class GatewayAuthorizationMixin:
         adapter = self._authorization_adapter(platform, profile)
         if adapter is None:
             return False
+        return bool(getattr(adapter, "authorization_is_upstream", False))
+
+    def _source_adapter_authorization_is_upstream(
+        self,
+        source: Optional[SessionSource],
+    ) -> bool:
+        adapter = self._adapter_for_source(source)
         return bool(getattr(adapter, "authorization_is_upstream", False))
 
     def _adapter_enforces_own_access_policy(
@@ -292,10 +325,7 @@ class GatewayAuthorizationMixin:
         if single_principal is not None and single_principal.enabled:
             upstream_authenticated = (
                 source.delivered_via_upstream_relay is True
-                or self._adapter_authorization_is_upstream(
-                    source.platform,
-                    profile=source.profile,
-                )
+                or self._source_adapter_authorization_is_upstream(source)
             )
             return bool(
                 single_principal.authorize(
@@ -339,12 +369,13 @@ class GatewayAuthorizationMixin:
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
-            source.platform,
-            profile=source.profile,
+        if (
+            source.delivered_via_upstream_relay is True
+            or self._source_adapter_authorization_is_upstream(source)
         ):
             return True
 
+        auth_env_scoped = getattr(source, "resolved_access_context", None) is not None
         user_id = source.user_id
 
         # Telegram (and similar) authorize entire group/forum/channel chats
@@ -363,7 +394,7 @@ class GatewayAuthorizationMixin:
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = _auth_env(chat_allowlist_env, scoped=auth_env_scoped)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -387,7 +418,12 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            allow_bots = _auth_env(
+                allow_bots_var or "",
+                "none",
+                scoped=auth_env_scoped,
+            ).lower()
+            if allow_bots_var and allow_bots in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -456,7 +492,10 @@ class GatewayAuthorizationMixin:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and _auth_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
+        if platform_allow_all_var and _auth_env(
+            platform_allow_all_var,
+            scoped=auth_env_scoped,
+        ).lower() in {"true", "1", "yes"}:
             return True
 
         # Adapter-verified role auth: the Discord adapter already confirmed the
@@ -487,13 +526,22 @@ class GatewayAuthorizationMixin:
             return True
 
         # Check platform-specific and global allowlists
-        platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
+        platform_allowlist = _auth_env(
+            platform_env_map.get(source.platform, ""),
+            scoped=auth_env_scoped,
+        )
         group_user_allowlist = ""
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
-            group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
-        global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
+            group_user_allowlist = _auth_env(
+                platform_group_user_env_map.get(source.platform, ""),
+                scoped=auth_env_scoped,
+            )
+            group_chat_allowlist = _auth_env(
+                platform_group_chat_env_map.get(source.platform, ""),
+                scoped=auth_env_scoped,
+            )
+        global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS", scoped=auth_env_scoped)
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
             # No env allowlist configured. Adapters that own their own
@@ -542,7 +590,10 @@ class GatewayAuthorizationMixin:
                 if effective_policy == "allowlist":
                     return True
             # No allowlists configured -- check global allow-all flag
-            return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+            return _auth_env(
+                "GATEWAY_ALLOW_ALL_USERS",
+                scoped=auth_env_scoped,
+            ).lower() in {"true", "1", "yes"}
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
@@ -641,10 +692,7 @@ class GatewayAuthorizationMixin:
         if single_principal is not None and single_principal.enabled:
             upstream_authenticated = (
                 source.delivered_via_upstream_relay is True
-                or self._adapter_authorization_is_upstream(
-                    source.platform,
-                    profile=source.profile,
-                )
+                or self._source_adapter_authorization_is_upstream(source)
             )
             return bool(
                 single_principal.authorize_elevated(
@@ -659,6 +707,7 @@ class GatewayAuthorizationMixin:
         platform: Optional[Platform],
         *,
         profile: Optional[str] = None,
+        source: Optional[SessionSource] = None,
     ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
@@ -679,6 +728,11 @@ class GatewayAuthorizationMixin:
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
+        auth_env_scoped = (
+            getattr(source, "resolved_access_context", None) is not None
+            if source is not None
+            else False
+        )
 
         # Check for an explicit per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
@@ -705,10 +759,14 @@ class GatewayAuthorizationMixin:
         # so unauthorized DMs should be dropped silently rather than answered
         # with a pairing code. An explicit pairing policy opts back into codes.
         # Prefer the profile-scoped live adapter's resolved policy in multiplex
-        # mode; fall back to the default profile's config.extra.
+        # mode. Legacy no-source callers may still fall back to config.extra.
         if platform:
-            dm_policy = self._adapter_dm_policy(platform, profile=profile)
-            if not dm_policy and config and hasattr(config, "platforms"):
+            if auth_env_scoped and source is not None:
+                adapter = self._adapter_for_source(source)
+                dm_policy = str(getattr(adapter, "_dm_policy", "") or "").strip().lower()
+            else:
+                dm_policy = self._adapter_dm_policy(platform, profile=profile)
+            if not auth_env_scoped and not dm_policy and config and hasattr(config, "platforms"):
                 platform_cfg = config.platforms.get(platform)
                 extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
                 if isinstance(extra, dict):
@@ -748,13 +806,16 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if _auth_env(
+                platform_env_map.get(platform, ""),
+                scoped=auth_env_scoped,
+            ):
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if _auth_env(env_key, scoped=auth_env_scoped):
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS", scoped=auth_env_scoped):
             return "ignore"
 
         return "pair"

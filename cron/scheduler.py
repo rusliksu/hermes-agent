@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -686,6 +687,50 @@ def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
     return True
 
 
+def _persisted_resolved_access_context(job: dict):
+    raw = job.get("resolved_access_context")
+    if raw is None:
+        return None
+    try:
+        from gateway.access_registry import deserialize_resolved_access_context
+
+        return deserialize_resolved_access_context(raw)
+    except Exception as exc:
+        raise RuntimeError("malformed persisted resolved_access_context") from exc
+
+
+def _enforce_persisted_cron_context(job: dict):
+    context = _persisted_resolved_access_context(job)
+    if context is None:
+        return None
+
+    role_id = str(getattr(context, "role_id", "") or "")
+    capabilities = getattr(context, "capabilities", frozenset())
+    if role_id == "owner":
+        if "cron" not in capabilities:
+            raise RuntimeError("owner cron requires cron capability")
+        return context
+    if role_id == "shared_room":
+        if "cron" not in capabilities:
+            raise RuntimeError("shared room cron requires cron capability")
+        deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        if deliver != "origin":
+            raise RuntimeError("shared room cron requires deliver=origin")
+        if _origin_matches_resolved_access_context(job, context):
+            return context
+        raise RuntimeError("shared room cron origin does not match resolved access context")
+    if role_id in {"family_standard", "family_sandbox"}:
+        if "self_reminder" not in capabilities:
+            raise RuntimeError("family cron requires self_reminder capability")
+        deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        if deliver != "origin":
+            raise RuntimeError("family cron requires deliver=origin")
+        if _origin_matches_resolved_access_context(job, context):
+            return context
+        raise RuntimeError("family cron origin does not match resolved access context")
+    raise RuntimeError(f"cron is not available for role {role_id!r}")
+
+
 def _maybe_mirror_cron_delivery(
     job: dict,
     platform_name: str,
@@ -1274,9 +1319,17 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
     """
+    context = _enforce_persisted_cron_context(job)
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
+    if context is not None and deliver == "origin":
+        delivery_target = context.delivery_target
+        return [{
+            "platform": delivery_target.platform,
+            "chat_id": str(delivery_target.chat_id),
+            "thread_id": delivery_target.thread_id,
+        }]
 
     raw_parts = [p.strip() for p in deliver.split(",") if p.strip()]
 
@@ -1294,6 +1347,21 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
+    if context is not None:
+        delivery_target = context.delivery_target
+        expected = (
+            delivery_target.platform.lower(),
+            str(delivery_target.chat_id),
+            None if delivery_target.thread_id is None else str(delivery_target.thread_id),
+        )
+        for target in targets:
+            resolved = (
+                str(target["platform"]).lower(),
+                str(target["chat_id"]),
+                None if target.get("thread_id") is None else str(target["thread_id"]),
+            )
+            if resolved != expected:
+                raise RuntimeError("delivery target does not match resolved access context")
     return targets
 
 
@@ -1301,6 +1369,18 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     """Resolve the concrete auto-delivery target for a cron job, if any."""
     targets = _resolve_delivery_targets(job)
     return targets[0] if targets else None
+
+
+def _origin_matches_resolved_access_context(job: dict, context) -> bool:
+    origin = _resolve_origin(job)
+    if not origin:
+        return False
+    target = context.delivery_target
+    return (
+        str(origin.get("platform") or "") == target.platform
+        and str(origin.get("chat_id") or "") == target.chat_id
+        and origin.get("thread_id") == target.thread_id
+    )
 
 
 # Media extension sets — audio routing is centralized in gateway.platforms.base
@@ -1454,6 +1534,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    typed_context = _persisted_resolved_access_context(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -1569,16 +1650,38 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        if typed_context is not None:
+            resolver = getattr(adapters, "resolve", None) if adapters is not None else None
+            if not callable(resolver):
+                msg = "typed cron delivery requires live adapter resolver"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            runtime_adapter = resolver(platform, typed_context.delivery_target.account)
+            if runtime_adapter is None:
+                msg = "typed cron delivery requires a unique live adapter for the resolved account"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            route_adapters = {platform: runtime_adapter}
+        else:
+            # Prefer the live adapter when the gateway is running — this supports E2EE
+            # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
+            runtime_adapter = (adapters or {}).get(platform)
+            route_adapters = adapters
+
         pconfig = config.platforms.get(platform)
         if not pconfig or not pconfig.enabled:
-            msg = f"platform '{platform_name}' not configured/enabled"
-            logger.warning("Job '%s': %s", job["id"], msg)
-            delivery_errors.append(msg)
-            continue
-
-        # Prefer the live adapter when the gateway is running — this supports E2EE
-        # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
-        runtime_adapter = (adapters or {}).get(platform)
+            if typed_context is not None:
+                pconfig = getattr(runtime_adapter, "config", None) or SimpleNamespace(
+                    enabled=True,
+                    extra={},
+                )
+            else:
+                msg = f"platform '{platform_name}' not configured/enabled"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
         delivered = False
         target_errors = []
 
@@ -1731,7 +1834,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(config, route_adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -1921,12 +2024,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                logger.warning(
-                    "Job '%s': %s, falling back to standalone",
-                    job["id"], err_msg,
-                )
+                if typed_context is not None:
+                    logger.warning(
+                        "Job '%s': %s; typed cron delivery has no standalone fallback",
+                        job["id"], err_msg,
+                    )
+                else:
+                    logger.warning(
+                        "Job '%s': %s, falling back to standalone",
+                        job["id"], err_msg,
+                    )
 
         if not delivered:
+            if typed_context is not None:
+                if not target_errors:
+                    target_errors.append(
+                        "typed cron delivery requires confirmed live adapter delivery"
+                    )
+                delivery_errors.extend(target_errors)
+                continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures
@@ -2677,6 +2793,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _persisted_context = _enforce_persisted_cron_context(job)
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2962,6 +3079,7 @@ def run_job(
         # inline/synchronous path, so results return within the job's own turn.
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
+        resolved_access_context=_persisted_context,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -3718,6 +3836,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    try:
+        _enforce_persisted_cron_context(job)
+    except Exception as exc:
+        logger.error("Job '%s': refusing to fire before side effects: %s", job.get("id"), exc)
+        return False
+
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]

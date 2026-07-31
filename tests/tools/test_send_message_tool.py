@@ -1393,6 +1393,46 @@ class TestSendTelegramThreadIdMapping:
         call2_kwargs = bot.send_message.await_args_list[1].kwargs
         assert "message_thread_id" not in call2_kwargs
 
+    def test_typed_topic_thread_not_found_denies_before_root_text_retry(self, monkeypatch):
+        """Typed topic delivery must not retry into the parent chat."""
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+        from gateway.session_context import bind_resolved_access_context
+
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        bot.send_message = AsyncMock(side_effect=[
+            Exception("Bad Request: message thread not found"),
+            SimpleNamespace(message_id=2),
+        ])
+        context = ResolvedAccessContext(
+            principal_id="principal-room",
+            role_id="shared_room",
+            profile_id="room-profile",
+            conversation_scope="telegram:room:-1001234567890:17585",
+            capabilities=frozenset({"send_message"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-main",
+                peer_kind="group",
+                chat_id="-1001234567890",
+                thread_id="17585",
+            ),
+        )
+
+        with bind_resolved_access_context(context):
+            result = asyncio.run(
+                _send_telegram("tok", "-1001234567890", "hello", thread_id="17585")
+            )
+
+        assert result == {
+            "error": "send_message_access_denied",
+            "reason": "delivery_target_mismatch",
+        }
+        bot.send_message.assert_awaited_once()
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["message_thread_id"] == 17585
+
     def test_thread_not_found_for_media_retries_without_message_thread_id(self, monkeypatch, tmp_path):
         """Media send with stale thread_id retries without it (#27012)."""
         bot = self._make_bot()
@@ -1422,6 +1462,53 @@ class TestSendTelegramThreadIdMapping:
         # Second call (retry): should NOT include message_thread_id
         call2_kwargs = bot.send_document.await_args_list[1].kwargs
         assert "message_thread_id" not in call2_kwargs
+
+    def test_typed_topic_thread_not_found_denies_before_root_media_retry(
+        self, monkeypatch, tmp_path
+    ):
+        """Typed topic media delivery must not retry into the parent chat."""
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+        from gateway.session_context import bind_resolved_access_context
+
+        bot = self._make_bot()
+        bot.send_document = AsyncMock(side_effect=[
+            Exception("Bad Request: message thread not found"),
+            SimpleNamespace(message_id=3),
+        ])
+        _install_telegram_mock(monkeypatch, bot)
+        test_file = tmp_path / "doc.txt"
+        test_file.write_text("test content")
+        context = ResolvedAccessContext(
+            principal_id="principal-room",
+            role_id="shared_room",
+            profile_id="room-profile",
+            conversation_scope="telegram:room:-1001234567890:17585",
+            capabilities=frozenset({"send_message"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-main",
+                peer_kind="group",
+                chat_id="-1001234567890",
+                thread_id="17585",
+            ),
+        )
+
+        with bind_resolved_access_context(context):
+            result = asyncio.run(
+                _send_telegram(
+                    "tok", "-1001234567890", "",
+                    media_files=[(str(test_file), False)],
+                    thread_id="17585",
+                )
+            )
+
+        assert result == {
+            "error": "send_message_access_denied",
+            "reason": "delivery_target_mismatch",
+        }
+        bot.send_document.assert_awaited_once()
+        kwargs = bot.send_document.await_args.kwargs
+        assert kwargs["message_thread_id"] == 17585
 
 
 # ---------------------------------------------------------------------------

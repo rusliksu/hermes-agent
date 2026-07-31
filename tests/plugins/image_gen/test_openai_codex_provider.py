@@ -11,8 +11,12 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
+
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
 
 # The plugin directory uses a hyphen, which is not a valid Python identifier
 # for the dotted-import form. Load it via importlib so tests don't need to
@@ -31,6 +35,22 @@ _PNG_HEX = (
 def _b64_png() -> str:
     import base64
     return base64.b64encode(bytes.fromhex(_PNG_HEX)).decode()
+
+
+def _access_context(profile_id="profile-a") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="dm:principal-a",
+        capabilities=frozenset(),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="10001",
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -248,6 +268,33 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "invalid_image_input"
         assert "not a supported image" in result["error"]
+
+    def test_typed_sibling_source_rejected_before_read_or_request(
+        self, provider, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        (tmp_path / "profiles" / "profile-a").mkdir(parents=True)
+        sibling = tmp_path / "profiles" / "profile-b" / "cache" / "images" / "source.png"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_bytes(bytes.fromhex(_PNG_HEX))
+        collect = Mock(return_value=_b64_png())
+        read_bytes = Mock(side_effect=AssertionError("read_bytes called"))
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", collect)
+
+        with (
+            bind_resolved_access_context(_access_context("profile-a")),
+            patch.object(codex_plugin.Path, "read_bytes", read_bytes),
+        ):
+            result = provider.generate("edit this", image_url=str(sibling))
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_image_input"
+        assert "restricted to the resolved access profile" in result["error"]
+        assert str(sibling) not in result["error"]
+        assert "profile-a" not in result["error"]
+        assert "profile-b" not in result["error"]
+        read_bytes.assert_not_called()
+        collect.assert_not_called()
 
     def test_partial_image_event_used_when_done_missing(self):
         """If output_item.done is missing, partial_image_b64 is accepted."""

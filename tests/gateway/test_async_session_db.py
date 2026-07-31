@@ -8,10 +8,31 @@ facade's contract and lock the gateway boundary so a 39th raw call can't regress
 
 import ast
 import asyncio
+import json
 import threading
 from pathlib import Path
 
 import pytest
+
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.access_registry import serialize_resolved_access_context
+
+
+def _handoff_context() -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family_standard",
+        profile_id="family-alpha",
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="u1",
+            thread_id=None,
+        ),
+    )
 
 import hermes_state
 from hermes_state import AsyncSessionDB
@@ -380,13 +401,24 @@ def test_offloaded_helpers_never_called_bare_on_loop():
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_concurrent_claim_handoff_single_winner(tmp_path):
+async def test_concurrent_claim_handoff_single_winner(tmp_path, monkeypatch):
+    async def _inline_to_thread(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
     db = AsyncSessionDB(hermes_state.SessionDB(db_path=tmp_path / "state.db"))
     sid = "s-handoff"
+    context = _handoff_context()
     await db.create_session(sid, "test")
-    await db.request_handoff(sid, "telegram")
+    await db.request_handoff(sid, "telegram", resolved_access_context=context)
+    await asyncio.to_thread(db._db.close)
 
-    results = await asyncio.gather(*(db.claim_handoff(sid) for _ in range(20)))
+    restarted = AsyncSessionDB(hermes_state.SessionDB(db_path=tmp_path / "state.db"))
+    pending = await restarted.list_pending_handoffs()
+    assert len(pending) == 1
+    assert json.loads(pending[0]["handoff_context_json"]) == serialize_resolved_access_context(context)
+
+    results = await asyncio.gather(*(restarted.claim_handoff(sid) for _ in range(20)))
 
     assert sum(results) == 1, f"exactly one claim must win, got {sum(results)}"
 

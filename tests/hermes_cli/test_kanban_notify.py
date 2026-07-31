@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
@@ -24,6 +25,109 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
     kb.init_db()
     return home
+
+
+def _registry_for_dm(*, profile_id: str, chat_id: str):
+    from gateway.access_registry import (
+        AccessRegistry,
+        DeliveryTarget,
+        PrincipalBinding,
+        ResolvedAccessContext,
+        RolePolicy,
+        TransportIdentity,
+    )
+
+    role = RolePolicy("family", frozenset({"kanban_notify"}))
+    target = DeliveryTarget(
+        platform="telegram",
+        account="bot-family",
+        peer_kind="dm",
+        chat_id=chat_id,
+    )
+    context = ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"kanban_notify"}),
+        delivery_target=target,
+    )
+    registry = AccessRegistry(
+        roles={"family": role},
+        profiles=frozenset({profile_id}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id=context.principal_id,
+                role_id=context.role_id,
+                profile_id=context.profile_id,
+                transport_identity=TransportIdentity(
+                    platform="telegram",
+                    account="bot-family",
+                    peer_kind="dm",
+                    user_id=chat_id,
+                    chat_id=chat_id,
+                ),
+                conversation_scope=context.conversation_scope,
+                delivery_target=target,
+            ),
+        ),
+        scope_capabilities={"private": frozenset({"kanban_notify"})},
+        backend_capabilities=frozenset({"kanban_notify"}),
+    )
+    return registry, context
+
+
+def _registry_session_entry(*, session_id: str, profile_id: str, chat_id: str, context=None):
+    from gateway.config import Platform
+    from gateway.session import SessionEntry, SessionSource
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="dm",
+        user_id=chat_id,
+        profile=profile_id,
+    )
+    if context is not None:
+        source.resolved_access_context = context
+    return SessionEntry(
+        session_key=f"agent:{profile_id}:telegram:dm:{chat_id}",
+        session_id=session_id,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+
+
+def _registry_runner(*, registry, entry):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "default"
+    runner.access_registry = registry
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner.session_store = SimpleNamespace(
+        lookup_by_session_id=MagicMock(return_value=entry)
+    )
+    default_adapter = MagicMock()
+    default_adapter.send = AsyncMock()
+    default_adapter.handle_message = AsyncMock()
+    family_adapter = MagicMock()
+    family_adapter.send = AsyncMock()
+    family_adapter.handle_message = AsyncMock()
+    family_adapter.extract_local_files = MagicMock(return_value=([], ""))
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._profile_adapters = {"family-alpha": {Platform.TELEGRAM: family_adapter}}
+    return runner, default_adapter, family_adapter
+
+
+async def _inline_to_thread(fn, /, *args, **kwargs):
+    return fn(*args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -60,7 +164,8 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -120,7 +225,8 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -191,7 +297,8 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     finally:
         conn.close()
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -212,7 +319,8 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     finally:
         conn.close()
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -278,7 +386,8 @@ async def test_notifier_does_not_call_init_db(kanban_home):
         init_db_calls.append((args, kwargs))
         return real_init_db(*args, **kwargs)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread), \
          patch("hermes_cli.kanban_db.init_db", side_effect=_spy_init_db):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
@@ -370,7 +479,8 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
         if tick_count >= 3:
             runner._running = False
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -425,7 +535,8 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -438,6 +549,252 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
     finally:
         conn.close()
     assert subs == []
+
+
+@pytest.mark.asyncio
+async def test_notifier_registry_uses_persisted_canonical_dm_source(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    registry, context = _registry_for_dm(
+        profile_id="family-alpha",
+        chat_id="family-dm-chat",
+    )
+    session_id = "durable-family-session"
+    entry = _registry_session_entry(
+        session_id=session_id,
+        profile_id="family-alpha",
+        chat_id="family-dm-chat",
+        context=context,
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="registry task",
+            assignee="worker1",
+            session_id=session_id,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="family-dm-chat",
+            user_id="family-dm-chat",
+            notifier_profile="family-alpha",
+        )
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    runner, default_adapter, family_adapter = _registry_runner(
+        registry=registry,
+        entry=entry,
+    )
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    family_adapter.send.side_effect = _send_and_stop
+
+    _orig_sleep = asyncio.sleep
+
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 8:
+            runner._running = False
+
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    runner.session_store.lookup_by_session_id.assert_called_with(session_id)
+    default_adapter.send.assert_not_called()
+    default_adapter.handle_message.assert_not_called()
+    family_adapter.send.assert_awaited_once()
+    assert family_adapter.send.await_args.args[0] == "family-dm-chat"
+    family_adapter.handle_message.assert_awaited_once()
+    event = family_adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source.chat_type == "dm"
+    assert event.source.chat_id == "family-dm-chat"
+    assert event.source.user_id == "family-dm-chat"
+    assert event.source.profile == "family-alpha"
+    assert event.source.resolved_access_context == context
+
+
+@pytest.mark.asyncio
+async def test_notifier_registry_denies_missing_persisted_context_before_adapter(
+    kanban_home, caplog,
+):
+    import hermes_cli.kanban_db as kb
+
+    registry, _context = _registry_for_dm(
+        profile_id="family-alpha",
+        chat_id="origin-secret-chat",
+    )
+    session_id = "missing-context-session-secret"
+    entry = _registry_session_entry(
+        session_id=session_id,
+        profile_id="family-alpha",
+        chat_id="origin-secret-chat",
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="missing context",
+            assignee="worker1",
+            session_id=session_id,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="origin-secret-chat",
+            user_id="origin-secret-chat",
+            notifier_profile="family-alpha",
+        )
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    runner, default_adapter, family_adapter = _registry_runner(
+        registry=registry,
+        entry=entry,
+    )
+    runner._adapter_for_source = MagicMock(side_effect=AssertionError("adapter selected"))
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    with caplog.at_level("WARNING"), \
+         patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "AccessRegistry callback denied" in rendered
+    assert "AccessRegistry ingress denied" in rendered
+    for raw in (
+        "missing-context-session-secret",
+        "origin-secret-chat",
+        "family-alpha",
+    ):
+        assert raw not in rendered
+    runner._adapter_for_source.assert_not_called()
+    default_adapter.send.assert_not_called()
+    family_adapter.send.assert_not_called()
+    family_adapter.handle_message.assert_not_called()
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_notifier_registry_denies_mismatched_subscription_and_advances_cursor(
+    kanban_home, caplog,
+):
+    import hermes_cli.kanban_db as kb
+
+    registry, context = _registry_for_dm(
+        profile_id="family-alpha",
+        chat_id="canonical-secret-chat",
+    )
+    session_id = "mismatch-session-secret"
+    entry = _registry_session_entry(
+        session_id=session_id,
+        profile_id="family-alpha",
+        chat_id="canonical-secret-chat",
+        context=context,
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="mismatch",
+            assignee="worker1",
+            session_id=session_id,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="guessed-secret-chat",
+            user_id="guessed-secret-user",
+            notifier_profile="wrong-profile-secret",
+        )
+        kb.block_task(conn, tid, reason="needs input", kind="needs_input")
+    finally:
+        conn.close()
+
+    runner, default_adapter, family_adapter = _registry_runner(
+        registry=registry,
+        entry=entry,
+    )
+    runner._adapter_for_source = MagicMock(side_effect=AssertionError("adapter selected"))
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    with caplog.at_level("WARNING"), \
+         patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "AccessRegistry callback denied" in rendered
+    assert "subscription_chat_mismatch" in rendered
+    for raw in (
+        "mismatch-session-secret",
+        "canonical-secret-chat",
+        "guessed-secret-chat",
+        "guessed-secret-user",
+        "wrong-profile-secret",
+        "family-alpha",
+    ):
+        assert raw not in rendered
+    runner._adapter_for_source.assert_not_called()
+    default_adapter.send.assert_not_called()
+    family_adapter.send.assert_not_called()
+    family_adapter.handle_message.assert_not_called()
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) >= 1
 
 
 @pytest.mark.asyncio
@@ -466,7 +823,8 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         source=source,
     )
 
-    out = await GatewayRunner._handle_kanban_command(runner, event)
+    with patch("gateway.slash_commands.asyncio.to_thread", side_effect=_inline_to_thread):
+        out = await GatewayRunner._handle_kanban_command(runner, event)
 
     assert "subscribed" in out.lower()
 
@@ -572,7 +930,8 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -648,7 +1007,8 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=_inline_to_thread):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,

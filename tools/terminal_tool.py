@@ -1229,13 +1229,21 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
 
 # Configuration from environment variables
 
-def _parse_env_var(name: str, default: str, converter: Any = int, type_label: str = "integer"):
+def _parse_env_var(
+    name: str,
+    default: str,
+    converter: Any = int,
+    type_label: str = "integer",
+    env_get=None,
+):
     """Parse an environment variable with *converter*, raising a clear error on bad values.
 
     Without this wrapper, a single malformed env var (e.g. TERMINAL_TIMEOUT=5m)
     causes an unhandled ValueError that kills every terminal command.
     """
-    raw = os.getenv(name, default)
+    if env_get is None:
+        env_get = os.getenv
+    raw = env_get(name, default)
     try:
         return converter(raw)
     except (ValueError, json.JSONDecodeError):
@@ -1266,6 +1274,7 @@ def _safe_getcwd() -> str:
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+_TERMINAL_BACKENDS = frozenset({"local", "ssh"}) | _CONTAINER_BACKENDS
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1346,14 +1355,104 @@ def _ensure_terminal_env_bridged() -> None:
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
+def _typed_terminal_env() -> dict[str, str] | None:
+    """Return profile-bound terminal env values for typed contexts.
+
+    None preserves the legacy process-env path. Values come from the bound
+    profile's config.yaml plus the fail-closed typed cwd helper; process env is
+    intentionally not consulted here.
+    """
+    try:
+        from agent.runtime_cwd import (
+            bound_profile_terminal_config,
+            resolve_bound_profile_cwd,
+        )
+
+        terminal_cfg = bound_profile_terminal_config()
+        if terminal_cfg is None:
+            return None
+        cwd = resolve_bound_profile_cwd()
+    except ValueError:
+        raise
+    except Exception:
+        return None
+
+    backend = terminal_cfg.get("backend")
+    if not isinstance(backend, str) or not backend.strip():
+        raise ValueError("typed terminal backend missing")
+    backend = backend.strip().lower()
+    if backend not in _TERMINAL_BACKENDS:
+        raise ValueError("typed terminal backend unknown")
+
+    env: dict[str, str] = {}
+    try:
+        from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
+    except Exception:
+        TERMINAL_CONFIG_ENV_MAP = {
+            "backend": "TERMINAL_ENV",
+            "modal_mode": "TERMINAL_MODAL_MODE",
+            "cwd": "TERMINAL_CWD",
+            "timeout": "TERMINAL_TIMEOUT",
+            "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+            "docker_image": "TERMINAL_DOCKER_IMAGE",
+            "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+            "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+            "modal_image": "TERMINAL_MODAL_IMAGE",
+            "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+            "ssh_host": "TERMINAL_SSH_HOST",
+            "ssh_user": "TERMINAL_SSH_USER",
+            "ssh_port": "TERMINAL_SSH_PORT",
+            "ssh_key": "TERMINAL_SSH_KEY",
+            "container_cpu": "TERMINAL_CONTAINER_CPU",
+            "container_memory": "TERMINAL_CONTAINER_MEMORY",
+            "container_disk": "TERMINAL_CONTAINER_DISK",
+            "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+            "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+            "docker_env": "TERMINAL_DOCKER_ENV",
+            "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+            "docker_network": "TERMINAL_DOCKER_NETWORK",
+            "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+            "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+            "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+            "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
+        }
+
+        def _terminal_env_value(value: Any) -> str:
+            if isinstance(value, (list, dict)):
+                return json.dumps(value)
+            return str(value)
+
+    for key, value in terminal_cfg.items():
+        if key == "cwd":
+            continue
+        if key == "backend":
+            value = backend
+        env_var = TERMINAL_CONFIG_ENV_MAP.get(key)
+        if env_var and value is not None:
+            env[env_var] = _terminal_env_value(value)
+    if cwd is not None:
+        env["TERMINAL_CWD"] = str(cwd)
+    return env
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
-    _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    typed_env = _typed_terminal_env()
+    if typed_env is None:
+        _ensure_terminal_env_bridged()
+
+    def _env_get(name: str, default: str = "") -> str:
+        if typed_env is not None:
+            return typed_env.get(name, default)
+        return os.getenv(name, default)
+
+    env_type = _env_get("TERMINAL_ENV", "local").strip().lower()
+    if typed_env is not None and env_type not in _TERMINAL_BACKENDS:
+        raise ValueError("typed terminal backend unknown")
     
-    mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
+    mount_docker_cwd = _env_get("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
     docker_backend = env_type == "docker"
 
@@ -1362,19 +1461,19 @@ def _get_env_config() -> Dict[str, Any]:
     # until a backend that can consume them is selected; a stale or invalid
     # Docker value should not make local terminal/execute_code unusable.
     if container_backend:
-        container_cpu = _parse_env_var("TERMINAL_CONTAINER_CPU", "1", float, "number")
-        container_memory = _parse_env_var("TERMINAL_CONTAINER_MEMORY", "5120")
-        container_disk = _parse_env_var("TERMINAL_CONTAINER_DISK", "51200")
+        container_cpu = _parse_env_var("TERMINAL_CONTAINER_CPU", "1", float, "number", _env_get)
+        container_memory = _parse_env_var("TERMINAL_CONTAINER_MEMORY", "5120", env_get=_env_get)
+        container_disk = _parse_env_var("TERMINAL_CONTAINER_DISK", "51200", env_get=_env_get)
     else:
         container_cpu = 1.0
         container_memory = 5120
         container_disk = 51200
 
     if docker_backend:
-        docker_forward_env = _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON")
-        docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
-        docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
-        docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
+        docker_forward_env = _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON", _env_get)
+        docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON", _env_get)
+        docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON", _env_get)
+        docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON", _env_get)
     else:
         docker_forward_env = []
         docker_volumes = []
@@ -1395,12 +1494,12 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    cwd = _env_get("TERMINAL_CWD", default_cwd)
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+        docker_cwd_source = _env_get("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
@@ -1418,40 +1517,40 @@ def _get_env_config() -> Dict[str, Any]:
 
     return {
         "env_type": env_type,
-        "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
-        "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "modal_mode": coerce_modal_mode(_env_get("TERMINAL_MODAL_MODE", "auto")),
+        "docker_image": _env_get("TERMINAL_DOCKER_IMAGE", default_image),
         "docker_forward_env": docker_forward_env,
-        "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
-        "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
-        "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "singularity_image": _env_get("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
+        "modal_image": _env_get("TERMINAL_MODAL_IMAGE", default_image),
+        "daytona_image": _env_get("TERMINAL_DAYTONA_IMAGE", default_image),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
-        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
-        "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
+        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180", env_get=_env_get),
+        "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300", env_get=_env_get),
         # SSH-specific config
-        "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
-        "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
-        "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
-        "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_host": _env_get("TERMINAL_SSH_HOST", ""),
+        "ssh_user": _env_get("TERMINAL_SSH_USER", ""),
+        "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22", env_get=_env_get),
+        "ssh_key": _env_get("TERMINAL_SSH_KEY", ""),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
-        "ssh_persistent": os.getenv(
+        "ssh_persistent": _env_get(
             "TERMINAL_SSH_PERSISTENT",
-            os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
+            _env_get("TERMINAL_PERSISTENT_SHELL", "true"),
         ).lower() in {"true", "1", "yes"},
-        "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
+        "local_persistent": _env_get("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
         # daytona -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        "container_persistent": _env_get("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
-        "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
-        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
+        "docker_run_as_host_user": _env_get("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_network": _env_get("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         # Cross-process container reuse (issue #20561).  The docs claim
         # "ONE long-lived container shared across sessions" — this toggle
@@ -1459,14 +1558,14 @@ def _get_env_config() -> Dict[str, Any]:
         # attaching to it instead of always starting a fresh one.  Set to
         # ``false`` for hard per-process isolation (no reuse, container is
         # removed on exit).
-        "docker_persist_across_processes": os.getenv(
+        "docker_persist_across_processes": _env_get(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
         ).lower() in {"true", "1", "yes"},
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
         # idle-reap window AND scoped to the current profile. Issue #20561.
-        "docker_orphan_reaper": os.getenv(
+        "docker_orphan_reaper": _env_get(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
     }
@@ -2083,7 +2182,12 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
 ) -> str:
-    """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
+    """Return the cwd for a command.
+
+    In typed gateway contexts the server-bound profile cwd is authoritative:
+    an explicit ``workdir=`` or session cwd record is accepted only when it
+    remains inside that profile-selected cwd base. Legacy/no-context paths keep
+    the historical "explicit workdir overrides everything" behavior.
 
     Otherwise the session's own cwd RECORD (``get_session_cwd``) wins — it is
     written after every completed command for this session, so it IS the
@@ -2092,6 +2196,17 @@ def _resolve_command_cwd(
     record yet (first command) runs in ``default_cwd`` (config/override cwd),
     which is also what seeds a fresh environment.
     """
+    candidate = workdir or get_session_cwd(session_key) or default_cwd
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        typed = resolve_bound_profile_cwd(candidate)
+    except ValueError:
+        raise
+    except Exception:
+        typed = None
+    if typed is not None:
+        return str(typed)
     if workdir:
         return workdir
     return get_session_cwd(session_key) or default_cwd
@@ -2156,6 +2271,15 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if workdir:
+            try:
+                from agent.runtime_cwd import resolve_bound_profile_cwd
+
+                resolve_bound_profile_cwd(workdir)
+            except ValueError:
+                raise
+            except Exception:
+                pass
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -2183,7 +2307,16 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        raw_cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        try:
+            from agent.runtime_cwd import resolve_bound_profile_cwd
+
+            typed_cwd = resolve_bound_profile_cwd(raw_cwd)
+        except ValueError:
+            raise
+        except Exception:
+            typed_cwd = None
+        cwd = str(typed_cwd) if typed_cwd is not None else raw_cwd
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2457,7 +2590,11 @@ def terminal_tool(
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
-            from tools.process_registry import process_registry
+            from tools.process_registry import (
+                ProcessNotificationSpec,
+                capture_resolved_access_context_payload,
+                process_registry,
+            )
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
@@ -2465,23 +2602,85 @@ def terminal_tool(
                 session_key=session_key,
             )
             try:
+                # Resolve notification mode before spawn: reader/poller threads
+                # can emit output or completion immediately after they start.
+                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+                    notify_on_complete=bool(notify_on_complete),
+                    watch_patterns=watch_patterns,
+                    background=bool(background),
+                )
+                notify_unsupported = ""
+                notification = None
+                if notify_on_complete or watch_patterns:
+                    from gateway.session_context import (
+                        async_delivery_supported as _async_ok,
+                        get_session_env as _gse,
+                    )
+
+                    # Stateless request/response sessions (the API server /
+                    # WebUI path) cannot route a completion back to the agent
+                    # after the turn ends — there is no persistent channel and
+                    # send() is a no-op. Registering a watcher there silently
+                    # no-ops (issue #10760). Refuse the promise instead: drop
+                    # the flags and tell the agent to poll.
+                    if not _async_ok():
+                        notify_on_complete = False
+                        watch_patterns = None
+                        notify_unsupported = (
+                            "notify_on_complete / watch_patterns are not available in "
+                            "this session — it cannot receive an async completion after "
+                            "the turn ends (a one-shot runner such as `hermes -z` or a "
+                            "cron job, or a stateless HTTP endpoint). The process is "
+                            "running in the background; retrieve its result with "
+                            "process(action='poll') or process(action='wait')."
+                        )
+                    else:
+                        try:
+                            access_context_payload = capture_resolved_access_context_payload()
+                        except ValueError as e:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": -1,
+                                "error": str(e),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
+                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                        notification = ProcessNotificationSpec(
+                            watcher_platform=_gw_platform,
+                            watcher_chat_id=_gse("HERMES_SESSION_CHAT_ID", "") if _gw_platform else "",
+                            watcher_user_id=_gse("HERMES_SESSION_USER_ID", "") if _gw_platform else "",
+                            watcher_user_name=_gse("HERMES_SESSION_USER_NAME", "") if _gw_platform else "",
+                            watcher_thread_id=_gse("HERMES_SESSION_THREAD_ID", "") if _gw_platform else "",
+                            watcher_message_id=_gse("HERMES_SESSION_MESSAGE_ID", "") if _gw_platform else "",
+                            watcher_interval=5 if notify_on_complete and _gw_platform else 0,
+                            notify_on_complete=bool(notify_on_complete),
+                            watch_patterns=tuple(watch_patterns or ()),
+                            resolved_access_context=access_context_payload,
+                        )
+
                 if env_type == "local":
-                    proc_session = process_registry.spawn_local(
-                        command=command,
-                        cwd=effective_cwd,
-                        task_id=effective_task_id,
-                        session_key=session_key,
-                        env_vars=env.env if hasattr(env, 'env') else None,
-                        use_pty=effective_pty,
-                    )
+                    spawn_kwargs = {
+                        "command": command,
+                        "cwd": effective_cwd,
+                        "task_id": effective_task_id,
+                        "session_key": session_key,
+                        "env_vars": env.env if hasattr(env, 'env') else None,
+                        "use_pty": effective_pty,
+                    }
+                    if notification is not None:
+                        spawn_kwargs["notification"] = notification
+                    proc_session = process_registry.spawn_local(**spawn_kwargs)
                 else:
-                    proc_session = process_registry.spawn_via_env(
-                        env=env,
-                        command=command,
-                        cwd=effective_cwd,
-                        task_id=effective_task_id,
-                        session_key=session_key,
-                    )
+                    spawn_kwargs = {
+                        "env": env,
+                        "command": command,
+                        "cwd": effective_cwd,
+                        "task_id": effective_task_id,
+                        "session_key": session_key,
+                    }
+                    if notification is not None:
+                        spawn_kwargs["notification"] = notification
+                    proc_session = process_registry.spawn_via_env(**spawn_kwargs)
 
                 result_data = {
                     "output": "Background process started",
@@ -2497,6 +2696,17 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if conflict_note:
+                    logger.warning("background proc %s: %s", proc_session.id, conflict_note)
+                    result_data["watch_patterns_ignored"] = conflict_note
+                if notify_unsupported:
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = notify_unsupported
+                    logger.info(
+                        "background proc %s: async delivery unsupported on this "
+                        "session; notify_on_complete/watch_patterns disabled",
+                        proc_session.id,
+                    )
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
@@ -2510,7 +2720,7 @@ def terminal_tool(
                 # surface the result. Cheap nudge here costs ~one read for
                 # server cases (false positive) and prevents silent
                 # blindness for bounded-task cases (false negative).
-                if background and not notify_on_complete and not watch_patterns:
+                if background and not notify_on_complete and not watch_patterns and not notify_unsupported:
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
                         "this process runs SILENTLY — you will not be told when "
@@ -2603,82 +2813,17 @@ def terminal_tool(
                             else canonical_hint
                         )
 
-                # Populate routing metadata on the session so that
-                # watch-pattern and completion notifications can be
-                # routed back to the correct chat/thread.
-                if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import (
-                        async_delivery_supported as _async_ok,
-                        get_session_env as _gse,
-                    )
-
-                    # Stateless request/response sessions (the API server /
-                    # WebUI path) cannot route a completion back to the agent
-                    # after the turn ends — there is no persistent channel and
-                    # send() is a no-op. Registering a watcher there silently
-                    # no-ops (issue #10760). Refuse the promise instead: drop
-                    # the flags and tell the agent to poll.
-                    if not _async_ok():
-                        notify_on_complete = False
-                        watch_patterns = None
-                        result_data["notify_on_complete"] = False
-                        result_data["notify_unsupported"] = (
-                            "notify_on_complete / watch_patterns are not available in "
-                            "this session — it cannot receive an async completion after "
-                            "the turn ends (a one-shot runner such as `hermes -z` or a "
-                            "cron job, or a stateless HTTP endpoint). The process is "
-                            "running in the background; retrieve its result with "
-                            "process(action='poll') or process(action='wait')."
-                        )
-                        logger.info(
-                            "background proc %s: async delivery unsupported on this "
-                            "session; notify_on_complete/watch_patterns disabled",
-                            proc_session.id,
-                        )
-                    else:
-                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                        if _gw_platform:
-                            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                            _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                            _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                            _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                            _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
-                            proc_session.watcher_platform = _gw_platform
-                            proc_session.watcher_chat_id = _gw_chat_id
-                            proc_session.watcher_user_id = _gw_user_id
-                            proc_session.watcher_user_name = _gw_user_name
-                            proc_session.watcher_thread_id = _gw_thread_id
-                            proc_session.watcher_message_id = _gw_message_id
-
-                # Mutual exclusion: if both notify_on_complete and watch_patterns
-                # are set, drop watch_patterns. The combination produces duplicate
-                # notifications (one per match + one on exit) that deliver
-                # asynchronously and can spam the user long after the process ends.
-                # notify_on_complete is the more useful signal for "let me know
-                # when the task finishes"; watch_patterns should be reserved for
-                # standalone mid-process signals on long-lived processes.
-                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-                    notify_on_complete=bool(notify_on_complete),
-                    watch_patterns=watch_patterns,
-                    background=bool(background),
-                )
-                if conflict_note:
-                    logger.warning("background proc %s: %s", proc_session.id, conflict_note)
-                    result_data["watch_patterns_ignored"] = conflict_note
-
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
-                    proc_session.notify_on_complete = True
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent
                     # turn.  CLI mode uses the completion_queue directly.
                     if proc_session.watcher_platform:
-                        proc_session.watcher_interval = 5
                         process_registry.pending_watchers.append({
                             "session_id": proc_session.id,
-                            "check_interval": 5,
+                            "check_interval": proc_session.watcher_interval,
                             "session_key": session_key,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
@@ -2687,11 +2832,11 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "resolved_access_context": proc_session.resolved_access_context,
                         })
 
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
-                    proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
                 return json.dumps(result_data, ensure_ascii=False)
@@ -2896,6 +3041,14 @@ def terminal_tool(
 
             return json.dumps(result_dict, ensure_ascii=False)
 
+    except ValueError as e:
+        logger.warning("terminal_tool rejected request-path authority: %s", e)
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Failed to execute command: {str(e)}",
+            "status": "error",
+        }, ensure_ascii=False)
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()

@@ -1119,6 +1119,29 @@ def _media_delivery_allowed_roots() -> List[Path]:
     return roots
 
 
+def _media_delivery_scoped_roots() -> List[Path] | None:
+    from gateway.access_registry import ResolvedAccessContext
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    if not isinstance(context, ResolvedAccessContext):
+        return []
+    profile_id = str(context.profile_id or "").strip()
+    if not profile_id:
+        return []
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        if not profile_exists(profile_id):
+            return []
+        profile_dir = get_profile_dir(profile_id)
+    except Exception:
+        return []
+    return [profile_dir / "cache" / subdir for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
+
+
 def _media_delivery_recency_seconds() -> float:
     """Return the recency window for trusting freshly-produced files.
 
@@ -1313,6 +1336,17 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     if not resolved.is_file():
+        return None
+
+    scoped_roots = _media_delivery_scoped_roots()
+    if scoped_roots is not None:
+        for root in scoped_roots:
+            try:
+                resolved_root = root.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if _path_is_within(resolved, resolved_root):
+                return str(resolved)
         return None
 
     # Cache / operator allowlist is always honored — these are unconditionally
@@ -2396,6 +2430,7 @@ class BasePlatformAdapter(ABC):
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+        self._ingress_guard: Optional[Callable[[MessageEvent], bool]] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -2873,6 +2908,19 @@ class BasePlatformAdapter(ABC):
             event.source = dataclasses.replace(source, thread_id=str(recovered))
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
+
+    def set_ingress_guard(self, guard: Optional[Callable[[MessageEvent], bool]]) -> None:
+        self._ingress_guard = guard
+
+    def _allow_ingress(self, event: MessageEvent) -> bool:
+        guard = getattr(self, "_ingress_guard", None)
+        if guard is None:
+            return True
+        try:
+            return bool(guard(event))
+        except Exception:
+            logger.error("Ingress guard failed; dropping message")
+            return False
 
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
@@ -4692,6 +4740,9 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        if not self._allow_ingress(event):
+            return
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -4992,30 +5043,33 @@ class BasePlatformAdapter(ABC):
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                from gateway.session_context import bind_resolved_access_context
 
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561).
-                # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
-                # with an unknown extension is intentionally left in the body for
-                # extract_local_files below to pick up rather than silently dropped (#34517).
-                text_content = _strip_media_directives(text_content).strip()
-                if images:
-                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+                with bind_resolved_access_context(getattr(event.source, "resolved_access_context", None)):
+                    # Extract MEDIA:<path> tags (from TTS tool) before other processing
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
-                local_files = []
-                if not is_ephemeral_response:
-                    # Auto-detect bare local file paths for native media delivery
-                    # (helps small models that don't use MEDIA: syntax). Skip
-                    # system/command notices so config paths stay visible text
-                    # instead of becoming native uploads.
-                    local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
-                    if local_files:
-                        logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                    # Extract image URLs and send them as native platform attachments
+                    images, text_content = self.extract_images(response)
+                    # Strip any remaining internal directives from message body (fixes #1561).
+                    # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
+                    # with an unknown extension is intentionally left in the body for
+                    # extract_local_files below to pick up rather than silently dropped (#34517).
+                    text_content = _strip_media_directives(text_content).strip()
+                    if images:
+                        logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+
+                    local_files = []
+                    if not is_ephemeral_response:
+                        # Auto-detect bare local file paths for native media delivery
+                        # (helps small models that don't use MEDIA: syntax). Skip
+                        # system/command notices so config paths stay visible text
+                        # instead of becoming native uploads.
+                        local_files, text_content = self.extract_local_files(text_content)
+                        local_files = self.filter_local_delivery_paths(local_files)
+                        if local_files:
+                            logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
@@ -5521,6 +5575,17 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def _profile_route_account_label(self) -> Optional[str]:
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        if not isinstance(extra, dict):
+            return None
+        account = extra.get("account")
+        if account is None and self.platform == Platform.WEIXIN:
+            account = extra.get("account_id")
+        if isinstance(account, str) and account.strip():
+            return account.strip()
+        return None
     
     def build_source(
         self,
@@ -5557,6 +5622,7 @@ class BasePlatformAdapter(ABC):
         # Resolve profile from configured routes (None when no match / no routes)
         profile = None
         runner = getattr(self, "gateway_runner", None)
+        route_account = self._profile_route_account_label()
         if runner is not None:
             try:
                 profile = runner._profile_name_for_source(
@@ -5575,9 +5641,14 @@ class BasePlatformAdapter(ABC):
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
+                        route_account=route_account,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                from gateway.profile_routing import ProfileRoutingError
+
+                if isinstance(exc, ProfileRoutingError):
+                    raise
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
@@ -5599,6 +5670,7 @@ class BasePlatformAdapter(ABC):
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
+            route_account=route_account,
             profile=profile,
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,

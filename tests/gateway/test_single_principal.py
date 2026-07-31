@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
@@ -59,6 +60,22 @@ def _runner(policy=None):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
     return runner
+
+
+def _resolved_shared_context(capabilities):
+    return ResolvedAccessContext(
+        principal_id="principal-room",
+        role_id="shared_room",
+        profile_id="room-profile",
+        conversation_scope="room",
+        capabilities=frozenset(capabilities),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="group",
+            chat_id="-10001",
+        ),
+    )
 
 
 def test_policy_parser_and_redacted_validation():
@@ -252,6 +269,97 @@ def test_shared_scope_binds_scoped_memory_with_full_tools_and_denies_admin_comma
             scope,
             {},
         )
+    with pytest.raises(RuntimeError, match="shared capability profile"):
+        runner._bind_shared_memory(
+            SimpleNamespace(valid_tool_names={"memory", "terminal"}),
+            scope,
+            {},
+            expected_tool_names=frozenset({"memory"}),
+        )
+
+
+def test_shared_room_context_keeps_configured_tool_profile():
+    from gateway.run import GatewayRunner
+
+    configured_toolsets = ["memory", "web", "terminal"]
+    context = _resolved_shared_context({"room_memory"})
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    source.resolved_access_context = context
+
+    assert GatewayRunner._toolsets_for_resolved_access_context(
+        configured_toolsets,
+        context,
+    ) == configured_toolsets
+
+    toolsets, expected_tools = GatewayRunner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=configured_toolsets,
+    )
+    assert toolsets == sorted(configured_toolsets)
+    assert isinstance(expected_tools, frozenset)
+
+
+def test_invalid_resolved_context_boundary_fails_closed():
+    from gateway.run import GatewayRunner
+
+    source = _source(OUTSIDER, chat_id="-10001", chat_type="group")
+    source.resolved_access_context = SimpleNamespace(
+        role_id="shared_room",
+        capabilities=frozenset({"room_memory"}),
+    )
+
+    assert GatewayRunner._toolsets_for_resolved_access_context(
+        ["memory", "web"],
+        source.resolved_access_context,
+    ) == []
+    assert GatewayRunner._shared_tool_profile_for_source(
+        source,
+        configured_toolsets=["memory", "web"],
+    ) == ([], frozenset())
+
+
+def test_family_resolved_context_limits_toolsets_by_capability():
+    from gateway.run import GatewayRunner
+
+    context = ResolvedAccessContext(
+        principal_id="family",
+        role_id="family_standard",
+        profile_id="family-profile",
+        conversation_scope="private",
+        capabilities=frozenset({"memory_search", "public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id=FAMILY,
+        ),
+    )
+
+    assert GatewayRunner._toolsets_for_resolved_access_context(
+        ["memory", "web", "terminal"],
+        context,
+    ) == ["memory", "web"]
+
+
+def test_shared_scope_agent_cache_signature_separates_tool_profile():
+    from gateway.run import GatewayRunner
+
+    base = dict(
+        model="model",
+        runtime={},
+        ephemeral_prompt="",
+        cache_keys={},
+        user_id=None,
+        user_id_alt=None,
+    )
+
+    assert GatewayRunner._agent_config_signature(
+        enabled_toolsets=["memory"],
+        **base,
+    ) != GatewayRunner._agent_config_signature(
+        enabled_toolsets=["memory", "web"],
+        **base,
+    )
 
 
 @pytest.mark.asyncio

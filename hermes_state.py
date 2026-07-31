@@ -58,6 +58,46 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
+def _session_scope_clause(
+    session_scope: Optional[Dict[str, Any]],
+    alias: str = "s",
+) -> Tuple[str, List[Any]]:
+    """SQL predicate for a trusted gateway-origin session scope.
+
+    ``session_scope`` is intentionally a neutral dict so hermes_state does not
+    import gateway access types. Malformed scopes deny instead of broadening.
+    """
+    if not session_scope:
+        return "", []
+
+    profile_name = session_scope.get("profile_name")
+    source = session_scope.get("source")
+    chat_type = session_scope.get("chat_type")
+    chat_id = session_scope.get("chat_id")
+    thread_id = session_scope.get("thread_id")
+    user_id = session_scope.get("user_id")
+    is_dm = session_scope.get("is_dm") is True
+
+    required = (profile_name, source, chat_type, chat_id)
+    if not all(isinstance(value, str) and value for value in required):
+        return "1 = 0", []
+    if is_dm and not isinstance(user_id, str):
+        return "1 = 0", []
+
+    clauses = [
+        f"{alias}.profile_name = ?",
+        f"{alias}.source = ?",
+        f"{alias}.chat_type = ?",
+        f"{alias}.chat_id = ?",
+        f"COALESCE({alias}.thread_id, '') = ?",
+    ]
+    params: List[Any] = [profile_name, source, chat_type, chat_id, thread_id or ""]
+    if is_dm:
+        clauses.append(f"{alias}.user_id = ?")
+        params.append(user_id)
+    return " AND ".join(clauses), params
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -788,6 +828,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    handoff_context_json TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
@@ -3244,6 +3285,49 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def session_in_scope(
+        self,
+        session_id: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return True when a session exists inside a trusted SQL scope."""
+        if not session_scope:
+            return self.get_session(session_id) is not None
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        if not scope_clause:
+            return self.get_session(session_id) is not None
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                [session_id, *scope_params],
+            ).fetchone()
+        return row is not None
+
+    def get_message_session_in_scope(
+        self,
+        message_id: int,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return a message's session id only when its session matches scope."""
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        where = "m.id = ?"
+        params: List[Any] = [message_id]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT m.session_id
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return row["session_id"] if row else None
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -3492,16 +3576,30 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    def get_session_by_title(
+        self,
+        title: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        scope_clause, scope_params = _session_scope_clause(session_scope, alias="sessions")
+        where = "title = ?"
+        params: List[Any] = [title]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE {where}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self,
+        title: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -3510,16 +3608,22 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, session_scope=session_scope)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        scope_clause, scope_params = _session_scope_clause(session_scope, alias="sessions")
+        where = "title LIKE ? ESCAPE '\\'"
+        params: List[Any] = [f"{escaped} #%"]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE {where} ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -3692,6 +3796,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3734,6 +3839,10 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        if scope_clause:
+            where_clauses.append(scope_clause)
+            params.extend(scope_params)
 
         if not include_children:
             # Show root sessions and branch sessions, while still hiding
@@ -3948,7 +4057,11 @@ class SessionDB:
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id, compact_rows=compact_rows)
+                tip_row = self._get_session_rich_row(
+                    tip_id,
+                    compact_rows=compact_rows,
+                    session_scope=session_scope,
+                )
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -4036,7 +4149,12 @@ class SessionDB:
             runs.append(s)
         return runs
 
-    def _get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        compact_rows: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
@@ -4045,6 +4163,12 @@ class SessionDB:
         ``list_sessions_rich`` for details).
         """
         _sel = self._compact_session_cols() if compact_rows else "s.*"
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        where = "s.id = ?"
+        params: List[Any] = [session_id]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         query = f"""
             SELECT {_sel},
                 COALESCE(
@@ -4059,10 +4183,10 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE {where}
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
         if not row:
             return None
@@ -5247,6 +5371,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -5308,6 +5433,7 @@ class SessionDB:
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
         params: list = [query]
+        scope_clause, scope_params = _session_scope_clause(session_scope)
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
             # are discoverable; only rewind/undo rows (active=0, compacted=0)
@@ -5328,6 +5454,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+        if scope_clause:
+            where_clauses.append(scope_clause)
+            params.extend(scope_params)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -5404,6 +5533,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if scope_clause:
+                    tri_where.append(scope_clause)
+                    tri_params.extend(scope_params)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -5461,6 +5593,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if scope_clause:
+                    like_where.append(scope_clause)
+                    like_params.extend(scope_params)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -7513,21 +7648,37 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        resolved_access_context: Any = None,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
+        context_json = None
+        if resolved_access_context is not None:
+            from gateway.access_registry import serialize_resolved_access_context
+
+            context_json = json.dumps(
+                serialize_resolved_access_context(resolved_access_context),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
-                "    handoff_error = NULL "
+                "    handoff_error = NULL, "
+                "    handoff_context_json = ? "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
+                (platform, context_json, session_id),
             )
             return cur.rowcount > 0
         return self._execute_write(_do)
@@ -7586,7 +7737,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
-                "handoff_error = NULL WHERE id = ?",
+                "handoff_error = NULL, handoff_context_json = NULL WHERE id = ?",
                 (session_id,),
             )
         self._execute_write(_do)
@@ -7596,7 +7747,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
+                "handoff_error = ?, handoff_context_json = NULL WHERE id = ?",
                 (error[:500], session_id),
             )
         self._execute_write(_do)

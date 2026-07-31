@@ -264,6 +264,118 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     return scrubbed
 
 
+def _set_child_pythonpath(env: dict[str, str], tmpdir: str, *, inherit: bool) -> None:
+    _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _pp_parts = [tmpdir, _hermes_root]
+    if inherit:
+        _existing_pp = env.get("PYTHONPATH", "")
+        if _existing_pp:
+            _pp_parts.append(_existing_pp)
+    env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+
+
+def _inject_local_child_runtime_env(
+    child_env: dict[str, str],
+    tmpdir: str,
+    rpc_endpoint: str,
+    rpc_token: str,
+    *,
+    inherit_pythonpath: bool,
+) -> None:
+    child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
+    child_env["HERMES_RPC_TOKEN"] = rpc_token
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    _set_child_pythonpath(child_env, tmpdir, inherit=inherit_pythonpath)
+
+
+def _profile_home_for_shell(profile_root: Any) -> str:
+    profile_home = profile_root / "home"
+    if profile_home.is_dir():
+        return str(profile_home)
+    return str(profile_root)
+
+
+def _set_profile_home_env(env: dict[str, str], profile_home: str) -> None:
+    env["HOME"] = profile_home
+    env["USERPROFILE"] = profile_home
+    drive, path = os.path.splitdrive(profile_home)
+    env["HOMEDRIVE"] = drive or profile_home
+    env["HOMEPATH"] = path or profile_home
+
+
+def _remove_typed_child_path_leaks(env: dict[str, str]) -> None:
+    for key in list(env):
+        upper = key.upper()
+        if (
+            key.startswith("XDG_")
+            or upper.startswith("TMP")
+            or upper.startswith("TEMP")
+            or upper == "VIRTUAL_ENV"
+            or upper.startswith("CONDA")
+        ):
+            env.pop(key, None)
+    for key in ("HERMES_REAL_HOME", "HERMES_CONFIG", "HERMES_ENV", "HERMES_TIMEZONE"):
+        env.pop(key, None)
+
+
+def _build_local_child_env(tmpdir: str, rpc_endpoint: str, rpc_token: str) -> dict[str, str]:
+    """Build the local execute_code child env.
+
+    Legacy/no typed context deliberately keeps the historical scrubber plus
+    apply_subprocess_home_env() behavior. Typed ResolvedAccessContext turns are
+    profile-bound and must not inherit owner/default profile paths or
+    passthrough credentials from process-global os.environ.
+    """
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        child_env = _scrub_child_env(os.environ)
+        _inject_local_child_runtime_env(
+            child_env,
+            tmpdir,
+            rpc_endpoint,
+            rpc_token,
+            inherit_pythonpath=True,
+        )
+        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+        if _tz_name:
+            child_env["TZ"] = _tz_name
+        child_env.pop("HERMES_TIMEZONE", None)
+        from hermes_constants import apply_subprocess_home_env
+        apply_subprocess_home_env(child_env)
+        return child_env
+
+    from gateway.access_registry import ResolvedAccessContext
+
+    if not isinstance(context, ResolvedAccessContext):
+        raise ValueError("malformed resolved access context")
+    from agent.runtime_cwd import bound_profile_home
+
+    profile_root = bound_profile_home()
+    if profile_root is None:
+        raise ValueError("resolved access profile home unavailable")
+
+    child_env = _scrub_child_env(os.environ, is_passthrough=lambda _name: False)
+    _remove_typed_child_path_leaks(child_env)
+    child_env["HERMES_HOME"] = str(profile_root)
+    child_env["HERMES_PROFILE"] = context.profile_id
+    _set_profile_home_env(child_env, _profile_home_for_shell(profile_root))
+    child_env["TMPDIR"] = tmpdir
+    child_env["TMP"] = tmpdir
+    child_env["TEMP"] = tmpdir
+    _inject_local_child_runtime_env(
+        child_env,
+        tmpdir,
+        rpc_endpoint,
+        rpc_token,
+        inherit_pythonpath=False,
+    )
+    return child_env
+
+
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
@@ -299,7 +411,7 @@ _TOOL_STUBS = {
     "write_file": (
         "write_file",
         "path: str, content: str, cross_profile: bool = False",
-        '"""Write content to a file (always overwrites). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
+        '"""Write content to a file (always overwrites). Returns dict with status. cross_profile=True is a legacy no-typed-context opt-out and is denied in typed access-context turns."""',
         '{"path": path, "content": content, "cross_profile": cross_profile}',
     ),
     "search_files": (
@@ -311,7 +423,7 @@ _TOOL_STUBS = {
     "patch": (
         "patch",
         'path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False',
-        '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
+        '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status. cross_profile=True is a legacy no-typed-context opt-out and is denied in typed access-context turns."""',
         '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile}',
     ),
     "terminal": (
@@ -733,7 +845,16 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        raw_cwd = overrides.get("cwd") or config["cwd"]
+        try:
+            from agent.runtime_cwd import resolve_bound_profile_cwd
+
+            typed_cwd = resolve_bound_profile_cwd(raw_cwd)
+        except ValueError:
+            raise
+        except Exception:
+            typed_cwd = None
+        cwd = str(typed_cwd) if typed_cwd is not None else raw_cwd
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona"}:
@@ -1197,7 +1318,15 @@ def execute_code(
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
+    try:
+        _env_config = _get_env_config()
+    except ValueError as exc:
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
     env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
@@ -1331,59 +1460,11 @@ def execute_code(
         rpc_thread.start()
 
         # --- Spawn child process ---
-        # Build a minimal environment for the child. We intentionally exclude
-        # API keys and tokens to prevent credential exfiltration from LLM-
-        # generated scripts. The child accesses tools via RPC, not direct API.
-        # Exception: env vars declared by loaded skills (via env_passthrough
-        # registry) or explicitly allowed by the user in config.yaml
-        # (terminal.env_passthrough) are passed through.  On Windows, a small
-        # OS-essential allowlist (SYSTEMROOT, WINDIR, COMSPEC, ...) is also
-        # passed through — without those, the child can't create a socket
-        # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
-        child_env = _scrub_child_env(os.environ)
-        child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
-        child_env["HERMES_RPC_TOKEN"] = rpc_token
-        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        # Force UTF-8 for the child's stdio and default file encoding.
-        #
-        # Without this, on Windows sys.stdout is bound to the console code
-        # page (cp1252 on US-locale installs), and any script that does
-        # ``print("café")`` or ``print("→")`` crashes with:
-        #
-        #   UnicodeEncodeError: 'charmap' codec can't encode character
-        #   '\u2192' in position N: character maps to <undefined>
-        #
-        # PYTHONIOENCODING fixes sys.stdin/stdout/stderr.
-        # PYTHONUTF8=1 enables "UTF-8 mode" (PEP 540) which additionally
-        # makes ``open()``'s default encoding UTF-8, so user scripts that
-        # write files without specifying encoding= also work correctly.
-        #
-        # On POSIX both values usually match the locale default already,
-        # so setting them is harmless belt-and-suspenders for environments
-        # with a C/POSIX locale (containers, minimal base images).
-        child_env["PYTHONIOENCODING"] = "utf-8"
-        child_env["PYTHONUTF8"] = "1"
-        # Ensure the hermes-agent root is importable in the sandbox so
-        # repo-root modules are available to child scripts.  We also prepend
-        # the staging tmpdir so ``from hermes_tools import ...`` resolves even
-        # when the subprocess CWD is not tmpdir (project mode).
-        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _existing_pp = child_env.get("PYTHONPATH", "")
-        _pp_parts = [tmpdir, _hermes_root]
-        if _existing_pp:
-            _pp_parts.append(_existing_pp)
-        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
-        # Inject user's configured timezone so datetime.now() in sandboxed
-        # code reflects the correct wall-clock time.  Only TZ is set —
-        # HERMES_TIMEZONE is an internal Hermes setting and must not leak
-        # into child processes.
-        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
-        if _tz_name:
-            child_env["TZ"] = _tz_name
-        child_env.pop("HERMES_TIMEZONE", None)
-
-        from hermes_constants import apply_subprocess_home_env
-        apply_subprocess_home_env(child_env)
+        # Build a minimal environment for the child. The legacy path preserves
+        # the historical scrubber/home-mode contract; typed
+        # ResolvedAccessContext turns are rebound to the server-resolved
+        # profile home and do not inherit process-global passthrough vars.
+        child_env = _build_local_child_env(tmpdir, rpc_endpoint, rpc_token)
 
         # Resolve interpreter + CWD based on execute_code mode.
         #   - strict : today's behavior (sys.executable + tmpdir CWD).
@@ -1810,6 +1891,8 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
     """
     if mode != "project":
         return staging_dir
+    recorded = None
+    session_cwd = None
     if task_id:
         # 1. The session's cwd record — IS the session's `cd` state.
         try:
@@ -1818,8 +1901,6 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             recorded = get_session_cwd(task_id)
         except Exception:
             recorded = None
-        if recorded and os.path.isdir(recorded):
-            return recorded
         # 2. Registered workspace override (session.cwd.set → gateway/TUI/ACP).
         try:
             from tools.file_tools import _registered_task_cwd_override
@@ -1827,6 +1908,19 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = _registered_task_cwd_override(task_id)
         except Exception:
             session_cwd = None
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        typed = resolve_bound_profile_cwd(recorded or session_cwd)
+    except ValueError:
+        raise
+    except Exception:
+        typed = None
+    if typed is not None:
+        return str(typed)
+    if task_id:
+        if recorded and os.path.isdir(recorded):
+            return recorded
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
     raw = os.environ.get("TERMINAL_CWD", "").strip()

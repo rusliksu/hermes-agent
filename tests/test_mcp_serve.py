@@ -15,7 +15,7 @@ import os
 import sqlite3
 import time
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -808,6 +808,72 @@ class TestE2EMessagesSend:
         call_args = mock.call_args[0][0]
         assert call_args["action"] == "send"
         assert call_args["target"] == "telegram:123456"
+
+    def test_send_with_typed_foreign_target_denies_before_sender(
+        self,
+        fake_mcp_server,
+        monkeypatch,
+    ):
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+        from gateway.config import Platform
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from gateway.session_context import bind_resolved_access_context
+
+        server, _ = fake_mcp_server
+        sender = AsyncMock(return_value={"success": True, "message_id": "foreign-msg"})
+        entry = PlatformEntry(
+            name="sendguard-mcp",
+            label="Send Guard MCP",
+            adapter_factory=lambda _cfg: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=sender,
+        )
+        platform_registry.register(entry)
+        platform = Platform("sendguard-mcp")
+        pconfig = type("PConfig", (), {"enabled": True, "token": None, "extra": {}})()
+        config = type(
+            "Config",
+            (),
+            {
+                "platforms": {platform: pconfig},
+                "get_home_channel": lambda self, _platform: None,
+            },
+        )()
+        context = ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="shared_room",
+            profile_id="family-profile",
+            conversation_scope="sendguard-mcp:shared:12345:root",
+            capabilities=frozenset({"send_message"}),
+            delivery_target=DeliveryTarget(
+                platform="sendguard-mcp",
+                account="bot-main",
+                peer_kind="group",
+                chat_id="12345",
+                thread_id=None,
+            ),
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        try:
+            with bind_resolved_access_context(context):
+                result = json.loads(
+                    server._tool_manager._tools["messages_send"].fn(
+                        target="sendguard-mcp:99999",
+                        message="foreign via mcp",
+                    )
+                )
+        finally:
+            platform_registry.unregister("sendguard-mcp")
+
+        assert result == {
+            "error": "send_message_access_denied",
+            "reason": "delivery_target_mismatch",
+        }
+        sender.assert_not_awaited()
 
 
 class TestE2EChannelsList:

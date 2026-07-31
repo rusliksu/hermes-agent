@@ -2,9 +2,18 @@
 
 import json
 import pytest
+from contextlib import contextmanager
 from pathlib import Path
 
+from gateway.access_registry import (
+    canonical_access_context_fingerprint,
+    DeliveryTarget,
+    ResolvedAccessContext,
+    shared_memory_namespace_for_access_context,
+)
+from gateway.session_context import bind_resolved_access_context, reset_session_vars
 from tools.memory_tool import (
+    MemoryAccessDenied,
     MemoryStore,
     memory_tool,
     _scan_memory_content,
@@ -268,6 +277,40 @@ def store(tmp_path, monkeypatch):
     return s
 
 
+def _access_context(
+    *,
+    role_id="family_standard",
+    capabilities=frozenset({"memory_search"}),
+    platform="telegram",
+    peer_kind="dm",
+    profile_id="profile-a",
+    scope="private",
+) -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id=role_id,
+        profile_id=profile_id,
+        conversation_scope=scope,
+        capabilities=frozenset(capabilities),
+        delivery_target=DeliveryTarget(
+            platform=platform,
+            account="bot-a",
+            peer_kind=peer_kind,
+            chat_id="10001" if peer_kind == "dm" else "-10001",
+        ),
+    )
+
+
+@contextmanager
+def _bound_access_context(context):
+    reset_session_vars()
+    try:
+        with bind_resolved_access_context(context):
+            yield
+    finally:
+        reset_session_vars()
+
+
 def test_scoped_memory_directories_are_isolated_and_user_profile_is_disabled(tmp_path):
     scope_a = MemoryStore(
         memory_dir=tmp_path / "scope-a",
@@ -300,6 +343,463 @@ def test_scoped_memory_directories_are_isolated_and_user_profile_is_disabled(tmp
     )
     assert denied["success"] is False
     assert not (tmp_path / "scope-a" / "USER.md").exists()
+
+
+def test_family_bound_store_allows_only_current_private_profile_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context()
+    store = MemoryStore(memory_dir=tmp_path / "memories", access_context=context)
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="user",
+                content="family preference",
+                store=store,
+            )
+        )
+
+    assert result["success"] is True
+    assert (tmp_path / "memories" / "USER.md").exists()
+
+
+@pytest.mark.parametrize(
+    "context,memory_dir,allow_user_profile",
+    [
+        (_access_context(platform="discord"), "memories", True),
+        (_access_context(peer_kind="group"), "memories", True),
+        (
+            _access_context(
+                role_id="shared_room",
+                capabilities=frozenset({"room_memory"}),
+                platform="discord",
+                peer_kind="group",
+                profile_id="room-profile",
+                scope="room-a",
+            ),
+            "memories/shared/room-a",
+            False,
+        ),
+        (
+            _access_context(
+                role_id="shared_room",
+                capabilities=frozenset({"room_memory"}),
+                peer_kind="forum",
+                profile_id="room-profile",
+                scope="room-a",
+            ),
+            "memories/shared/room-a",
+            False,
+        ),
+    ],
+)
+def test_typed_memory_denies_malformed_transport_before_read_or_mkdir(
+    tmp_path, monkeypatch, context, memory_dir, allow_user_profile
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    read_called = False
+
+    def _read_file(_path):
+        nonlocal read_called
+        read_called = True
+        raise AssertionError("memory file was read")
+
+    monkeypatch.setattr(MemoryStore, "_read_file", staticmethod(_read_file))
+    store = MemoryStore(
+        memory_dir=tmp_path / memory_dir,
+        allow_user_profile=allow_user_profile,
+        access_context=context,
+    )
+
+    with _bound_access_context(context):
+        with pytest.raises(MemoryAccessDenied):
+            store.load_from_disk()
+
+    assert read_called is False
+    assert not (tmp_path / memory_dir).exists()
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        _access_context(capabilities=frozenset()),
+        _access_context(role_id="unknown_role"),
+        {"principal_id": "malformed"},
+    ],
+)
+def test_typed_memory_denial_happens_before_read_or_mkdir(
+    tmp_path, monkeypatch, context
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    read_called = False
+
+    def _read_file(_path):
+        nonlocal read_called
+        read_called = True
+        raise AssertionError("memory file was read")
+
+    monkeypatch.setattr(MemoryStore, "_read_file", staticmethod(_read_file))
+    store = MemoryStore(memory_dir=tmp_path / "memories", access_context=context)
+
+    with _bound_access_context(context):
+        with pytest.raises(MemoryAccessDenied):
+            store.load_from_disk()
+
+    assert read_called is False
+    assert not (tmp_path / "memories").exists()
+
+
+def test_memory_tool_denies_mismatched_store_before_validation_and_write_gate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    current = _access_context(profile_id="profile-a")
+    stale = _access_context(profile_id="profile-b")
+    store = MemoryStore(memory_dir=tmp_path / "memories", access_context=stale)
+
+    def _write_gate(*_args, **_kwargs):
+        raise AssertionError("write gate should not run")
+
+    monkeypatch.setattr("tools.memory_tool._apply_write_gate", _write_gate)
+    with _bound_access_context(current):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="not-a-real-target",
+                content="should not stage",
+                store=store,
+            )
+        )
+
+    assert result == {"error": "memory_access_denied", "success": False}
+    assert not (tmp_path / "memories").exists()
+
+
+@pytest.mark.parametrize("current", [None, _access_context()])
+def test_typed_memory_denies_missing_current_context_or_mismatched_path_before_io(
+    tmp_path, monkeypatch, current
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context()
+    store = MemoryStore(
+        memory_dir=tmp_path / "other-profile" / "memories",
+        access_context=context,
+    )
+    with _bound_access_context(current):
+        with pytest.raises(MemoryAccessDenied):
+            store.load_from_disk()
+    assert not (tmp_path / "other-profile").exists()
+
+
+def test_stale_frozen_snapshot_is_not_exposed_under_mismatched_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context(profile_id="profile-a")
+    other = _access_context(profile_id="profile-b")
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("private fact", encoding="utf-8")
+    store = MemoryStore(memory_dir=memory_dir, access_context=context)
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+    with _bound_access_context(other):
+        with pytest.raises(MemoryAccessDenied):
+            store.format_for_system_prompt("memory")
+
+
+def test_shared_room_memory_is_room_only_and_user_profile_denied(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context(
+        role_id="shared_room",
+        capabilities=frozenset({"room_memory"}),
+        peer_kind="group",
+        profile_id="room-profile",
+        scope="room-a",
+    )
+    namespace = shared_memory_namespace_for_access_context(context)
+    store = MemoryStore(
+        memory_dir=tmp_path / "memories" / "shared" / namespace,
+        allow_user_profile=False,
+        access_context=context,
+    )
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+        saved = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="room visible fact",
+                store=store,
+            )
+        )
+        denied = json.loads(
+            memory_tool(
+                action="add",
+                target="user",
+                content="private profile",
+                store=store,
+            )
+        )
+
+    assert saved["success"] is True
+    assert denied == {"error": "memory_access_denied", "success": False}
+    assert (tmp_path / "memories" / "shared" / namespace / "MEMORY.md").exists()
+    assert not (tmp_path / "memories" / "shared" / namespace / "USER.md").exists()
+
+
+def test_shared_memory_denies_different_valid_child_namespace_before_io(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context(
+        role_id="shared_room",
+        capabilities=frozenset({"room_memory"}),
+        peer_kind="group",
+        profile_id="room-profile",
+        scope="room-a",
+    )
+    other = _access_context(
+        role_id="shared_room",
+        capabilities=frozenset({"room_memory"}),
+        peer_kind="group",
+        profile_id="room-profile",
+        scope="room-b",
+    )
+    store = MemoryStore(
+        memory_dir=tmp_path / "memories" / "shared" / shared_memory_namespace_for_access_context(other),
+        allow_user_profile=False,
+        access_context=context,
+    )
+
+    with _bound_access_context(context):
+        with pytest.raises(MemoryAccessDenied):
+            store.load_from_disk()
+
+    assert not (tmp_path / "memories").exists()
+
+
+@pytest.mark.parametrize(
+    "link_rel",
+    [
+        ("memories",),
+        ("memories", "shared"),
+        ("memories", "shared", "access"),
+        ("memories", "shared", "access", "final"),
+    ],
+)
+def test_typed_memory_denies_symlink_below_profile_home_before_io(
+    tmp_path, monkeypatch, link_rel
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    private = len(link_rel) == 1
+    context = _access_context() if private else _access_context(
+        role_id="shared_room",
+        capabilities=frozenset({"room_memory"}),
+        peer_kind="group",
+        profile_id="room-profile",
+        scope="room-a",
+    )
+    expected_dir = tmp_path / "memories"
+    if not private:
+        expected_dir = (
+            tmp_path
+            / "memories"
+            / "shared"
+            / shared_memory_namespace_for_access_context(context)
+        )
+    link_path = tmp_path.joinpath(*link_rel)
+    if link_rel[-1] == "final":
+        link_path = expected_dir
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    real_target = tmp_path / "real-target"
+    real_target.mkdir()
+    link_path.symlink_to(real_target, target_is_directory=True)
+    read_file = pytest.MonkeyPatch()
+    read_called = False
+
+    def _read_file(_path):
+        nonlocal read_called
+        read_called = True
+        raise AssertionError("memory file was read")
+
+    read_file.setattr(MemoryStore, "_read_file", staticmethod(_read_file))
+    try:
+        store = MemoryStore(
+            memory_dir=expected_dir,
+            allow_user_profile=private,
+            access_context=context,
+        )
+        with _bound_access_context(context):
+            with pytest.raises(MemoryAccessDenied):
+                store.load_from_disk()
+    finally:
+        read_file.undo()
+
+    assert read_called is False
+
+
+def test_typed_memory_allows_profile_home_symlink_selected_by_resolver(
+    tmp_path, monkeypatch
+):
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: linked_home)
+    context = _access_context()
+    store = MemoryStore(memory_dir=linked_home / "memories", access_context=context)
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="profile home symlink allowed",
+                store=store,
+            )
+        )
+
+    assert result["success"] is True
+    assert (real_home / "memories" / "MEMORY.md").exists()
+
+
+@pytest.mark.parametrize("shared_final_symlink", [False, True])
+def test_typed_memory_symlink_denies_write_before_gate_or_file_write(
+    tmp_path, monkeypatch, shared_final_symlink
+):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context()
+    memory_dir = tmp_path / "memories"
+    if shared_final_symlink:
+        context = _access_context(
+            role_id="shared_room",
+            capabilities=frozenset({"room_memory"}),
+            peer_kind="group",
+            profile_id="room-profile",
+            scope="room-a",
+        )
+        memory_dir = (
+            tmp_path
+            / "memories"
+            / "shared"
+            / shared_memory_namespace_for_access_context(context)
+        )
+    memory_dir.parent.mkdir(parents=True, exist_ok=True)
+    real_target = tmp_path / "real-target"
+    real_target.mkdir()
+    memory_dir.symlink_to(real_target, target_is_directory=True)
+    store = MemoryStore(
+        memory_dir=memory_dir,
+        allow_user_profile=not shared_final_symlink,
+        access_context=context,
+    )
+
+    def _write_gate(*_args, **_kwargs):
+        raise AssertionError("write gate should not run")
+
+    def _write_file(_path, _entries):
+        raise AssertionError("memory file should not be written")
+
+    monkeypatch.setattr("tools.memory_tool._apply_write_gate", _write_gate)
+    monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(_write_file))
+    with _bound_access_context(context):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="blocked",
+                store=store,
+            )
+        )
+
+    assert result == {"error": "memory_access_denied", "success": False}
+
+
+def test_typed_non_owner_drift_result_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context()
+    memory_dir = tmp_path / "memories"
+    store = MemoryStore(memory_dir=memory_dir, access_context=context, memory_char_limit=50)
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+        assert store.add("memory", "short fact")["success"] is True
+        path = memory_dir / "MEMORY.md"
+        path.write_text(path.read_text(encoding="utf-8") + "\n" + "x" * 80, encoding="utf-8")
+        result = json.loads(
+            memory_tool(
+                action="replace",
+                target="memory",
+                old_text="short",
+                content="updated",
+                store=store,
+            )
+        )
+
+    assert result == {"success": False, "error": "memory_drift_detected"}
+    assert "/" not in json.dumps(result)
+    assert "bak" not in json.dumps(result).lower()
+
+
+def test_typed_non_owner_write_failure_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    context = _access_context()
+    store = MemoryStore(memory_dir=tmp_path / "memories", access_context=context)
+
+    def _write_file(_path, _entries):
+        raise RuntimeError(f"boom at {tmp_path}/memories/access/deadbeef")
+
+    monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(_write_file))
+    with _bound_access_context(context):
+        store.load_from_disk()
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="new fact",
+                store=store,
+            )
+        )
+
+    assert result == {"error": "memory_write_failed", "success": False}
+    rendered = json.dumps(result)
+    assert "/" not in rendered
+    assert "deadbeef" not in rendered
+    assert "boom" not in rendered
+
+
+def test_typed_memory_stages_only_opaque_pending_scope(tmp_path, monkeypatch):
+    from tools import write_approval as wa
+
+    monkeypatch.setattr("tools.memory_tool.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.write_approval.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.write_approval.write_approval_enabled", lambda _subsystem: True)
+    context = _access_context(profile_id="profile-secret", scope="scope-secret")
+    store = MemoryStore(memory_dir=tmp_path / "memories", access_context=context)
+
+    with _bound_access_context(context):
+        store.load_from_disk()
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="stage scoped",
+                store=store,
+            )
+        )
+
+    assert result["staged"] is True
+    rec = wa.get_pending("memory", result["pending_id"])
+    assert rec["scope_key"] == canonical_access_context_fingerprint(context)
+    rendered = json.dumps(rec)
+    assert "profile-secret" not in rendered
+    assert "scope-secret" not in rendered
 
 
 class TestMemoryStoreAdd:

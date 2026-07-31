@@ -1427,6 +1427,25 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    _memory_access_context = None
+    _typed_memory_context_is_owner = True
+    mem_config = {}
+    try:
+        from gateway.access_registry import (
+            ResolvedAccessContext as _ResolvedAccessContext,
+            serialize_resolved_access_context as _serialize_resolved_access_context,
+        )
+        from gateway.session_context import get_resolved_access_context as _get_resolved_access_context
+
+        _memory_access_context = _get_resolved_access_context(None)
+        if _memory_access_context is not None:
+            _typed_memory_context_is_owner = (
+                isinstance(_memory_access_context, _ResolvedAccessContext)
+                and _serialize_resolved_access_context(_memory_access_context)
+                and _memory_access_context.role_id == "owner"
+            )
+    except Exception:
+        _typed_memory_context_is_owner = False
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1438,9 +1457,13 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    access_context=_memory_access_context,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
+            agent._memory_store = None
+            agent._memory_enabled = False
+            agent._user_profile_enabled = False
             pass  # Memory is optional -- don't break agent init
     
 
@@ -1448,7 +1471,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and _typed_memory_context_is_owner:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 

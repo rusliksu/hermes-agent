@@ -4266,6 +4266,7 @@ class TestMatrixRequireMention:
             },
         )
         adapter = MatrixAdapter(config)
+        adapter._allowed_rooms = set()
         adapter._is_dm_room = AsyncMock(return_value=False)
         adapter._resolve_room_identity = AsyncMock(
             return_value=MagicMock(display_name="Project Room")
@@ -4291,6 +4292,7 @@ class TestMatrixFreeResponsePolicy:
         self.adapter._user_id = "@bot:example.org"
         self.adapter._require_mention = True
         self.adapter._free_rooms = {"!free:example.org"}
+        self.adapter._allowed_rooms = set()
         self.adapter._is_dm_room = AsyncMock(return_value=False)
         self.adapter._resolve_room_identity = AsyncMock(
             return_value=MagicMock(display_name="Free Room")

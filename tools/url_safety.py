@@ -248,6 +248,19 @@ def _global_allow_private_urls() -> bool:
     return _cached_allow_private
 
 
+def _typed_allow_private_urls() -> bool | None:
+    """Return typed request allow-private policy, or None for legacy paths."""
+    try:
+        from agent.runtime_browser import browser_request_authority
+
+        authority = browser_request_authority()
+    except Exception:
+        raise
+    if authority is None:
+        return None
+    return authority.allow_private_urls
+
+
 def _reset_allow_private_cache() -> None:
     """Reset the cached toggle — only for tests."""
     global _allow_private_resolved, _cached_allow_private
@@ -407,8 +420,13 @@ def is_safe_url(url: str) -> bool:
             logger.warning("Blocked request to internal hostname: %s", hostname)
             return False
 
-        # Check the global toggle AFTER blocking metadata hostnames
-        allow_all_private = _global_allow_private_urls()
+        # Check typed request policy before legacy process-global toggles.
+        typed_allow_private = _typed_allow_private_urls()
+        allow_all_private = (
+            typed_allow_private
+            if typed_allow_private is not None
+            else _global_allow_private_urls()
+        )
 
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
 

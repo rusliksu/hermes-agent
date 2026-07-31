@@ -265,6 +265,11 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def _enabled_tools_for_dispatch(agent) -> list[str] | None:
+    valid_tool_names = getattr(agent, "valid_tool_names", None)
+    return list(valid_tool_names) if valid_tool_names is not None else None
+
+
 def _apply_tool_request_middleware_for_agent(
     agent,
     *,
@@ -359,7 +364,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
-    parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
+    parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -375,6 +380,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_args,
                     [],
                     malformed_args_result,
+                    False,
                     False,
                 )
             )
@@ -403,6 +409,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # the session was not granted is rejected before any checkpoint,
         # hook, or dispatch fires.
         _ts_scope_block = None
+        _allow_unlisted_tool_search_call = False
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
@@ -411,6 +418,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
                         function_args = _underlying_args
+                        _allow_unlisted_tool_search_call = True
                     else:
                         _ts_scope_block = json.dumps({
                             "error": (
@@ -521,13 +529,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception:
                     pass
 
-        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
+        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail, _allow_unlisted_tool_search_call))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, _, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+        for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call) in enumerate(parsed_calls, 1):
             display_args = _redact_tool_args_for_display(name, args) or args
             args_str = json.dumps(display_args, ensure_ascii=False)
             if agent.verbose_logging:
@@ -537,7 +545,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
@@ -548,7 +556,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
@@ -561,7 +569,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
@@ -570,7 +578,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     agent._current_tool = tool_names_str
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
-    def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
+    def _run_tool(index, tool_call, function_name, function_args, middleware_trace, allow_unlisted_tool_search_call):
         """Worker function executed in a thread."""
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
@@ -611,6 +619,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pre_tool_block_checked=True,
                     skip_tool_request_middleware=True,
                     tool_request_middleware_trace=list(middleware_trace),
+                    allow_unlisted_tool_search_call=allow_unlisted_tool_search_call,
                 )
             except KeyboardInterrupt:
                 try:
@@ -663,8 +672,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     try:
         runnable_calls = [
-            (i, tc, name, args)
-            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            (i, tc, name, args, allow_unlisted_tool_search_call)
+            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []
@@ -683,13 +692,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             executor = DaemonThreadPoolExecutor(max_workers=max_workers)
             abandon_executor = False
             try:
-                for submit_index, (i, tc, name, args) in enumerate(runnable_calls):
+                for submit_index, (i, tc, name, args, allow_unlisted_tool_search_call) in enumerate(runnable_calls):
                     # Propagate the agent turn's ContextVars (e.g.
                     # _approval_session_key) AND thread-local approval/sudo
                     # callbacks into the worker thread; clears callbacks on exit.
                     try:
                         f = executor.submit(
-                            propagate_context_to_thread(_run_tool), i, tc, name, args, parsed_calls[i][3]
+                            propagate_context_to_thread(_run_tool),
+                            i,
+                            tc,
+                            name,
+                            args,
+                            parsed_calls[i][3],
+                            allow_unlisted_tool_search_call,
                         )
                     except RuntimeError as submit_error:
                         if not _is_interpreter_shutdown_submit_error(submit_error):
@@ -700,7 +715,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             "skipping %d unsubmitted tool(s)",
                             len(skipped_calls),
                         )
-                        for skipped_i, _tc, skipped_name, skipped_args in skipped_calls:
+                        for skipped_i, _tc, skipped_name, skipped_args, _allow_unlisted in skipped_calls:
                             if results[skipped_i] is None:
                                 middleware_trace = parsed_calls[skipped_i][3]
                                 result = (
@@ -827,7 +842,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, allow_unlisted_tool_search_call) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
         # A worker can finish and write results[i] in the window between the
@@ -1082,6 +1097,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
         _ts_scope_block: Optional[str] = None
+        _allow_unlisted_tool_search_call = False
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
@@ -1090,6 +1106,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     if _underlying in _tool_search_scoped_names(agent):
                         function_name = _underlying
                         function_args = _underlying_args
+                        _allow_unlisted_tool_search_call = True
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -1489,12 +1506,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=_enabled_tools_for_dispatch(agent),
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    allow_unlisted_tool_search_call=_allow_unlisted_tool_search_call,
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1531,12 +1549,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    enabled_tools=_enabled_tools_for_dispatch(agent),
                     skip_pre_tool_call_hook=True,
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    allow_unlisted_tool_search_call=_allow_unlisted_tool_search_call,
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

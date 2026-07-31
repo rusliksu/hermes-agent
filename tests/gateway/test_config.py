@@ -92,6 +92,77 @@ class TestPlatformConfigRoundtrip:
         # extra; from_dict must honor it there too (mirrors _grn fallback).
         restored = PlatformConfig.from_dict({"extra": {"typing_indicator": False}})
         assert restored.typing_indicator is False
+
+
+class TestMatrixProfileScopedEnvPolicyBridge:
+    def test_scoped_matrix_policy_env_binds_platform_extra(self, monkeypatch):
+        monkeypatch.delenv("MATRIX_ALLOWED_ROOMS", raising=False)
+        monkeypatch.delenv("MATRIX_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("MATRIX_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        token = set_secret_scope(
+            {
+                "MATRIX_ACCESS_TOKEN": "syt_test",
+                "MATRIX_HOMESERVER": "https://matrix.example.org",
+                "MATRIX_ALLOWED_ROOMS": "!room-a:example.org,!room-b:example.org",
+                "MATRIX_ALLOWED_USERS": "@alice:example.org,@bob:example.org",
+                "MATRIX_ALLOW_ALL_USERS": "false",
+                "GATEWAY_ALLOW_ALL_USERS": "true",
+                "MATRIX_FREE_RESPONSE_ROOMS": "!free:example.org",
+                "MATRIX_REQUIRE_MENTION": "false",
+                "MATRIX_THREAD_REQUIRE_MENTION": "true",
+                "MATRIX_PROCESS_NOTICES": "true",
+                "MATRIX_IGNORE_USER_PATTERNS": "^@bridge_",
+                "MATRIX_APPROVAL_REQUIRE_SENDER": "false",
+                "MATRIX_SESSION_SCOPE": "thread",
+                "MATRIX_AUTO_THREAD": "false",
+                "MATRIX_DM_AUTO_THREAD": "true",
+                "MATRIX_DM_MENTION_THREADS": "true",
+            }
+        )
+        try:
+            config = load_gateway_config()
+        finally:
+            reset_secret_scope(token)
+
+        extra = config.platforms[Platform.MATRIX].extra
+        assert extra["allowed_rooms"] == "!room-a:example.org,!room-b:example.org"
+        assert extra["allowed_users"] == "@alice:example.org,@bob:example.org"
+        assert extra["allow_all_users"] == "false"
+        assert extra["free_response_rooms"] == "!free:example.org"
+        assert extra["require_mention"] == "false"
+        assert extra["thread_require_mention"] == "true"
+        assert extra["process_notices"] == "true"
+        assert extra["ignore_user_patterns"] == "^@bridge_"
+        assert extra["approval_require_sender"] == "false"
+        assert extra["session_scope"] == "thread"
+        assert extra["auto_thread"] == "false"
+        assert extra["dm_auto_thread"] == "true"
+        assert extra["dm_mention_threads"] == "true"
+
+    def test_scoped_empty_matrix_policy_env_does_not_inherit_process_env(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("MATRIX_ALLOWED_ROOMS", "!owner-room:example.org")
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@owner:example.org")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        token = set_secret_scope(
+            {
+                "MATRIX_ACCESS_TOKEN": "syt_test",
+                "MATRIX_HOMESERVER": "https://matrix.example.org",
+            }
+        )
+        try:
+            config = load_gateway_config()
+        finally:
+            reset_secret_scope(token)
+
+        extra = config.platforms[Platform.MATRIX].extra
+        assert "allowed_rooms" not in extra
+        assert "allowed_users" not in extra
+        assert "allow_all_users" not in extra
+
     def test_channel_overrides_roundtrip(self):
         pc = PlatformConfig(
             enabled=True,

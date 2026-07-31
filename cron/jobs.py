@@ -353,8 +353,9 @@ def _jobs_lock():
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# into output writes/deletes. ``resolved_access_context`` is the server-owned
+# authority snapshot; changing it would retarget an existing job.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "resolved_access_context"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1087,6 +1088,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    resolved_access_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1163,6 +1165,16 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_resolved_context = None
+    if resolved_access_context is not None:
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+
+        normalized_resolved_context = serialize_resolved_access_context(
+            deserialize_resolved_access_context(resolved_access_context)
+        )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1258,6 +1270,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_resolved_context is not None:
+        job["resolved_access_context"] = copy.deepcopy(normalized_resolved_context)
 
     with _jobs_lock():
         jobs = load_jobs()

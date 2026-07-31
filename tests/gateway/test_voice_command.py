@@ -51,6 +51,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 
 
@@ -100,6 +102,51 @@ class TestHandleVoiceCommand:
         result = await runner._handle_voice_command(event)
         assert "enabled" in result.lower()
         assert runner._voice_mode["telegram:123"] == "voice_only"
+
+    @pytest.mark.asyncio
+    async def test_voice_on_uses_typed_family_profile_adapter_when_source_profile_missing(self, runner):
+        default_adapter = SimpleNamespace(
+            _auto_tts_enabled_chats=set(),
+            _auto_tts_disabled_chats=set(),
+            platform=Platform.TELEGRAM,
+        )
+        family_adapter = SimpleNamespace(
+            _auto_tts_enabled_chats=set(),
+            _auto_tts_disabled_chats=set(),
+            platform=Platform.TELEGRAM,
+        )
+        runner.adapters = {Platform.TELEGRAM: default_adapter}
+        runner._profile_adapters = {
+            "family-profile": {Platform.TELEGRAM: family_adapter},
+        }
+        source = SessionSource(
+            profile=None,
+            platform=Platform.TELEGRAM,
+            chat_id="family-chat",
+            user_id="family-user",
+        )
+        source.resolved_access_context = ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"chat"}),
+            delivery_target=DeliveryTarget(
+                platform=Platform.TELEGRAM.value,
+                account="family-account",
+                peer_kind="dm",
+                chat_id="family-chat",
+            ),
+        )
+        event = MessageEvent(text="/voice on", message_type=MessageType.TEXT, source=source)
+
+        result = await runner._handle_voice_command(event)
+
+        assert "enabled" in result.lower()
+        assert family_adapter._auto_tts_enabled_chats == {"family-chat"}
+        assert family_adapter._auto_tts_disabled_chats == set()
+        assert default_adapter._auto_tts_enabled_chats == set()
+        assert default_adapter._auto_tts_disabled_chats == set()
 
     @pytest.mark.asyncio
     async def test_voice_off(self, runner):

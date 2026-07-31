@@ -9,29 +9,73 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import asyncio
 import json
 import logging
+import queue
+import threading
+from contextvars import copy_context
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
+DIRECTORY_PATH: Optional[Any] = None
 # User-maintained friendly-name overlay. The directory is fully regenerated
 # from live adapters + session data on a timer, so hand-edits to
 # channel_directory.json don't survive. Aliases declared here are re-applied
 # on every build AND every load, giving durable human-friendly names (and
 # letting you pre-name a chat before it has produced any traffic).
 # Format: {"<platform>": {"<chat_id>": "<friendly name>", ...}, ...}
-CHANNEL_ALIASES_PATH = get_hermes_home() / "channel_aliases.json"
+CHANNEL_ALIASES_PATH: Optional[Any] = None
+
+
+def _directory_path() -> Any:
+    if DIRECTORY_PATH is not None:
+        return DIRECTORY_PATH
+    return get_hermes_home() / "channel_directory.json"
+
+
+def _channel_aliases_path() -> Any:
+    if CHANNEL_ALIASES_PATH is not None:
+        return CHANNEL_ALIASES_PATH
+    return get_hermes_home() / "channel_aliases.json"
+
+
+async def _run_sync_in_thread(func, *args):
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+    context = copy_context()
+
+    def target() -> None:
+        try:
+            result = context.run(func, *args)
+        except BaseException as exc:
+            result_queue.put((False, exc))
+        else:
+            result_queue.put((True, result))
+
+    threading.Thread(
+        target=target,
+        name=f"channel-directory-{getattr(func, '__name__', 'worker')}",
+        daemon=True,
+    ).start()
+    while True:
+        try:
+            ok, value = result_queue.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.001)
+            continue
+        if ok:
+            return value
+        raise value
 
 
 def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
-    if not CHANNEL_ALIASES_PATH.exists():
+    aliases_path = _channel_aliases_path()
+    if not aliases_path.exists():
         return {}
     try:
-        with open(CHANNEL_ALIASES_PATH, encoding="utf-8") as f:
+        with open(aliases_path, encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -113,7 +157,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     Build a channel directory from connected platform adapters and session data.
 
-    Returns the directory dict and writes it to DIRECTORY_PATH.
+    Returns the directory dict and writes it to the current profile path.
     """
     from gateway.config import Platform
 
@@ -122,7 +166,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     for platform, adapter in adapters.items():
         try:
             if platform == Platform.DISCORD:
-                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
+                platforms["discord"] = await _run_sync_in_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
@@ -143,7 +187,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             or plat_name not in adapter_platform_names
         ):
             continue
-        platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
+        platforms[plat_name] = await _run_sync_in_thread(_build_from_sessions, plat_name)
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them). Same
@@ -157,7 +201,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 and entry.name not in platforms
                 and entry.name in adapter_platform_names
             ):
-                platforms[entry.name] = await asyncio.to_thread(_build_from_sessions, entry.name)
+                platforms[entry.name] = await _run_sync_in_thread(
+                    _build_from_sessions,
+                    entry.name,
+                )
     except Exception:
         pass
 
@@ -170,7 +217,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
-        atomic_json_write(DIRECTORY_PATH, directory)
+        atomic_json_write(_directory_path(), directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
@@ -224,7 +271,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     """
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
-        return await asyncio.to_thread(_build_from_sessions, "slack")
+        return await _run_sync_in_thread(_build_from_sessions, "slack")
 
     channels: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -268,7 +315,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             continue
 
     # Merge in DM/group entries discovered from session history.
-    for entry in await asyncio.to_thread(_build_from_sessions, "slack"):
+    for entry in await _run_sync_in_thread(_build_from_sessions, "slack"):
         if entry.get("id") not in seen_ids:
             channels.append(entry)
             seen_ids.add(entry.get("id"))
@@ -378,12 +425,13 @@ def _build_from_sessions_json(platform_name: str) -> List[Dict[str, str]]:
 
 def load_directory() -> Dict[str, Any]:
     """Load the cached channel directory from disk."""
-    if not DIRECTORY_PATH.exists():
+    directory_path = _directory_path()
+    if not directory_path.exists():
         base = {"updated_at": None, "platforms": {}}
         _apply_channel_aliases(base["platforms"])
         return base
     try:
-        with open(DIRECTORY_PATH, encoding="utf-8") as f:
+        with open(directory_path, encoding="utf-8") as f:
             data = json.load(f)
         # Re-apply aliases on read so friendly names take effect immediately,
         # even between timed rebuilds and for brand-new alias entries.

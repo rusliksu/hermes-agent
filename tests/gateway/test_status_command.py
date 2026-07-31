@@ -704,6 +704,45 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_profile_command_fails_closed_when_typed_profile_resolution_fails(monkeypatch):
+    """A typed multiplexed context must not fall back to the owner home."""
+    from gateway.profile_routing import ProfileRoutingError
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.config.multiplex_profiles = True
+
+    event = _make_event("/profile")
+    event.source.profile = "family-profile"
+    event.source.resolved_access_context = SimpleNamespace(profile_id="family-profile")
+
+    def raise_missing_resolved_profile(_source):
+        raise ProfileRoutingError("missing_resolved_profile")
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_profile_home_for_source",
+        raise_missing_resolved_profile,
+    )
+    monkeypatch.setattr(
+        "hermes_constants.display_hermes_home",
+        lambda: "/owner/default/home",
+    )
+
+    result = await runner._handle_profile_command(event)
+
+    assert result == "Profile unavailable."
+    assert "/owner/default/home" not in result
+
+
+@pytest.mark.asyncio
 async def test_profile_command_ignores_stamp_when_multiplexing_off(monkeypatch, tmp_path):
     """Without ``gateway.multiplex_profiles`` a stamped source is ignored:
     /profile keeps reporting the active profile and the default home,
@@ -756,6 +795,104 @@ async def test_profile_command_unstamped_source_unchanged(monkeypatch, tmp_path)
 
     assert "**Profile:** `default`" in result
     assert f"**Home:** `{hermes_home}`" in result
+
+
+def _make_typed_profile_rollback_case(monkeypatch, tmp_path, family_config: str):
+    from gateway import run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.config.multiplex_profiles = True
+
+    owner_home = tmp_path / "owner-home"
+    family_home = owner_home / "profiles" / "family-profile"
+    owner_workspace = tmp_path / "owner_workspace"
+    family_workspace = tmp_path / "family_workspace"
+    family_home.mkdir(parents=True)
+    owner_workspace.mkdir()
+    family_workspace.mkdir()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", owner_home)
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setenv("TERMINAL_CWD", str(owner_workspace))
+    (owner_home / "config.yaml").write_text(
+        f"checkpoints:\n  enabled: true\nterminal:\n  cwd: {owner_workspace}\n",
+        encoding="utf-8",
+    )
+    (family_home / "config.yaml").write_text(family_config, encoding="utf-8")
+
+    event = _make_event("/rollback")
+    event.source.profile = "family-profile"
+    event.source.resolved_access_context = SimpleNamespace(profile_id="family-profile")
+
+    return SimpleNamespace(runner=runner, event=event, family_workspace=family_workspace)
+
+
+@pytest.mark.asyncio
+async def test_rollback_command_uses_typed_profile_checkpoint_enabled_gate(monkeypatch, tmp_path):
+    from tools.checkpoint_manager import CheckpointManager
+
+    case = _make_typed_profile_rollback_case(
+        monkeypatch,
+        tmp_path,
+        "checkpoints:\n  enabled: false\n",
+    )
+    list_checkpoints = MagicMock(return_value=[])
+    monkeypatch.setattr(CheckpointManager, "list_checkpoints", list_checkpoints)
+
+    result = await case.runner._handle_rollback_command(case.event)
+
+    assert "Checkpoints are not enabled." in result
+    list_checkpoints.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rollback_command_requires_typed_profile_terminal_cwd(monkeypatch, tmp_path):
+    from tools.checkpoint_manager import CheckpointManager
+
+    case = _make_typed_profile_rollback_case(
+        monkeypatch,
+        tmp_path,
+        "checkpoints:\n  enabled: true\n",
+    )
+    list_checkpoints = MagicMock(return_value=[])
+    monkeypatch.setattr(CheckpointManager, "list_checkpoints", list_checkpoints)
+
+    result = await case.runner._handle_rollback_command(case.event)
+
+    assert "Checkpoints are not enabled." in result
+    list_checkpoints.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rollback_command_lists_typed_profile_terminal_cwd(monkeypatch, tmp_path):
+    from tools.checkpoint_manager import CheckpointManager
+
+    case = _make_typed_profile_rollback_case(
+        monkeypatch,
+        tmp_path,
+        "checkpoints:\n"
+        "  enabled: true\n"
+        f"terminal:\n  cwd: {tmp_path / 'family_workspace'}\n",
+    )
+    list_checkpoints = MagicMock(return_value=[{"hash": "abc123"}])
+    monkeypatch.setattr(CheckpointManager, "list_checkpoints", list_checkpoints)
+    monkeypatch.setattr(
+        "tools.checkpoint_manager.format_checkpoint_list",
+        lambda _checkpoints, cwd: f"checkpoint listing for {cwd}",
+    )
+
+    result = await case.runner._handle_rollback_command(case.event)
+
+    list_checkpoints.assert_called_once_with(str(case.family_workspace))
+    assert f"checkpoint listing for {case.family_workspace}" in result
 
 
 @pytest.mark.asyncio

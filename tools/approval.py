@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2072,13 +2073,16 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             *,
+                             expected_request_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
     resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    is resolved (FIFO), unless a non-empty *expected_request_id* selects an
+    exact pending approval.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2090,7 +2094,21 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if expected_request_id is not None:
+            if not expected_request_id or resolve_all:
+                return 0
+            target_index = next(
+                (
+                    index
+                    for index, entry in enumerate(queue)
+                    if str(entry.data.get("approval_request_id") or "") == expected_request_id
+                ),
+                None,
+            )
+            if target_index is None:
+                return 0
+            targets = [queue.pop(target_index)]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -3075,6 +3093,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
+    approval_data = dict(approval_data)
+    approval_data["approval_request_id"] = secrets.token_urlsafe(24)
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)

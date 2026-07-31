@@ -1078,7 +1078,9 @@ def _handle_create(args: dict, **kw) -> str:
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    from gateway.session_context import get_session_env
+
+    session_id = get_session_env("HERMES_SESSION_ID", "") or None
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)

@@ -187,6 +187,51 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
     ".envrc",
 }
 
+_PROFILE_BOUND_READ_DENIED = (
+    "Access denied: local file reads are restricted to the resolved access profile."
+)
+
+
+def _raise_if_outside_resolved_profile(path: str) -> None:
+    """Fail closed for typed contexts whose local read escapes the profile root."""
+    lowered = str(path or "").strip().lower()
+    if lowered.startswith(("http://", "https://", "data:")):
+        return
+
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        context = get_resolved_access_context(None)
+    except Exception as exc:  # noqa: BLE001 - context lookup is part of the boundary
+        raise ValueError(_PROFILE_BOUND_READ_DENIED) from exc
+    if context is None:
+        return
+
+    try:
+        from gateway.access_registry import ResolvedAccessContext
+    except Exception as exc:  # noqa: BLE001 - fail closed if the contract is unavailable
+        raise ValueError(_PROFILE_BOUND_READ_DENIED) from exc
+
+    if not isinstance(context, ResolvedAccessContext):
+        raise ValueError(_PROFILE_BOUND_READ_DENIED)
+    profile_id = context.profile_id
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        raise ValueError(_PROFILE_BOUND_READ_DENIED)
+
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        if not profile_exists(profile_id):
+            raise ValueError(_PROFILE_BOUND_READ_DENIED)
+        profile_root = get_profile_dir(profile_id).resolve()
+        candidate = Path(str(path)).expanduser().resolve()
+    except Exception as exc:  # noqa: BLE001 - malformed profile/path state denies
+        raise ValueError(_PROFILE_BOUND_READ_DENIED) from exc
+    try:
+        candidate.relative_to(profile_root)
+    except ValueError as exc:
+        raise ValueError(_PROFILE_BOUND_READ_DENIED) from exc
+
 
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
@@ -344,12 +389,15 @@ def raise_if_read_blocked(path: str) -> None:
     enforces the same read boundary with identical semantics instead of each
     open-coding the try/except block (#57698).
 
-    Best-effort by design: if ``agent.file_safety`` machinery is somehow
-    unavailable at the call site the guard no-ops rather than breaking local
-    image loading — consistent with the defense-in-depth (not security
-    boundary) framing of the denylist itself. The blocking ``ValueError`` from
-    a real hit still propagates; only unexpected internal errors are swallowed.
+    The typed ``ResolvedAccessContext`` profile boundary is a real fail-closed
+    boundary and runs first. The legacy credential denylist remains best-effort
+    by design: if that machinery is somehow unavailable at the call site the
+    guard no-ops rather than breaking local image loading — consistent with the
+    defense-in-depth (not security boundary) framing of the denylist itself.
+    The blocking ``ValueError`` from a real hit still propagates; only
+    unexpected internal errors are swallowed.
     """
+    _raise_if_outside_resolved_profile(path)
     try:
         blocked = get_read_block_error(path)
     except Exception:  # noqa: BLE001 - guard must never break local-file loading

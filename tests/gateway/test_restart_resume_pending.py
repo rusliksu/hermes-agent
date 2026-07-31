@@ -33,6 +33,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.access_registry import (
+    AccessRegistry,
+    DeliveryTarget,
+    PrincipalBinding,
+    ResolvedAccessContext,
+    RolePolicy,
+    TransportIdentity,
+)
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
@@ -45,6 +53,7 @@ from gateway.run import (
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
+    RestartTestAdapter,
     make_restart_runner,
     make_restart_source,
 )
@@ -78,6 +87,49 @@ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
 
 def _make_store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+def _resume_registry_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-1",
+            thread_id=None,
+        ),
+    )
+
+
+def _resume_registry() -> AccessRegistry:
+    identity = TransportIdentity(
+        platform="telegram",
+        account="bot-a",
+        peer_kind="dm",
+        user_id="chat-1",
+        chat_id="chat-1",
+    )
+    return AccessRegistry(
+        roles={"family": RolePolicy("family", frozenset({"public_web"}))},
+        profiles=frozenset({"family-alpha"}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id="principal-family",
+                role_id="family",
+                profile_id="family-alpha",
+                transport_identity=identity,
+                conversation_scope="private",
+                delivery_target=_resume_registry_context().delivery_target,
+            ),
+        ),
+        scope_capabilities={"private": frozenset({"public_web"})},
+        backend_capabilities=frozenset({"public_web"}),
+    )
 
 
 def _build_agent_history(history: list) -> list:
@@ -1098,6 +1150,94 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_with_access_registry_uses_restored_profile_adapter():
+    runner, default_adapter = make_restart_runner()
+    runner.access_registry = _resume_registry()
+    runner.config.multiplex_profiles = True
+    profile_adapter = RestartTestAdapter()
+    profile_adapter.handle_message = AsyncMock()
+    default_adapter.handle_message = AsyncMock()
+    runner._profile_adapters = {"family-alpha": {Platform.TELEGRAM: profile_adapter}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="chat-1",
+    )
+    source.resolved_access_context = _resume_registry_context()
+    restored_entry = SessionEntry.from_dict(
+        SessionEntry(
+            session_key="agent:family-alpha:telegram:dm:chat-1",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=datetime.now(),
+        ).to_dict()
+    )
+    runner.session_store._entries = {restored_entry.session_key: restored_entry}
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    default_adapter.handle_message.assert_not_called()
+    profile_adapter.handle_message.assert_awaited_once()
+    event = profile_adapter.handle_message.await_args.args[0]
+    assert event is not None
+    assert event.source.profile == "family-alpha"
+    assert event.source.resolved_access_context == _resume_registry_context()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "stale"])
+async def test_startup_auto_resume_registry_denies_before_adapter_selection(case, caplog):
+    runner, adapter = make_restart_runner()
+    runner.access_registry = _resume_registry()
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {"family-alpha": {Platform.TELEGRAM: adapter}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="chat-1",
+    )
+    if case == "stale":
+        source.resolved_access_context = _resume_registry_context(profile_id="stale-profile")
+    pending_entry = SessionEntry(
+        session_key="agent:family-alpha:telegram:dm:chat-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._adapter_for_source = MagicMock(side_effect=AssertionError("adapter selected"))
+
+    with caplog.at_level("WARNING"):
+        scheduled = runner._schedule_resume_pending_sessions()
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert scheduled == 0
+    assert "AccessRegistry ingress denied" in rendered
+    assert "principal-family" not in rendered
+    assert "family-alpha" not in rendered
+    assert "stale-profile" not in rendered
+    assert "chat-1" not in rendered
+    assert "bot-a" not in rendered
+    runner._adapter_for_source.assert_not_called()
 
 
 @pytest.mark.asyncio

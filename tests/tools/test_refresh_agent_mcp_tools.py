@@ -284,6 +284,61 @@ def test_stale_generation_refresh_does_not_clobber_newer(monkeypatch):
     assert "mcp_new_tool" in agent.valid_tool_names
 
 
+def test_stale_mcp_pool_generation_refresh_does_not_publish(monkeypatch):
+    """A profile-local MCP pool change during rebuild rejects stale output even
+    when the global registry generation is unchanged."""
+    from agent.secret_scope import set_multiplex_active
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+    from gateway.session_context import bind_resolved_access_context, reset_session_vars
+
+    agent = _agent(["read_file", "mcp__demo__fresh"])
+    context = ResolvedAccessContext(
+        principal_id="principal-profile-a",
+        role_id="family_standard",
+        profile_id="profile-a",
+        conversation_scope="dm:a",
+        capabilities=frozenset({"mcp"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-main",
+            peer_kind="dm",
+            chat_id="chat-profile-a",
+        ),
+    )
+
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [_tool("read_file")])
+
+    set_multiplex_active(True)
+    reset_session_vars()
+    try:
+        with bind_resolved_access_context(context):
+            pool = mcp_tool._current_mcp_pool()
+            assert pool is not None
+            with mcp_tool._lock:
+                pool.generation = 1
+
+            def _mutate_pool_generation(_agent, _defs, _names):
+                with mcp_tool._lock:
+                    pool.generation += 1
+                return set()
+
+            monkeypatch.setattr(
+                mcp_tool,
+                "_reinject_post_build_tools",
+                _mutate_pool_generation,
+            )
+            added = mcp_tool.refresh_agent_mcp_tools(agent)
+    finally:
+        reset_session_vars()
+        set_multiplex_active(False)
+        with mcp_tool._lock:
+            mcp_tool._profile_pools.clear()
+
+    assert added == set()
+    assert "mcp__demo__fresh" in agent.valid_tool_names
+
+
 def test_wait_returns_instantly_when_no_discovery_thread(monkeypatch):
     """The common case (no MCP / discovery done) pays ~0s regardless of bound."""
     import time

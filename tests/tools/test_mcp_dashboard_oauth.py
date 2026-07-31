@@ -132,6 +132,30 @@ def test_dashboard_flow_cannot_resurrect_after_terminal_error():
     assert flow.authorization_url is None
 
 
+@pytest.mark.asyncio
+async def test_dashboard_wait_timeout_does_not_leak_tasks_or_threads():
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-timeout",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/flow-timeout",
+    )
+    before_tasks = set(asyncio.all_tasks())
+    before_threads = {thread.ident for thread in threading.enumerate()}
+
+    with pytest.raises(TimeoutError):
+        await flow.wait_for_authorization_url(timeout=0.001)
+    await asyncio.sleep(0)
+
+    after_tasks = set(asyncio.all_tasks())
+    after_threads = {thread.ident for thread in threading.enumerate()}
+    assert after_tasks - before_tasks == set()
+    assert after_threads == before_threads
+
+
 def test_dashboard_context_overrides_redirect_and_handlers():
     from tools.mcp_dashboard_oauth import (
         DashboardOAuthFlow,

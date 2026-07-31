@@ -1106,28 +1106,39 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
-def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
-    """An explicit ``session_id`` arg from the model wins over the env
-    propagation. Edge case but exercised: a tool call could carry a
-    different session id (e.g. cross-session linking) and the explicit
-    arg should not be silently overwritten."""
-    monkeypatch.setenv("HERMES_SESSION_ID", "from-env")
+def test_create_ignores_hostile_session_id_arg_and_poisoned_env(
+    monkeypatch, worker_env
+):
+    """Server/task-local session context is authoritative for task stamping."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "poisoned-process-env")
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    out = kt._handle_create({
-        "title": "explicit override",
-        "assignee": "peer",
-        "parents": [worker_env],
-        "session_id": "explicit-arg",
-    })
-    d = json.loads(out)
-    assert d["ok"] is True
-    conn = kb.connect()
+
+    reset_session_vars()
+    tokens = set_session_vars(session_id="server-bound-session")
     try:
-        new_task = kb.get_task(conn, d["task_id"])
-        assert new_task.session_id == "explicit-arg"
+        out = kt._handle_create({
+            "title": "runtime context wins",
+            "assignee": "peer",
+            "parents": [worker_env],
+            "session_id": "hostile-model-arg",
+        })
+        d = json.loads(out)
+        assert d["ok"] is True
+        conn = kb.connect()
+        try:
+            new_task = kb.get_task(conn, d["task_id"])
+            assert new_task.session_id == "server-bound-session"
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        clear_session_vars(tokens)
+        reset_session_vars()
 
 
 def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):

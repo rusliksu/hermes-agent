@@ -9,9 +9,12 @@ All run zero LLM calls.
 """
 import json
 import time
+from contextlib import contextmanager
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import reset_session_vars, set_session_vars
 from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
@@ -19,11 +22,85 @@ from tools.session_search_tool import (
     _format_timestamp,
     session_search,
 )
+from tools.registry import registry
 
 
 @pytest.fixture
 def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
+
+
+@pytest.fixture(autouse=True)
+def _clear_resolved_access_context():
+    reset_session_vars()
+    yield
+    reset_session_vars()
+
+
+def _access_context(
+    *,
+    role_id="family_standard",
+    profile_id="family-alpha",
+    chat_id="chat-a",
+    thread_id="thread-a",
+    peer_kind="dm",
+    capabilities=frozenset({"session_search"}),
+) -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id=f"principal-{profile_id}",
+        role_id=role_id,
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset(capabilities),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind=peer_kind,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        ),
+    )
+
+
+@contextmanager
+def _bound_context(context):
+    reset_session_vars()
+    set_session_vars(resolved_access_context=context)
+    try:
+        yield
+    finally:
+        reset_session_vars()
+
+
+def _seed_scoped_session(
+    db,
+    session_id,
+    *,
+    profile_name="family-alpha",
+    chat_id="chat-a",
+    thread_id="thread-a",
+    source="telegram",
+    chat_type="dm",
+    user_id=None,
+    title=None,
+    content="scoped rosebud session secret",
+):
+    user_id = chat_id if user_id is None and chat_type == "dm" else user_id
+    db.create_session(
+        session_id,
+        source=source,
+        user_id=user_id,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+        profile_name=profile_name,
+    )
+    if title:
+        db.set_session_title(session_id, title)
+    first_id = db.append_message(session_id, role="user", content=content)
+    db.append_message(session_id, role="assistant", content=f"assistant echoes {content}")
+    db._conn.commit()
+    return first_id
 
 
 def _seed_modpack_sessions(db):
@@ -80,6 +157,10 @@ class TestSchema:
         # Mode is inferred from which args are set — no explicit mode param
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
         assert "mode" not in params
+
+    def test_no_profile_parameter(self):
+        params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        assert "profile" not in params
 
     def test_sort_enum(self):
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
@@ -490,86 +571,300 @@ class TestReadShape:
 
 
 # =========================================================================
-# Cross-profile read — `profile` swaps in another profile's DB (read-only)
+# Profile isolation
 # =========================================================================
 
-class TestCrossProfileRead:
-    def _patch_profiles(self, monkeypatch, home, exists=True):
-        from hermes_cli import profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
-        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
-        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: exists)
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
-
-    def test_profile_param_reads_other_db(self, db, tmp_path, monkeypatch):
+class TestProfileIsolation:
+    def _make_other_db(self, tmp_path, session_id="s_other"):
         other_home = tmp_path / "other_home"
         other_home.mkdir()
         other = SessionDB(other_home / "state.db")
-        other.create_session("s_other", source="cli")
+        other.create_session(session_id, source="cli")
         other._conn.execute(
-            "UPDATE sessions SET title = ? WHERE id = ?", ("Other Profile Chat", "s_other")
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Other Profile Chat", session_id)
         )
-        other.append_message("s_other", role="user", content="hello from the other profile")
+        other.append_message(session_id, role="user", content="hello from the other profile")
         other._conn.commit()
+        return other_home, other
 
-        self._patch_profiles(monkeypatch, other_home)
+    def test_public_function_rejects_profile_argument(self, db):
+        with pytest.raises(TypeError):
+            session_search(session_id="s_other", profile="other", db=db)  # type: ignore[call-arg]
 
-        # s_other lives only in the other profile; the current `db` lacks it.
-        result = json.loads(session_search(session_id="s_other", profile="other", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["session_meta"]["title"] == "Other Profile Chat"
+    def test_registry_dispatch_ignores_foreign_profile_argument(self, db, tmp_path):
+        self._make_other_db(tmp_path, "s_other")
 
-    def test_bare_id_locates_across_profiles(self, db, tmp_path, monkeypatch):
-        # The real-world failure: model dropped the owning profile and passed a
-        # bare id. The tool must scan profiles and find it anyway.
-        other_home = tmp_path / "asdf_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_far", source="cli")
-        other.append_message("s_far", role="user", content="hi")
-        other._conn.commit()
-
-        from collections import namedtuple
-        from hermes_cli import profiles as profiles_mod
-        Info = namedtuple("Info", "name path")
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
-        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
-
-        # `db` (current profile) lacks s_far; no profile passed → scan finds it.
-        result = json.loads(session_search(session_id="s_far", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["profile"] == "asdf"
-
-    def test_unknown_profile_errors(self, db, monkeypatch, tmp_path):
-        self._patch_profiles(monkeypatch, tmp_path, exists=False)
-        result = json.loads(session_search(session_id="x", profile="ghost", db=db))
+        result = json.loads(registry.dispatch(
+            "session_search",
+            {"session_id": "s_other", "profile": "other"},
+            db=db,
+        ))
         assert result["success"] is False
-        assert "ghost" in result.get("error", "")
+        assert "s_other" in result.get("error", "")
 
-    def test_combined_value_autosplits(self, db, tmp_path, monkeypatch):
-        # Agent passed the raw "@session:<profile>/<id>" value as session_id with
-        # no separate profile — the tool should recover both.
-        other_home = tmp_path / "other_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_other", source="cli")
-        other.append_message("s_other", role="user", content="hi")
-        other._conn.commit()
+    def test_embedded_profile_session_id_does_not_traverse(self, db, tmp_path):
+        self._make_other_db(tmp_path, "s_other")
 
-        self._patch_profiles(monkeypatch, other_home)
+        result = json.loads(session_search(session_id="other/s_other", db=db))
 
-        # Every permutation the model might send must resolve to (asdf, s_other).
-        for kwargs in (
-            {"session_id": "asdf/s_other"},                    # full value, no profile
-            {"session_id": "asdf/s_other", "profile": "asdf"},  # full value AND profile
-            {"session_id": "s_other", "profile": "asdf"},       # bare id + profile
-        ):
-            result = json.loads(session_search(db=db, **kwargs))
-            assert result["success"] is True, kwargs
-            assert result["mode"] == "read"
-            assert result["session_id"] == "s_other"
+        assert result["success"] is False
+        assert "other/s_other" in result.get("error", "")
+
+    def test_bare_foreign_id_is_not_located_across_profiles(self, db, tmp_path, monkeypatch):
+        other_home, _other = self._make_other_db(tmp_path, "s_far")
+
+        from hermes_cli import profiles as profiles_mod
+        monkeypatch.setattr(
+            profiles_mod,
+            "get_profile_dir",
+            lambda _name: pytest.fail("session_search must not scan profile homes"),
+        )
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: pytest.fail("session_search must not list profiles"),
+        )
+
+        result = json.loads(session_search(session_id="s_far", db=db))
+
+        assert result["success"] is False
+        assert "s_far" in result.get("error", "")
+        assert other_home.exists()
+
+    def test_own_db_reads_still_work(self, db):
+        db.create_session("s_own", source="cli")
+        db.append_message("s_own", role="user", content="own profile content")
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_own", db=db))
+
+        assert result["success"] is True
+        assert result["mode"] == "read"
+        assert result["session_id"] == "s_own"
+
+
+class TestTypedSessionScope:
+    @pytest.mark.parametrize("role_id", ["family_standard", "family_sandbox"])
+    def test_family_browse_discover_title_read_and_scroll_own_scope(self, db, role_id):
+        anchor = _seed_scoped_session(
+            db,
+            "own-family",
+            title="Own Family Topic",
+            content="own scoped rosebud memory",
+        )
+        with _bound_context(_access_context(role_id=role_id)):
+            browse = json.loads(session_search(db=db))
+            discover = json.loads(session_search(query="rosebud", db=db))
+            title = json.loads(session_search(query="Own Family Topic", db=db))
+            read = json.loads(session_search(session_id="own-family", db=db))
+            scroll = json.loads(session_search(
+                session_id="own-family",
+                around_message_id=anchor,
+                db=db,
+            ))
+
+        assert [row["session_id"] for row in browse["results"]] == ["own-family"]
+        assert discover["results"][0]["session_id"] == "own-family"
+        assert title["results"][0]["matched_role"] == "session_title"
+        assert read["success"] is True
+        assert scroll["success"] is True
+
+    @pytest.mark.parametrize("foreign_id", ["foreign-profile", "foreign-dm", "foreign-thread"])
+    def test_family_scope_hides_foreign_profile_dm_and_thread(self, db, foreign_id):
+        foreign_titles = {
+            "foreign-profile": "Foreign Profile Secret",
+            "foreign-dm": "Foreign DM Secret",
+            "foreign-thread": "Foreign Thread Secret",
+        }
+        own_anchor = _seed_scoped_session(
+            db,
+            "own-family",
+            title="Own visible",
+            content="visible own topic",
+        )
+        foreign_anchor = _seed_scoped_session(
+            db,
+            "foreign-profile",
+            profile_name="family-beta",
+            title="Foreign Profile Secret",
+            content="foreign rosebud profile secret",
+        )
+        _seed_scoped_session(
+            db,
+            "foreign-dm",
+            chat_id="chat-b",
+            title="Foreign DM Secret",
+            content="foreign rosebud dm secret",
+        )
+        _seed_scoped_session(
+            db,
+            "foreign-thread",
+            thread_id="thread-b",
+            title="Foreign Thread Secret",
+            content="foreign rosebud thread secret",
+        )
+        if foreign_id != "foreign-profile":
+            foreign_anchor = db.get_messages(foreign_id)[0]["id"]
+
+        with _bound_context(_access_context()):
+            browse = json.loads(session_search(db=db))
+            discover = json.loads(session_search(query="foreign rosebud", db=db))
+            title = json.loads(session_search(query=foreign_titles[foreign_id], db=db))
+            read = json.loads(session_search(session_id=foreign_id, db=db))
+            scroll = json.loads(session_search(
+                session_id=foreign_id,
+                around_message_id=foreign_anchor,
+                db=db,
+            ))
+            own_scroll = json.loads(session_search(
+                session_id="own-family",
+                around_message_id=own_anchor,
+                db=db,
+            ))
+
+        browsed_ids = {row["session_id"] for row in browse["results"]}
+        assert browsed_ids == {"own-family"}
+        assert discover["results"] == []
+        assert title["results"] == []
+        assert read["success"] is False
+        assert scroll["success"] is False
+        assert own_scroll["success"] is True
+
+    def test_foreign_direct_ids_stop_before_transcript_io(self, db, monkeypatch):
+        foreign_anchor = _seed_scoped_session(
+            db,
+            "foreign-profile",
+            profile_name="family-beta",
+            title="Foreign Direct Secret",
+            content="foreign direct rosebud secret",
+        )
+
+        def fail_io(*_args, **_kwargs):
+            pytest.fail("foreign session reached transcript IO")
+
+        monkeypatch.setattr(db, "get_messages", fail_io)
+        monkeypatch.setattr(db, "get_messages_around", fail_io)
+        monkeypatch.setattr(db, "get_anchored_view", fail_io)
+
+        with _bound_context(_access_context()):
+            read = json.loads(session_search(session_id="foreign-profile", db=db))
+            scroll = json.loads(session_search(
+                session_id="foreign-profile",
+                around_message_id=foreign_anchor,
+                db=db,
+            ))
+
+        assert read["success"] is False
+        assert scroll["success"] is False
+
+    def test_owner_typed_context_sees_owner_profile_only(self, db):
+        _seed_scoped_session(
+            db,
+            "owner-session",
+            profile_name="owner-profile",
+            title="Owner Secret",
+            content="owner rosebud secret",
+        )
+        _seed_scoped_session(
+            db,
+            "family-session",
+            profile_name="family-alpha",
+            title="Family Secret",
+            content="family rosebud secret",
+        )
+
+        with _bound_context(_access_context(
+            role_id="owner",
+            profile_id="owner-profile",
+            capabilities=frozenset(),
+        )):
+            discover = json.loads(session_search(query="rosebud", db=db))
+            foreign_read = json.loads(session_search(session_id="family-session", db=db))
+
+        assert [row["session_id"] for row in discover["results"]] == ["owner-session"]
+        assert foreign_read["success"] is False
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            _access_context(role_id="shared_room", peer_kind="group", chat_id="room-a"),
+            _access_context(role_id="family_admin"),
+            _access_context(role_id="family_custom"),
+            _access_context(role_id="owner", peer_kind="group", chat_id="room-a"),
+            _access_context(role_id="unknown_role"),
+            {"profile_id": "family-alpha"},
+        ],
+    )
+    def test_denied_contexts_fail_before_transcript_io(self, context):
+        class NoIoDB:
+            def __getattr__(self, name):
+                pytest.fail(f"unexpected db read: {name}")
+
+        with _bound_context(context):
+            result = json.loads(session_search(query="anything", db=NoIoDB()))
+
+        assert result["success"] is False
+
+    def test_typed_missing_db_does_not_lazy_open_default(self, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state,
+            "SessionDB",
+            lambda: pytest.fail("typed session_search must not lazy-open SessionDB"),
+        )
+        with _bound_context(_access_context()):
+            result = json.loads(session_search())
+
+        assert result["success"] is False
+        assert "caller-supplied SessionDB" in result["error"]
+
+    def test_none_context_preserves_lazy_sessiondb_fallback(self, monkeypatch):
+        class LazyDB:
+            def list_sessions_rich(self, **_kwargs):
+                return [{
+                    "id": "legacy-lazy",
+                    "title": "Legacy Lazy",
+                    "source": "cli",
+                    "started_at": 1,
+                    "last_active": 2,
+                    "message_count": 1,
+                    "preview": "legacy",
+                    "parent_session_id": None,
+                }]
+
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "SessionDB", LazyDB)
+        result = json.loads(session_search())
+
+        assert result["success"] is True
+        assert result["results"][0]["session_id"] == "legacy-lazy"
+
+    def test_model_supplied_profile_cannot_modify_typed_scope(self, db):
+        _seed_scoped_session(
+            db,
+            "own-family",
+            title="Own visible",
+            content="visible own topic",
+        )
+        _seed_scoped_session(
+            db,
+            "foreign-profile",
+            profile_name="family-beta",
+            title="Foreign Secret",
+            content="foreign rosebud profile secret",
+        )
+
+        with _bound_context(_access_context()):
+            result = json.loads(registry.dispatch(
+                "session_search",
+                {"query": "foreign rosebud", "profile": "family-beta"},
+                db=db,
+            ))
+
+        assert result["success"] is True
+        assert result["results"] == []
 
 
 # =========================================================================

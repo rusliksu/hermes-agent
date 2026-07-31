@@ -17,8 +17,11 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateway.access_registry import ResolvedAccessContext
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +147,47 @@ def _is_session_key_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+def _serialize_origin_resolved_access_context(origin: "SessionSource") -> Optional[Dict[str, Any]]:
+    context = getattr(origin, "resolved_access_context", None)
+    if context is None:
+        return None
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        logger.warning(
+            "gateway.session: omitted malformed resolved access context: reason=%s",
+            str(exc),
+        )
+        return None
+
+
+def _restore_origin_resolved_access_context(
+    origin: Optional["SessionSource"],
+    data: Dict[str, Any],
+) -> None:
+    if "resolved_access_context" not in data:
+        return
+    if origin is None:
+        logger.warning(
+            "gateway.session: ignored resolved access context without origin: reason=%s",
+            "missing_origin",
+        )
+        return
+    try:
+        from gateway.access_registry import deserialize_resolved_access_context
+
+        context = deserialize_resolved_access_context(data["resolved_access_context"])
+    except ValueError as exc:
+        logger.warning(
+            "gateway.session: ignored malformed resolved access context: reason=%s",
+            str(exc),
+        )
+        return
+    origin.resolved_access_context = context
+
+
 @dataclass
 class SessionSource:
     """
@@ -175,6 +219,10 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    # Wire-invisible trusted account label from server config, used only for
+    # profile route matching. Deliberately excluded from to_dict/from_dict and
+    # prompt context so it is not persisted or exposed to the model.
+    route_account: Optional[str] = None
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
@@ -202,6 +250,20 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+
+    # Internal, wire-INVISIBLE server-resolved authority context. Set only by
+    # gateway ingress after AccessRegistry resolution; excluded from
+    # to_dict/from_dict and prompt construction.
+    resolved_access_context: Optional["ResolvedAccessContext"] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _trusted_transport_identity_fingerprint: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -674,6 +736,19 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+def _source_with_serializable_context(source: SessionSource) -> bool:
+    context = getattr(source, "resolved_access_context", None)
+    if context is None:
+        return False
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+
+        serialize_resolved_access_context(context)
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass
 class SessionEntry:
     """
@@ -790,6 +865,9 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+            resolved_context = _serialize_origin_resolved_access_context(self.origin)
+            if resolved_context is not None:
+                result["resolved_access_context"] = resolved_context
         return result
     
     @classmethod
@@ -797,6 +875,7 @@ class SessionEntry:
         origin = None
         if "origin" in data and isinstance(data["origin"], dict):
             origin = SessionSource.from_dict(data["origin"])
+        _restore_origin_resolved_access_context(origin, data)
         
         platform = None
         if data.get("platform"):
@@ -1366,6 +1445,20 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
+        context = getattr(source, "resolved_access_context", None) if source is not None else None
+        if context is not None:
+            from gateway.profile_routing import ProfileRoutingError
+
+            context_profile = getattr(context, "profile_id", None)
+            if not isinstance(context_profile, str) or not context_profile.strip():
+                raise ProfileRoutingError("missing_resolved_profile")
+            context_profile = context_profile.strip()
+            source_profile = (getattr(source, "profile", "") or "").strip()
+            if source_profile and source_profile != context_profile:
+                raise ProfileRoutingError("resolved_profile_mismatch")
+            if not getattr(self.config, "multiplex_profiles", False):
+                raise ProfileRoutingError("resolved_profile_requires_multiplex")
+            return context_profile
         if not getattr(self.config, "multiplex_profiles", False):
             return None
         if source is not None and source.profile:
@@ -1431,6 +1524,37 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
+
+    def _validate_incoming_session_authority(self, source: SessionSource) -> Any:
+        registry = getattr(self.config, "access_registry", None)
+        if registry is None:
+            return None
+        return registry.validate_resolved_context(
+            getattr(source, "resolved_access_context", None)
+        )
+
+    def _validate_persisted_session_authority(
+        self,
+        entry: SessionEntry,
+        incoming_context: Any,
+    ) -> None:
+        registry = getattr(self.config, "access_registry", None)
+        if registry is None:
+            return
+        persisted_origin = getattr(entry, "origin", None)
+        persisted_context = registry.validate_resolved_context(
+            getattr(persisted_origin, "resolved_access_context", None)
+        )
+        if persisted_context != incoming_context:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+
+            raise AccessDeniedError(
+                "persisted_resolved_access_context_mismatch",
+                RedactedAuditMetadata.from_delivery_target(
+                    "session_authority_mismatch",
+                    getattr(incoming_context, "delivery_target", None),
+                ),
+            )
 
     def _create_entry_from_recovered_row(
         self,
@@ -1868,6 +1992,7 @@ class SessionStore:
         same key share the owner's result, including concurrent ``force_new``
         deliveries, so only one routing transition and SQLite row is created.
         """
+        incoming_context = self._validate_incoming_session_authority(source)
         session_key = self._generate_session_key(source)
         inflight_lock = getattr(self, "_inflight_lock", None)
         if inflight_lock is None:
@@ -1892,7 +2017,11 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(source, force_new=force_new)
+            result = self._get_or_create_session_impl(
+                source,
+                force_new=force_new,
+                incoming_context=incoming_context,
+            )
             slot.result = result
             return result
         except BaseException as exc:
@@ -1907,6 +2036,7 @@ class SessionStore:
         self,
         source: SessionSource,
         force_new: bool = False,
+        incoming_context: Any = None,
     ) -> SessionEntry:
         """Perform one session routing transition for the single-flight owner.
 
@@ -1914,6 +2044,8 @@ class SessionStore:
         recovery DB queries) is performed *outside* ``self._lock``. The lock
         protects only ``_entries`` / ``_loaded`` mutations.
         """
+        if incoming_context is None:
+            incoming_context = self._validate_incoming_session_authority(source)
         session_key = self._generate_session_key(source)
         now = _now()
 
@@ -1921,13 +2053,16 @@ class SessionStore:
         db_create_kwargs = None
         existing_session_id = None
         force_new_observed_entry = None
+        had_authoritative_entry = False
 
-        # ---- Phase 0: lock read -- existing session_id for compression tip ----
-        if not force_new:
-            with self._lock:
-                self._ensure_loaded_locked()
-                entry = self._entries.get(session_key)
-                if entry is not None:
+        # ---- Phase 0: lock read -- authority + existing session_id for compression tip ----
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is not None:
+                had_authoritative_entry = True
+                self._validate_persisted_session_authority(entry, incoming_context)
+                if not force_new:
                     existing_session_id = entry.session_id
 
         # Compression tip lookup outside the lock (DB I/O).
@@ -2026,6 +2161,8 @@ class SessionStore:
                     # Another thread handled this entry during our lock-free
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
+                    if _source_with_serializable_context(source):
+                        entry.origin = source
                     _needs_save = True
                 else:
                     # Stale check clean.  Apply reset decision.
@@ -2039,13 +2176,19 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
+                        if _source_with_serializable_context(source):
+                            entry.origin = source
                         _needs_save = True
             else:
                 if not force_new:
                     _needs_recover = True
 
         # ---- Phase 3: no-lock I/O -- recovery + create + save + DB ops ----
-        if _needs_recover and db_end_session_id is None:
+        recovery_allowed = (
+            incoming_context is None
+            or had_authoritative_entry
+        )
+        if _needs_recover and db_end_session_id is None and recovery_allowed:
             recovered = self._query_recoverable_session(
                 session_key=session_key, source=source, now=now,
             )

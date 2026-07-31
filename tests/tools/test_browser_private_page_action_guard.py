@@ -127,7 +127,7 @@ def test_browser_back_blocks_when_landed_page_is_private(monkeypatch):
     out = json.loads(browser_tool.browser_back(task_id="task-1"))
 
     assert out["success"] is False
-    assert PRIVATE_URL in out["error"]
+    assert PRIVATE_URL not in out["error"]
     assert "private or internal address" in out["error"]
     # The blocked payload must not itself leak the raw URL as a "url" field
     # the way the success payload does.

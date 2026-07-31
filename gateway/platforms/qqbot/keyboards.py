@@ -14,13 +14,14 @@ This module provides:
   keyboard for tool-approval flows.
 - :func:`build_update_prompt_keyboard` — Yes/No keyboard for update confirms.
 - :func:`parse_approval_button_data` / :func:`parse_update_prompt_button_data`
-  — decode the ``button_data`` payload from ``INTERACTION_CREATE``.
+  — decode the non-authoritative ``button_data`` payload from
+  ``INTERACTION_CREATE``.
 - :class:`ApprovalRequest` + :class:`ApprovalSender` — high-level helper that
   builds an approval message with keyboard and posts it to a c2c / group chat.
 
 ``button_data`` formats::
 
-    approve:<session_key>:<decision>      # decision = allow-once|allow-always|deny
+    approve:<approval_id>:<decision>      # decision = allow-once|allow-always|deny
     update_prompt:<answer>                # answer = y|n
 
 Ported from WideLee's qqbot-agent-sdk v1.2.2 (``approval.py`` + ``dto.py``
@@ -41,11 +42,9 @@ logger = logging.getLogger(__name__)
 APPROVAL_BUTTON_PREFIX = "approve:"
 UPDATE_PROMPT_PREFIX = "update_prompt:"
 
-# Pattern: approve:<session_key>:<decision>
-# session_key may itself contain colons (e.g. agent:main:qqbot:c2c:OPENID),
-# so the session_key group is greedy but trails the decision.
+# Pattern: approve:<opaque approval_id>:<decision>
 _APPROVAL_DATA_RE = re.compile(
-    r"^approve:(.+):(allow-once|allow-always|deny)$"
+    r"^approve:([^:]+):(allow-once|allow-always|deny)$"
 )
 
 # Pattern: update_prompt:y | update_prompt:n
@@ -159,11 +158,11 @@ class InlineKeyboard:
 # ── INTERACTION_CREATE parsing ───────────────────────────────────────
 
 def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
-    """Parse approval ``button_data`` into ``(session_key, decision)``.
+    """Parse approval ``button_data`` into ``(approval_id, decision)``.
 
     :param button_data: Raw ``data.resolved.button_data`` from
         ``INTERACTION_CREATE``.
-    :returns: ``(session_key, decision)`` or ``None`` if not an approval button.
+    :returns: ``(approval_id, decision)`` or ``None`` if not an approval button.
     """
     m = _APPROVAL_DATA_RE.match(button_data or "")
     if not m:
@@ -201,31 +200,31 @@ def _make_callback_button(
     )
 
 
-def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -> InlineKeyboard:
+def build_approval_keyboard(approval_id: str, *, allow_permanent: bool = True) -> InlineKeyboard:
     """Build the approval keyboard, hiding persistent scope when unavailable.
 
     Layout: ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` — all three share
     ``group_id='approval'`` so clicking one greys out the rest.
 
-    :param session_key: Embedded into ``button_data`` so the decision
-        routes back to the right pending approval.
+    :param approval_id: Opaque adapter-local callback id. Session authority is
+        looked up from server-side pending state, never from button data.
     """
     buttons = [
         _make_callback_button(
             btn_id="allow", label="✅ 允许一次", visited_label="已允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-once",
+            data=f"{APPROVAL_BUTTON_PREFIX}{approval_id}:allow-once",
             style=1, group_id="approval",
         )
     ]
     if allow_permanent:
         buttons.append(_make_callback_button(
             btn_id="always", label="⭐ 始终允许", visited_label="已始终允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-always",
+            data=f"{APPROVAL_BUTTON_PREFIX}{approval_id}:allow-always",
             style=1, group_id="approval",
         ))
     buttons.append(_make_callback_button(
         btn_id="deny", label="❌ 拒绝", visited_label="已拒绝",
-        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:deny",
+        data=f"{APPROVAL_BUTTON_PREFIX}{approval_id}:deny",
         style=0, group_id="approval",
     ))
     return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
@@ -265,7 +264,8 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
 class ApprovalRequest:
     """Structured approval-request display data.
 
-    :param session_key: Routes the decision back to the waiting caller.
+    :param session_key: Server-side authority for the waiting caller.
+    :param approval_id: Opaque callback id embedded into ``button_data``.
     :param title: Short title at the top.
     :param description: Optional longer description.
     :param command_preview: Command text (exec approvals).
@@ -283,6 +283,7 @@ class ApprovalRequest:
     severity: str = ""
     timeout_sec: int = 120
     allow_permanent: bool = True
+    approval_id: str = ""
 
 
 def build_approval_text(req: ApprovalRequest) -> str:
@@ -367,12 +368,16 @@ class ApprovalSender:
         :param msg_id: Reply-to message id (required for passive messages).
         :returns: ``True`` on success, ``False`` on failure.
         """
+        if not req.approval_id:
+            logger.warning("[%s] Approval request missing callback id", self._log_tag)
+            return False
+
         text = build_approval_text(req)
-        keyboard = build_approval_keyboard(req.session_key)
+        keyboard = build_approval_keyboard(req.approval_id)
 
         logger.info(
-            "[%s] Sending approval request to %s:%s (session=%.20s…)",
-            self._log_tag, chat_type, chat_id, req.session_key,
+            "[%s] Sending approval request to %s chat",
+            self._log_tag, chat_type,
         )
 
         try:
@@ -382,19 +387,19 @@ class ApprovalSender:
                 await self._post_group(chat_id, text, msg_id, keyboard)
             else:
                 logger.warning(
-                    "[%s] Approval: unsupported chat_type %r",
-                    self._log_tag, chat_type,
+                    "[%s] Approval: unsupported chat_type",
+                    self._log_tag,
                 )
                 return False
             logger.info(
-                "[%s] Approval message sent to %s:%s",
-                self._log_tag, chat_type, chat_id,
+                "[%s] Approval message sent",
+                self._log_tag,
             )
             return True
         except Exception as exc:
             logger.error(
-                "[%s] Failed to send approval message to %s:%s: %s",
-                self._log_tag, chat_type, chat_id, exc,
+                "[%s] Failed to send approval message: %s",
+                self._log_tag, exc,
             )
             return False
 

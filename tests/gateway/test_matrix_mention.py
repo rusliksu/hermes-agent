@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, PlatformConfig
 
 # The matrix adapter module is importable without mautrix installed
 # (module-level imports use try/except with stubs).  No need for
@@ -15,18 +15,23 @@ from gateway.config import PlatformConfig
 # needing real mautrix APIs mock them individually.
 
 
-def _make_adapter(tmp_path=None):
+def _make_adapter(tmp_path=None, *, extra=None):
     """Create a MatrixAdapter with mocked config."""
     from plugins.platforms.matrix.adapter import MatrixAdapter
 
+    cfg_extra = {
+        "homeserver": "https://matrix.example.org",
+        "user_id": "@hermes:example.org",
+    }
+    if extra:
+        cfg_extra.update(extra)
     config = PlatformConfig(
         enabled=True,
         token="syt_test_token",
-        extra={
-            "homeserver": "https://matrix.example.org",
-            "user_id": "@hermes:example.org",
-        },
+        extra=cfg_extra,
     )
+    if cfg_extra.pop("_test_profile_scoped", False):
+        setattr(config, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, True)
     adapter = MatrixAdapter(config)
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
     adapter.handle_message = AsyncMock()
@@ -430,6 +435,82 @@ async def test_require_mention_free_response_room(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_profile_scoped_matrix_ignores_poisoned_process_free_response_rooms(monkeypatch):
+    monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
+    monkeypatch.setenv(
+        "MATRIX_FREE_RESPONSE_ROOMS", "!room1:example.org,!room2:example.org"
+    )
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+
+    adapter = _make_adapter(
+        extra={
+            "_test_profile_scoped": True,
+            "require_mention": True,
+            "auto_thread": False,
+        }
+    )
+    event = _make_event("hello without mention", room_id="!room1:example.org")
+
+    await adapter._on_room_message(event)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_direct_matrix_adapter_honors_free_response_env(monkeypatch):
+    monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
+    monkeypatch.setenv("MATRIX_FREE_RESPONSE_ROOMS", "!room1:example.org")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+
+    adapter = _make_adapter()
+    event = _make_event("hello without mention", room_id="!room1:example.org")
+
+    await adapter._on_room_message(event)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_profile_scoped_malformed_falsey_require_mention_keeps_safe_default(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+    caplog.set_level("WARNING", logger="plugins.platforms.matrix.adapter")
+
+    adapter = _make_adapter(
+        extra={
+            "_test_profile_scoped": True,
+            "require_mention": [],
+            "auto_thread": False,
+        }
+    )
+    event = _make_event("hello without mention")
+
+    await adapter._on_room_message(event)
+
+    assert adapter._matrix_profile_scoped is True
+    assert adapter._require_mention is True
+    assert "malformed boolean policy field require_mention" in caplog.text
+    assert "[]" not in caplog.text
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_user_extra_runtime_authority_key_does_not_activate_profile_scoped_mode(
+    monkeypatch,
+):
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+
+    adapter = _make_adapter(
+        extra={"_hermes_runtime_authority": "profile_config"}
+    )
+
+    assert adapter._matrix_profile_scoped is False
+    assert adapter._require_mention is False
+
+
+@pytest.mark.asyncio
 async def test_require_mention_bot_participated_thread(monkeypatch):
     """Threads with prior bot participation bypass mention requirement."""
     monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
@@ -723,6 +804,56 @@ async def test_dm_mention_thread_tracks_participation(monkeypatch):
 
 
 class TestMatrixConfigBridge:
+    def test_yaml_bridge_seeds_platform_config_extra(self, monkeypatch, tmp_path):
+        from gateway.config import Platform, load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "matrix:\n"
+            "  enabled: true\n"
+            "  require_mention: false\n"
+            "  free_response_rooms:\n"
+            "    - '!room1:example.org'\n"
+            "  allowed_rooms:\n"
+            "    - '!room2:example.org'\n"
+            "  allowed_users:\n"
+            "    - '@alice:example.org'\n"
+            "  ignore_user_patterns:\n"
+            "    - '^@_bridge_'\n"
+            "  process_notices: true\n"
+            "  session_scope: room\n"
+            "  auto_thread: false\n"
+            "  dm_mention_threads: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        for name in (
+            "MATRIX_REQUIRE_MENTION",
+            "MATRIX_FREE_RESPONSE_ROOMS",
+            "MATRIX_ALLOWED_ROOMS",
+            "MATRIX_ALLOWED_USERS",
+            "MATRIX_IGNORE_USER_PATTERNS",
+            "MATRIX_PROCESS_NOTICES",
+            "MATRIX_SESSION_SCOPE",
+            "MATRIX_AUTO_THREAD",
+            "MATRIX_DM_MENTION_THREADS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.MATRIX].extra
+        assert extra["require_mention"] is False
+        assert extra["free_response_rooms"] == ["!room1:example.org"]
+        assert extra["allowed_rooms"] == ["!room2:example.org"]
+        assert extra["allowed_users"] == ["@alice:example.org"]
+        assert extra["ignore_user_patterns"] == ["^@_bridge_"]
+        assert extra["process_notices"] is True
+        assert extra["session_scope"] == "room"
+        assert extra["auto_thread"] is False
+        assert extra["dm_mention_threads"] is True
+
     def test_yaml_bridge_sets_env_vars(self, monkeypatch, tmp_path):
         """Matrix YAML config should bridge to env vars."""
         monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)

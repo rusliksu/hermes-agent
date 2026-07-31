@@ -70,6 +70,14 @@ from hermes_constants import agent_browser_runnable, get_hermes_home
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+from agent.runtime_browser import (
+    browser_request_authority,
+    browser_scope_fingerprint,
+    browser_scoped_task_key,
+    _contained_profile_path,
+    sanitize_browser_env_for_typed,
+    typed_browser_home,
+)
 
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
@@ -99,6 +107,9 @@ def _build_browser_env() -> dict:
     from tools.environments.local import hermes_subprocess_env
 
     env = hermes_subprocess_env(inherit_credentials=False)
+    authority = browser_request_authority()
+    if authority is not None:
+        return sanitize_browser_env_for_typed(env, authority)
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
@@ -193,7 +204,7 @@ def _discover_homebrew_node_dirs() -> tuple[str, ...]:
 
 def _browser_candidate_path_dirs() -> list[str]:
     """Return ordered browser CLI PATH candidates shared by discovery and execution."""
-    hermes_home = get_hermes_home()
+    hermes_home = typed_browser_home() or get_hermes_home()
     hermes_node_bin = str(hermes_home / "node" / "bin")
     hermes_node_root = str(hermes_home / "node")
     hermes_nm_bin = str(hermes_home / "node_modules" / ".bin")
@@ -213,6 +224,19 @@ def _merge_browser_path(existing_path: str = "") -> str:
             prefix_parts.append(part)
 
     return os.pathsep.join(prefix_parts + path_parts)
+
+
+def _browser_subprocess_path(existing_path: str = "") -> str:
+    if browser_request_authority() is not None:
+        return _merge_browser_path("")
+    return _merge_browser_path(existing_path)
+
+
+def _npx_browser_executable() -> str:
+    if browser_request_authority() is not None:
+        typed_path = _merge_browser_path("")
+        return shutil.which("npx", path=typed_path) or "npx"
+    return shutil.which("npx") or "npx"
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -468,6 +492,10 @@ def _get_cdp_override() -> str:
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
     """
+    authority = browser_request_authority()
+    if authority is not None:
+        return _resolve_cdp_override(authority.cdp_url)
+
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
         return _resolve_cdp_override(env_override)
@@ -680,6 +708,9 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     ``_is_legacy_provider_registry_overridden``.
     """
     global _cached_cloud_provider, _cloud_provider_resolved
+    authority = browser_request_authority()
+    if authority is not None:
+        return authority.cloud_provider
     if _cloud_provider_resolved:
         return _cached_cloud_provider
 
@@ -809,6 +840,10 @@ def _is_local_backend() -> bool:
     that the terminal cannot.  In this case, SSRF protection should be
     enabled even though the browser is technically "local".
     """
+    authority = browser_request_authority()
+    if authority is not None:
+        return False
+
     # A CDP override points the browser at a separate Chrome process whose
     # network position is not guaranteed to match the terminal (it may live
     # off-host). Don't treat it as a trusted local backend — otherwise a
@@ -851,6 +886,9 @@ def _get_browser_engine() -> str:
     renderer (no screenshots).
     """
     global _cached_browser_engine, _browser_engine_resolved
+    authority = browser_request_authority()
+    if authority is not None:
+        return authority.browser_engine()
     if _browser_engine_resolved:
         return _cached_browser_engine
 
@@ -1053,7 +1091,7 @@ def _run_chrome_fallback_command(
     # bare container), fall back to the bare name and let Popen raise with
     # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = _npx_browser_executable()
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -1063,7 +1101,7 @@ def _run_chrome_fallback_command(
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
-    browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+    browser_env["PATH"] = _browser_subprocess_path(browser_env.get("PATH", ""))
 
     if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
@@ -1182,6 +1220,9 @@ def _auto_local_for_private_urls() -> bool:
     to use the cloud provider in the same conversation.
     """
     global _auto_local_for_private_urls_resolved, _cached_auto_local_for_private_urls
+    authority = browser_request_authority()
+    if authority is not None:
+        return authority.auto_local_for_private_urls
     if _auto_local_for_private_urls_resolved:
         return _cached_auto_local_for_private_urls
 
@@ -1279,6 +1320,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
+    task_id = browser_scoped_task_key(task_id)
     if _get_cdp_override():
         return task_id
     if _is_camofox_mode():
@@ -1318,6 +1360,10 @@ def _session_info_owned_by_task(session_info: Dict[str, Any], task_id: str, sess
         return False
     if key is not None and key != session_key:
         return False
+    current_fingerprint = browser_scope_fingerprint()
+    stored_fingerprint = session_info.get("access_fingerprint")
+    if current_fingerprint is not None and stored_fingerprint != current_fingerprint:
+        return False
     return True
 
 
@@ -1333,6 +1379,7 @@ def _last_session_key(task_id: str) -> str:
     """
     if task_id is None:
         task_id = "default"
+    task_id = browser_scoped_task_key(task_id)
     recorded_key = _last_active_session_key.get(task_id)
     if not recorded_key:
         return task_id
@@ -1356,6 +1403,9 @@ def _allow_private_urls() -> bool:
     for the process lifetime.  Defaults to ``False`` (SSRF protection active).
     """
     global _cached_allow_private_urls, _allow_private_urls_resolved
+    authority = browser_request_authority()
+    if authority is not None:
+        return authority.allow_private_urls
     if _allow_private_urls_resolved:
         return _cached_allow_private_urls
 
@@ -2026,6 +2076,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     """
     if task_id is None:
         task_id = "default"
+    access_fingerprint = browser_scope_fingerprint()
 
     # Start the cleanup thread if not running (handles inactivity timeouts)
     _start_browser_cleanup_thread()
@@ -2036,7 +2087,10 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     with _cleanup_lock:
         # Check if we already have a session for this task
         if task_id in _active_sessions:
-            return _active_sessions[task_id]
+            existing = _active_sessions[task_id]
+            if _session_info_owned_by_task(existing, _bare_task_id_for_session_key(task_id), task_id):
+                return existing
+            raise ValueError("typed browser session authority mismatch")
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2092,10 +2146,15 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         # were doing the network call. Use the existing one to avoid leaking
         # orphan cloud sessions.
         if task_id in _active_sessions:
-            return _active_sessions[task_id]
+            existing = _active_sessions[task_id]
+            if _session_info_owned_by_task(existing, _bare_task_id_for_session_key(task_id), task_id):
+                return existing
+            raise ValueError("typed browser session authority mismatch")
         session_info = dict(session_info)
         session_info.setdefault("session_key", task_id)
         session_info.setdefault("owner_task_id", _bare_task_id_for_session_key(task_id))
+        if access_fingerprint is not None:
+            session_info["access_fingerprint"] = access_fingerprint
         _active_sessions[task_id] = session_info
 
     # Lazy-start the CDP supervisor now that the session exists (if the
@@ -2131,7 +2190,9 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         FileNotFoundError: If agent-browser is not installed
     """
     global _cached_agent_browser, _agent_browser_resolved
-    if _agent_browser_resolved:
+    authority = browser_request_authority()
+    use_global_cache = authority is None
+    if use_global_cache and _agent_browser_resolved:
         if _cached_agent_browser is None:
             raise FileNotFoundError(
                 "agent-browser CLI not found (cached). Install it with: "
@@ -2154,16 +2215,17 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     # the next working resolution (extended PATH → local .bin → npx) instead of
     # caching the broken one and silently killing every browser tool.
 
-    # Check if it's in PATH (global install)
-    which_result = shutil.which("agent-browser")
-    if which_result and (
-        agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
-    ):
-        if not validate:
+    if authority is None:
+        # Check if it's in PATH (global install)
+        which_result = shutil.which("agent-browser")
+        if which_result and (
+            agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
+        ):
+            if not validate:
+                return which_result
+            _cached_agent_browser = which_result
+            _agent_browser_resolved = True
             return which_result
-        _cached_agent_browser = which_result
-        _agent_browser_resolved = True
-        return which_result
 
     # Build an extended search PATH including Hermes-managed Node, macOS
     # versioned Homebrew installs, and fallback system dirs like Termux.
@@ -2175,8 +2237,9 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return which_result
-            _cached_agent_browser = which_result
-            _agent_browser_resolved = True
+            if use_global_cache:
+                _cached_agent_browser = which_result
+                _agent_browser_resolved = True
             return which_result
 
     # Check local node_modules/.bin/ (npm install in repo root).
@@ -2196,20 +2259,22 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         ):
             if not validate:
                 return local_which
-            _cached_agent_browser = local_which
-            _agent_browser_resolved = True
-            return _cached_agent_browser
+            if use_global_cache:
+                _cached_agent_browser = local_which
+                _agent_browser_resolved = True
+            return local_which
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
+    npx_path = shutil.which("npx") if authority is None else None
     if not npx_path and extended_path:
         npx_path = shutil.which("npx", path=extended_path)
     if npx_path:
         if not validate:
             return "npx agent-browser"
-        _cached_agent_browser = "npx agent-browser"
-        _agent_browser_resolved = True
-        return _cached_agent_browser
+        if use_global_cache:
+            _cached_agent_browser = "npx agent-browser"
+            _agent_browser_resolved = True
+        return "npx agent-browser"
 
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")
@@ -2218,22 +2283,25 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     try:
         from hermes_cli.dep_ensure import ensure_dependency
         if ensure_dependency("browser"):
+            browser_home = typed_browser_home() or get_hermes_home()
             candidates = [
-                shutil.which("agent-browser"),
+                shutil.which("agent-browser") if authority is None else None,
                 shutil.which("agent-browser", path=extended_path) if extended_path else None,
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node_modules" / ".bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node" / "bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node")),
+                shutil.which("agent-browser", path=str(browser_home / "node_modules" / ".bin")),
+                shutil.which("agent-browser", path=str(browser_home / "node" / "bin")),
+                shutil.which("agent-browser", path=str(browser_home / "node")),
             ]
             for recheck in candidates:
                 if recheck and agent_browser_runnable(recheck):
-                    _cached_agent_browser = recheck
-                    _agent_browser_resolved = True
+                    if use_global_cache:
+                        _cached_agent_browser = recheck
+                        _agent_browser_resolved = True
                     return recheck
     except Exception:
         pass
 
-    _agent_browser_resolved = True
+    if use_global_cache:
+        _agent_browser_resolved = True
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: "
         f"{_browser_install_hint()}\n"
@@ -2362,7 +2430,7 @@ def _run_browser_command(
     # Only the synthetic npx fallback needs to expand into multiple argv items.
     # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
     if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
+        _npx_bin = _npx_browser_executable()
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
         cmd_prefix = [browser_cmd]
@@ -2391,7 +2459,7 @@ def _run_browser_command(
 
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
-        browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+        browser_env["PATH"] = _browser_subprocess_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
         # Tell the agent-browser daemon to self-terminate after being idle
@@ -2798,6 +2866,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": "Blocked: URL contains what appears to be an API key or token. "
                      "Secrets must not be sent in URLs.",
         })
+    try:
+        browser_request_authority()
+    except ValueError as exc:
+        return json.dumps({
+            "success": False,
+            "error": f"Blocked: typed browser authority denied ({exc})",
+        })
 
     # SSRF protection — block private/internal addresses before navigating.
     # Skipped for local backends (Camofox, headless Chromium without a cloud
@@ -3012,7 +3087,10 @@ def browser_snapshot(
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
+    blocked = _blocked_private_page_read(effective_task_id, "read a page snapshot")
+    if blocked is not None:
+        return blocked
 
     # Build command args based on full flag
     args = []
@@ -3107,7 +3185,7 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
     blocked = _blocked_private_page_action(effective_task_id, "click")
     if blocked is not None:
         return blocked
@@ -3148,7 +3226,7 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
     blocked = _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
@@ -3222,7 +3300,10 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             result = camofox_scroll(direction, task_id)
         return result
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
+    blocked = _blocked_private_page_action(effective_task_id, "scroll")
+    if blocked is not None:
+        return blocked
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -3253,7 +3334,7 @@ def browser_back(task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
     result = _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -3271,9 +3352,8 @@ def browser_back(task_id: Optional[str] = None) -> str:
                 return json.dumps({
                     "success": False,
                     "error": (
-                        "Blocked: page URL targets a private or internal address "
-                        f"({_blocked_url}). Browser history navigation (back) "
-                        "landed on this address."
+                        "Blocked: browser history navigation (back) landed on "
+                        "a private or internal address."
                     ),
                 }, ensure_ascii=False)
         data = result.get("data", {})
@@ -3305,7 +3385,7 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
     blocked = _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
@@ -3342,6 +3422,22 @@ def _blocked_private_page_action(effective_task_id: str, action: str) -> Optiona
     }, ensure_ascii=False)
 
 
+def _blocked_private_page_read(effective_task_id: str, action: str) -> Optional[str]:
+    """Return a blocked payload before a content-returning browser read."""
+    if not _eval_ssrf_guard_active(effective_task_id):
+        return None
+    blocked_url = _current_page_private_url(effective_task_id)
+    if not blocked_url:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": (
+            "Blocked: page URL targets a private or internal address. "
+            f"Refusing to {action} in this browser mode."
+        ),
+    }, ensure_ascii=False)
+
+
 def browser_console(clear: bool = False, expression: Optional[str] = None, task_id: Optional[str] = None) -> str:
     """Get browser console messages and JavaScript errors, or evaluate JS in the page.
 
@@ -3369,7 +3465,7 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
 
     if _eval_ssrf_guard_active(effective_task_id):
         _blocked_url = _current_page_private_url(effective_task_id)
@@ -3642,7 +3738,7 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
 
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
 
     if _eval_ssrf_guard_active(effective_task_id):
         blocked_literal = _expression_targets_private_url(expression)
@@ -3931,7 +4027,10 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
+    blocked = _blocked_private_page_read(effective_task_id, "extract page images")
+    if blocked is not None:
+        return blocked
 
     # Use eval to run JavaScript that extracts images
     js_code = """JSON.stringify(
@@ -4023,7 +4122,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(browser_scoped_task_key(task_id or "default"))
 
     # ── Private-network guard: block vision from eval-navigated private pages ──
     # After any eval (browser_console) that may have changed location.href to a
@@ -4360,6 +4459,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
     if task_id is None:
         task_id = "default"
+    task_id = browser_scoped_task_key(task_id)
 
     # Expand to the full set of session keys to reap. For a bare task_id
     # that includes the cloud/primary key + the local sidecar if one exists.
@@ -4523,17 +4623,24 @@ def _chromium_search_roots() -> List[str]:
        on Windows.
     """
     roots: List[str] = []
-    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-    if env_path and env_path != "0":
-        roots.append(env_path)
-    home = os.path.expanduser("~")
+    authority = browser_request_authority()
+    if authority is None:
+        env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_path and env_path != "0":
+            roots.append(env_path)
+        home = os.path.expanduser("~")
+    else:
+        home = str(authority.profile_home)
     roots.append(os.path.join(home, ".cache", "ms-playwright"))
     if sys.platform == "darwin":
         roots.append(os.path.join(home, "Library", "Caches", "ms-playwright"))
     if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA") or os.path.join(
-            home, "AppData", "Local"
-        )
+        if authority is None:
+            local = os.environ.get("LOCALAPPDATA") or os.path.join(
+                home, "AppData", "Local"
+            )
+        else:
+            local = str(_contained_profile_path(authority.profile_home, "AppData", "Local"))
         roots.append(os.path.join(local, "ms-playwright"))
     return roots
 
@@ -4558,25 +4665,35 @@ def _chromium_installed() -> bool:
     fail at runtime.
     """
     global _cached_chromium_installed
-    if _cached_chromium_installed is not None:
+    authority = browser_request_authority()
+    use_global_cache = authority is None
+    if use_global_cache and _cached_chromium_installed is not None:
         return _cached_chromium_installed
 
-    # 1. AGENT_BROWSER_EXECUTABLE_PATH — explicit user-configured browser
-    ab_path = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
-    if ab_path:
-        if os.path.isfile(ab_path) or shutil.which(ab_path):
-            _cached_chromium_installed = True
-            return True
+    # 1. AGENT_BROWSER_EXECUTABLE_PATH — explicit user-configured browser.
+    # Typed multiplex contexts do not inherit process-global browser paths.
+    if authority is None:
+        ab_path = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip()
+        if ab_path:
+            if os.path.isfile(ab_path) or shutil.which(ab_path):
+                _cached_chromium_installed = True
+                return True
 
     # 2. System Chrome/Chromium in PATH (common names)
+    which_kwargs = (
+        {}
+        if authority is None
+        else {"path": _browser_subprocess_path("")}
+    )
     system_chrome = (
-        shutil.which("google-chrome")
-        or shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("chrome")
+        shutil.which("google-chrome", **which_kwargs)
+        or shutil.which("chromium", **which_kwargs)
+        or shutil.which("chromium-browser", **which_kwargs)
+        or shutil.which("chrome", **which_kwargs)
     )
     if system_chrome:
-        _cached_chromium_installed = True
+        if use_global_cache:
+            _cached_chromium_installed = True
         return True
 
     # 3. Playwright browser cache (legacy — chromium-* / chromium_headless_shell-* dirs)
@@ -4593,10 +4710,12 @@ def _chromium_installed() -> bool:
             if entry.startswith("chromium-") or entry.startswith(
                 "chromium_headless_shell-"
             ):
-                _cached_chromium_installed = True
+                if use_global_cache:
+                    _cached_chromium_installed = True
                 return True
 
-    _cached_chromium_installed = False
+    if use_global_cache:
+        _cached_chromium_installed = False
     return False
 
 
@@ -4639,7 +4758,7 @@ def _maybe_autoinstall_chromium() -> bool:
         return False
 
     if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+        install_cmd = [_npx_browser_executable(), "-y", "agent-browser", "install"]
     else:
         install_cmd = [browser_cmd, "install"]
 

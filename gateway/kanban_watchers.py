@@ -112,6 +112,60 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _kanban_registry_delivery_source(self, sub: dict, task) -> tuple[bool, Any]:
+        """Validate a kanban callback against the persisted originating source."""
+        if getattr(self, "access_registry", None) is None:
+            return True, None
+
+        def _deny(reason: str) -> tuple[bool, None]:
+            logger.warning(
+                "kanban notifier: AccessRegistry callback denied: reason=%s",
+                reason,
+            )
+            return False, None
+
+        if task is None:
+            return _deny("missing_task")
+        session_id = getattr(task, "session_id", None)
+        if not session_id:
+            return _deny("missing_origin_session_id")
+        lookup = getattr(getattr(self, "session_store", None), "lookup_by_session_id", None)
+        if not callable(lookup):
+            return _deny("session_lookup_unavailable")
+        try:
+            entry = lookup(str(session_id))
+        except Exception:
+            return _deny("session_lookup_failed")
+        source = getattr(entry, "origin", None) if entry is not None else None
+        if source is None:
+            return _deny("missing_session_origin")
+
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+        )
+        if not self._allow_access_registry_ingress(event):
+            return _deny("internal_ingress_denied")
+        canonical = event.source
+        platform = getattr(getattr(canonical, "platform", None), "value", None)
+        if (sub.get("platform") or "").lower() != (platform or "").lower():
+            return _deny("subscription_platform_mismatch")
+        if str(sub.get("chat_id") or "") != str(getattr(canonical, "chat_id", "") or ""):
+            return _deny("subscription_chat_mismatch")
+        if str(sub.get("thread_id") or "") != str(getattr(canonical, "thread_id", "") or ""):
+            return _deny("subscription_thread_mismatch")
+        sub_profile = str(sub.get("notifier_profile") or "").strip()
+        if sub_profile and sub_profile != str(getattr(canonical, "profile", "") or ""):
+            return _deny("subscription_profile_mismatch")
+        sub_user = str(sub.get("user_id") or "").strip()
+        if sub_user and sub_user != str(getattr(canonical, "user_id", "") or ""):
+            return _deny("subscription_user_mismatch")
+        return True, canonical
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -186,8 +240,9 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        registry_mode = getattr(self, "access_registry", None) is not None
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
-        if not notifier_profile:
+        if not notifier_profile and not registry_mode:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
@@ -198,11 +253,13 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
-                    active_platforms = {
-                        getattr(platform, "value", str(platform)).lower()
-                        for platform in self.adapters.keys()
-                    }
-                    if not active_platforms:
+                    active_platforms: set[str] = set()
+                    if not registry_mode:
+                        active_platforms = {
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in self.adapters.keys()
+                        }
+                    if not registry_mode and not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
 
@@ -252,22 +309,23 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
+                                if not registry_mode:
+                                    owner_profile = sub.get("notifier_profile") or None
+                                    if owner_profile and owner_profile != notifier_profile:
+                                        _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
+                                        if not _owner_adapters:
+                                            logger.debug(
+                                                "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
+                                                sub.get("task_id"), owner_profile, notifier_profile,
+                                            )
+                                            continue
+                                    platform = (sub.get("platform") or "").lower()
+                                    if platform not in active_platforms:
                                         logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
+                                            "kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                                            sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
-                                    continue
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -301,26 +359,49 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
+                    allowed, canonical_source = self._kanban_registry_delivery_source(sub, task)
+                    task_terminal = task and task.status in {"done", "archived"}
+                    if not allowed:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
+                        if task_terminal:
+                            await asyncio.to_thread(
+                                self._kanban_unsub, sub, board_slug,
+                            )
                         continue
-                    sub_profile = sub.get("notifier_profile") or ""
-                    # Route via the SAME chokepoint the authorization path uses
-                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
-                    # profile with its own adapter-registry entry must be served
-                    # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
-                    # secondary profile's task notification is delivered by the
-                    # wrong bot (the cross-profile mis-delivery this whole change
-                    # exists to fix). The helper returns None only when the profile
-                    # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if canonical_source is not None:
+                        plat = canonical_source.platform
+                        platform_str = getattr(plat, "value", str(plat)).lower()
+                        sub_profile = getattr(canonical_source, "profile", None) or ""
+                        chat_id = canonical_source.chat_id
+                        thread_id = getattr(canonical_source, "thread_id", None) or ""
+                        user_id = getattr(canonical_source, "user_id", None)
+                        adapter = self._adapter_for_source(canonical_source)
+                    else:
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            # Unknown platform string; skip and advance cursor so
+                            # we don't replay forever.
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        sub_profile = sub.get("notifier_profile") or ""
+                        chat_id = sub["chat_id"]
+                        thread_id = sub.get("thread_id") or ""
+                        user_id = sub.get("user_id")
+                        # Route via the SAME chokepoint the authorization path uses
+                        # (gateway/authz_mixin.py::_authorization_adapter): a stamped
+                        # profile with its own adapter-registry entry must be served
+                        # by THAT profile's same-platform adapter and must NOT silently
+                        # fall back to the default profile's adapter — otherwise a
+                        # secondary profile's task notification is delivered by the
+                        # wrong bot (the cross-profile mis-delivery this whole change
+                        # exists to fix). The helper returns None only when the profile
+                        # (or default) genuinely has no adapter for the platform.
+                        adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -406,15 +487,15 @@ class GatewayKanbanWatchersMixin:
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
-                            metadata["thread_id"] = sub["thread_id"]
+                        if thread_id:
+                            metadata["thread_id"] = thread_id
                         sub_key = (
-                            sub["task_id"], sub["platform"],
-                            sub["chat_id"], sub.get("thread_id") or "",
+                            sub["task_id"], platform_str,
+                            chat_id, thread_id,
                         )
                         try:
                             await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                chat_id, msg, metadata=metadata,
                             )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -433,7 +514,7 @@ class GatewayKanbanWatchersMixin:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
-                                        chat_id=sub["chat_id"],
+                                        chat_id=chat_id,
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
@@ -488,7 +569,6 @@ class GatewayKanbanWatchersMixin:
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
@@ -514,31 +594,17 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
-                                    _source = SessionSource(
-                                        platform=plat,
-                                        chat_id=sub["chat_id"],
-                                        chat_type="group",
-                                        thread_id=sub.get("thread_id") or None,
-                                        user_id=sub.get("user_id"),
-                                        profile=sub_profile or None,
-                                    )
+                                    if canonical_source is not None:
+                                        _source = canonical_source
+                                    else:
+                                        _source = SessionSource(
+                                            platform=plat,
+                                            chat_id=chat_id,
+                                            chat_type="group",
+                                            thread_id=thread_id or None,
+                                            user_id=user_id,
+                                            profile=sub_profile or None,
+                                        )
                                     _synth_event = MessageEvent(
                                         text=_synth,
                                         message_type=MessageType.TEXT,

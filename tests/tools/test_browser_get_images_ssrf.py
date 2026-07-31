@@ -40,7 +40,7 @@ def test_blocks_images_on_private_page(monkeypatch):
     result = json.loads(browser_tool.browser_get_images(task_id="test"))
     assert result["success"] is False
     assert "private or internal address" in result["error"]
-    assert PRIVATE_URL in result["error"]
+    assert PRIVATE_URL not in result["error"]
 
 
 def test_allows_images_on_public_page(monkeypatch):

@@ -222,17 +222,9 @@ def _data_url_to_input_image_url(value: str) -> str:
 
 def _local_image_to_data_url(value: str) -> str:
     """Read a local image path and return a validated data:image URL."""
-    try:
-        from agent.file_safety import get_read_block_error
+    from agent.file_safety import raise_if_read_blocked
 
-        blocked = get_read_block_error(value)
-        if blocked:
-            raise ValueError(blocked)
-    except ValueError:
-        raise
-    except Exception as exc:
-        logger.debug("Codex image input read guard unavailable: %s", exc)
-
+    raise_if_read_blocked(value)
     path = Path(os.path.expanduser(value)).resolve()
     if not path.is_file():
         raise ValueError(f"Image input path does not exist or is not a file: {value}")

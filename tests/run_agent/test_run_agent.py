@@ -3083,8 +3083,18 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                allow_unlisted_tool_search_call=False,
             )
             assert result == "result"
+
+    def test_invoke_tool_empty_tool_surface_passes_empty_enabled_tools(self, agent):
+        """An agent with no valid tools must deny direct tool dispatch."""
+        agent.valid_tool_names = set()
+        with patch("run_agent.handle_function_call", return_value="denied") as mock_hfc:
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        assert mock_hfc.call_args.kwargs["enabled_tools"] == []
+        assert result == "denied"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

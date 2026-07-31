@@ -15,6 +15,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.access_registry import (
+    AccessDeniedError,
+    DeliveryTarget,
+    RedactedAuditMetadata,
+    ResolvedAccessContext,
+)
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -23,6 +29,22 @@ from gateway.single_principal import SinglePrincipalPolicy
 
 OWNER = "10001"
 FAMILY = "30003"
+
+
+def _make_context() -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="raw-principal-sentinel",
+        role_id="owner",
+        profile_id="raw-profile-sentinel",
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="raw-account-sentinel",
+            peer_kind="dm",
+            chat_id="c1",
+        ),
+    )
 
 
 def _make_source(user_id: str = "u1") -> SessionSource:
@@ -170,6 +192,42 @@ async def test_gate_on_pending_confirm_registered(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_registry_missing_context_denied_before_pending_registration_and_send(caplog):
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner.access_registry = MagicMock()
+    runner.access_registry.validate_resolved_context.side_effect = AccessDeniedError(
+        "missing_resolved_access_context",
+        RedactedAuditMetadata.from_delivery_target("validate_context", None),
+    )
+    runner._session_key_for_source = MagicMock(
+        side_effect=AssertionError("session key must not be built after denial")
+    )
+    session_key = build_session_key(_make_source())
+    _slash_confirm_mod.clear(session_key)
+
+    with caplog.at_level("WARNING"):
+        result = await runner._request_slash_confirm(
+            event=_make_event("/new"),
+            command="new",
+            title="/new",
+            message="confirm",
+            handler=AsyncMock(return_value="must not run"),
+        )
+
+    assert result is None
+    runner.access_registry.validate_resolved_context.assert_called_once_with(None)
+    runner._session_key_for_source.assert_not_called()
+    runner.adapters[Platform.TELEGRAM].send_slash_confirm.assert_not_awaited()
+    assert _slash_confirm_mod.get_pending(session_key) is None
+    assert "reason=missing_resolved_access_context" in caplog.text
+    assert "raw-" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_resolve_once_runs_execute_and_returns_result():
     """Resolving the pending confirm with 'once' runs the destructive
     action and returns its output."""
@@ -201,6 +259,89 @@ async def test_resolve_once_runs_execute_and_returns_result():
     assert resolved == "✨ fresh session"
     # Pending should be cleared after resolve.
     assert _slash_confirm_mod.get_pending(session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_registry_stale_context_denied_at_resolution_consumes_pending(caplog):
+    from tools import slash_confirm as _slash_confirm_mod
+
+    context = _make_context()
+    runner = _make_runner()
+    runner.access_registry = MagicMock()
+    runner.access_registry.validate_resolved_context.side_effect = [
+        context,
+        AccessDeniedError(
+            "resolved_access_context_mismatch",
+            RedactedAuditMetadata.from_delivery_target(
+                "validate_context", context.delivery_target
+            ),
+        ),
+    ]
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda src: session_key
+    _slash_confirm_mod.clear(session_key)
+    raw_handler = AsyncMock(return_value="must not run")
+    event = _make_event("/new")
+    event.source.resolved_access_context = context
+
+    await runner._request_slash_confirm(
+        event=event,
+        command="new",
+        title="/new",
+        message="confirm",
+        handler=raw_handler,
+    )
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+
+    with caplog.at_level("WARNING"):
+        resolved = await _slash_confirm_mod.resolve(
+            session_key, pending["confirm_id"], "once",
+        )
+
+    assert resolved is None
+    raw_handler.assert_not_awaited()
+    assert _slash_confirm_mod.get_pending(session_key) is None
+    assert runner.access_registry.validate_resolved_context.call_count == 2
+    assert "reason=resolved_access_context_mismatch" in caplog.text
+    assert "raw-" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_registry_current_context_executes_once():
+    from tools import slash_confirm as _slash_confirm_mod
+
+    context = _make_context()
+    runner = _make_runner()
+    runner.access_registry = MagicMock()
+    runner.access_registry.validate_resolved_context.return_value = context
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda src: session_key
+    _slash_confirm_mod.clear(session_key)
+    raw_handler = AsyncMock(return_value="executed")
+    event = _make_event("/new")
+    event.source.resolved_access_context = context
+
+    await runner._request_slash_confirm(
+        event=event,
+        command="new",
+        title="/new",
+        message="confirm",
+        handler=raw_handler,
+    )
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+
+    resolved = await _slash_confirm_mod.resolve(
+        session_key, pending["confirm_id"], "once",
+    )
+
+    raw_handler.assert_awaited_once_with("once")
+    assert resolved == "executed"
+    assert _slash_confirm_mod.get_pending(session_key) is None
+    assert runner.access_registry.validate_resolved_context.call_count == 2
 
 
 @pytest.mark.asyncio

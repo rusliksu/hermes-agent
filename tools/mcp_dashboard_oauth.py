@@ -14,8 +14,18 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
+
+
+async def _wait_event_async(event: threading.Event, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+    return True
 
 
 @dataclass
@@ -25,6 +35,8 @@ class DashboardOAuthFlow:
     profile: str | None
     hermes_home: str
     redirect_uri: str
+    access_context: Any = None
+    pool_key: Any = None
     reconnect_live: bool = False
     created_at: float = field(default_factory=time.time)
     status: str = "starting"
@@ -52,7 +64,7 @@ class DashboardOAuthFlow:
             self._authorization_ready.set()
 
     async def wait_for_authorization_url(self, timeout: float = 30.0) -> str:
-        ready = await asyncio.to_thread(self._authorization_ready.wait, timeout)
+        ready = await _wait_event_async(self._authorization_ready, timeout)
         if not ready:
             raise TimeoutError("Timed out waiting for MCP authorization URL")
         if not self.authorization_url:
@@ -84,7 +96,7 @@ class DashboardOAuthFlow:
             self._callback_ready.set()
 
     async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None]:
-        ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
+        ready = await _wait_event_async(self._callback_ready, timeout)
         if not ready:
             raise TimeoutError("Timed out waiting for MCP OAuth callback")
         if self._callback_error:

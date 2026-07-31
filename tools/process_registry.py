@@ -76,6 +76,25 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def _access_context_event_key() -> str:
+    from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+
+    return ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+
+
+def capture_resolved_access_context_payload() -> Optional[Dict[str, Any]]:
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    try:
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        raise ValueError("malformed_resolved_access_context") from exc
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -85,6 +104,21 @@ def format_uptime_short(seconds: int) -> str:
         return f"{mins}m {secs}s"
     hours, mins = divmod(mins, 60)
     return f"{hours}h {mins}m"
+
+
+@dataclass
+class ProcessNotificationSpec:
+    """Pre-start notification metadata for a background process."""
+    watcher_platform: str = ""
+    watcher_chat_id: str = ""
+    watcher_user_id: str = ""
+    watcher_user_name: str = ""
+    watcher_thread_id: str = ""
+    watcher_message_id: str = ""
+    watcher_interval: int = 0
+    notify_on_complete: bool = False
+    watch_patterns: tuple = ()
+    resolved_access_context: Optional[dict] = None
 
 
 @dataclass
@@ -117,6 +151,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    resolved_access_context: Optional[dict] = None  # Reserved six-field access payload
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -212,6 +247,24 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _apply_notification_spec(
+        session: ProcessSession,
+        notification: Optional[ProcessNotificationSpec],
+    ) -> None:
+        if notification is None:
+            return
+        session.watcher_platform = notification.watcher_platform
+        session.watcher_chat_id = notification.watcher_chat_id
+        session.watcher_user_id = notification.watcher_user_id
+        session.watcher_user_name = notification.watcher_user_name
+        session.watcher_thread_id = notification.watcher_thread_id
+        session.watcher_message_id = notification.watcher_message_id
+        session.watcher_interval = notification.watcher_interval
+        session.notify_on_complete = notification.notify_on_complete
+        session.watch_patterns = list(notification.watch_patterns or ())
+        session.resolved_access_context = notification.resolved_access_context
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -311,9 +364,17 @@ class ProcessRegistry:
 
         if return_early:
             if should_disable:
+                try:
+                    self._write_checkpoint()
+                except Exception:
+                    logger.debug(
+                        "Failed to checkpoint watch-disabled transition for %s",
+                        session.id,
+                        exc_info=True,
+                    )
                 # Emit exactly one "watch disabled, falling back to notify_on_complete"
                 # summary event so the agent/user sees why things went quiet.
-                self.completion_queue.put({
+                evt = {
                     "session_id": session.id,
                     "session_key": session.session_key,
                     "command": session.command,
@@ -332,7 +393,10 @@ class ProcessRegistry:
                         f"Falling back to notify_on_complete semantics; you'll get "
                         f"exactly one notification when the process exits."
                     ),
-                })
+                }
+                if session.resolved_access_context is not None:
+                    evt[_access_context_event_key()] = session.resolved_access_context
+                self.completion_queue.put(evt)
             return
 
         # Trim matched output to a reasonable size
@@ -344,7 +408,7 @@ class ProcessRegistry:
         if not self._global_watch_admit(now):
             return
 
-        self.completion_queue.put({
+        evt = {
             "session_id": session.id,
             "session_key": session.session_key,
             "command": session.command,
@@ -358,7 +422,10 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
-        })
+        }
+        if session.resolved_access_context is not None:
+            evt[_access_context_event_key()] = session.resolved_access_context
+        self.completion_queue.put(evt)
 
     def _global_watch_admit(self, now: float) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
@@ -686,6 +753,14 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    @staticmethod
+    def _terminate_env_pid(env: Any, pid: int) -> None:
+        """Terminate a sandbox PID through the environment without interpolating user input."""
+        safe_pid = int(pid)
+        if safe_pid <= 0:
+            raise ValueError("invalid sandbox pid")
+        env.execute(f"kill {safe_pid} 2>/dev/null", timeout=5)
+
     def spawn_local(
         self,
         command: str,
@@ -694,6 +769,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notification: Optional[ProcessNotificationSpec] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -713,6 +789,7 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        self._apply_notification_spec(session, notification)
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -735,21 +812,28 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
-                reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
-                    daemon=True,
-                    name=f"proc-pty-reader-{session.id}",
-                )
-                session._reader_thread = reader
-                reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
-                self._write_checkpoint()
+                try:
+                    # PTY reader thread
+                    reader = threading.Thread(
+                        target=self._pty_reader_loop,
+                        args=(session,),
+                        daemon=True,
+                        name=f"proc-pty-reader-{session.id}",
+                    )
+                    session._reader_thread = reader
+                    with self._lock:
+                        self._prune_if_needed()
+                        self._running[session.id] = session
+                    self._write_checkpoint()
+                    reader.start()
+                except Exception:
+                    with self._lock:
+                        self._running.pop(session.id, None)
+                    try:
+                        pty_proc.terminate(force=True)
+                    except Exception:
+                        pass
+                    raise
                 return session
 
             except ImportError:
@@ -787,7 +871,6 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
-            # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -795,17 +878,18 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
-
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
+            with self._lock:
+                self._running.pop(session.id, None)
             try:
                 if not _IS_WINDOWS:
                     try:
@@ -833,6 +917,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notification: Optional[ProcessNotificationSpec] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -855,6 +940,7 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        self._apply_notification_spec(session, notification)
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -905,23 +991,42 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
-
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
-            self._write_checkpoint()
+            try:
+                # Start a poller thread that periodically reads the log file
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+                self._write_checkpoint()
+                reader.start()
+            except Exception:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                try:
+                    self._terminate_env_pid(env, session.pid)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to terminate env background pid %s after setup failure: %s",
+                        session.pid,
+                        exc,
+                    )
+                try:
+                    self._write_checkpoint()
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to clear env background checkpoint after setup failure: %s",
+                        exc,
+                    )
+                raise
+        else:
+            with self._lock:
+                self._prune_if_needed()
 
         return session
 
@@ -1089,7 +1194,7 @@ class ProcessRegistry:
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            evt = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1102,7 +1207,10 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            if session.resolved_access_context is not None:
+                evt[_access_context_event_key()] = session.resolved_access_context
+            self.completion_queue.put(evt)
 
     # ----- Query Methods -----
 
@@ -1549,7 +1657,7 @@ class ProcessRegistry:
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                self._terminate_env_pid(session.env_ref, session.pid)
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -1908,6 +2016,8 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "watch_disabled": s._watch_disabled,
+                            "resolved_access_context": s.resolved_access_context,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1984,8 +2094,10 @@ class ProcessRegistry:
                 watcher_thread_id=entry.get("watcher_thread_id", ""),
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
-                notify_on_complete=entry.get("notify_on_complete", False),
+                notify_on_complete=entry.get("notify_on_complete", False) or bool(entry.get("watch_disabled", False)),
                 watch_patterns=entry.get("watch_patterns", []),
+                _watch_disabled=entry.get("watch_disabled", False),
+                resolved_access_context=entry.get("resolved_access_context"),
             )
             with self._lock:
                 self._running[session.id] = session
@@ -2005,6 +2117,7 @@ class ProcessRegistry:
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
+                    "resolved_access_context": session.resolved_access_context,
                 })
 
         self._write_checkpoint()
@@ -2296,6 +2409,40 @@ def _redact_process_result(result: dict) -> dict:
     return result
 
 
+def _current_process_session_key() -> str:
+    try:
+        from tools.approval import get_current_session_key
+        return get_current_session_key(default="") or ""
+    except Exception:
+        return ""
+
+
+def _process_not_found_result(session_id: str) -> dict:
+    return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+
+def _lookup_process_record(session_id: str) -> Optional[ProcessSession]:
+    with process_registry._lock:
+        return process_registry._running.get(session_id) or process_registry._finished.get(session_id)
+
+
+def _process_record_visible_to_current_context(
+    session: Optional[ProcessSession],
+    *,
+    task_id: Any,
+    session_key: str,
+) -> bool:
+    if session is None:
+        return False
+
+    current_task_id = str(task_id or "")
+    current_session_key = str(session_key or "")
+    return (
+        bool(current_task_id and session.task_id == current_task_id)
+        or bool(current_session_key and session.session_key == current_session_key)
+    )
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2306,11 +2453,7 @@ def _handle_process(args, **kw):
         # Surface session-scoped background processes (e.g. a forgotten
         # preview server) in addition to this task's own — they share the
         # gateway session_key and can block session reset (#29177).
-        try:
-            from tools.approval import get_current_session_key
-            session_key = get_current_session_key(default="") or ""
-        except Exception:
-            session_key = ""
+        session_key = _current_process_session_key()
         return json.dumps(
             {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
             ensure_ascii=False,
@@ -2318,6 +2461,14 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        session_key = _current_process_session_key()
+        target = _lookup_process_record(session_id)
+        if not _process_record_visible_to_current_context(
+            target,
+            task_id=task_id,
+            session_key=session_key,
+        ):
+            return json.dumps(_process_not_found_result(session_id), ensure_ascii=False)
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":

@@ -2,9 +2,29 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock, patch
+
 import pytest
 
 from agent import video_gen_registry
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
+
+
+def _access_context(profile_id="profile-a") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="dm:principal-a",
+        capabilities=frozenset(),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="10001",
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -224,3 +244,29 @@ def test_xai_video_file_input_blocks_credential_store_symlink(tmp_path, monkeypa
 
     with pytest.raises(ValueError, match="credential store"):
         _video_ref_to_xai_url(str(video_link))
+
+
+def test_xai_video_file_input_rejects_typed_sibling_before_read(
+    tmp_path, monkeypatch
+):
+    import plugins.video_gen.xai as xai_plugin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profiles" / "profile-a").mkdir(parents=True)
+    sibling = tmp_path / "profiles" / "profile-b" / "cache" / "videos" / "clip.mp4"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_bytes(b"video")
+    read_bytes = Mock(side_effect=AssertionError("read_bytes called"))
+
+    with (
+        bind_resolved_access_context(_access_context("profile-a")),
+        patch.object(xai_plugin.Path, "read_bytes", read_bytes),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            xai_plugin._video_ref_to_xai_url(str(sibling))
+
+    assert "restricted to the resolved access profile" in str(excinfo.value)
+    assert str(sibling) not in str(excinfo.value)
+    assert "profile-a" not in str(excinfo.value)
+    assert "profile-b" not in str(excinfo.value)
+    read_bytes.assert_not_called()

@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -44,7 +45,11 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, TYPE_CHECKING, Union
+from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from gateway.access_registry import AccessRegistry
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -56,6 +61,16 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from gateway.access_registry import (
+    AccessDeniedError,
+    RedactedAuditMetadata,
+    ResolvedAccessContext,
+    canonical_access_context_fingerprint,
+    deserialize_resolved_access_context,
+    serialize_resolved_access_context,
+    shared_memory_namespace_for_access_context,
+)
+from gateway.handoff import categorize_handoff_failure, resolve_handoff_access_context
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -100,11 +115,26 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
 )
-
-
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+
+def _transport_identity_fingerprint(identity: Any) -> str:
+    canonical = json.dumps(
+        {
+            "platform": getattr(identity, "platform", None),
+            "account": getattr(identity, "account", None),
+            "peer_kind": getattr(identity, "peer_kind", None),
+            "user_id": getattr(identity, "user_id", None),
+            "chat_id": getattr(identity, "chat_id", None),
+            "thread_id": getattr(identity, "thread_id", None),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
@@ -1917,6 +1947,7 @@ from gateway.config import (
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
     HomeChannel,
+    MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR,
     PlatformConfig,
     load_gateway_config,
 )
@@ -2972,6 +3003,81 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+def _cron_route_account_label(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+class _GatewayCronAdapterView:
+    """Live dict-like view over a runner's primary adapters plus exact accounts."""
+
+    def __init__(self, runner: "GatewayRunner"):
+        self._runner = runner
+
+    def _primary(self) -> Dict[Platform, BasePlatformAdapter]:
+        return getattr(self._runner, "adapters", None) or {}
+
+    def get(self, platform, default=None):
+        return self._primary().get(platform, default)
+
+    def items(self):
+        return self._primary().items()
+
+    def values(self):
+        return self._primary().values()
+
+    def keys(self):
+        return self._primary().keys()
+
+    def __iter__(self):
+        return iter(self._primary())
+
+    def __len__(self):
+        return len(self._primary())
+
+    def __contains__(self, platform):
+        return platform in self._primary()
+
+    def __getitem__(self, platform):
+        return self._primary()[platform]
+
+    @staticmethod
+    def _adapter_for_platform(adapter_map, platform):
+        if not isinstance(adapter_map, dict):
+            return None
+        candidate = adapter_map.get(platform)
+        if candidate is not None:
+            return candidate
+        expected = getattr(platform, "value", platform)
+        for key, value in adapter_map.items():
+            if getattr(key, "value", key) == expected:
+                return value
+        return None
+
+    def resolve(self, platform, account: str):
+        expected = _cron_route_account_label(account)
+        if not expected:
+            return None
+        matches = []
+        seen_ids = set()
+
+        def consider(adapter):
+            if adapter is None or id(adapter) in seen_ids:
+                return
+            seen_ids.add(id(adapter))
+            label_fn = getattr(adapter, "_profile_route_account_label", None)
+            if not callable(label_fn):
+                return
+            if _cron_route_account_label(label_fn()) == expected:
+                matches.append(adapter)
+
+        consider(self._adapter_for_platform(self._primary(), platform))
+        for profile_map in (getattr(self._runner, "_profile_adapters", None) or {}).values():
+            consider(self._adapter_for_platform(profile_map, platform))
+        return matches[0] if len(matches) == 1 else None
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -3000,14 +3106,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    access_registry: Optional["AccessRegistry"] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(
+        self,
+        config: Optional[GatewayConfig] = None,
+        access_registry: Optional["AccessRegistry"] = None,
+    ):
         global _gateway_runner_ref
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self.access_registry = (
+            access_registry
+            if access_registry is not None
+            else getattr(self.config, "access_registry", None)
+        )
         self._single_principal_policy = self.config.single_principal
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
@@ -3025,6 +3141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._cron_adapter_view_cache = _GatewayCronAdapterView(self)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -3722,7 +3839,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
-                pass
+                if getattr(source, "resolved_access_context", None) is not None:
+                    # Bound access contexts must not fall through to legacy defaults.
+                    raise
         config = getattr(self, "config", None)
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy
@@ -3751,16 +3870,126 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _shared_scope_for_source(self, source: SessionSource):
+        context = getattr(source, "resolved_access_context", None)
+        if context is not None:
+            try:
+                namespace = shared_memory_namespace_for_access_context(context)
+            except ValueError:
+                return None
+            from gateway.single_principal import SharedTelegramScope
+
+            return SharedTelegramScope(
+                memory_namespace=namespace,
+                is_topic=bool(getattr(source, "thread_id", None)),
+            )
         policy = getattr(self, "_single_principal_policy", None)
         if policy is None:
             return None
         return policy.shared_scope(source)
 
     @staticmethod
-    def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
-        from tools.memory_tool import MemoryStore
+    def _toolsets_for_resolved_access_context(
+        configured_toolsets: list[str],
+        context: Any,
+    ) -> list[str]:
+        if context is None:
+            return list(configured_toolsets)
+        if not isinstance(context, ResolvedAccessContext):
+            return []
+        role_id = context.role_id
+        capabilities = context.capabilities
+        if not isinstance(role_id, str) or not isinstance(capabilities, frozenset):
+            return []
+        if role_id == "owner":
+            return list(configured_toolsets)
+        if role_id == "shared_room":
+            return list(configured_toolsets)
 
-        if "memory" not in set(getattr(agent, "valid_tool_names", set())):
+        role_capability_toolsets = {
+            "family_standard": {
+                "memory_search": "memory",
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+            },
+            "family_sandbox": {
+                "memory_search": "memory",
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+                "delegation": "delegation",
+            },
+        }
+        capability_toolsets = role_capability_toolsets.get(role_id)
+        if capability_toolsets is None:
+            return []
+
+        configured = {str(toolset) for toolset in configured_toolsets}
+        allowed = {
+            toolset
+            for capability, toolset in capability_toolsets.items()
+            if capability in capabilities and toolset in configured
+        }
+        if "wolfram" in capabilities:
+            allowed.update(configured & {"wolfram", "mcp-wolfram"})
+        return sorted(allowed)
+
+    @staticmethod
+    def _shared_tool_profile_for_source(
+        source: SessionSource,
+        configured_toolsets: list[str] | None = None,
+        disabled_toolsets: list[str] | None = None,
+    ) -> tuple[list[str], frozenset[str]]:
+        context = getattr(source, "resolved_access_context", None)
+        if (
+            context is not None
+            and (
+                not isinstance(context, ResolvedAccessContext)
+                or context.role_id != "shared_room"
+                or not isinstance(context.capabilities, frozenset)
+            )
+        ):
+            return [], frozenset()
+
+        toolsets = sorted(str(toolset) for toolset in (configured_toolsets or []))
+        try:
+            from model_tools import get_tool_definitions
+
+            expected_tools = frozenset(
+                definition["function"]["name"]
+                for definition in get_tool_definitions(
+                    enabled_toolsets=toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                )
+            )
+        except Exception:
+            return toolsets, frozenset()
+        return toolsets, expected_tools
+
+    @staticmethod
+    def _bind_shared_memory(
+        agent: Any,
+        scope: Any,
+        memory_config: dict,
+        *,
+        expected_tool_names: frozenset[str] | None = None,
+    ) -> None:
+        from tools.memory_tool import MemoryStore
+        from gateway.session_context import get_resolved_access_context
+
+        valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        if expected_tool_names is not None:
+            valid = valid_tool_names == set(expected_tool_names)
+        else:
+            valid = "memory" in valid_tool_names
+        if not valid:
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -3768,6 +3997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_char_limit=memory_config.get("user_char_limit", 1375),
             memory_dir=memory_dir,
             allow_user_profile=False,
+            access_context=get_resolved_access_context(None),
         )
         store.load_from_disk()
         agent._memory_store = store
@@ -6058,6 +6288,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
+        registry = getattr(self, "access_registry", None)
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
@@ -6076,10 +6307,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source is None:
                 source = self._get_cached_session_source(session_key)
 
-            if source is not None:
+            chat_type = None
+            if registry is not None:
+                try:
+                    context = registry.validate_resolved_context(
+                        getattr(source, "resolved_access_context", None)
+                    )
+                except AccessDeniedError as exc:
+                    logger.warning(
+                        "Skipping shutdown notification for unresolved access context: reason=%s audit=%s",
+                        exc.reason,
+                        exc.audit.as_dict(),
+                    )
+                    continue
+                except Exception:
+                    audit = RedactedAuditMetadata.from_delivery_target(
+                        "shutdown_notification",
+                        getattr(getattr(source, "resolved_access_context", None), "delivery_target", None),
+                    )
+                    logger.warning(
+                        "Skipping shutdown notification after access registry error: audit=%s",
+                        audit.as_dict(),
+                    )
+                    continue
+
+                target = context.delivery_target
+                platform_str = target.platform
+                chat_id = str(target.chat_id)
+                thread_id = target.thread_id
+                chat_type = target.peer_kind
+            elif source is not None:
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                chat_type = getattr(source, "chat_type", None)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -6099,7 +6360,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                adapter = (
+                    self._adapter_for_source(source)
+                    if registry is not None
+                    else self.adapters.get(platform)
+                )
                 if not adapter:
                     continue
 
@@ -6111,22 +6376,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
-                reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
-                if reply_to_message_id is None and restart_source is not None:
-                    try:
-                        restart_platform = restart_source.platform.value
-                        restart_chat_id = str(restart_source.chat_id)
-                        restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
-                            reply_to_message_id = getattr(restart_source, "message_id", None)
-                    except Exception:
-                        pass
+                reply_to_message_id = None
+                if registry is None:
+                    reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
+                    if reply_to_message_id is None and restart_source is not None:
+                        try:
+                            restart_platform = restart_source.platform.value
+                            restart_chat_id = str(restart_source.chat_id)
+                            restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
+                            if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
+                                reply_to_message_id = getattr(restart_source, "message_id", None)
+                        except Exception:
+                            pass
 
                 metadata = self._thread_metadata_for_target(
                     platform,
                     chat_id,
                     thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
+                    chat_type=chat_type,
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
@@ -6154,6 +6421,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+            return
+
+        if registry is not None:
+            logger.debug(
+                "Skipping unbound home-channel shutdown notifications under access registry"
+            )
             return
 
         # Suppress ONLY the home-channel broadcast when the drain that is ending
@@ -6938,34 +7211,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if entry.session_key in self._running_agents:
                 continue
 
+            # Empty-text internal event — the _is_resume_pending branch in
+            # _handle_message_with_agent prepends the proper reason-aware
+            # system note before the turn runs.
             source = entry.origin
+            event = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            if getattr(self, "access_registry", None) is not None:
+                if not self._allow_access_registry_ingress(event):
+                    logger.warning(
+                        "Skipping auto-resume: access registry denied internal event"
+                    )
+                    continue
+            else:
+                # Validate the session owner against the current allowlist
+                # before auto-resuming. A session created before
+                # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
+                # before the owner was removed from it, must not silently
+                # receive a full agent response on gateway restart just
+                # because it has a resume-pending marker (issue #23778).
+                try:
+                    if not self._is_user_authorized(source):
+                        logger.warning(
+                            "Skipping auto-resume for %s: session owner is no "
+                            "longer authorized under the current allowlist",
+                            entry.session_key,
+                        )
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping auto-resume for %s: authorization check failed: %s",
+                        entry.session_key, exc,
+                    )
+                    continue
+
+            source = event.source
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
                     "Skipping auto-resume for %s: adapter not ready for %s",
                     entry.session_key,
                     getattr(source.platform, "value", source.platform),
-                )
-                continue
-
-            # Validate the session owner against the current allowlist
-            # before auto-resuming. A session created before
-            # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
-            # before the owner was removed from it, must not silently
-            # receive a full agent response on gateway restart just
-            # because it has a resume-pending marker (issue #23778).
-            try:
-                if not self._is_user_authorized(source):
-                    logger.warning(
-                        "Skipping auto-resume for %s: session owner is no "
-                        "longer authorized under the current allowlist",
-                        entry.session_key,
-                    )
-                    continue
-            except Exception as exc:
-                logger.warning(
-                    "Skipping auto-resume for %s: authorization check failed: %s",
-                    entry.session_key, exc,
                 )
                 continue
 
@@ -6978,15 +7268,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = MessageEvent(
-                text="",
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -7411,6 +7692,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            adapter.set_ingress_guard(self._allow_access_registry_ingress)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
             
@@ -7809,16 +8091,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         await self._process_handoff(row)
                         await self._session_db.complete_handoff(session_id)
-                    except Exception as exc:
+                    except AccessDeniedError as exc:
                         logger.warning(
-                            "Handoff for session %s failed: %s",
-                            session_id, exc, exc_info=True,
+                            "Handoff denied: reason=%s audit=%s",
+                            exc.reason,
+                            exc.audit.as_dict(),
                         )
-                        await self._session_db.fail_handoff(session_id, str(exc))
+                        await self._session_db.fail_handoff(session_id, exc.reason)
+                    except Exception as exc:
+                        safe_reason = categorize_handoff_failure(
+                            exc,
+                            registry_configured=(
+                                getattr(self, "access_registry", None) is not None
+                            ),
+                        )
+                        if safe_reason is None:
+                            logger.warning(
+                                "Handoff for session %s failed: %s",
+                                session_id, exc, exc_info=True,
+                            )
+                            await self._session_db.fail_handoff(session_id, str(exc))
+                        else:
+                            logger.warning("Handoff failed: reason=%s", safe_reason)
+                            await self._session_db.fail_handoff(session_id, safe_reason)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+                safe_reason = categorize_handoff_failure(
+                    exc,
+                    registry_configured=(
+                        getattr(self, "access_registry", None) is not None
+                    ),
+                )
+                if safe_reason is None:
+                    logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+                else:
+                    logger.debug("Handoff watcher tick error: reason=%s", safe_reason)
             await asyncio.sleep(interval)
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
@@ -7837,6 +8145,142 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform = Platform(platform_name)
         except (ValueError, KeyError):
             raise RuntimeError(f"unknown platform '{platform_name}'")
+
+        registry = getattr(self, "access_registry", None)
+        if registry is not None:
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                raise AccessDeniedError(
+                    "access_registry_requires_multiplex",
+                    RedactedAuditMetadata("handoff"),
+                )
+            raw_context = row.get("handoff_context_json")
+            if not isinstance(raw_context, str) or not raw_context.strip():
+                raise AccessDeniedError(
+                    "handoff_missing_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                )
+            try:
+                payload = json.loads(raw_context)
+            except (TypeError, ValueError):
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                ) from None
+            if not isinstance(payload, dict):
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                )
+            try:
+                context = registry.validate_resolved_context(
+                    deserialize_resolved_access_context(payload)
+                )
+                expected_context = resolve_handoff_access_context(
+                    self.config,
+                    platform,
+                    access_registry=registry,
+                )
+            except AccessDeniedError:
+                raise
+            except Exception:
+                raise AccessDeniedError(
+                    "handoff_malformed_resolved_access_context",
+                    RedactedAuditMetadata("handoff"),
+                ) from None
+            if expected_context != context:
+                raise AccessDeniedError(
+                    "handoff_destination_mismatch",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_destination_mismatch",
+                        getattr(context, "delivery_target", None),
+                    ),
+                )
+
+            target = context.delivery_target
+            if target.platform != platform.value:
+                raise AccessDeniedError(
+                    "handoff_platform_mismatch",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_platform_mismatch",
+                        target,
+                    ),
+                )
+            if (
+                platform != Platform.TELEGRAM
+                or target.peer_kind != "dm"
+                or target.thread_id is not None
+            ):
+                raise AccessDeniedError(
+                    "handoff_registry_unsupported_destination",
+                    RedactedAuditMetadata.from_delivery_target(
+                        "handoff_registry_unsupported_destination",
+                        target,
+                    ),
+                )
+
+            adapter = self.adapters.get(platform)
+            if not adapter:
+                raise RuntimeError(
+                    f"platform '{platform_name}' is not active in this gateway"
+                )
+
+            cli_title = row.get("title") or cli_session_id[:8]
+            dest_source = SessionSource(
+                platform=platform,
+                chat_id=target.chat_id,
+                chat_type=target.peer_kind,
+                user_id=target.chat_id,
+                thread_id=None,
+                profile=context.profile_id,
+                route_account=target.account,
+                resolved_access_context=context,
+            )
+            session_key = build_session_key(
+                dest_source,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+            )
+            await self.async_session_store.get_or_create_session(dest_source)
+            switched = await self.async_session_store.switch_session(
+                session_key,
+                cli_session_id,
+            )
+            if switched is None:
+                raise RuntimeError("could not switch handoff session")
+            self._evict_cached_agent(session_key)
+            self._release_running_agent_state(session_key)
+
+            synthetic_event = MessageEvent(
+                text=(
+                    f"[Session was just handed off from CLI (\"{cli_title}\") "
+                    "to this Telegram DM. The full prior conversation history "
+                    "is loaded above. Briefly confirm you're working here and "
+                    "summarize what we were working on, so the user can "
+                    "continue from this device.]"
+                ),
+                source=dest_source,
+                internal=True,
+            )
+            logger.info(
+                "Handoff: dispatching registry-bound synthetic turn "
+                "for CLI session (platform=%s)",
+                platform_name,
+            )
+            response_text = await self._handle_message(synthetic_event)
+            if not response_text:
+                return
+            try:
+                result = await adapter.send(
+                    chat_id=target.chat_id,
+                    content=response_text,
+                    metadata=None,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"adapter.send failed: {exc}") from exc
+            if not getattr(result, "success", True):
+                err = getattr(result, "error", "send returned success=False")
+                raise RuntimeError(f"adapter.send failed: {err}")
+            return
 
         # Adapter must be live
         adapter = self.adapters.get(platform)
@@ -8277,6 +8721,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    adapter.set_ingress_guard(self._allow_access_registry_ingress)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
@@ -8854,6 +9299,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
 
+    def _cron_adapter_view(self):
+        view = getattr(self, "_cron_adapter_view_cache", None)
+        if view is None:
+            view = _GatewayCronAdapterView(self)
+            self._cron_adapter_view_cache = view
+        return view
+
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
 
@@ -9019,6 +9471,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            adapter.set_ingress_guard(self._allow_access_registry_ingress)
             adapter.set_authorization_check(
                 self._make_adapter_auth_check(adapter.platform, profile_name=profile_name)
             )
@@ -9117,6 +9570,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         through to the built-in if/elif chain for core platforms.
         """
         if hasattr(config, "extra") and isinstance(config.extra, dict):
+            if (
+                platform == Platform.MATRIX
+                and getattr(self.config, "multiplex_profiles", False)
+            ):
+                config = dataclasses.replace(config, extra=dict(config.extra))
+                setattr(config, MATRIX_PROFILE_CONFIG_AUTHORITY_ATTR, True)
             config.extra.setdefault(
                 "group_sessions_per_user",
                 self.config.group_sessions_per_user,
@@ -9311,19 +9770,164 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _allow_access_registry_ingress(self, event: MessageEvent) -> bool:
+        registry = getattr(self, "access_registry", None)
+        if registry is None:
+            return True
+
+        source = getattr(event, "source", None)
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s",
+                "access_registry_requires_multiplex",
+            )
+            return False
+        try:
+            from gateway.access_registry import (
+                AccessDeniedError,
+                RedactedAuditMetadata,
+                TransportIdentity,
+            )
+
+            if source is None:
+                raise AccessDeniedError(
+                    "malformed_session_source",
+                    RedactedAuditMetadata("ingress"),
+                )
+            context_prebound = getattr(source, "resolved_access_context", None) is not None
+            if context_prebound:
+                context = registry.validate_resolved_context(
+                    getattr(source, "resolved_access_context", None)
+                )
+                target = context.delivery_target
+                audit = RedactedAuditMetadata.from_delivery_target("delivery_target", target)
+                route_account = getattr(source, "route_account", None)
+                if not getattr(event, "internal", False):
+                    marker = getattr(
+                        source,
+                        "_trusted_transport_identity_fingerprint",
+                        None,
+                    )
+                    if not isinstance(marker, str) or not marker:
+                        raise AccessDeniedError("missing_trusted_transport_identity", audit)
+                    identity = TransportIdentity.from_session_source(
+                        source,
+                        account=route_account,
+                    )
+                    if marker != _transport_identity_fingerprint(identity):
+                        raise AccessDeniedError("trusted_transport_identity_mismatch", audit)
+                source_platform = getattr(getattr(source, "platform", None), "value", None)
+                if (
+                    source_platform != target.platform
+                    or getattr(source, "chat_type", None) != target.peer_kind
+                    or getattr(source, "chat_id", None) != target.chat_id
+                    or getattr(source, "thread_id", None) != target.thread_id
+                    or (
+                        target.peer_kind == "dm"
+                        and getattr(source, "user_id", None) != target.chat_id
+                    )
+                ):
+                    reason = (
+                        "internal_delivery_target_mismatch"
+                        if getattr(event, "internal", False)
+                        else "delivery_target_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
+                if isinstance(route_account, str):
+                    route_account = route_account.strip()
+                elif route_account is not None:
+                    reason = (
+                        "internal_route_account_mismatch"
+                        if getattr(event, "internal", False)
+                        else "route_account_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
+                if route_account and route_account != target.account:
+                    reason = (
+                        "internal_route_account_mismatch"
+                        if getattr(event, "internal", False)
+                        else "route_account_mismatch"
+                    )
+                    raise AccessDeniedError(reason, audit)
+            elif getattr(event, "internal", False):
+                raise AccessDeniedError(
+                    "missing_resolved_access_context",
+                    RedactedAuditMetadata("internal_ingress"),
+                )
+            else:
+                identity = TransportIdentity.from_session_source(
+                    source,
+                    account=getattr(source, "route_account", None),
+                )
+                context = registry.resolve(identity)
+                source._trusted_transport_identity_fingerprint = (
+                    _transport_identity_fingerprint(identity)
+                )
+            requested = getattr(source, "profile", None)
+            if requested is not None and not isinstance(requested, str):
+                audit = RedactedAuditMetadata.from_delivery_target(
+                    "malformed_profile_route",
+                    context.delivery_target,
+                )
+                raise AccessDeniedError("malformed_profile_route", audit)
+            requested_profile = requested.strip() if isinstance(requested, str) else ""
+            if requested_profile and requested_profile != context.profile_id:
+                if context_prebound or getattr(event, "internal", False):
+                    audit = RedactedAuditMetadata.from_delivery_target(
+                        "profile_route_mismatch",
+                        context.delivery_target,
+                    )
+                else:
+                    audit = RedactedAuditMetadata.from_transport(
+                        "profile_route_mismatch",
+                        identity,
+                    )
+                logger.warning(
+                    "AccessRegistry ingress denied: reason=%s audit=%s",
+                    "profile_route_mismatch",
+                    audit.as_dict(),
+                )
+                return False
+            source.resolved_access_context = context
+            source.profile = context.profile_id
+            source.route_account = context.delivery_target.account
+            return True
+        except AccessDeniedError as exc:
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s audit=%s",
+                exc.reason,
+                exc.audit.as_dict(),
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "AccessRegistry ingress denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": "resolve"},
+            )
+            return False
+
+    def _typed_command_authority_denial(
+        self,
+        event: MessageEvent,
+        canonical: Optional[str],
+    ) -> Optional[str]:
+        if not canonical or getattr(self, "access_registry", None) is None:
+            return None
+        try:
+            from gateway.access_registry import command_args_have_authority_selector
+
+            self.access_registry.validate_resolved_context(
+                getattr(getattr(event, "source", None), "resolved_access_context", None)
+            )
+            if command_args_have_authority_selector(event.get_command_args()):
+                return "Authority selector denied."
+        except Exception:
+            return "Authority selector denied."
+        return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
-        """
-        Handle an incoming message from any platform.
-        
-        This is the core message processing pipeline:
-        1. Check user authorization
-        2. Check for commands (/new, /reset, etc.)
-        3. Check for running agent and interrupt if needed
-        4. Get or create session
-        5. Build context for agent
-        6. Run agent conversation
-        7. Return response
-        """
+        """Resolve ingress, then handle typed multiplex messages in profile scope."""
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -9342,6 +9946,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+
+        if not self._allow_access_registry_ingress(event):
+            return None
+
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(source, "resolved_access_context", None) is not None
+        ):
+            with _profile_runtime_scope(
+                self._resolve_profile_home_for_source(source)
+            ):
+                return await self._handle_message_after_ingress(event)
+        return await self._handle_message_after_ingress(event)
+
+    async def _handle_message_after_ingress(
+        self,
+        event: MessageEvent,
+    ) -> Optional[str]:
+        """Handle an ingress-validated message through the shared dispatch path."""
+        source = event.source
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -9440,6 +10064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
                     profile=source.profile,
+                    source=source,
                 )
                 == "pair"
             ):
@@ -9721,6 +10346,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+            _authority_denied = self._typed_command_authority_denial(
+                event,
+                _cmd_def_inner.name if _cmd_def_inner else _evt_cmd,
+            )
+            if _authority_denied is not None:
+                return _authority_denied
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -10133,6 +10764,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
 
+        _authority_denied = self._typed_command_authority_denial(event, canonical)
+        if _authority_denied is not None:
+            return _authority_denied
+
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM
         # vs group). When unset → backward-compat: every allowed user can
@@ -10200,6 +10835,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     command = event.get_command()
                     _cmd_def = _resolve_cmd(command) if command else None
                     canonical = _cmd_def.name if _cmd_def else command
+                    _authority_denied = self._typed_command_authority_denial(
+                        event,
+                        canonical,
+                    )
+                    if _authority_denied is not None:
+                        return _authority_denied
                     break
 
         if canonical == "new":
@@ -11155,13 +11796,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length_async
 
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
                 _msg_config_ctx = None
                 _msg_cfg = None
                 _msg_model_cfg = {}
                 _msg_custom_providers = []
+                _msg_profile_home = None
+                _msg_typed_context = isinstance(
+                    getattr(source, "resolved_access_context", None),
+                    ResolvedAccessContext,
+                )
                 try:
-                    _msg_cfg = _load_gateway_config()
+                    if _msg_typed_context:
+                        _msg_profile_home = Path(
+                            self._resolve_profile_home_for_source(source)
+                        ).resolve()
+                        if not _msg_profile_home.is_dir():
+                            raise ValueError("resolved profile home is not a directory")
+                        with _profile_runtime_scope(_msg_profile_home):
+                            _msg_cfg = _load_gateway_config()
+                    else:
+                        _msg_cfg = _load_gateway_config()
                     _msg_model_cfg = _msg_cfg.get("model", {})
                     if isinstance(_msg_model_cfg, dict):
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
@@ -11175,6 +11829,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _msg_custom_providers = _msg_cfg.get("custom_providers") or []
                 except Exception:
                     pass
+                if _msg_typed_context:
+                    if _msg_profile_home is None:
+                        raise ValueError("resolved profile home unavailable")
+                    _msg_cwd = str(_msg_profile_home)
+                    _msg_terminal_cfg = (
+                        _msg_cfg.get("terminal") if isinstance(_msg_cfg, dict) else None
+                    )
+                    _msg_configured_cwd = (
+                        _msg_terminal_cfg.get("cwd")
+                        if isinstance(_msg_terminal_cfg, dict)
+                        else None
+                    )
+                    if isinstance(_msg_configured_cwd, str):
+                        _msg_candidate = _msg_configured_cwd.strip()
+                        try:
+                            _msg_candidate_path = Path(_msg_candidate)
+                            if (
+                                _msg_candidate
+                                and _msg_candidate.lower() not in CWD_PLACEHOLDERS
+                                and "\x00" not in _msg_candidate
+                                and _msg_candidate_path.is_absolute()
+                                and _msg_candidate_path.is_dir()
+                            ):
+                                _msg_cwd = str(_msg_candidate_path)
+                        except (OSError, ValueError):
+                            pass
+                else:
+                    _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
                 # Resolve the session's actual model/provider/base_url the
                 # same way the hygiene compression block does (~11080).
                 # GatewayRunner has no self._model/self._base_url attrs
@@ -12432,14 +13114,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
+                _footer_line = self._build_runtime_footer_for_source(
+                    source,
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -14064,7 +14743,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._toolsets_for_resolved_access_context(
+                configured_toolsets,
+                getattr(source, "resolved_access_context", None),
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -14757,24 +15440,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
-        loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                discover_mcp_tools,
+                shutdown_current_mcp_servers,
+                snapshot_current_mcp_server_names,
+            )
 
             # Capture old server names before shutdown
-            with _lock:
-                old_servers = set(_servers.keys())
+            old_servers = await self._run_in_executor_with_context(
+                snapshot_current_mcp_server_names
+            )
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await self._run_in_executor_with_context(shutdown_current_mcp_servers)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             # Compute what changed
-            with _lock:
-                connected_servers = set(_servers.keys())
+            connected_servers = await self._run_in_executor_with_context(
+                snapshot_current_mcp_server_names
+            )
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
@@ -14800,6 +15488,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # gate in _handle_reload_mcp_command before we reach this point.
             try:
                 from tools.mcp_tool import refresh_agent_mcp_tools
+                from gateway.session_context import bind_resolved_access_context
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
@@ -14811,6 +15500,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 continue
                             if _agent is None:
                                 continue
+                            try:
+                                _stored_context = deserialize_resolved_access_context(
+                                    serialize_resolved_access_context(
+                                        getattr(_agent, "_gateway_resolved_access_context", None)
+                                    )
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Skipping cached agent MCP refresh for %s: "
+                                    "missing exact resolved access context",
+                                    _sess_key,
+                                )
+                                continue
                             # Preserve each cached agent's build-time toolset
                             # selection EXACTLY: a gateway session built with a
                             # restricted enabled_toolsets (e.g. ["safe"]) must
@@ -14820,7 +15522,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # edit; gateway agents are per-session and may be
                             # deliberately locked down. (Contract is asserted by
                             # test_reload_mcp_preserves_per_agent_toolset_overrides.)
-                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
+                            with bind_resolved_access_context(_stored_context):
+                                refresh_agent_mcp_tools(_agent, quiet_mode=True)
             except Exception as _exc:
                 logger.debug(
                     "Failed to update cached agent tools after MCP reload: %s",
@@ -14987,6 +15690,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools import slash_confirm as _slash_confirm_mod
 
         source = event.source
+        captured_context = getattr(source, "resolved_access_context", None)
+        registry = getattr(self, "access_registry", None)
+
+        def _captured_context_is_current() -> bool:
+            if registry is None:
+                return True
+            try:
+                registry.validate_resolved_context(captured_context)
+            except AccessDeniedError as exc:
+                logger.warning(
+                    "Slash-confirm access denied: reason=%s audit=%s",
+                    exc.reason,
+                    exc.audit.as_dict(),
+                )
+                return False
+            return True
+
+        if not _captured_context_is_current():
+            return None
+
         session_key = self._session_key_for_source(source)
         # Bare-runner test harnesses (object.__new__(GatewayRunner)) skip
         # __init__ and don't have the counter attribute — fall back to a
@@ -15001,7 +15724,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
-        _slash_confirm_mod.register(session_key, confirm_id, command, handler)
+        if registry is not None:
+            async def _guarded_handler(choice: str):
+                if not _captured_context_is_current():
+                    return None
+                if (
+                    getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                    and captured_context is not None
+                ):
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        return await handler(choice)
+                return await handler(choice)
+
+            registered_handler = _guarded_handler
+        else:
+            registered_handler = handler
+
+        _slash_confirm_mod.register(session_key, confirm_id, command, registered_handler)
 
         adapter = self._adapter_for_source(source)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -15704,6 +16449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            resolved_access_context=getattr(context.source, "resolved_access_context", None),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -16122,6 +16868,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
+    def _synthetic_access_context_for_event(self, evt: dict):
+        registry = getattr(self, "access_registry", None)
+        evt_type = str(evt.get("type") or "")
+        gated_types = {"async_delegation", "completion", "watch_match", "watch_disabled"}
+        if registry is None or evt_type not in gated_types:
+            return True, None
+
+        try:
+            from gateway.access_registry import (
+                AccessDeniedError,
+                RedactedAuditMetadata,
+                deserialize_resolved_access_context,
+            )
+            from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+        except Exception:
+            logger.warning(
+                "Synthetic notification access denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": evt_type or "unknown"},
+            )
+            return False, None
+
+        payload = evt.get(ASYNC_DELEGATION_ACCESS_CONTEXT_KEY)
+        try:
+            if payload is None:
+                raise AccessDeniedError(
+                    "missing_resolved_access_context",
+                    RedactedAuditMetadata(evt_type or "synthetic_notification"),
+                )
+            try:
+                context = deserialize_resolved_access_context(payload)
+            except ValueError as exc:
+                raise AccessDeniedError(
+                    "malformed_resolved_access_context",
+                    RedactedAuditMetadata(evt_type or "synthetic_notification"),
+                ) from exc
+            context = registry.validate_resolved_context(context)
+            return True, context
+        except AccessDeniedError as exc:
+            logger.warning(
+                "Synthetic notification access denied: reason=%s audit=%s",
+                exc.reason,
+                exc.audit.as_dict(),
+            )
+            return False, None
+
+    def _restore_synthetic_access_context(self, source, context, evt_type: str = ""):
+        registry = getattr(self, "access_registry", None)
+        if registry is None or context is None:
+            return source
+
+        try:
+            from copy import copy
+
+            candidate = copy(source)
+            candidate.resolved_access_context = context
+            gate_event = type(
+                "_SyntheticAccessEvent",
+                (),
+                {"source": candidate, "internal": True},
+            )()
+            if not self._allow_access_registry_ingress(gate_event):
+                return None
+            return candidate
+        except Exception:
+            logger.warning(
+                "Synthetic notification access denied: reason=%s audit=%s",
+                "registry_error",
+                {"event": evt_type or "unknown"},
+            )
+            return None
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -16134,6 +16952,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        context_ok, access_context = self._synthetic_access_context_for_event(evt)
+        if not context_ok:
+            return None
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
@@ -16141,12 +16962,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 evt.get("session_id", "unknown"),
             )
             return None
+        source = self._restore_synthetic_access_context(
+            source,
+            access_context,
+            str(evt.get("type") or ""),
+        )
+        if source is None:
+            return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         try:
@@ -16377,6 +17201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
         message_id = str(watcher.get("message_id") or "").strip() or None
+        resolved_access_context = watcher.get("resolved_access_context")
         agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
@@ -16449,6 +17274,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                     }
+                    session_context_payload = getattr(
+                        session,
+                        "resolved_access_context",
+                        None,
+                    )
+                    from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+                    if session_context_payload is not None:
+                        completion_evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = session_context_payload
+                    elif resolved_access_context is not None:
+                        completion_evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] = resolved_access_context
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -16640,8 +17475,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        resolved_access_context: Any = None,
     ) -> str:
-        """Compute a stable string key from agent config values.
+        """Compute a stable opaque key from agent config and access context.
 
         When this signature changes between messages, the cached AIAgent is
         discarded and rebuilt.  When it stays the same, the cached agent is
@@ -16667,6 +17503,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``resolved_access_context`` is optional for legacy callers.  When
+        present, only its canonical opaque six-field fingerprint enters the
+        signature; malformed context objects fail closed with ``ValueError``.
         """
         import hashlib, json as _j
 
@@ -16679,21 +17519,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _cache_keys_sorted = sorted((cache_keys or {}).items())
 
+        signature_values = [
+            model,
+            _api_key_fingerprint,
+            runtime.get("base_url", ""),
+            runtime.get("provider", ""),
+            runtime.get("api_mode", ""),
+            sorted(enabled_toolsets) if enabled_toolsets else [],
+            # reasoning_config excluded — it's set per-message on the
+            # cached agent and doesn't affect system prompt or tools.
+            ephemeral_prompt or "",
+            _cache_keys_sorted,
+            str(user_id or ""),
+            str(user_id_alt or ""),
+        ]
+        if resolved_access_context is not None:
+            signature_values.append(
+                canonical_access_context_fingerprint(resolved_access_context)
+            )
+
         blob = _j.dumps(
-            [
-                model,
-                _api_key_fingerprint,
-                runtime.get("base_url", ""),
-                runtime.get("provider", ""),
-                runtime.get("api_mode", ""),
-                sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
-                ephemeral_prompt or "",
-                _cache_keys_sorted,
-                str(user_id or ""),
-                str(user_id_alt or ""),
-            ],
+            signature_values,
             sort_keys=True,
             default=str,
         )
@@ -17426,12 +18272,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Proxy mode: forward messages to a remote Hermes API server
     # ------------------------------------------------------------------
 
-    def _get_proxy_url(self) -> Optional[str]:
+    def _source_has_typed_access_context(self, source: Any = None) -> bool:
+        return isinstance(getattr(source, "resolved_access_context", None), ResolvedAccessContext)
+
+    @staticmethod
+    def _normalize_server_bound_proxy_url(raw: Any) -> Optional[str]:
+        if not isinstance(raw, str):
+            return None
+        url = raw.strip().rstrip("/")
+        if not url:
+            return None
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        return url
+
+    def _get_proxy_key(self, source: Any = None) -> Optional[str]:
+        if self._source_has_typed_access_context(source):
+            try:
+                from agent.secret_scope import current_secret_scope, get_secret
+
+                if current_secret_scope() is None:
+                    return None
+                key = get_secret("GATEWAY_PROXY_KEY", "") or ""
+            except Exception:
+                logger.warning("Proxy disabled for typed context: scoped proxy key unavailable")
+                return None
+            key = str(key).strip()
+            return key or None
+        return os.getenv("GATEWAY_PROXY_KEY", "").strip() or None
+
+    def _get_proxy_url(self, source: Any = None) -> Optional[str]:
         """Return the proxy URL if proxy mode is configured, else None.
 
-        Checks GATEWAY_PROXY_URL env var first (convenient for Docker),
-        then ``gateway.proxy_url`` in config.yaml.
+        Legacy no-context callers keep the env-first behavior. Typed
+        multiplex turns must use only the resolved profile config plus scoped
+        secret provider; process-global proxy env must not route the request.
         """
+        if self._source_has_typed_access_context(source):
+            try:
+                cfg = _load_gateway_config()
+            except Exception:
+                logger.warning("Proxy disabled for typed context: scoped proxy config unavailable")
+                return None
+            gateway_cfg = cfg.get("gateway") if isinstance(cfg, dict) else None
+            raw_url = gateway_cfg.get("proxy_url") if isinstance(gateway_cfg, dict) else None
+            proxy_url = self._normalize_server_bound_proxy_url(raw_url)
+            if proxy_url is None:
+                return None
+            if self._get_proxy_key(source) is None:
+                return None
+            return proxy_url
         url = os.getenv("GATEWAY_PROXY_URL", "").strip()
         if url:
             return url.rstrip("/")
@@ -17475,7 +18369,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": [],
             }
 
-        proxy_url = self._get_proxy_url()
+        proxy_url = self._get_proxy_url(source)
         if not proxy_url:
             return {
                 "final_response": "⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
@@ -17484,7 +18378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": [],
             }
 
-        proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        proxy_key = self._get_proxy_key(source) or ""
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -17819,8 +18713,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                account=getattr(source, "route_account", None),
+                peer_kind=getattr(source, "chat_type", None),
+                user_id=getattr(source, "user_id", None),
             )
-        except Exception:
+        except Exception as exc:
+            from gateway.profile_routing import ProfileRoutingError
+
+            if isinstance(exc, ProfileRoutingError):
+                logger.warning(
+                    "Exact Telegram DM profile routing denied: %s",
+                    exc.reason,
+                )
+                raise
             logger.warning(
                 "Profile route matching failed for %s/%s, falling back to default",
                 source.platform, source.chat_id, exc_info=True,
@@ -17834,6 +18739,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
         )
         return None
+
+    def _build_runtime_footer_for_source(
+        self,
+        source: SessionSource,
+        *,
+        model: Optional[str],
+        context_tokens: int,
+        context_length: Optional[int],
+    ) -> str:
+        """Build a final footer without typed-profile fallback to global state."""
+        from gateway.runtime_footer import build_footer_line
+
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            return build_footer_line(
+                user_config=_load_gateway_config(),
+                platform_key=_platform_config_key(source.platform),
+                model=model,
+                context_tokens=context_tokens,
+                context_length=context_length,
+                cwd=None,
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            user_config = _load_gateway_config()
+            terminal = user_config.get("terminal")
+            configured_cwd = terminal.get("cwd") if isinstance(terminal, dict) else None
+            cwd = ""
+            if isinstance(configured_cwd, str):
+                candidate = configured_cwd.strip()
+                try:
+                    if (
+                        candidate.lower() not in CWD_PLACEHOLDERS
+                        and "\x00" not in candidate
+                        and Path(candidate).is_absolute()
+                    ):
+                        cwd = candidate
+                except (OSError, ValueError):
+                    pass
+            return build_footer_line(
+                user_config=user_config,
+                platform_key=_platform_config_key(source.platform),
+                model=model,
+                context_tokens=context_tokens,
+                context_length=context_length,
+                cwd=cwd,
+            )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
@@ -17851,6 +18804,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
+        from gateway.profile_routing import ProfileRoutingError
+
+        context = getattr(source, "resolved_access_context", None)
+        if context is not None:
+            context_profile = getattr(context, "profile_id", None)
+            if not isinstance(context_profile, str) or not context_profile.strip():
+                raise ProfileRoutingError("missing_resolved_profile")
+            context_profile = context_profile.strip()
+            source_profile = (getattr(source, "profile", "") or "").strip()
+            if source_profile and source_profile != context_profile:
+                raise ProfileRoutingError("resolved_profile_mismatch")
+            try:
+                if not profile_exists(context_profile):
+                    logger.warning(
+                        "Resolved access profile routing denied: missing_resolved_profile"
+                    )
+                    raise ProfileRoutingError("missing_resolved_profile")
+                return get_profile_dir(context_profile)
+            except ProfileRoutingError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Resolved access profile routing denied: resolved_profile_lookup_failed",
+                    exc_info=True,
+                )
+                raise ProfileRoutingError("resolved_profile_lookup_failed")
         
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
@@ -17878,7 +18857,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return get_hermes_home()
             return profile_dir
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, ProfileRoutingError):
+                raise
             # Catch normalization errors, path errors, etc.
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
@@ -17920,7 +18901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
+        if self._get_proxy_url(source):
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -17944,7 +18925,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._toolsets_for_resolved_access_context(
+            configured_toolsets,
+            getattr(source, "resolved_access_context", None),
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
@@ -18896,22 +19881,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
-            # Combine platform context, YAML channel_prompts hint for this chat,
-            # channel_overrides system_prompt (or global ephemeral), and gateway
-            # ephemeral prompt from _get_system_prompt_for_channel.
-            combined_ephemeral = context_prompt or ""
-            event_channel_prompt = (channel_prompt or "").strip()
-            if event_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            cfg_channel_prompt = self._get_system_prompt_for_channel(
-                source.platform,
-                source.chat_id or "",
-                thread_id=getattr(source, "thread_id", None),
-                parent_id=getattr(source, "parent_chat_id", None),
-                allow_global=shared_scope is None,
+            access_context = getattr(source, "resolved_access_context", None)
+            isolate_context_files = shared_scope is not None or (
+                isinstance(access_context, ResolvedAccessContext)
+                and access_context.role_id != "owner"
             )
-            if cfg_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            combined_ephemeral = context_prompt or ""
+            if access_context is None:
+                # Legacy path: preserve event channel_prompts plus
+                # channel_overrides/global ephemeral prompt behavior.
+                event_channel_prompt = (channel_prompt or "").strip()
+                if event_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+                cfg_channel_prompt = self._get_system_prompt_for_channel(
+                    source.platform,
+                    source.chat_id or "",
+                    thread_id=getattr(source, "thread_id", None),
+                    parent_id=getattr(source, "parent_chat_id", None),
+                    allow_global=shared_scope is None,
+                )
+                if cfg_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            elif shared_scope is None:
+                # Security: event/startup/default-profile prompts are
+                # process-scoped, not authority-safe for multiplexed profiles.
+                profile_prompt = str(
+                    cfg_get(user_config, "agent", "system_prompt", default="") or ""
+                ).strip()
+                if profile_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + profile_prompt).strip()
             if shared_scope is not None:
                 shared_prompt = (
                     "This is a shared multi-user Telegram scope. The configured "
@@ -19087,6 +20085,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if shared_scope is not None
                     else getattr(source, "user_id_alt", None)
                 ),
+                resolved_access_context=getattr(source, "resolved_access_context", None),
             )
             agent = None
             reused_cached_agent = False
@@ -19320,16 +20319,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
-                    skip_context_files=shared_scope is not None,
-                    load_soul_identity=shared_scope is not None,
+                    skip_context_files=isolate_context_files,
+                    load_soul_identity=isolate_context_files,
                     skip_memory=shared_scope is not None,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                if shared_scope is not None:
+                if shared_scope is not None and "memory" in enabled_toolsets:
                     memory_config = user_config.get("memory") or {}
-                    self._bind_shared_memory(agent, shared_scope, memory_config)
+                    self._bind_shared_memory(
+                        agent,
+                        shared_scope,
+                        memory_config,
+                    )
+                try:
+                    agent._gateway_resolved_access_context = deserialize_resolved_access_context(
+                        serialize_resolved_access_context(
+                            getattr(source, "resolved_access_context", None)
+                        )
+                    )
+                except Exception:
+                    pass
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
@@ -19642,13 +20653,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = dict(_status_thread_metadata or {})
+                        _approval_request_id = str(
+                            approval_data.get("approval_request_id") or ""
+                        )
+                        if _approval_request_id:
+                            _approval_metadata["approval_request_id"] = _approval_request_id
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata or None,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
@@ -21831,7 +22848,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    cron_start_kwargs = {"adapters": runner._cron_adapter_view(), "loop": asyncio.get_running_loop()}
     # External cron providers own their remote scheduling contract. Only the
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.

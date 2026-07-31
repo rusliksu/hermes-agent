@@ -308,6 +308,146 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _current_resolved_access_snapshot() -> Optional[tuple[Any, Dict[str, Any]]]:
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context()
+    if context is None:
+        return None
+    return context, serialize_resolved_access_context(context)
+
+
+def _context_role(context: Any) -> str:
+    return str(getattr(context, "role_id", "") or "")
+
+
+def _is_owner_context(context: Any) -> bool:
+    return _context_role(context) == "owner"
+
+
+def _is_family_context(context: Any) -> bool:
+    return _context_role(context) in {"family_standard", "family_sandbox"}
+
+
+def _origin_from_resolved_access_context(context: Any) -> Dict[str, Optional[str]]:
+    target = getattr(context, "delivery_target", None)
+    return {
+        "platform": str(getattr(target, "platform", "") or ""),
+        "chat_id": str(getattr(target, "chat_id", "") or ""),
+        "thread_id": getattr(target, "thread_id", None),
+    }
+
+
+def _family_deliver_allowed(deliver: Optional[str]) -> bool:
+    normalized_deliver = _normalize_deliver_param(deliver)
+    return normalized_deliver in {None, "origin"}
+
+
+def _guard_configured_cron_action(
+    action: str,
+    snapshot: Optional[tuple[Any, Dict[str, Any]]],
+    *,
+    deliver: Any = None,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Optional[str]]]]:
+    if snapshot is None:
+        return None, _origin_from_env()
+
+    context, serialized = snapshot
+    if _context_role(context) == "shared_room":
+        if "cron" not in getattr(context, "capabilities", frozenset()):
+            raise ValueError("shared room cron requires cron capability")
+        if action == "create" and not _family_deliver_allowed(deliver):
+            raise ValueError("shared room cron can only deliver to the current room/topic")
+        if (
+            action == "update"
+            and deliver is not None
+            and _normalize_deliver_param(deliver) != "origin"
+        ):
+            raise ValueError("shared room cron can only deliver to the current room/topic")
+        return serialized, _origin_from_resolved_access_context(context)
+    if _is_family_context(context):
+        if "self_reminder" not in getattr(context, "capabilities", frozenset()):
+            raise ValueError("family cron requires self_reminder capability")
+        if action == "create" and not _family_deliver_allowed(deliver):
+            raise ValueError("family cron can only deliver to the current conversation")
+        if (
+            action == "update"
+            and deliver is not None
+            and _normalize_deliver_param(deliver) != "origin"
+        ):
+            raise ValueError("family cron can only deliver to the current conversation")
+        return serialized, _origin_from_resolved_access_context(context)
+    if _is_owner_context(context):
+        if "cron" not in getattr(context, "capabilities", frozenset()):
+            raise ValueError("owner cron requires cron capability")
+        return serialized, _origin_from_env()
+    raise ValueError(f"cron is not available for role {_context_role(context)!r}")
+
+
+def _job_matches_resolved_context(job: Dict[str, Any], serialized: Dict[str, Any]) -> bool:
+    return job.get("resolved_access_context") == serialized
+
+
+def _visible_jobs_for_context(
+    jobs: List[Dict[str, Any]],
+    snapshot: Optional[tuple[Any, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if snapshot is None:
+        return jobs
+    serialized = snapshot[1]
+    if _is_owner_context(snapshot[0]):
+        return [
+            job
+            for job in jobs
+            if job.get("resolved_access_context") is None
+            or _job_matches_resolved_context(job, serialized)
+        ]
+    return [job for job in jobs if _job_matches_resolved_context(job, serialized)]
+
+
+def _resolve_job_ref_for_context(
+    ref: str,
+    snapshot: Optional[tuple[Any, Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    if snapshot is None:
+        return resolve_job_ref(ref)
+    jobs = _visible_jobs_for_context(list_jobs(include_disabled=True), snapshot)
+    for job in jobs:
+        if job["id"] == ref:
+            return job
+    ref_lower = ref.lower()
+    name_matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
+    if not name_matches:
+        return None
+    if len(name_matches) > 1:
+        raise AmbiguousJobReference(ref, name_matches)
+    return name_matches[0]
+
+
+def _require_job_in_context(
+    job: Dict[str, Any],
+    snapshot: Optional[tuple[Any, Dict[str, Any]]],
+) -> None:
+    if snapshot is None:
+        return
+    if _is_owner_context(snapshot[0]):
+        if job.get("resolved_access_context") is None:
+            return
+        if _job_matches_resolved_context(job, snapshot[1]):
+            return
+        raise ValueError("cron job is outside the current resolved access context")
+    if not _job_matches_resolved_context(job, snapshot[1]):
+        raise ValueError("cron job is outside the current resolved access context")
+    if (
+        _context_role(snapshot[0]) == "shared_room"
+        and _normalize_deliver_param(job.get("deliver")) != "origin"
+    ):
+        raise ValueError("shared room cron can only deliver to the current room/topic")
+    if _is_family_context(snapshot[0]) and _normalize_deliver_param(job.get("deliver")) != "origin":
+        raise ValueError("family cron can only deliver to the current conversation")
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -684,6 +824,12 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        snapshot = _current_resolved_access_snapshot()
+        serialized_context, resolved_origin = _guard_configured_cron_action(
+            normalized,
+            snapshot,
+            deliver=deliver,
+        )
 
         if normalized == "create":
             if not schedule:
@@ -726,12 +872,14 @@ def cronjob(
                 from cron.jobs import get_job as _get_job
                 refs = [context_from] if isinstance(context_from, str) else context_from
                 for ref_id in refs:
-                    if not _get_job(ref_id):
+                    ref_job = _get_job(ref_id)
+                    if not ref_job:
                         return tool_error(
                             f"context_from job '{ref_id}' not found. "
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+                    _require_job_in_context(ref_job, snapshot)
 
             job = create_job(
                 prompt=prompt or "",
@@ -739,7 +887,7 @@ def cronjob(
                 name=name,
                 repeat=repeat,
                 deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
+                origin=resolved_origin,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
@@ -750,6 +898,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                resolved_access_context=serialized_context,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -774,14 +923,20 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            jobs = [
+                _format_job(job)
+                for job in _visible_jobs_for_context(
+                    list_jobs(include_disabled=include_disabled),
+                    snapshot,
+                )
+            ]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
         try:
-            job = resolve_job_ref(job_id)
+            job = _resolve_job_ref_for_context(job_id, snapshot)
         except AmbiguousJobReference as exc:
             return json.dumps(
                 {
@@ -804,6 +959,7 @@ def cronjob(
                 {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
             )
+        _require_job_in_context(job, snapshot)
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
 
@@ -912,12 +1068,14 @@ def cronjob(
                 if refs:
                     from cron.jobs import get_job as _get_job
                     for ref_id in refs:
-                        if not _get_job(ref_id):
+                        ref_job = _get_job(ref_id)
+                        if not ref_job:
                             return tool_error(
                                 f"context_from job '{ref_id}' not found. "
                                 "Use cronjob(action='list') to see available jobs.",
                                 success=False,
                             )
+                        _require_job_in_context(ref_job, snapshot)
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None

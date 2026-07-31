@@ -402,6 +402,33 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     assert agent.tools is same  # not replaced → no churn
 
 
+def test_between_turns_refresh_cleans_last_removed_mcp_tool():
+    agent = _FakeAgent()
+    agent.tools = [
+        {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "mcp__demo__removed", "description": "", "parameters": {}}},
+    ]
+    agent.valid_tool_names = {"read_file", "mcp__demo__removed"}
+
+    import model_tools
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch.object(
+             model_tools,
+             "get_tool_definitions",
+             return_value=[
+                 {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {}}},
+             ],
+         ) as gtd:
+        _build(agent)
+
+    gtd.assert_called_once()
+    assert agent.valid_tool_names == {"read_file"}
+    assert all(
+        not t["function"]["name"].startswith("mcp__")
+        for t in agent.tools
+    )
+
+
 def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
     agent = _make_agent_with_cooldown(
         tmp_path / "state.db",
@@ -450,4 +477,3 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-

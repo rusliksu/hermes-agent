@@ -31,7 +31,7 @@ support.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
@@ -54,6 +54,85 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _session_scope_from_resolved_context() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return a trusted SQL scope from task-local gateway context.
+
+    ``None`` context is the legacy CLI/cron path and is not an error. Any
+    present-but-invalid context fails closed before DB creation or reads.
+    """
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        context = get_resolved_access_context(None)
+    except Exception:
+        logging.debug("session_search could not read resolved access context", exc_info=True)
+        return None, "session_search denied: resolved access context unavailable"
+    if context is None:
+        return None, None
+
+    try:
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+    except Exception:
+        logging.debug("session_search could not import access registry types", exc_info=True)
+        return None, "session_search denied: access registry unavailable"
+
+    target = getattr(context, "delivery_target", None)
+    if not isinstance(context, ResolvedAccessContext) or not isinstance(target, DeliveryTarget):
+        return None, "session_search denied: malformed resolved access context"
+
+    required = (
+        context.principal_id,
+        context.role_id,
+        context.profile_id,
+        context.conversation_scope,
+        target.platform,
+        target.account,
+        target.peer_kind,
+        target.chat_id,
+    )
+    if not all(_nonempty_str(value) for value in required):
+        return None, "session_search denied: malformed resolved access context"
+    if not isinstance(context.capabilities, frozenset):
+        return None, "session_search denied: malformed resolved access context"
+
+    role_id = context.role_id.strip()
+    capabilities = context.capabilities
+    if role_id == "family_standard" or role_id == "family_sandbox":
+        if "session_search" not in capabilities:
+            return None, "session_search denied: role lacks session_search capability"
+    elif role_id == "owner":
+        pass
+    else:
+        return None, "session_search denied: role is not allowed to use session_search"
+
+    peer_kind = target.peer_kind.strip()
+    if peer_kind != "dm":
+        return None, "session_search denied: typed access context requires DM delivery target"
+    return {
+        "profile_name": context.profile_id,
+        "source": target.platform,
+        "chat_type": "dm",
+        "chat_id": target.chat_id,
+        "thread_id": target.thread_id or "",
+        "user_id": target.chat_id,
+        "is_dm": True,
+    }, None
+
+
+def _session_in_scope(db, session_id: str, session_scope: Optional[Dict[str, Any]]) -> bool:
+    if not session_scope:
+        return True
+    try:
+        return bool(db.session_in_scope(session_id, session_scope))
+    except Exception:
+        logging.debug("session scope check failed for %s", session_id, exc_info=True)
+        return False
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -81,10 +160,16 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _resolve_to_parent(db, session_id: str) -> str:
+def _resolve_to_parent(
+    db,
+    session_id: str,
+    session_scope: Optional[Dict[str, Any]] = None,
+) -> str:
     """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
     if not session_id:
         return session_id
+    if not _session_in_scope(db, session_id, session_scope):
+        return ""
     visited = set()
     cur = session_id
     while cur and cur not in visited:
@@ -95,6 +180,8 @@ def _resolve_to_parent(db, session_id: str) -> str:
                 break
             parent = s.get("parent_session_id")
             if not parent:
+                break
+            if not _session_in_scope(db, parent, session_scope):
                 break
             cur = parent
         except Exception as e:
@@ -141,74 +228,13 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _resolve_profile_db(profile: str):
-    """Open another profile's ``state.db`` read-only, or None for the current one.
-
-    The desktop's ``@session:<profile>/<id>`` links always carry the source
-    profile, so a linked session from profile B can be read while the agent
-    runs in profile A. ``read_only=True`` (mode=ro) takes no write lock — safe
-    to point at a live profile's DB, including our own. Returns None when no
-    profile is given (use the caller's default db).
-    """
-    if profile is None or not str(profile).strip():
-        return None
-
-    from hermes_cli import profiles as profiles_mod
-    from hermes_state import SessionDB
-
-    canon = profiles_mod.normalize_profile_name(profile)
-    profiles_mod.validate_profile_name(canon)
-    if not profiles_mod.profile_exists(canon):
-        raise ValueError(f"profile '{canon}' does not exist")
-
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
-
-
-def _locate_session_db(session_id: str):
-    """Scan every profile's ``state.db`` (read-only) for a session id.
-
-    Returns ``(db, profile_name)`` for the first profile that owns the id, or
-    ``(None, None)``. Session ids are globally unique (timestamp + random hex),
-    so the first hit is authoritative. This is the safety net for linked-session
-    reads where the model dropped the owning profile from the link and passed a
-    bare id — we find it wherever it actually lives instead of failing.
-    """
-    from pathlib import Path
-
-    try:
-        from hermes_cli import profiles as profiles_mod
-        from hermes_state import SessionDB
-    except Exception:
-        return None, None
-
-    targets = [("default", profiles_mod.get_profile_dir("default"))]
-    try:
-        targets += [(info.name, info.path) for info in profiles_mod.list_profiles()]
-    except Exception:
-        logging.debug("list_profiles failed during session locate", exc_info=True)
-
-    seen: set = set()
-    for name, home in targets:
-        db_path = Path(home) / "state.db"
-        key = str(db_path)
-        if key in seen or not db_path.exists():
-            continue
-        seen.add(key)
-        try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
-        except Exception:
-            continue
-        try:
-            if pdb.get_session(session_id):
-                return pdb, name
-        except Exception:
-            logging.debug("get_session probe failed for %s in %s", session_id, name, exc_info=True)
-        pdb.close()
-
-    return None, None
-
-
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+def _read_session(
+    db,
+    session_id: str,
+    head: int = 20,
+    tail: int = 10,
+    session_scope: Optional[Dict[str, Any]] = None,
+) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -216,6 +242,9 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     full, large ones return the first ``head`` and last ``tail`` messages with a
     pointer to scroll the middle.
     """
+    if not _session_in_scope(db, session_id, session_scope):
+        return tool_error(f"session_id not found: {session_id}", success=False)
+
     try:
         meta = db.get_session(session_id) or {}
     except Exception as e:
@@ -257,16 +286,22 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    session_scope: Optional[Dict[str, Any]] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            session_scope=session_scope,
         )  # fetch extra so we can skip current
 
-        current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+        current_root = _resolve_to_parent(db, current_session_id, session_scope) if current_session_id else None
 
         results = []
         for s in sessions:
@@ -306,6 +341,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    session_scope: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -316,6 +352,8 @@ def _scroll(
     if not isinstance(session_id, str) or not session_id.strip():
         return tool_error("scroll requires session_id", success=False)
     session_id = session_id.strip()
+    if not _session_in_scope(db, session_id, session_scope):
+        return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
         around_message_id = int(around_message_id)
@@ -333,8 +371,8 @@ def _scroll(
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
     if current_session_id:
-        a_root = _resolve_to_parent(db, session_id)
-        c_root = _resolve_to_parent(db, current_session_id)
+        a_root = _resolve_to_parent(db, session_id, session_scope)
+        c_root = _resolve_to_parent(db, current_session_id, session_scope)
         if a_root and c_root and a_root == c_root:
             return tool_error(
                 "scroll rejected: anchor lives in the current session lineage (already in your active context)",
@@ -366,19 +404,22 @@ def _scroll(
     if not messages:
         owning = None
         try:
-            conn = getattr(db, "_conn", None)
-            if conn is not None:
-                row = conn.execute(
-                    "SELECT session_id FROM messages WHERE id = ?",
-                    (around_message_id,),
-                ).fetchone()
-                owning = row[0] if row else None
+            if session_scope:
+                owning = db.get_message_session_in_scope(around_message_id, session_scope)
+            else:
+                conn = getattr(db, "_conn", None)
+                if conn is not None:
+                    row = conn.execute(
+                        "SELECT session_id FROM messages WHERE id = ?",
+                        (around_message_id,),
+                    ).fetchone()
+                    owning = row[0] if row else None
         except Exception as e:
             logging.debug("owning-session lookup failed: %s", e, exc_info=True)
             owning = None
         if owning and owning != session_id:
-            a_root = _resolve_to_parent(db, session_id)
-            o_root = _resolve_to_parent(db, owning)
+            a_root = _resolve_to_parent(db, session_id, session_scope)
+            o_root = _resolve_to_parent(db, owning, session_scope)
             if a_root and o_root and a_root == o_root:
                 try:
                     rebind_view = db.get_messages_around(owning, around_message_id, window=window)
@@ -433,6 +474,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    session_scope: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -440,14 +482,14 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        session_id = db.resolve_session_by_title(title_query, session_scope=session_scope)
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
     if not session_id:
         return None
 
-    lineage_root = _resolve_to_parent(db, session_id)
+    lineage_root = _resolve_to_parent(db, session_id, session_scope)
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
 
@@ -457,6 +499,8 @@ def _title_match_result(
         logging.debug("get_session failed for title match %s", session_id, exc_info=True)
         session_meta = {}
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
+        return None
+    if not _session_in_scope(db, session_id, session_scope):
         return None
 
     try:
@@ -503,11 +547,12 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    session_scope: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    current_lineage_root = _resolve_to_parent(db, current_session_id, session_scope) if current_session_id else None
+    title_result = _title_match_result(db, query, current_lineage_root, session_scope)
 
     try:
         raw_results = db.search_messages(
@@ -519,6 +564,7 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            session_scope=session_scope,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -556,7 +602,9 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
+        resolved_sid = _resolve_to_parent(db, raw_sid, session_scope)
+        if not resolved_sid:
+            continue
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue
@@ -574,6 +622,8 @@ def _discover(
             continue
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
+        if not _session_in_scope(db, hit_sid, session_scope):
+            continue
         try:
             view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
         except Exception as e:
@@ -628,8 +678,6 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
-    # Cross-profile (any shape)
-    profile: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -638,10 +686,19 @@ def session_search(
     Read:      pass ``session_id`` (no anchor) — dumps the whole session.
     Browse:    pass nothing.
 
-    Pass ``profile`` to read another profile's sessions (e.g. resolving an
-    ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
-    anchor is set — the agent has asked for a specific slice.
+    The caller supplies the trusted SessionDB. Model/tool arguments cannot
+    select another profile. Scroll wins over read/discovery when an anchor is
+    set — the agent has asked for a specific slice.
     """
+    session_scope, access_error = _session_scope_from_resolved_context()
+    if access_error:
+        return tool_error(access_error, success=False)
+    if session_scope and db is None:
+        return tool_error(
+            "session_search denied: typed access context requires caller-supplied SessionDB",
+            success=False,
+        )
+
     if db is None:
         try:
             from hermes_state import SessionDB
@@ -651,30 +708,6 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
-    # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
-    # Session ids never contain "/", so a slash unambiguously means profile/id —
-    # always strip the prefix off the id, and adopt the embedded profile only
-    # when one wasn't passed explicitly. Handles every permutation the model
-    # might send (full value as id, with or without a separate profile=).
-    if isinstance(session_id, str) and "/" in session_id:
-        emb_profile, _, emb_id = session_id.partition("/")
-        if emb_id:
-            session_id = emb_id
-            if emb_profile and (profile is None or not str(profile).strip()):
-                profile = emb_profile
-
-    # Cross-profile read: swap in the named profile's DB (read-only) for every
-    # shape below. The current-session-lineage guards no longer apply across
-    # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
-        try:
-            profile_db = _resolve_profile_db(profile)
-        except Exception as e:
-            return tool_error(f"profile '{profile}': {e}", success=False)
-        if profile_db is not None:
-            db = profile_db
-            current_session_id = None
-
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -683,28 +716,12 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            session_scope=session_scope,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
-        sid = session_id.strip()
-        result = _read_session(db, sid)
-        if json.loads(result).get("success"):
-            return result
-
-        # Miss in the target profile — the model may have dropped the owning
-        # profile from the link. Scan every profile and read it from wherever
-        # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
-            try:
-                found = json.loads(_read_session(located, sid))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
-        return result
+        return _read_session(db, session_id.strip(), session_scope=session_scope)
 
     # Limit clamp [1, 10]
     if not isinstance(limit, int):
@@ -716,7 +733,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, session_scope)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -737,6 +754,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        session_scope=session_scope,
     )
 
 
@@ -793,11 +811,10 @@ SESSION_SEARCH_SCHEMA = {
         "       - When messages_before or messages_after is < window, you're at the "
         "start or end of the session.\n\n"
         "  3) READ — pass `session_id` only (no around_message_id):\n"
-        "     session_search(session_id=\"...\", profile=\"work\")\n"
+        "     session_search(session_id=\"...\")\n"
         "     Dumps the whole session by id (first 20 + last 10 messages when "
-        "large). This is how you resolve an `@session:<profile>/<id>` link the "
-        "user dropped into the chat: split the value on `/` into profile + id "
-        "and call session_search(session_id=id, profile=profile).\n\n"
+        "large). Only sessions from the caller-supplied local session DB are "
+        "visible; profile-qualified or foreign session IDs are not resolved.\n\n"
         "  4) BROWSE — no args:\n"
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
@@ -882,15 +899,6 @@ SESSION_SEARCH_SCHEMA = {
                     "behaviour) or 'tool' to search tool output only."
                 ),
             },
-            "profile": {
-                "type": "string",
-                "description": (
-                    "Optional. Read sessions from another Hermes profile's database "
-                    "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
-                    "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
-                ),
-            },
         },
         "required": [],
     },
@@ -912,7 +920,6 @@ registry.register(
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
         sort=args.get("sort"),
-        profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

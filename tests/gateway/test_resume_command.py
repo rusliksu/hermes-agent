@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -24,6 +25,22 @@ def _make_event(text="/resume", platform=Platform.TELEGRAM,
         user_name="testuser",
     )
     return MessageEvent(text=text, source=source)
+
+
+def _resolved_context(profile_id="family-alpha") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-alpha",
+        role_id="family",
+        profile_id=profile_id,
+        conversation_scope="dm:alpha",
+        capabilities=frozenset({"chat"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="chat-alpha",
+        ),
+    )
 
 
 def _session_key_for_event(event):
@@ -45,6 +62,10 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
         session_db = AsyncSessionDB(session_db)
     runner._session_db = session_db
     runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._active_session_leases = {}
+    runner._busy_ack_ts = {}
+    runner._persist_active_agents = lambda: None
     runner._is_user_authorized = lambda _source: True
 
     # Compute the real session key if an event is provided
@@ -61,6 +82,24 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     runner.session_store = mock_store
 
     return runner
+
+
+class _FakeResumeDB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def get_session(self, session_id):
+        return self.rows.get(session_id)
+
+    async def resolve_session_by_title(self, title):
+        return None
+
+    async def resolve_resume_session_id(self, session_id):
+        return session_id
+
+    async def get_session_title(self, session_id):
+        row = self.rows.get(session_id) or {}
+        return row.get("title")
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +714,180 @@ class TestHandleSessionsCommand:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_resolved_context_live_origin_requires_matching_profile(self):
+        runner = _make_runner()
+        caller = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-a",
+            chat_type="group",
+            user_id="12345",
+        )
+        caller.resolved_access_context = _resolved_context("family-alpha")
+        same_origin = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-a",
+            chat_type="group",
+            user_id="12345",
+        )
+
+        same_origin.profile = ""
+        runner._gateway_session_origin_for_id = lambda sid: same_origin
+        assert await runner._resume_target_allowed(caller, "live_sid", allow_override=False) is False
+
+        same_origin.profile = "owner"
+        assert await runner._resume_target_allowed(caller, "live_sid", allow_override=False) is False
+
+        same_origin.profile = "family-alpha"
+        assert await runner._resume_target_allowed(caller, "live_sid", allow_override=False) is True
+
+    @pytest.mark.asyncio
+    async def test_resolved_context_persisted_row_requires_matching_profile(self, tmp_path):
+        runner = _make_runner()
+        runner._session_db = _FakeResumeDB({
+            "row_missing_profile": {
+                "id": "row_missing_profile",
+                "source": "telegram",
+                "user_id": "12345",
+                "chat_id": "chat-a",
+                "chat_type": "group",
+            },
+            "row_other_profile": {
+                "id": "row_other_profile",
+                "source": "telegram",
+                "user_id": "12345",
+                "chat_id": "chat-a",
+                "chat_type": "group",
+                "profile_name": "owner",
+            },
+            "row_same_profile": {
+                "id": "row_same_profile",
+                "source": "telegram",
+                "user_id": "12345",
+                "chat_id": "chat-a",
+                "chat_type": "group",
+                "profile_name": "family-alpha",
+            },
+            "row_same_profile_other_chat": {
+                "id": "row_same_profile_other_chat",
+                "source": "telegram",
+                "user_id": "12345",
+                "chat_id": "chat-b",
+                "chat_type": "group",
+                "profile_name": "family-alpha",
+            },
+        })
+        runner._gateway_session_origin_for_id = lambda sid: None
+        caller = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-a",
+            chat_type="group",
+            user_id="12345",
+        )
+        caller.resolved_access_context = _resolved_context("family-alpha")
+
+        assert await runner._resume_target_allowed(caller, "row_missing_profile", False) is False
+        assert await runner._resume_target_allowed(caller, "row_other_profile", False) is False
+        assert await runner._resume_target_allowed(caller, "row_same_profile", False) is True
+        assert await runner._resume_target_allowed(caller, "row_same_profile_other_chat", False) is False
+
+    @pytest.mark.asyncio
+    async def test_resolved_context_admin_all_cannot_cross_profile(self, tmp_path):
+        target_id = "raw_target_session_001"
+        event = _make_event(
+            text=f"/resume --all {target_id}",
+            user_id="12345",
+            chat_id="chat-a",
+        )
+        event.source.chat_type = "group"
+        event.source.resolved_access_context = _resolved_context("family-alpha")
+        runner = _make_runner(
+            session_db=None,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        runner._session_db = _FakeResumeDB({
+            target_id: {
+                "id": target_id,
+                "source": "telegram",
+                "user_id": "12345",
+                "chat_id": "chat-a",
+                "chat_type": "group",
+                "profile_name": "owner",
+                "title": "Owner Title",
+            }
+        })
+        runner._gateway_session_origin_for_id = lambda sid: None
+        runner._resume_caller_is_admin = lambda source: True
+
+        result = await runner._handle_resume_command(event)
+
+        runner.session_store.switch_session.assert_not_called()
+        assert result
+        text = result.lower()
+        assert target_id.lower() not in text
+        assert "owner" not in text
+        assert "owner title" not in text
+        assert "family-alpha" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_context_admin_all_legacy_override_unchanged(self, tmp_path):
+        target_id = "legacy_cross_profile"
+        caller = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-a",
+            chat_type="group",
+            user_id="12345",
+        )
+        runner = _make_runner()
+        runner._resume_caller_is_admin = lambda source: True
+
+        assert await runner._resume_target_allowed(caller, target_id, True) is True
+
+    @pytest.mark.asyncio
+    async def test_resolved_context_cross_room_cannot_cross_profile(self, tmp_path):
+        target_id = "matrix_raw_target_001"
+        event = _make_event(
+            text=f"/resume --cross-room {target_id}",
+            platform=Platform.MATRIX,
+            user_id="@alice:hs",
+            chat_id="!room-a:hs",
+        )
+        event.source.chat_type = "group"
+        event.source.resolved_access_context = _resolved_context("family-alpha")
+        runner = _make_runner(
+            session_db=None,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        runner._session_db = _FakeResumeDB({
+            target_id: {
+                "id": target_id,
+                "source": "matrix",
+                "user_id": "@alice:hs",
+                "chat_id": "!room-b:hs",
+                "title": "Matrix Owner Title",
+            }
+        })
+        target_origin = SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!room-b:hs",
+            chat_type="group",
+            user_id="@alice:hs",
+            profile="owner",
+        )
+        runner._gateway_session_origin_for_id = lambda sid: target_origin
+
+        result = await runner._handle_resume_command(event)
+
+        runner.session_store.switch_session.assert_not_called()
+        assert result
+        text = result.lower()
+        assert target_id.lower() not in text
+        assert "owner" not in text
+        assert "matrix owner title" not in text
+        assert "family-alpha" not in text
+
+    @pytest.mark.asyncio
     async def test_resume_target_allowed_dm_no_chat_id_scopes_by_user(self, tmp_path):
         """A DM is keyed on user_id; a no-chat_id DM row is resumable by the same
         user (chat_id legitimately absent on both sides), unlike a group row."""
@@ -904,8 +1117,9 @@ class TestSameOriginChatGroupScoping:
 
 class TestResumeRowVisibleMatrixAllScoping:
     """Non-admin Matrix `/resume --all` must NOT enumerate every Matrix titled
-    session: the cross-room listing short-circuit is admin-only, mirroring the
-    non-Matrix branch. A non-admin `--all` falls back to same-room scoping."""
+    session: the cross-room listing short-circuit is admin-only on the legacy
+    no-resolved-context path, mirroring the non-Matrix branch. A non-admin
+    `--all` falls back to same-room scoping."""
 
     @staticmethod
     def _matrix_src(chat_id="!room-a:hs", user_id="@alice:hs"):

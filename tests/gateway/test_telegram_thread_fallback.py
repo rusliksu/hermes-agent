@@ -904,6 +904,7 @@ async def test_send_dm_topic_reply_not_found_fails_closed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("inline_asyncio_to_thread")
 @pytest.mark.parametrize(
     ("method_name", "bot_method_name", "path_kw", "filename", "payload"),
     [
@@ -916,6 +917,7 @@ async def test_send_dm_topic_reply_not_found_fails_closed():
 )
 async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(
     tmp_path,
+    monkeypatch,
     method_name,
     bot_method_name,
     path_kw,
@@ -925,6 +927,11 @@ async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(
     adapter = _make_adapter()
     media_path = tmp_path / filename
     media_path.write_bytes(payload)
+    if method_name == "send_voice":
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._probe_voice_duration_seconds",
+            lambda _path: None,
+        )
     call_log = []
 
     async def mock_send_media(**kwargs):

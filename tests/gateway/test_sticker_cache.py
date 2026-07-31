@@ -39,6 +39,22 @@ class TestLoadSaveCache:
 
 
 class TestCacheSticker:
+    def test_runtime_home_change_is_authoritative_without_cache_path_monkeypatch(self, tmp_path, monkeypatch):
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        cache_sticker_description("same-uid", "Profile A")
+
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        assert get_cached_description("same-uid") is None
+        cache_sticker_description("same-uid", "Profile B")
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        assert get_cached_description("same-uid")["description"] == "Profile A"
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        assert get_cached_description("same-uid")["description"] == "Profile B"
+
     def test_cache_and_retrieve(self, tmp_path):
         cache_file = tmp_path / "cache.json"
         with patch("gateway.sticker_cache.CACHE_PATH", cache_file):

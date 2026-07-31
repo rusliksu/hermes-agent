@@ -8,6 +8,7 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
@@ -19,6 +20,25 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    @staticmethod
+    def _register_test_tool(name, toolset):
+        from tools.registry import registry
+
+        registry.register(
+            name=name,
+            toolset=toolset,
+            schema={
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} test tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            handler=lambda args, **kw: json.dumps({"ok": True, "tool": name}),
+            override=True,
+        )
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))
@@ -200,6 +220,119 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_enabled_tools_denies_hidden_registered_tool_before_dispatch(self, monkeypatch):
+        hidden = "mcp_wolfram_hidden_guard_test"
+        self._register_test_tool(hidden, "mcp-wolfram-guard-test")
+        dispatch_called = False
+
+        def fake_dispatch(*args, **kwargs):
+            nonlocal dispatch_called
+            dispatch_called = True
+            raise AssertionError("hidden tool must not dispatch")
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("middleware must not run for denied tools")
+            ),
+        )
+
+        result = json.loads(handle_function_call(
+            hidden,
+            {},
+            enabled_tools=["tool_search", "tool_call"],
+            enabled_toolsets=["mcp-wolfram-guard-test"],
+        ))
+
+        assert "error" in result
+        assert "not available in this session" in result["error"]
+        assert dispatch_called is False
+
+    def test_enabled_tools_allows_listed_registered_tool(self, monkeypatch):
+        allowed = "mcp_allowed_dispatch_guard_test"
+        self._register_test_tool(allowed, "mcp-allowed-guard-test")
+
+        def fake_dispatch(tool_name, args, **kwargs):
+            return json.dumps({"ok": True, "tool": tool_name, "args": args})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(handle_function_call(
+            allowed,
+            {"value": "kept"},
+            enabled_tools=[allowed],
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+        ))
+
+        assert result == {"ok": True, "tool": allowed, "args": {"value": "kept"}}
+
+    def test_enabled_tools_preserves_tool_search_bridge_dispatch(self):
+        bridged = "mcp_bridge_dispatch_guard_test"
+        self._register_test_tool(bridged, "mcp-bridge-guard-test")
+
+        result = json.loads(handle_function_call(
+            "tool_call",
+            {"name": bridged, "arguments": {"value": "via-bridge"}},
+            enabled_tools=["tool_search", "tool_describe", "tool_call"],
+            enabled_toolsets=["mcp-bridge-guard-test"],
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+        ))
+
+        assert result == {"ok": True, "tool": bridged}
+
+
+def test_multiplex_mcp_helper_failure_fails_closed_without_registry_fallback(monkeypatch):
+    import agent.secret_scope as secret_scope
+    from gateway.session_context import reset_session_vars
+    from tools.registry import registry
+    import model_tools
+
+    tool_name = "mcp__global_alias_guard__echo"
+    secret_scope.set_multiplex_active(True)
+    reset_session_vars()
+    model_tools._tool_defs_cache.clear()
+    registry.register(
+        name=tool_name,
+        toolset="mcp-global_alias_guard",
+        schema={
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "must not leak under multiplex helper failure",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        handler=lambda args, **kw: "{}",
+        override=True,
+    )
+    registry.register_toolset_alias("global_alias_guard", "mcp-global_alias_guard")
+    monkeypatch.setattr(
+        secret_scope,
+        "is_multiplex_active",
+        lambda: (_ for _ in ()).throw(RuntimeError("state probe failed")),
+    )
+
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=["global_alias_guard"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        registry.deregister(tool_name)
+        model_tools._tool_defs_cache.clear()
+        reset_session_vars()
+        secret_scope.set_multiplex_active(False)
+
+    assert [
+        d["function"]["name"]
+        for d in definitions
+        if d["function"]["name"].startswith("mcp__")
+    ] == []
 
 
 # =========================================================================

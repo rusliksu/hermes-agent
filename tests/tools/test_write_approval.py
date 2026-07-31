@@ -237,6 +237,32 @@ def test_pending_store_roundtrip(hermes_home):
     assert wa.get_pending("memory", rec["id"]) is None
 
 
+def test_scoped_pending_store_filters_without_changing_legacy_all_records(hermes_home):
+    from tools import write_approval as wa
+
+    a = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "memory", "content": "a"},
+        summary="a",
+        origin="foreground",
+        scope_key="scope-a",
+    )
+    b = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "memory", "content": "b"},
+        summary="b",
+        origin="foreground",
+        scope_key="scope-b",
+    )
+
+    assert {r["id"] for r in wa.list_pending("memory")} == {a["id"], b["id"]}
+    assert [r["id"] for r in wa.list_pending("memory", scope_key="scope-a")] == [a["id"]]
+    assert wa.pending_count("memory", scope_key="scope-b") == 1
+    assert wa.get_pending("memory", a["id"], scope_key="scope-b") is None
+    assert wa.discard_pending("memory", a["id"], scope_key="scope-b") is False
+    assert wa.get_pending("memory", a["id"]) is not None
+
+
 # ---------------------------------------------------------------------------
 # Shared command handler
 # ---------------------------------------------------------------------------
@@ -261,6 +287,167 @@ def test_handle_approve_all(hermes_home):
     assert "Approved 2" in out
     assert wa.pending_count("memory") == 0
     assert len(store.user_entries) == 2
+
+
+def test_handle_scoped_pending_commands_do_not_cross_contexts(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store_a = MemoryStore(); store_a.load_from_disk()
+    rec_a = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "memory", "content": "scope a"},
+        summary="scope a",
+        origin="foreground",
+        scope_key="scope-a",
+    )
+    rec_b = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "memory", "content": "scope b"},
+        summary="scope b",
+        origin="foreground",
+        scope_key="scope-b",
+    )
+
+    listed = handle_pending_subcommand(
+        wa.MEMORY,
+        ["pending"],
+        pending_scope_key="scope-a",
+    )
+    assert rec_a["id"] in listed
+    assert rec_b["id"] not in listed
+
+    guessed = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", rec_b["id"]],
+        memory_store=store_a,
+        pending_scope_key="scope-a",
+    )
+    assert "No pending memory write" in guessed
+
+    approved = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", "all"],
+        memory_store=store_a,
+        pending_scope_key="scope-a",
+    )
+    assert "Approved 1" in approved
+    assert store_a.memory_entries == ["scope a"]
+    assert wa.get_pending("memory", rec_a["id"]) is None
+    assert wa.get_pending("memory", rec_b["id"]) is not None
+
+    rejected = handle_pending_subcommand(
+        wa.MEMORY,
+        ["reject", rec_b["id"]],
+        pending_scope_key="scope-a",
+    )
+    assert "No pending memory write" in rejected
+    assert wa.get_pending("memory", rec_b["id"]) is not None
+
+    rejected_b = handle_pending_subcommand(
+        wa.MEMORY,
+        ["reject", rec_b["id"]],
+        pending_scope_key="scope-b",
+    )
+    assert "Rejected pending memory write" in rejected_b
+    assert wa.pending_count("memory") == 0
+
+
+def test_typed_pending_memory_records_are_scoped_in_same_home(hermes_home):
+    from pathlib import Path
+
+    from gateway.access_registry import (
+        canonical_access_context_fingerprint,
+        DeliveryTarget,
+        ResolvedAccessContext,
+    )
+    from gateway.session_context import bind_resolved_access_context, reset_session_vars
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools import write_approval as wa
+
+    def context(chat_id, scope):
+        return ResolvedAccessContext(
+            principal_id=f"principal-{chat_id}",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope=scope,
+            capabilities=frozenset({"memory_search"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id=chat_id,
+            ),
+        )
+
+    _set_approval("memory", True)
+    home = Path(hermes_home)
+    ctx_a = context("10001", "private-a")
+    ctx_b = context("10002", "private-b")
+    key_a = canonical_access_context_fingerprint(ctx_a)
+    key_b = canonical_access_context_fingerprint(ctx_b)
+    reset_session_vars()
+    try:
+        with bind_resolved_access_context(ctx_a):
+            store_a = MemoryStore(memory_dir=home / "memories", access_context=ctx_a)
+            store_a.load_from_disk()
+            rec_a = json.loads(
+                memory_tool("add", "memory", "typed a", store=store_a)
+            )
+        with bind_resolved_access_context(ctx_b):
+            store_b = MemoryStore(memory_dir=home / "memories", access_context=ctx_b)
+            store_b.load_from_disk()
+            rec_b = json.loads(
+                memory_tool("add", "memory", "typed b", store=store_b)
+            )
+
+        assert wa.get_pending("memory", rec_a["pending_id"])["scope_key"] == key_a
+        assert wa.get_pending("memory", rec_b["pending_id"])["scope_key"] == key_b
+
+        with bind_resolved_access_context(ctx_a):
+            listed = handle_pending_subcommand(
+                wa.MEMORY,
+                ["pending"],
+                pending_scope_key=key_a,
+            )
+            assert rec_a["pending_id"] in listed
+            assert rec_b["pending_id"] not in listed
+            guessed = handle_pending_subcommand(
+                wa.MEMORY,
+                ["approve", rec_b["pending_id"]],
+                memory_store=store_a,
+                pending_scope_key=key_a,
+            )
+            assert "No pending memory write" in guessed
+            approved = handle_pending_subcommand(
+                wa.MEMORY,
+                ["approve", "all"],
+                memory_store=store_a,
+                pending_scope_key=key_a,
+            )
+            assert "Approved 1" in approved
+
+            rejected = handle_pending_subcommand(
+                wa.MEMORY,
+                ["reject", rec_b["pending_id"]],
+                pending_scope_key=key_a,
+            )
+            assert "No pending memory write" in rejected
+
+        assert wa.get_pending("memory", rec_a["pending_id"]) is None
+        assert wa.get_pending("memory", rec_b["pending_id"]) is not None
+
+        with bind_resolved_access_context(ctx_b):
+            rejected_b = handle_pending_subcommand(
+                wa.MEMORY,
+                ["reject", rec_b["pending_id"]],
+                pending_scope_key=key_b,
+            )
+        assert "Rejected pending memory write" in rejected_b
+    finally:
+        reset_session_vars()
 
 
 def test_handle_reject(hermes_home):

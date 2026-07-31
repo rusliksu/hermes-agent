@@ -12,6 +12,11 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_callback_port(monkeypatch):
+    monkeypatch.setattr("tools.mcp_oauth._reserve_callback_port", lambda: 8765)
+
+
 def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypatch):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.mcp_oauth import HermesTokenStorage
@@ -37,14 +42,19 @@ def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypat
         token = set_hermes_home_override(home)
         try:
             provider = manager.get_or_build_provider("shared", "https://mcp.example/mcp", {})
-            asyncio.run(provider._initialize())
             providers.append(provider)
         finally:
             reset_hermes_home_override(token)
 
     assert providers[0] is not providers[1]
-    assert providers[0].context.current_tokens.access_token == "TOKEN_A"
-    assert providers[1].context.current_tokens.access_token == "TOKEN_B"
+    assert (
+        asyncio.run(providers[0].context.storage.get_tokens()).access_token
+        == "TOKEN_A"
+    )
+    assert (
+        asyncio.run(providers[1].context.storage.get_tokens()).access_token
+        == "TOKEN_B"
+    )
 
 
 def test_manager_explicit_home_removes_only_that_profiles_tokens(tmp_path):
@@ -73,6 +83,213 @@ def test_manager_explicit_home_removes_only_that_profiles_tokens(tmp_path):
 
     assert paths[0].exists()
     assert not paths[1].exists()
+
+
+def test_typed_token_storage_uses_opaque_scope_directory(tmp_path):
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_tool import MCPPoolKey
+
+    key = MCPPoolKey(profile_id="raw-profile-a", conversation_scope="raw-scope-a")
+    storage = HermesTokenStorage("raw-server", hermes_home=tmp_path, typed_pool_key=key)
+
+    path = storage._tokens_path()
+
+    assert path.name == "tokens.json"
+    assert path.parent.parent == tmp_path / "mcp-tokens"
+    assert len(path.parent.name) == 64
+    assert all(ch in "0123456789abcdef" for ch in path.parent.name)
+    rendered = str(path)
+    assert "raw-profile-a" not in rendered
+    assert "raw-scope-a" not in rendered
+    assert "raw-server" not in rendered
+
+
+def test_typed_manager_and_storage_require_explicit_home_before_io(monkeypatch):
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import MCPPoolKey
+
+    key = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    calls = {"ambient_home": 0, "token_dir": 0, "provider": 0}
+
+    def ambient_home():
+        calls["ambient_home"] += 1
+        raise AssertionError("ambient home must not be read")
+
+    def token_dir(*_args, **_kwargs):
+        calls["token_dir"] += 1
+        raise AssertionError("storage path must not be touched")
+
+    def build_provider(*_args, **_kwargs):
+        calls["provider"] += 1
+        raise AssertionError("provider must not be built")
+
+    monkeypatch.setattr("hermes_constants.get_hermes_home", ambient_home)
+    monkeypatch.setattr("tools.mcp_oauth._get_token_dir", token_dir)
+    monkeypatch.setattr(MCPOAuthManager, "_build_provider", build_provider)
+
+    with pytest.raises(ValueError, match="profile-bound-oauth-home-missing"):
+        HermesTokenStorage("shared", typed_pool_key=key)
+    with pytest.raises(ValueError, match="profile-bound-oauth-home-missing"):
+        HermesTokenStorage("shared", hermes_home="", typed_pool_key=key)
+    with pytest.raises(ValueError, match="profile-bound-oauth-home-missing"):
+        MCPOAuthManager().get_or_build_provider(
+            "shared", "https://mcp.example/mcp", {}, pool_key=key
+        )
+
+    assert calls == {"ambient_home": 0, "token_dir": 0, "provider": 0}
+
+
+def test_typed_manager_and_storage_reject_empty_pool_key_fields(tmp_path):
+    from types import SimpleNamespace
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    bad_keys = (
+        SimpleNamespace(profile_id="", conversation_scope="dm:a"),
+        SimpleNamespace(profile_id="profile-a", conversation_scope=""),
+    )
+
+    for key in bad_keys:
+        with pytest.raises(ValueError, match="profile-bound-oauth-key-invalid"):
+            HermesTokenStorage("shared", hermes_home=tmp_path, typed_pool_key=key)
+        with pytest.raises(ValueError, match="profile-bound-oauth-key-invalid"):
+            MCPOAuthManager().get_or_build_provider(
+                "shared",
+                "https://mcp.example/mcp",
+                {},
+                hermes_home=tmp_path,
+                pool_key=key,
+            )
+
+
+def test_typed_oauth_tokens_present_fail_closed_legacy_permissive(monkeypatch):
+    from hermes_cli.mcp_config import _oauth_tokens_present
+    from tools.mcp_tool import MCPPoolKey
+
+    class BoomStorage:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("storage boom")
+
+    monkeypatch.setattr("tools.mcp_oauth.HermesTokenStorage", BoomStorage)
+
+    key = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    assert _oauth_tokens_present("shared", hermes_home="/tmp/profile-a", typed_pool_key=key) is False
+    assert _oauth_tokens_present("shared") is True
+
+
+def test_typed_manager_isolates_same_home_server_by_scope(tmp_path, monkeypatch):
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import MCPPoolKey
+
+    _set_interactive_stdin(monkeypatch)
+    key_a = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    key_b = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:b")
+    for key, token_value in ((key_a, "TOKEN_A"), (key_b, "TOKEN_B")):
+        storage = HermesTokenStorage("shared", hermes_home=tmp_path, typed_pool_key=key)
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        storage._tokens_path().write_text(
+            '{"access_token":"%s","token_type":"Bearer","expires_in":3600}'
+            % token_value
+        )
+
+    manager = MCPOAuthManager()
+    provider_a = manager.get_or_build_provider(
+        "shared",
+        "https://mcp.example/mcp",
+        {},
+        hermes_home=tmp_path,
+        pool_key=key_a,
+    )
+    provider_b = manager.get_or_build_provider(
+        "shared",
+        "https://mcp.example/mcp",
+        {},
+        hermes_home=tmp_path,
+        pool_key=key_b,
+    )
+
+    assert provider_a is not provider_b
+    assert (
+        asyncio.run(provider_a.context.storage.get_tokens()).access_token
+        == "TOKEN_A"
+    )
+    assert (
+        asyncio.run(provider_b.context.storage.get_tokens()).access_token
+        == "TOKEN_B"
+    )
+
+
+def test_typed_manager_remove_restore_evict_are_scope_local(tmp_path, monkeypatch):
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import MCPPoolKey
+
+    _set_interactive_stdin(monkeypatch)
+    key_a = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    key_b = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:b")
+    storage_a = HermesTokenStorage("shared", hermes_home=tmp_path, typed_pool_key=key_a)
+    storage_b = HermesTokenStorage("shared", hermes_home=tmp_path, typed_pool_key=key_b)
+    for storage in (storage_a, storage_b):
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        storage._tokens_path().write_text('{"access_token":"x","token_type":"Bearer"}')
+
+    manager = MCPOAuthManager()
+    provider_a = manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_a
+    )
+    provider_b = manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_b
+    )
+
+    entry_b = manager.remove("shared", hermes_home=tmp_path, pool_key=key_b)
+    assert storage_a._tokens_path().exists()
+    assert not storage_b._tokens_path().exists()
+    assert manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_a
+    ) is provider_a
+
+    manager.restore_entry("shared", entry_b, hermes_home=tmp_path, pool_key=key_b)
+    assert manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_b
+    ) is provider_b
+    manager.evict("shared", hermes_home=tmp_path, pool_key=key_a)
+    assert manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_b
+    ) is provider_b
+
+
+@pytest.mark.asyncio
+async def test_typed_invalidate_is_scope_local(tmp_path, monkeypatch):
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import MCPPoolKey
+
+    _set_interactive_stdin(monkeypatch)
+    key_a = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:a")
+    key_b = MCPPoolKey(profile_id="profile-a", conversation_scope="dm:b")
+    for key in (key_a, key_b):
+        storage = HermesTokenStorage("shared", hermes_home=tmp_path, typed_pool_key=key)
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        storage._tokens_path().write_text('{"access_token":"x","token_type":"Bearer"}')
+
+    manager = MCPOAuthManager()
+    provider_a = manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_a
+    )
+    provider_b = manager.get_or_build_provider(
+        "shared", "https://mcp.example/mcp", {}, hermes_home=tmp_path, pool_key=key_b
+    )
+    provider_a._initialized = True
+    provider_b._initialized = True
+
+    assert await manager.invalidate_if_disk_changed(
+        "shared", hermes_home=tmp_path, pool_key=key_a
+    ) is True
+    assert provider_a._initialized is False
+    assert provider_b._initialized is True
 
 
 def test_manager_can_restore_removed_entry_after_failed_reauth(tmp_path, monkeypatch):

@@ -692,14 +692,16 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
                 f"'{other_profile}' ({other_path}). To edit a skill in "
                 f"another profile, switch profiles (`hermes -p "
                 f"{other_profile}`) or operate via explicit file tools "
-                f"with ``cross_profile=True``."
+                f"with ``cross_profile=True`` only in a legacy no-typed-context "
+                f"session."
             )
         else:
             names = ", ".join(f"'{p}'" for p, _ in others)
             base += (
                 f" Skills by that name exist in other profiles: {names}. "
                 f"Switch profiles (`hermes -p <name>`) to edit there, or "
-                f"operate via explicit file tools with ``cross_profile=True``."
+                f"operate via explicit file tools with ``cross_profile=True`` "
+                f"only in a legacy no-typed-context session."
             )
     else:
         base += " Use skills_list() to see available skills."

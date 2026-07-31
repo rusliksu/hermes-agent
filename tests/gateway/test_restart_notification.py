@@ -7,6 +7,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
+from gateway.access_registry import (
+    AccessRegistry,
+    DeliveryTarget,
+    PrincipalBinding,
+    ResolvedAccessContext,
+    RolePolicy,
+    TransportIdentity,
+)
 from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
@@ -14,6 +22,60 @@ from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
 )
+
+
+def _restart_access_context(
+    *,
+    chat_id: str = "validated-chat",
+    thread_id: str | None = None,
+) -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-family",
+        role_id="family",
+        profile_id="family-profile",
+        conversation_scope="private",
+        capabilities=frozenset({"public_web"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="main",
+            peer_kind="dm",
+            chat_id=chat_id,
+            thread_id=thread_id,
+        ),
+    )
+
+
+def _restart_access_registry(context: ResolvedAccessContext) -> AccessRegistry:
+    target = context.delivery_target
+    return AccessRegistry(
+        roles={
+            context.role_id: RolePolicy(
+                context.role_id,
+                context.capabilities,
+            )
+        },
+        profiles=frozenset({context.profile_id}),
+        principal_bindings=(
+            PrincipalBinding(
+                principal_id=context.principal_id,
+                role_id=context.role_id,
+                profile_id=context.profile_id,
+                transport_identity=TransportIdentity(
+                    platform=target.platform,
+                    account=target.account,
+                    peer_kind=target.peer_kind,
+                    user_id=target.chat_id,
+                    chat_id=target.chat_id,
+                    thread_id=target.thread_id,
+                ),
+                conversation_scope=context.conversation_scope,
+                delivery_target=target,
+            ),
+        ),
+        shared_scope_bindings=(),
+        scope_capabilities={context.conversation_scope: context.capabilities},
+        backend_capabilities=context.capabilities,
+    )
 
 
 # ── restart marker helpers ───────────────────────────────────────────────
@@ -663,6 +725,135 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_registry_uses_validated_context_target_not_stale_source():
+    runner, adapter = make_restart_runner()
+    context = _restart_access_context(
+        chat_id="validated-chat",
+        thread_id="validated-topic",
+    )
+    runner.access_registry = _restart_access_registry(context)
+    runner._profile_adapters = {context.profile_id: {Platform.TELEGRAM: adapter}}
+    source = make_restart_source(
+        chat_id="stale-chat",
+        chat_type="group",
+        thread_id="stale-topic",
+    )
+    source.message_id = "stale-source-message-462"
+    source.resolved_access_context = context
+    session_key = build_session_key(source)
+
+    runner._running_agents[session_key] = object()
+    runner.session_store = None
+    runner._cache_session_source(session_key, source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once_with(
+        "validated-chat",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        metadata={
+            "thread_id": "validated-topic",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "validated-topic",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_registry_uses_context_profile_adapter_for_exact_target():
+    runner, default_adapter = make_restart_runner()
+    _, profile_adapter = make_restart_runner()
+    context = _restart_access_context(chat_id="family-exact-chat")
+    runner.access_registry = _restart_access_registry(context)
+    source = make_restart_source(chat_id="family-exact-chat")
+    source.profile = context.profile_id
+    source.resolved_access_context = context
+    session_key = build_session_key(source, profile=context.profile_id)
+
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    runner._cache_session_source(session_key, source)
+    runner._profile_adapters = {
+        context.profile_id: {Platform.TELEGRAM: profile_adapter}
+    }
+    profile_adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="profile-shutdown")
+    )
+    default_adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="default-shutdown")
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    profile_adapter.send.assert_awaited_once_with(
+        "family-exact-chat",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        metadata=None,
+    )
+    default_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_registry_missing_profile_adapter_does_not_fallback_default():
+    runner, default_adapter = make_restart_runner()
+    context = _restart_access_context(chat_id="family-exact-chat")
+    runner.access_registry = _restart_access_registry(context)
+    source = make_restart_source(chat_id="stale-default-chat")
+    source.profile = context.profile_id
+    source.resolved_access_context = context
+    session_key = build_session_key(source, profile=context.profile_id)
+
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    runner._cache_session_source(session_key, source)
+    runner._profile_adapters = {}
+    default_adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="default-shutdown")
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    default_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_registry_skips_unbound_home_channel_broadcast():
+    runner, default_adapter = make_restart_runner()
+    context = _restart_access_context(chat_id="validated-chat")
+    runner.access_registry = _restart_access_registry(context)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="unbound-home-chat",
+        name="Default home",
+    )
+    default_adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="home-shutdown")
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    default_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_registry_missing_context_skips_parsed_session_key():
+    runner, adapter = make_restart_runner()
+    context = _restart_access_context(chat_id="validated-chat")
+    runner.access_registry = _restart_access_registry(context)
+    source = make_restart_source(chat_id="parsable-chat")
+    session_key = build_session_key(source)
+
+    runner._running_agents[session_key] = object()
+    runner.session_store = None
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_not_called()
 
 
 @pytest.mark.asyncio

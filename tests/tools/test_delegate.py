@@ -11,12 +11,20 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
 import threading
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import (
+    get_resolved_access_context,
+    reset_session_vars,
+    set_session_vars,
+)
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -31,6 +39,7 @@ from tools.delegate_tool import (
     _build_child_progress_callback,
     _build_child_system_prompt,
     _extract_output_tail,
+    _resolve_workspace_hint,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -59,6 +68,51 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+def _access_context(
+    *,
+    role_id="owner",
+    capabilities=frozenset({"delegation"}),
+) -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-secret",
+        role_id=role_id,
+        profile_id="profile-secret",
+        conversation_scope="scope-secret",
+        capabilities=frozenset(capabilities),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="account-secret",
+            peer_kind="dm",
+            chat_id="chat-secret",
+            thread_id="thread-secret",
+        ),
+    )
+
+
+@contextmanager
+def _bound_access_context(context):
+    reset_session_vars()
+    set_session_vars(resolved_access_context=context)
+    try:
+        yield
+    finally:
+        reset_session_vars()
+
+
+def _delegation_creds():
+    return {
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "model": None,
+        "request_overrides": None,
+        "max_output_tokens": None,
+        "command": None,
+        "args": None,
+    }
 
 
 class TestDelegateRequirements(unittest.TestCase):
@@ -296,6 +350,311 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="test"))
         self.assertIn("error", result)
         self.assertIn("parent agent", result["error"])
+
+    def test_resolved_access_context_denies_before_side_effects(self):
+        denied_contexts = [
+            _access_context(role_id="family_standard"),
+            _access_context(role_id="shared_room"),
+            _access_context(role_id="unknown"),
+            _access_context(role_id="owner", capabilities=frozenset({"web"})),
+            {
+                "principal_id": "principal-secret",
+                "role_id": "owner",
+                "profile_id": "profile-secret",
+                "delivery_target": "chat-secret",
+            },
+        ]
+
+        for context in denied_contexts:
+            with self.subTest(context=context):
+                parent = _make_mock_parent()
+                with (
+                    _bound_access_context(context),
+                    patch("tools.delegate_tool._resolve_delegation_credentials") as resolve,
+                    patch("tools.delegate_tool._build_child_agent") as build_child,
+                ):
+                    result = json.loads(
+                        delegate_task(goal="deny before side effects", parent_agent=parent)
+                    )
+
+                self.assertEqual(
+                    result["error"],
+                    "Delegation is not permitted for this access context.",
+                )
+                self.assertIn(
+                    result["code"],
+                    {"delegation_not_permitted", "malformed_access_context"},
+                )
+                for raw in (
+                    "principal-secret",
+                    "profile-secret",
+                    "scope-secret",
+                    "account-secret",
+                    "chat-secret",
+                    "thread-secret",
+                ):
+                    self.assertNotIn(raw, json.dumps(result, ensure_ascii=False))
+                resolve.assert_not_called()
+                build_child.assert_not_called()
+
+    def test_resolved_access_context_allows_only_delegation_roles_with_capability(self):
+        for role_id in ("owner", "family_sandbox"):
+            with self.subTest(role_id=role_id):
+                parent = _make_mock_parent()
+                with (
+                    _bound_access_context(_access_context(role_id=role_id)),
+                    patch(
+                        "tools.delegate_tool._resolve_delegation_credentials",
+                        return_value=_delegation_creds(),
+                    ),
+                    patch("run_agent.AIAgent") as MockAgent,
+                ):
+                    child = MagicMock()
+                    child.run_conversation.return_value = {
+                        "final_response": "ok",
+                        "completed": True,
+                        "api_calls": 1,
+                        "messages": [],
+                    }
+                    MockAgent.return_value = child
+
+                    result = json.loads(
+                        delegate_task(goal="allowed", parent_agent=parent)
+                    )
+
+                self.assertEqual(result["results"][0]["status"], "completed")
+                self.assertEqual(result["results"][0]["summary"], "ok")
+
+    def test_resolved_access_context_survives_inner_worker_hop(self):
+        parent = _make_mock_parent()
+        access_context = _access_context(role_id="family_sandbox")
+        captured = {}
+
+        def run_conversation(user_message, task_id=None, stream_callback=None):
+            captured["context"] = get_resolved_access_context()
+            return {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        with (
+            _bound_access_context(access_context),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=_delegation_creds(),
+            ),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            child = MagicMock()
+            child.run_conversation.side_effect = run_conversation
+            MockAgent.return_value = child
+
+            result = json.loads(
+                delegate_task(
+                    goal="visible after inner hop",
+                    role="orchestrator",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertIs(captured["context"], access_context)
+        self.assertEqual(captured["context"].role_id, "family_sandbox")
+        self.assertEqual(captured["context"].profile_id, "profile-secret")
+        self.assertIn("delegation", captured["context"].capabilities)
+
+    def test_resolved_access_context_survives_batch_and_inner_worker_hops(self):
+        parent = _make_mock_parent()
+        access_context = _access_context(role_id="owner")
+        captured = []
+
+        def make_child():
+            child = MagicMock()
+
+            def run_conversation(user_message, task_id=None, stream_callback=None):
+                captured.append(get_resolved_access_context())
+                return {
+                    "final_response": user_message,
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            child.run_conversation.side_effect = run_conversation
+            return child
+
+        with (
+            _bound_access_context(access_context),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=_delegation_creds(),
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            MockAgent.side_effect = lambda *args, **kwargs: make_child()
+
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "A"}, {"goal": "B"}],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual([entry["status"] for entry in result["results"]], ["completed", "completed"])
+        self.assertEqual(len(captured), 2)
+        self.assertTrue(all(context is access_context for context in captured))
+
+    def test_family_sandbox_child_prompt_excludes_foreign_workspace_hint(self):
+        with tempfile.TemporaryDirectory(
+            prefix="foreign-owner-workspace-marker-"
+        ) as workspace:
+            parent = _make_mock_parent()
+            parent.enabled_toolsets = ["terminal", "file", "delegation"]
+            parent.disabled_toolsets = []
+            parent._subdirectory_hints = types.SimpleNamespace(
+                working_dir=workspace
+            )
+            parent.terminal_cwd = workspace
+            parent.cwd = workspace
+
+            with (
+                _bound_access_context(_access_context(role_id="family_sandbox")),
+                patch.dict(os.environ, {"TERMINAL_CWD": workspace}),
+            ):
+                prompt = _build_child_system_prompt(
+                    "delegated sandbox work",
+                    workspace_path=_resolve_workspace_hint(parent),
+                )
+
+            self.assertNotIn("WORKSPACE PATH", prompt)
+            self.assertNotIn(workspace, prompt)
+            self.assertNotIn("foreign-owner-workspace-marker", prompt)
+
+    def test_non_owner_workspace_hint_does_not_touch_global_or_parent_cwd(self):
+        class ExplodingParent:
+            def __getattribute__(self, name):
+                raise AssertionError(f"parent cwd candidate accessed: {name}")
+
+        with (
+            _bound_access_context(_access_context(role_id="family_sandbox")),
+            patch(
+                "tools.delegate_tool.os.getenv",
+                side_effect=AssertionError("TERMINAL_CWD accessed"),
+            ) as getenv,
+        ):
+            self.assertIsNone(_resolve_workspace_hint(ExplodingParent()))
+
+        getenv.assert_not_called()
+
+    def test_owner_and_legacy_workspace_hint_keep_existing_resolution(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            parent = _make_mock_parent()
+            parent._subdirectory_hints = types.SimpleNamespace(
+                working_dir=workspace
+            )
+            parent.terminal_cwd = workspace
+            parent.cwd = workspace
+
+            for context in (_access_context(role_id="owner"), None):
+                with (
+                    self.subTest(context=context),
+                    _bound_access_context(context),
+                    patch.dict(os.environ, {"TERMINAL_CWD": workspace}),
+                ):
+                    self.assertEqual(_resolve_workspace_hint(parent), workspace)
+
+    def test_delegate_cwd_seed_policy_matches_access_context(self):
+        from tools import terminal_tool
+
+        with tempfile.TemporaryDirectory(
+            prefix="foreign-owner-workspace-marker-"
+        ) as foreign_cwd:
+            cases = [
+                ("family_sandbox", _access_context(role_id="family_sandbox"), None),
+                ("owner", _access_context(role_id="owner"), foreign_cwd),
+                ("legacy", None, foreign_cwd),
+            ]
+            for label, context, expected_child_cwd in cases:
+                with (
+                    self.subTest(label=label),
+                    patch.object(terminal_tool, "_session_cwd", {}, create=False),
+                ):
+                    parent = _make_mock_parent()
+                    parent.enabled_toolsets = ["terminal", "file", "delegation"]
+                    parent.disabled_toolsets = []
+                    parent._credential_pool = None
+                    parent._current_task_id = "parent-task"
+                    terminal_tool.record_session_cwd(parent._current_task_id, foreign_cwd)
+
+                    original_get_session_cwd = terminal_tool.get_session_cwd
+                    original_record_session_cwd = terminal_tool.record_session_cwd
+                    get_calls = []
+                    record_calls = []
+                    captured = {}
+
+                    def get_session_cwd_spy(session_key):
+                        get_calls.append(session_key)
+                        return original_get_session_cwd(session_key)
+
+                    def record_session_cwd_spy(session_key, cwd):
+                        record_calls.append((session_key, cwd))
+                        return original_record_session_cwd(session_key, cwd)
+
+                    def run_conversation(user_message, task_id=None, stream_callback=None):
+                        captured["task_id"] = task_id
+                        captured["child_cwd"] = terminal_tool.get_session_cwd(task_id)
+                        return {
+                            "final_response": "ok",
+                            "completed": True,
+                            "api_calls": 1,
+                            "messages": [],
+                        }
+
+                    child = MagicMock()
+                    child._credential_pool = None
+                    child.run_conversation.side_effect = run_conversation
+
+                    with (
+                        _bound_access_context(context),
+                        patch(
+                            "tools.delegate_tool._resolve_delegation_credentials",
+                            return_value=_delegation_creds(),
+                        ),
+                        patch("run_agent.AIAgent", return_value=child),
+                        patch.object(
+                            terminal_tool,
+                            "get_session_cwd",
+                            side_effect=get_session_cwd_spy,
+                        ),
+                        patch.object(
+                            terminal_tool,
+                            "record_session_cwd",
+                            side_effect=record_session_cwd_spy,
+                        ),
+                    ):
+                        result = json.loads(
+                            delegate_task(goal="cwd policy probe", parent_agent=parent)
+                        )
+
+                    self.assertEqual(result["results"][0]["status"], "completed")
+                    self.assertEqual(captured["child_cwd"], expected_child_cwd)
+                    self.assertEqual(
+                        terminal_tool.get_session_cwd(captured["task_id"]),
+                        expected_child_cwd,
+                    )
+                    if label == "family_sandbox":
+                        self.assertNotIn(parent._current_task_id, get_calls)
+                        self.assertEqual(record_calls, [])
+                    else:
+                        self.assertIn(parent._current_task_id, get_calls)
+                        self.assertEqual(
+                            record_calls,
+                            [(captured["task_id"], foreign_cwd)],
+                        )
 
     def test_depth_limit(self):
         parent = _make_mock_parent(depth=2)

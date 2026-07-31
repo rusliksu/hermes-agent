@@ -4,6 +4,7 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 """
 
 import asyncio
+import contextvars
 import json
 import threading
 import time
@@ -120,6 +121,54 @@ class TestLoadMCPConfig:
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert result == {}
+
+    def test_legacy_env_placeholders_still_expand(self, monkeypatch):
+        """Non-multiplex MCP config keeps legacy ${VAR}/${env:VAR} behavior."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import _load_mcp_config
+
+        set_multiplex_active(False)
+        monkeypatch.setenv("MCP_LEGACY_A", "legacy-a")
+        monkeypatch.setenv("MCP_LEGACY_B", "legacy-b")
+        servers = {
+            "demo": {
+                "command": "demo",
+                "args": ["${MCP_LEGACY_A}", "${env:MCP_LEGACY_B}"],
+                "env": {"TOKEN": "${MCP_LEGACY_A}"},
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv", return_value=None):
+            result = _load_mcp_config()
+
+        assert result["demo"]["args"] == ["legacy-a", "legacy-b"]
+        assert result["demo"]["env"] == {"TOKEN": "legacy-a"}
+
+    def test_multiplex_load_mcp_config_reads_raw_without_dotenv_or_env_expansion(self, monkeypatch):
+        """Typed multiplex load returns raw placeholders and avoids process env expansion."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import _load_mcp_config
+
+        set_multiplex_active(True)
+        monkeypatch.setenv("MCP_RAW_TOKEN", "ambient-secret")
+        raw_servers = {
+            "demo": {
+                "command": "demo",
+                "args": ["${credential:token}", "${MCP_RAW_TOKEN}"],
+                "credential_refs": {"token": "MCP_RAW_TOKEN"},
+                "tools": {"include": ["echo"], "resources": False, "prompts": False},
+            }
+        }
+
+        try:
+            with patch("hermes_cli.config.read_raw_config", return_value={"mcp_servers": raw_servers}), \
+                 patch("hermes_cli.config.load_config", side_effect=AssertionError("load_config denied")), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv", side_effect=AssertionError("dotenv denied")):
+                result = _load_mcp_config()
+
+            assert result["demo"]["args"] == ["${credential:token}", "${MCP_RAW_TOKEN}"]
+        finally:
+            set_multiplex_active(False)
 
 
 class TestMCPStatus:
@@ -2813,6 +2862,35 @@ def _make_llm_tool_response(tool_calls_data=None, model="test-model"):
     )
 
 
+def _make_sampling_access_context(profile_id="profile-alpha", scope="dm:alpha"):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+    return ResolvedAccessContext(
+        principal_id=f"principal-{profile_id}",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope=scope,
+        capabilities=frozenset({"mcp"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-main",
+            peer_kind="dm",
+            chat_id=f"chat-{profile_id}",
+        ),
+    )
+
+
+def _captured_sampling_context(access_context):
+    from gateway.session_context import bind_resolved_access_context
+
+    with bind_resolved_access_context(access_context):
+        return contextvars.copy_context()
+
+
+async def _inline_to_thread(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # 1. _safe_numeric helper
 # ---------------------------------------------------------------------------
@@ -3125,6 +3203,96 @@ class TestSamplingCallbackText:
 
         assert isinstance(result, CreateMessageResult)
         assert result.stopReason == "maxTokens"
+
+
+class TestSamplingCallbackAccessContext:
+    def test_captured_context_wins_over_poisoned_ambient_context_at_call_llm_boundary(self, monkeypatch):
+        """Regression: sampling used poisoned ambient context B instead of captured MCP caller A."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.session_context import bind_resolved_access_context, get_resolved_access_context
+        from tools.mcp_tool import MCPServerTask
+
+        monkeypatch.setattr("tools.mcp_tool.asyncio.to_thread", _inline_to_thread)
+        set_multiplex_active(True)
+        captured_context = _make_sampling_access_context("profile-a", "dm:a")
+        ambient_context = _make_sampling_access_context("profile-b", "dm:b")
+        owner = MCPServerTask("ctx_owner")
+        owner._pending_call_context = _captured_sampling_context(captured_context)
+        handler = SamplingHandler("ctx", {}, owner=owner)
+        seen = {}
+
+        def fake_call_llm(**_kwargs):
+            seen["context"] = get_resolved_access_context(None)
+            return _make_llm_response()
+
+        try:
+            with bind_resolved_access_context(ambient_context), \
+                 patch("agent.auxiliary_client.call_llm", side_effect=fake_call_llm):
+                result = asyncio.run(handler(None, _make_sampling_params()))
+        finally:
+            set_multiplex_active(False)
+
+        assert isinstance(result, CreateMessageResult)
+        assert seen["context"] == captured_context
+
+    def test_multiplex_missing_capture_denies_before_rate_model_or_llm(self):
+        """Regression: server-initiated sampling without captured caller authority reached LLM."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import MCPServerTask
+
+        set_multiplex_active(True)
+        owner = MCPServerTask("missing_owner")
+        handler = SamplingHandler("missing", {"max_rpm": 0, "model": "poison"}, owner=owner)
+
+        try:
+            with patch.object(handler, "_resolve_model", side_effect=AssertionError("model denied")), \
+                 patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("llm denied")) as mock_call:
+                result = asyncio.run(handler(None, _make_sampling_params()))
+        finally:
+            set_multiplex_active(False)
+
+        assert isinstance(result, ErrorData)
+        assert result.code == -1
+        assert result.message == "Sampling denied: strict resolved MCP context required for server 'missing'"
+        assert handler.metrics["errors"] == 1
+        mock_call.assert_not_called()
+
+    def test_multiplex_malformed_capture_denies_before_model_or_llm(self):
+        """Regression: malformed captured sampling authority fell through to model selection."""
+        from agent.secret_scope import set_multiplex_active
+        from tools.mcp_tool import MCPServerTask
+
+        set_multiplex_active(True)
+        owner = MCPServerTask("malformed_owner")
+        owner._pending_call_context = _captured_sampling_context({"profile_id": "profile-a"})
+        handler = SamplingHandler("malformed", {}, owner=owner)
+
+        try:
+            with patch.object(handler, "_resolve_model", side_effect=AssertionError("model denied")), \
+                 patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("llm denied")) as mock_call:
+                result = asyncio.run(handler(None, _make_sampling_params()))
+        finally:
+            set_multiplex_active(False)
+
+        assert isinstance(result, ErrorData)
+        assert result.code == -1
+        assert result.message == "Sampling denied: strict resolved MCP context required for server 'malformed'"
+        assert handler.metrics["errors"] == 1
+        mock_call.assert_not_called()
+
+    def test_non_multiplex_legacy_no_owner_still_calls_model(self, monkeypatch):
+        """Legacy non-multiplex sampling remains owner/capture-free."""
+        from agent.secret_scope import set_multiplex_active
+
+        monkeypatch.setattr("tools.mcp_tool.asyncio.to_thread", _inline_to_thread)
+        set_multiplex_active(False)
+        handler = SamplingHandler("legacy", {})
+
+        with patch("agent.auxiliary_client.call_llm", return_value=_make_llm_response()) as mock_call:
+            result = asyncio.run(handler(None, _make_sampling_params()))
+
+        assert isinstance(result, CreateMessageResult)
+        mock_call.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -3525,7 +3693,7 @@ class TestSessionKwargs:
 
 class TestMCPServerTaskSamplingIntegration:
     def test_sampling_handler_created_when_enabled(self):
-        """MCPServerTask.run() creates a SamplingHandler when sampling is enabled."""
+        """MCPServerTask.run() creates a SamplingHandler owned by the server task."""
         from tools.mcp_tool import MCPServerTask, _MCP_SAMPLING_TYPES
 
         server = MCPServerTask("int_test")
@@ -3533,20 +3701,20 @@ class TestMCPServerTaskSamplingIntegration:
             "command": "fake",
             "sampling": {"enabled": True, "max_rpm": 5},
         }
-        # We only need to test the setup logic, not the actual connection.
-        # Calling run() would attempt a real connection, so we test the
-        # sampling setup portion directly.
-        server._config = config
-        sampling_config = config.get("sampling", {})
-        if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
-            server._sampling = SamplingHandler(server.name, sampling_config)
-        else:
-            server._sampling = None
+
+        async def fake_run_stdio(self, _config):
+            self._shutdown_event.set()
+
+        with patch.object(MCPServerTask, "_run_stdio", fake_run_stdio), \
+             patch.object(MCPServerTask, "_is_http", return_value=False):
+            asyncio.run(server.run(config))
 
         assert server._sampling is not None
         assert isinstance(server._sampling, SamplingHandler)
         assert server._sampling.server_name == "int_test"
         assert server._sampling.max_rpm == 5
+        if _MCP_SAMPLING_TYPES:
+            assert server._sampling.owner is server
 
     def test_sampling_handler_none_when_disabled(self):
         """MCPServerTask._sampling is None when sampling is disabled."""

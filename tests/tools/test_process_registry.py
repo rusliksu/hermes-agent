@@ -14,9 +14,16 @@ from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
+    ProcessNotificationSpec,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+)
+from tools.async_delegation import ASYNC_DELEGATION_ACCESS_CONTEXT_KEY
+from gateway.access_registry import (
+    DeliveryTarget,
+    ResolvedAccessContext,
+    serialize_resolved_access_context,
 )
 
 
@@ -46,6 +53,25 @@ def _make_session(
         output_buffer=output,
     )
     return s
+
+
+def _access_context_payload():
+    return serialize_resolved_access_context(
+        ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family_standard",
+            profile_id="family-profile",
+            conversation_scope="private",
+            capabilities=frozenset({"public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="123",
+                thread_id=None,
+            ),
+        )
+    )
 
 
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
@@ -657,6 +683,102 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_spawn_local_registers_notification_spec_before_reader_can_finish(self, registry, tmp_path):
+        payload = _access_context_payload()
+
+        class FakeStdout:
+            def __init__(self):
+                self._chunks = iter(["READY\n", ""])
+
+            def read(self, _size):
+                return next(self._chunks)
+
+        proc = MagicMock()
+        proc.pid = 7777
+        proc.stdout = FakeStdout()
+        proc.returncode = 0
+
+        def instant_thread(target, args=(), **_kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        spec = ProcessNotificationSpec(
+            notify_on_complete=True,
+            watch_patterns=("READY",),
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="u123",
+            watcher_user_name="alice",
+            watcher_thread_id="42",
+            watcher_message_id="m1",
+            watcher_interval=5,
+            resolved_access_context=payload,
+        )
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.threading.Thread", side_effect=instant_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo READY", cwd=str(tmp_path), notification=spec)
+
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        assert [evt["type"] for evt in events] == ["watch_match", "completion"]
+        assert events[0]["platform"] == "telegram"
+        for evt in events:
+            assert evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
+
+    def test_spawn_via_env_registers_notification_spec_before_poller_can_finish(self, registry):
+        payload = _access_context_payload()
+
+        class FakeEnv:
+            def execute(self, command, **_kwargs):
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command.startswith("cat ") and command.endswith(".log 2>/dev/null"):
+                    return {"output": "READY\n"}
+                if command.startswith("kill -0"):
+                    return {"output": "1\n"}
+                if command.startswith("cat ") and command.endswith(".exit"):
+                    return {"output": "0\n"}
+                raise AssertionError(command)
+
+        def instant_thread(target, args=(), **_kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        spec = ProcessNotificationSpec(
+            notify_on_complete=True,
+            watch_patterns=("READY",),
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="u123",
+            watcher_user_name="alice",
+            watcher_thread_id="42",
+            watcher_message_id="m1",
+            watcher_interval=5,
+            resolved_access_context=payload,
+        )
+
+        with patch("tools.process_registry.threading.Thread", side_effect=instant_thread), \
+             patch("tools.process_registry.time.sleep", return_value=None), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(FakeEnv(), "echo READY", notification=spec)
+
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        assert [evt["type"] for evt in events] == ["watch_match", "completion"]
+        for evt in events:
+            assert evt[ASYNC_DELEGATION_ACCESS_CONTEXT_KEY] == payload
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
@@ -911,6 +1033,59 @@ class TestPopenLeakOnSetupFailure:
         assert session.pid == 7777
 
 
+class TestEnvLeakOnSetupFailure:
+    """Env-backed sandbox processes must not leak if post-launch setup fails."""
+
+    def test_env_pid_killed_when_poller_start_fails(self, registry, tmp_path):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append((command, kwargs))
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command == "kill 4321 2>/dev/null":
+                    return {"output": "", "returncode": 0}
+                raise AssertionError(command)
+
+        fake_thread = MagicMock()
+        fake_thread.start.side_effect = RuntimeError("poller start failed")
+        checkpoint = tmp_path / "procs.json"
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            with pytest.raises(RuntimeError, match="poller start failed"):
+                registry.spawn_via_env(FakeEnv(), "echo hello")
+
+        kill_calls = [(cmd, kwargs) for cmd, kwargs in commands if cmd.startswith("kill ")]
+        assert kill_calls == [("kill 4321 2>/dev/null", {"timeout": 5})]
+        assert registry._running == {}
+        assert json.loads(checkpoint.read_text()) == []
+
+    def test_env_cleanup_failure_preserves_poller_start_error(self, registry, tmp_path):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append((command, kwargs))
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                if command == "kill 4321 2>/dev/null":
+                    raise OSError("kill failed")
+                raise AssertionError(command)
+
+        fake_thread = MagicMock()
+        fake_thread.start.side_effect = RuntimeError("poller start failed")
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+             patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            with pytest.raises(RuntimeError, match="poller start failed"):
+                registry.spawn_via_env(FakeEnv(), "echo hello")
+
+        assert any(cmd == "kill 4321 2>/dev/null" for cmd, _kwargs in commands)
+        assert registry._running == {}
+
+
 # =========================================================================
 # Checkpoint
 # =========================================================================
@@ -945,12 +1120,14 @@ class TestCheckpoint:
     def test_write_checkpoint_includes_watcher_metadata(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()
+            payload = _access_context_payload()
             s.watcher_platform = "telegram"
             s.watcher_chat_id = "999"
             s.watcher_user_id = "u123"
             s.watcher_user_name = "alice"
             s.watcher_thread_id = "42"
             s.watcher_interval = 60
+            s.resolved_access_context = payload
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -962,9 +1139,11 @@ class TestCheckpoint:
             assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
+            assert data[0]["resolved_access_context"] == payload
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
+        payload = _access_context_payload()
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
@@ -977,6 +1156,7 @@ class TestCheckpoint:
             "watcher_user_name": "alice",
             "watcher_thread_id": "42",
             "watcher_interval": 60,
+            "resolved_access_context": payload,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
@@ -990,6 +1170,8 @@ class TestCheckpoint:
             assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
+            assert w["resolved_access_context"] == payload
+            assert registry.get("proc_live").resolved_access_context == payload
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -1166,6 +1348,24 @@ class TestKillProcess:
 # =========================================================================
 
 class TestProcessToolHandler:
+    def _install_registry(self, monkeypatch, sessions, current_session_key=""):
+        from tools import process_registry as pr
+        import tools.approval as approval
+
+        reg = ProcessRegistry()
+        for session in sessions:
+            if session.exited:
+                reg._finished[session.id] = session
+            else:
+                reg._running[session.id] = session
+        monkeypatch.setattr(pr, "process_registry", reg)
+        monkeypatch.setattr(
+            approval,
+            "get_current_session_key",
+            lambda default="": current_session_key or default,
+        )
+        return pr, reg
+
     def test_list_action(self):
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "list"}))
@@ -1180,6 +1380,168 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
+
+    def test_defect_foreign_process_log_is_denied_without_output(self, monkeypatch):
+        """Privacy defect: model args must not read another task's process log."""
+        foreign = _make_session(
+            sid="proc_foreign_log_guard",
+            task_id="task_foreign_log_owner",
+            exited=True,
+            exit_code=0,
+            output="FOREIGN_LOG_SENTINEL_VISIBLE",
+        )
+        foreign.session_key = "session_foreign_log_owner"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_log_reader",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "log", "session_id": foreign.id},
+            task_id="task_current_log_reader",
+        ))
+
+        assert result["status"] == "not_found"
+        assert "output" not in result
+        assert "FOREIGN_LOG_SENTINEL_VISIBLE" not in json.dumps(result)
+
+    def test_defect_foreign_process_wait_does_not_consume_completion(self, monkeypatch):
+        """Denied wait must not mark a foreign completion as consumed."""
+        foreign = _make_session(
+            sid="proc_foreign_wait_guard",
+            task_id="task_foreign_wait_owner",
+            exited=True,
+            exit_code=0,
+            output="FOREIGN_WAIT_COMPLETION_SENTINEL",
+        )
+        foreign.session_key = "session_foreign_wait_owner"
+        pr, reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_waiter",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "wait", "session_id": foreign.id, "timeout": 1},
+            task_id="task_current_waiter",
+        ))
+
+        assert result["status"] == "not_found"
+        assert reg.is_completion_consumed(foreign.id) is False
+        assert "FOREIGN_WAIT_COMPLETION_SENTINEL" not in json.dumps(result)
+
+    def test_defect_foreign_process_kill_is_denied_and_target_unchanged(self, monkeypatch):
+        """Denied kill must not terminate or reclassify a foreign process."""
+        class _RecordingPty:
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self, force=False):
+                self.terminated = force
+
+        foreign = _make_session(
+            sid="proc_foreign_kill_guard",
+            task_id="task_foreign_kill_owner",
+            output="FOREIGN_KILL_OUTPUT_UNREAD",
+        )
+        foreign.session_key = "session_foreign_kill_owner"
+        foreign._pty = _RecordingPty()
+        pr, reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_killer",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "kill", "session_id": foreign.id},
+            task_id="task_current_killer",
+        ))
+
+        assert result["status"] == "not_found"
+        assert foreign._pty.terminated is False
+        assert foreign.exited is False
+        assert reg._running[foreign.id] is foreign
+        assert reg.is_completion_consumed(foreign.id) is False
+
+    def test_defect_foreign_process_write_is_denied_and_target_unchanged(self, monkeypatch):
+        """Denied stdin write must not send bytes into a foreign process."""
+        class _RecordingPty:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+        foreign = _make_session(
+            sid="proc_foreign_write_guard",
+            task_id="task_foreign_write_owner",
+            output="FOREIGN_WRITE_BUFFER_UNREAD",
+        )
+        foreign.session_key = "session_foreign_write_owner"
+        foreign._pty = _RecordingPty()
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [foreign],
+            current_session_key="session_current_writer",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "write", "session_id": foreign.id, "data": "answer 42"},
+            task_id="task_current_writer",
+        ))
+
+        assert result["status"] == "not_found"
+        assert foreign._pty.writes == []
+        assert foreign.output_buffer == "FOREIGN_WRITE_BUFFER_UNREAD"
+
+    def test_defect_same_session_key_process_remains_allowed_cross_task(self, monkeypatch):
+        """Same gateway session-key processes remain accessible across task ids."""
+        shared = _make_session(
+            sid="proc_same_session_key_guard",
+            task_id="task_previous_same_session",
+            exited=True,
+            exit_code=0,
+            output="SAME_SESSION_KEY_ALLOWED_LINE",
+        )
+        shared.session_key = "session_shared_process_guard"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [shared],
+            current_session_key="session_shared_process_guard",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "log", "session_id": shared.id},
+            task_id="task_current_same_session",
+        ))
+
+        assert result["status"] == "exited"
+        assert result["output"] == "SAME_SESSION_KEY_ALLOWED_LINE"
+
+    def test_defect_process_list_scope_is_unchanged(self, monkeypatch):
+        """List still shows current task plus same-session-key forgotten jobs."""
+        current = _make_session(sid="proc_list_current_guard", task_id="task_list_current")
+        current.session_key = "session_list_shared"
+        forgotten = _make_session(sid="proc_list_forgotten_guard", task_id="task_list_previous")
+        forgotten.session_key = "session_list_shared"
+        unrelated = _make_session(sid="proc_list_unrelated_guard", task_id="task_list_other")
+        unrelated.session_key = "session_list_other"
+        pr, _reg = self._install_registry(
+            monkeypatch,
+            [current, forgotten, unrelated],
+            current_session_key="session_list_shared",
+        )
+
+        result = json.loads(pr._handle_process(
+            {"action": "list"},
+            task_id="task_list_current",
+        ))
+        by_id = {row["session_id"]: row for row in result["processes"]}
+
+        assert set(by_id) == {"proc_list_current_guard", "proc_list_forgotten_guard"}
+        assert by_id["proc_list_forgotten_guard"].get("session_scoped") is True
+        assert "session_scoped" not in by_id["proc_list_current_guard"]
 
 
 # =========================================================================
@@ -2204,7 +2566,10 @@ class TestHandleProcessRedaction:
             monkeypatch, "printenv",
             "MY_SERVICE_TOKEN=abc123randomopaquetokenvalue999\nHOME=/home/u",
         )
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "log", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "abc123randomopaquetokenvalue999" not in out["output"]
         assert "HOME=/home/u" in out["output"]
 
@@ -2213,7 +2578,10 @@ class TestHandleProcessRedaction:
             monkeypatch, "python app.py",
             "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
         )
-        out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "poll", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "abc123def456" not in out["output_preview"]
 
     def test_disabled_passes_through(self, monkeypatch):
@@ -2227,5 +2595,8 @@ class TestHandleProcessRedaction:
         sess.exit_code = 0
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(pr._handle_process(
+            {"action": "log", "session_id": sess.id},
+            task_id=sess.task_id,
+        ))
         assert "zzzopaque1234567890abcdef" in out["output"]

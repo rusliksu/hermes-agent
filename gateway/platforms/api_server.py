@@ -989,6 +989,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        self._run_pending_approvals: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -4291,10 +4292,16 @@ class APIServerAdapter(BasePlatformAdapter):
             provider = resolve_cron_scheduler()
 
             loop = asyncio.get_running_loop()
+            runner = self.gateway_runner or request.app.get("gateway_runner")
+            if runner is None:
+                fire_adapters = None
+            else:
+                view_fn = getattr(runner, "_cron_adapter_view", None)
+                fire_adapters = view_fn() if callable(view_fn) else getattr(runner, "adapters", None)
             # Fire in the background (202 immediately). fire_due claims via the
             # store CAS, so a retry while this is in flight is de-duped.
             task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+                asyncio.to_thread(provider.fire_due, job_id, adapters=fire_adapters, loop=loop)
             )
             reservation["detached"] = True
             task.add_done_callback(
@@ -4836,14 +4843,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    choices = _approval_event_choices(
+                        smart_denied=bool(event.get("smart_denied")),
+                        allow_permanent=event.get("allow_permanent") is not False,
+                    )
+                    approval_request_id = str(event.get("approval_request_id") or "")
+                    if approval_request_id:
+                        self._run_pending_approvals.setdefault(run_id, {})[approval_request_id] = {
+                            "allowed_choices": choices,
+                        }
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
+                        "choices": choices,
                     })
                     self._set_run_status(
                         run_id,
@@ -5000,6 +5013,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_pending_approvals.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -5119,6 +5133,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        approval_request_id = str(body.get("approval_request_id") or "").strip()
+        if not approval_request_id:
+            return web.json_response(
+                _openai_error(
+                    "approval_request_id is required",
+                    code="approval_request_id_missing",
+                    param="approval_request_id",
+                ),
+                status=400,
+            )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -5134,13 +5158,41 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        if resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "resolve_all is not supported for API run approvals",
+                    code="approval_resolve_all_forbidden",
+                ),
+                status=400,
+            )
+        pending_for_run = self._run_pending_approvals.get(run_id) or {}
+        pending = pending_for_run.get(approval_request_id)
+        if not pending:
+            return web.json_response(
+                _openai_error(
+                    f"Run has no matching pending approval: {run_id}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+        allowed_choices = {str(item) for item in pending.get("allowed_choices") or []}
+        if choice not in allowed_choices:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice for this request",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
         try:
             from tools.approval import resolve_gateway_approval
 
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
-                resolve_all=resolve_all,
+                resolve_all=False,
+                expected_request_id=approval_request_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -5154,6 +5206,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
+        pending_for_run.pop(approval_request_id, None)
+        if not pending_for_run:
+            self._run_pending_approvals.pop(run_id, None)
 
         self._set_run_status(run_id, "running", last_event="approval.responded")
         q = self._run_streams.get(run_id)
@@ -5164,6 +5219,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
+                    "approval_request_id": approval_request_id,
                     "resolved": resolved,
                 })
             except Exception:
@@ -5173,6 +5229,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.run.approval_response",
             "run_id": run_id,
             "choice": choice,
+            "approval_request_id": approval_request_id,
             "resolved": resolved,
         })
 
@@ -5237,6 +5294,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_pending_approvals.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [

@@ -365,6 +365,8 @@ class GatewaySlashCommandsMixin:
                 with _profile_runtime_scope(profile_home):
                     display = display_hermes_home()
             except Exception:
+                if getattr(source, "resolved_access_context", None) is not None:
+                    return "Profile unavailable."
                 display = display_hermes_home()
         else:
             display = display_hermes_home()
@@ -542,7 +544,7 @@ class GatewaySlashCommandsMixin:
         is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
-        adapter = self.adapters.get(source.platform) if source else None
+        adapter = self._adapter_for_source(source) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
         def _clean_str(value: Any) -> str:
@@ -678,8 +680,8 @@ class GatewaySlashCommandsMixin:
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
-            adapter = self.adapters.get(Platform.MATRIX)
-            scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
+            adapter = self._adapter_for_source(source)
+            scope = getattr(adapter, "_matrix_session_scope", "auto")
             thread = source.thread_id or "none"
             lines.extend([
                 "",
@@ -723,7 +725,34 @@ class GatewaySlashCommandsMixin:
         return None
 
     @staticmethod
-    def _same_matrix_room(current: SessionSource, origin: Optional[SessionSource]) -> bool:
+    def _resolved_context_profile_id(source: SessionSource) -> Optional[str]:
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            return None
+        profile_id = getattr(context, "profile_id", None)
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            return ""
+        return profile_id.strip()
+
+    def _origin_matches_resolved_profile(
+        self, current: SessionSource, origin: Optional[SessionSource]
+    ) -> bool:
+        context_profile = self._resolved_context_profile_id(current)
+        if context_profile is None:
+            return True
+        origin_profile = (getattr(origin, "profile", "") or "").strip()
+        return bool(context_profile) and bool(origin_profile) and origin_profile == context_profile
+
+    def _row_matches_resolved_profile(self, source: SessionSource, row: dict) -> bool:
+        context_profile = self._resolved_context_profile_id(source)
+        if context_profile is None:
+            return True
+        row_profile = str(row.get("profile_name") or "").strip()
+        return bool(context_profile) and bool(row_profile) and row_profile == context_profile
+
+    def _same_matrix_room(self, current: SessionSource, origin: Optional[SessionSource]) -> bool:
+        if not self._origin_matches_resolved_profile(current, origin):
+            return False
         return (
             origin is not None
             and origin.platform == Platform.MATRIX
@@ -754,6 +783,8 @@ class GatewaySlashCommandsMixin:
         contract via ``is_shared_multi_user_session``.
         """
         if origin is None or current is None:
+            return False
+        if not self._origin_matches_resolved_profile(current, origin):
             return False
         if origin.platform != current.platform:
             return False
@@ -836,9 +867,11 @@ class GatewaySlashCommandsMixin:
         otherwise falls back to the DB row's source + user_id (the sessions
         table has no chat_id). An identity-bearing caller is allowed only when
         the row PROVES the same owner; a row that lacks enough ownership data
-        fails closed. An explicit admin ``--all`` override bypasses scoping.
+        fails closed. An explicit admin ``--all`` override bypasses scoping only
+        on the legacy no-resolved-context path.
         """
-        if allow_override and self._resume_caller_is_admin(source):
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
+        if allow_override and not has_resolved_context and self._resume_caller_is_admin(source):
             return True
         # Use the live origin only when it resolves to a real SessionSource; a
         # store that can't resolve it (or an unexpected lookup error) must not
@@ -853,6 +886,8 @@ class GatewaySlashCommandsMixin:
         try:
             row = await self._session_db.get_session(target_id) or {}
         except Exception:
+            return False
+        if not self._row_matches_resolved_profile(source, row):
             return False
         caller_src = source.platform.value if source.platform else None
         row_src = row.get("source")
@@ -885,7 +920,8 @@ class GatewaySlashCommandsMixin:
         # otherwise rely on row_uid == caller_uid must fail closed here to stay
         # in lock-step with the key boundary (CWE-639). Shared group/thread
         # sessions are unaffected (they don't scope by participant at all), and
-        # an admin --all override still bypasses this above.
+        # a legacy no-resolved-context admin --all override still bypasses this
+        # above.
         caller_keys_on_alt = bool(str(getattr(source, "user_id_alt", "") or ""))
         if caller_uid:
             # Identity-bearing caller: allow only when the row PROVES the same
@@ -965,7 +1001,8 @@ class GatewaySlashCommandsMixin:
         # enumerate, a persisted session by id/title. Fail closed. A legitimate
         # same-chat resume of an ACTIVE session still works through the
         # live-origin branch above (which compares chat_id), and an operator can
-        # use the admin --all override. (CWE-639: IDOR on session routing.)
+        # use the admin --all override only on the legacy no-resolved-context
+        # path. (CWE-639: IDOR on session routing.)
         return False
 
     async def _resume_row_visible(
@@ -976,19 +1013,20 @@ class GatewaySlashCommandsMixin:
         Prevents cross-origin enumeration of session ids/previews via the
         numbered /resume list. Preserves the existing Matrix room-scoping
         semantics; scopes every other platform to the caller's own sessions
-        unless an admin passes ``--all``.
+        unless a legacy no-resolved-context admin passes ``--all``.
         """
         sid = str(row.get("id") or "")
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
         if source.platform == Platform.MATRIX:
             # Cross-room enumeration is cross-ORIGIN data access: gate the
             # ``--all`` short-circuit behind a real configured admin, exactly
             # like the non-Matrix branch below. A non-admin Matrix ``--all``
             # falls back to same-room scoping rather than exposing every Matrix
             # titled session.
-            if allow_all and self._resume_caller_is_admin(source):
+            if allow_all and not has_resolved_context and self._resume_caller_is_admin(source):
                 return True
             return self._same_matrix_room(source, self._gateway_session_origin_for_id(sid))
-        if allow_all and self._resume_caller_is_admin(source):
+        if allow_all and not has_resolved_context and self._resume_caller_is_admin(source):
             return True
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
@@ -1801,6 +1839,9 @@ class GatewaySlashCommandsMixin:
                             )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if getattr(source, "resolved_access_context", None) is not None:
+                        metadata = dict(metadata or {})
+                        metadata["_resolved_access_context"] = source.resolved_access_context
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
@@ -2169,11 +2210,11 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import _gateway_config_home, _load_gateway_config
         from hermes_constants import display_hermes_home
 
         args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / 'config.yaml'
+        config_path = _gateway_config_home() / "config.yaml"
 
         try:
             config = _load_gateway_config()
@@ -2303,7 +2344,7 @@ class GatewaySlashCommandsMixin:
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2321,7 +2362,7 @@ class GatewaySlashCommandsMixin:
             had = mgr.has_goal()
             mgr.clear()
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2390,7 +2431,7 @@ class GatewaySlashCommandsMixin:
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
-        adapter = self.adapters.get(event.source.platform) if event.source else None
+        adapter = self._adapter_for_source(event.source) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
@@ -2558,7 +2599,7 @@ class GatewaySlashCommandsMixin:
         platform = event.source.platform
         voice_key = self._voice_key(platform, chat_id)
 
-        adapter = self.adapters.get(platform)
+        adapter = self._adapter_for_source(event.source)
 
         if args in {"on", "enable"}:
             self._voice_mode[voice_key] = "voice_only"
@@ -2590,7 +2631,7 @@ class GatewaySlashCommandsMixin:
                 "all": t("gateway.voice.label_all"),
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
@@ -2634,20 +2675,36 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
-        from gateway.run import _hermes_home
         from tools.checkpoint_manager import CheckpointManager, format_checkpoint_list
+
+        typed_multiplex = (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(getattr(event, "source", None), "resolved_access_context", None)
+            is not None
+        )
+        if typed_multiplex:
+            try:
+                config_home = self._resolve_profile_home_for_source(event.source)
+            except Exception:
+                return t("gateway.rollback.not_enabled")
+        else:
+            from gateway.run import _hermes_home
+
+            config_home = _hermes_home
 
         # Read checkpoint config from config.yaml
         cp_cfg = {}
+        terminal_cfg = {}
         try:
             import yaml as _y
-            _cfg_path = _hermes_home / "config.yaml"
+            _cfg_path = config_home / "config.yaml"
             if _cfg_path.exists():
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _data = _y.safe_load(_f) or {}
                 cp_cfg = _data.get("checkpoints", {})
                 if isinstance(cp_cfg, bool):
                     cp_cfg = {"enabled": cp_cfg}
+                terminal_cfg = _data.get("terminal", {})
         except Exception:
             pass
 
@@ -2661,7 +2718,19 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_cfg.get("max_file_size_mb", 10),
         )
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        if typed_multiplex:
+            cwd_value = terminal_cfg.get("cwd") if isinstance(terminal_cfg, dict) else None
+            if not isinstance(cwd_value, str):
+                return t("gateway.rollback.not_enabled")
+            cwd_value = cwd_value.strip()
+            if not cwd_value or cwd_value in {".", "auto", "cwd"}:
+                return t("gateway.rollback.not_enabled")
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.is_absolute() or not cwd_path.is_dir():
+                return t("gateway.rollback.not_enabled")
+            cwd = str(cwd_path)
+        else:
+            cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -2863,6 +2932,9 @@ class GatewaySlashCommandsMixin:
             metadata = self._thread_metadata_for_source(
                 event.source, self._reply_anchor_for_event(event)
             )
+            if getattr(event.source, "resolved_access_context", None) is not None:
+                metadata = dict(metadata or {})
+                metadata["_resolved_access_context"] = event.source.resolved_access_context
             result = await adapter.send_choice_picker(
                 chat_id=event.source.chat_id,
                 title=title,
@@ -2977,39 +3049,109 @@ class GatewaySlashCommandsMixin:
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
         """
-        from gateway.run import _hermes_home
+        from contextlib import nullcontext
+
+        from hermes_constants import get_hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
-        session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        source = event.source
+        registry = getattr(self, "access_registry", None)
+        access_context = None
+        shared_scope = None
+        profile_home = None
+        pending_scope_key = None
+        if registry is not None:
+            try:
+                from gateway.access_registry import canonical_access_context_fingerprint
 
-        def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
-            atomic_config_write(config_path, user_config)
-            # New setting must take effect next message → drop cached agent.
-            self._evict_cached_agent(session_key)
+                access_context = registry.validate_resolved_context(
+                    getattr(source, "resolved_access_context", None)
+                )
+                role_id = getattr(access_context, "role_id", None)
+                capabilities = getattr(access_context, "capabilities", frozenset())
+                if role_id == "owner":
+                    pass
+                elif role_id in {"family_standard", "family_sandbox"}:
+                    if "memory_search" not in capabilities:
+                        return "Memory access denied."
+                elif role_id == "shared_room":
+                    if "room_memory" not in capabilities:
+                        return "Memory access denied."
+                    shared_scope = self._shared_scope_for_source(source)
+                    if shared_scope is None:
+                        return "Memory access denied."
+                else:
+                    return "Memory access denied."
+                pending_scope_key = canonical_access_context_fingerprint(access_context)
+                profile_home = self._resolve_profile_home_for_source(source)
+            except Exception:
+                return "Memory access denied."
 
-        # Apply approved writes against a fresh on-disk store (the gateway has
-        # no long-lived agent; the store persists to the same MEMORY/USER.md).
-        # load_on_disk_store() honors the user's configured char limits.
-        store = load_on_disk_store()
+        runtime_scope = nullcontext()
+        context_scope = nullcontext()
+        if registry is not None:
+            from gateway.run import _profile_runtime_scope
+            from gateway.session_context import bind_resolved_access_context
 
-        out = handle_pending_subcommand(
-            wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
-        )
-        if out is None:
-            out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
-                   "reject <id>, approval <on|off>.")
-        return out
+            runtime_scope = _profile_runtime_scope(profile_home)
+            context_scope = bind_resolved_access_context(access_context)
+
+        with runtime_scope:
+            with context_scope:
+                session_key = self._session_key_for_source(source)
+                config_path = get_hermes_home() / "config.yaml"
+
+                def _set_approval(enabled: bool):
+                    import yaml
+                    user_config = {}
+                    if config_path.exists():
+                        with open(config_path, encoding="utf-8") as f:
+                            user_config = yaml.safe_load(f) or {}
+                    user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
+                    atomic_config_write(config_path, user_config)
+                    # New setting must take effect next message → drop cached agent.
+                    self._evict_cached_agent(session_key)
+
+                memory_dir = None
+                allow_user_profile = True
+                if shared_scope is not None:
+                    memory_dir = (
+                        get_hermes_home()
+                        / "memories"
+                        / "shared"
+                        / shared_scope.memory_namespace
+                    )
+                    allow_user_profile = False
+
+                # Apply approved writes against a fresh on-disk store (the gateway has
+                # no long-lived agent; the store persists to the same MEMORY/USER.md).
+                # load_on_disk_store() honors the user's configured char limits.
+                try:
+                    store = load_on_disk_store(
+                        memory_dir=memory_dir,
+                        allow_user_profile=allow_user_profile,
+                        access_context=access_context,
+                    )
+
+                    out = handle_pending_subcommand(
+                        wa.MEMORY,
+                        args,
+                        memory_store=store,
+                        set_mode_fn=_set_approval,
+                        pending_scope_key=pending_scope_key,
+                    )
+                except Exception:
+                    if registry is None:
+                        raise
+                    return "Memory access denied."
+                if out is None:
+                    out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
+                           "reject <id>, approval <on|off>.")
+                return out
 
     async def _handle_skills_command(self, event: MessageEvent) -> str:
         """Handle /skills on the gateway — pending skill-write review only.
@@ -3163,9 +3305,13 @@ class GatewaySlashCommandsMixin:
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
-        from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key
+        from gateway.run import (
+            _gateway_config_home,
+            _load_gateway_config,
+            _platform_config_key,
+        )
 
-        config_path = _hermes_home / "config.yaml"
+        config_path = _gateway_config_home() / "config.yaml"
         platform_key = _platform_config_key(event.source.platform)
 
         # --- check config gate ------------------------------------------------
@@ -3232,10 +3378,15 @@ class GatewaySlashCommandsMixin:
         are respected but not modified here — edit config.yaml directly for
         per-platform control.
         """
-        from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key, _resolve_gateway_model
+        from gateway.run import (
+            _gateway_config_home,
+            _load_gateway_config,
+            _platform_config_key,
+            _resolve_gateway_model,
+        )
         from gateway.runtime_footer import resolve_footer_config
 
-        config_path = _hermes_home / "config.yaml"
+        config_path = _gateway_config_home() / "config.yaml"
         platform_key = _platform_config_key(event.source.platform)
 
         # --- parse argument -------------------------------------------------
@@ -3850,9 +4001,16 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
+        has_resolved_context = self._resolved_context_profile_id(source) is not None
         if source.platform == Platform.MATRIX:
             target_origin = self._gateway_session_origin_for_id(target_id)
-            if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
+            effective_cross_room = allow_cross_room and not has_resolved_context
+            if not self._same_matrix_room(source, target_origin) and not effective_cross_room:
+                if has_resolved_context:
+                    return t(
+                        "gateway.resume.blocked_not_owner",
+                        name=t("gateway.topic.untitled_session"),
+                    )
                 if target_origin is None:
                     return t("gateway.resume.matrix_blocked_no_origin", name=name)
                 return t(
@@ -3867,6 +4025,11 @@ class GatewaySlashCommandsMixin:
             # Bind /resume to the caller's own platform/user/chat on every
             # non-Matrix adapter so one user can't attach to another's
             # persisted transcript.
+            if self._resolved_context_profile_id(source) is not None:
+                return t(
+                    "gateway.resume.blocked_not_owner",
+                    name=t("gateway.topic.untitled_session"),
+                )
             return t("gateway.resume.blocked_not_owner", name=name)
 
         # Check if already on that session
@@ -3919,7 +4082,7 @@ class GatewaySlashCommandsMixin:
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
-        if source.platform == Platform.MATRIX and allow_cross_room:
+        if source.platform == Platform.MATRIX and allow_cross_room and not has_resolved_context:
             return t(
                 "gateway.resume.matrix_cross_room_success",
                 title=title,
@@ -4644,7 +4807,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
@@ -4701,7 +4864,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.deny.no_pending")
 
         # Resume typing indicator — agent continues (with BLOCKED result).
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 

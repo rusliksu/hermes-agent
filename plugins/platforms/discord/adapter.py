@@ -5603,6 +5603,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            approval_request_id = str((metadata or {}).get("approval_request_id") or "")
+            if not approval_request_id:
+                return SendResult(success=False, error="approval request id missing")
             # Resolve channel — use thread_id from metadata if present
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
@@ -5661,6 +5664,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = ExecApprovalView(
                 session_key=session_key,
+                approval_request_id=approval_request_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
                 require_admin=require_admin,
@@ -6913,6 +6917,7 @@ def _define_discord_view_classes() -> None:
         def __init__(
             self,
             session_key: str,
+            approval_request_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
             require_admin: bool = False,
@@ -6922,6 +6927,7 @@ def _define_discord_view_classes() -> None:
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.approval_request_id = approval_request_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -6931,12 +6937,17 @@ def _define_discord_view_classes() -> None:
             self.admin_user_ids = {
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
+            self.allowed_choices = ["once"]
             self.resolved = False
             if smart_denied:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
+                self.allowed_choices.append("session")
                 self.remove_item(self.allow_always)
+            else:
+                self.allowed_choices.extend(["session", "always"])
+            self.allowed_choices.append("deny")
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized.
@@ -6988,8 +6999,36 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
-            self.resolved = True
+            if choice not in set(self.allowed_choices):
+                await interaction.response.send_message(
+                    "That approval choice is not available for this prompt~",
+                    ephemeral=True,
+                )
+                return
 
+            try:
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    expected_request_id=self.approval_request_id,
+                )
+                logger.info(
+                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, self.session_key, choice, interaction.user.display_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                count = 0
+
+            if not count:
+                await interaction.response.send_message(
+                    "This approval is no longer pending~",
+                    ephemeral=True,
+                )
+                return
+
+            self.resolved = True
             # Update the embed with the decision
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
             if embed:
@@ -7001,17 +7040,6 @@ def _define_discord_view_classes() -> None:
                 child.disabled = True
 
             await interaction.response.edit_message(embed=embed, view=self)
-
-            # Unblock the waiting agent thread via the gateway approval queue
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(
