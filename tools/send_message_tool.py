@@ -682,6 +682,41 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+def _platform_value(platform) -> str:
+    return platform.value if hasattr(platform, "value") else str(platform)
+
+
+def _deny_if_resolved_delivery_target_mismatch(platform, chat_id, thread_id):
+    """Fail closed when a typed access context is bound to another target."""
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        context = get_resolved_access_context(None)
+    except Exception:
+        context = None
+    if context is None:
+        return None
+
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+
+        serialized = serialize_resolved_access_context(context)
+        delivery_target = serialized["delivery_target"]
+    except Exception:
+        return {"error": "send_message_access_denied", "reason": "malformed_resolved_access_context"}
+
+    platform_name = _platform_value(platform)
+    actual_thread_id = None if thread_id is None else str(thread_id)
+    same_target = (
+        platform_name == delivery_target["platform"]
+        and str(chat_id) == delivery_target["chat_id"]
+        and actual_thread_id == delivery_target["thread_id"]
+    )
+    if same_target:
+        return None
+    return {"error": "send_message_access_denied", "reason": "delivery_target_mismatch"}
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -703,7 +738,10 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
-    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    platform_name = _platform_value(platform)
+    denial = _deny_if_resolved_delivery_target_mismatch(platform, chat_id, thread_id)
+    if denial:
+        return denial
     runner = None
     try:
         from gateway.run import _gateway_runner_ref
@@ -787,6 +825,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
+    denial = _deny_if_resolved_delivery_target_mismatch(platform, chat_id, thread_id)
+    if denial:
+        return denial
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
