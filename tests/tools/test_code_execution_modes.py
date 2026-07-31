@@ -17,6 +17,7 @@ import os
 import sys
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -41,6 +42,74 @@ from tools.code_execution_tool import (
     build_execute_code_schema,
     execute_code,
 )
+
+
+def _typed_context(profile_id="profile-a"):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id="family_standard",
+        profile_id=profile_id,
+        conversation_scope="dm:principal-a",
+        capabilities=frozenset({"code"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="1001",
+        ),
+    )
+
+
+def _make_profile(root: Path, profile_id="profile-a") -> tuple[Path, Path]:
+    profile_root = root / "profiles" / profile_id
+    profile_home = profile_root / "home"
+    profile_home.mkdir(parents=True)
+    return profile_root, profile_home
+
+
+def _capture_local_child_env(monkeypatch, *, context, env):
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as terminal_tool
+    from gateway.session_context import bind_resolved_access_context
+
+    captured = {}
+
+    class FakeServerSocket:
+        def bind(self, _address):
+            return None
+
+        def listen(self, _backlog):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+        def accept(self):
+            raise cet.socket.timeout()
+
+        def close(self):
+            return None
+
+    def fake_popen(_args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        raise RuntimeError("captured child env before spawn")
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr("tools.approval.check_execute_code_guard", lambda *_a, **_k: {"approved": True})
+    monkeypatch.setattr(cet, "_load_config", lambda: {"timeout": 5, "max_tool_calls": 5, "mode": "strict"})
+    monkeypatch.setattr(cet, "_resolve_child_python", lambda _mode: sys.executable)
+    monkeypatch.setattr(cet, "_resolve_child_cwd", lambda _mode, tmpdir, task_id="": tmpdir)
+    monkeypatch.setattr(cet.socket, "socket", lambda *_args, **_kwargs: FakeServerSocket())
+    monkeypatch.setattr(cet.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cet.subprocess, "Popen", fake_popen)
+
+    with patch.dict(os.environ, env, clear=True), bind_resolved_access_context(context):
+        raw = execute_code("print('env probe')", task_id="typed-env-probe", enabled_tools=["terminal"])
+
+    return captured, json.loads(raw)
 
 
 @contextmanager
@@ -446,6 +515,194 @@ class TestExecuteCodeModeIntegration(unittest.TestCase):
         result = self._run(code, mode="strict")
         self.assertEqual(result["status"], "success")
         self.assertIn("mock", result["output"])
+
+
+def test_typed_execute_code_child_env_uses_bound_profile_not_poisoned_owner_env(monkeypatch, tmp_path):
+    """Defect: typed execute_code inherited owner/default HOME and Hermes paths."""
+    owner_root = tmp_path / "owner-default-hermes"
+    profile_root, profile_home = _make_profile(owner_root)
+    owner_home = tmp_path / "owner-home"
+    owner_home.mkdir()
+    owner_tmp = tmp_path / "owner-tmp"
+    owner_tmp.mkdir()
+    owner_xdg = tmp_path / "owner-xdg"
+    owner_xdg.mkdir()
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "TERMINAL_ENV": "local",
+        "HERMES_HOME": str(owner_root),
+        "HERMES_PROFILE": "default",
+        "HERMES_REAL_HOME": str(owner_home),
+        "HERMES_CONFIG": str(owner_root / "config.yaml"),
+        "HERMES_ENV": str(owner_root / ".env"),
+        "HOME": str(owner_home),
+        "USERPROFILE": str(owner_home),
+        "HOMEDRIVE": "Z:",
+        "HOMEPATH": "\\Users\\owner",
+        "XDG_CONFIG_HOME": str(owner_xdg),
+        "XDG_RUNTIME_DIR": str(owner_xdg / "runtime"),
+        "TMPDIR": str(owner_tmp),
+        "TMP": str(owner_tmp),
+        "TEMP": str(owner_tmp),
+        "PYTHONPATH": str(owner_root / "owner-pythonpath"),
+        "VIRTUAL_ENV": str(owner_root / "venv"),
+        "CONDA_PREFIX": str(owner_root / "conda"),
+    }
+
+    captured, result = _capture_local_child_env(
+        monkeypatch,
+        context=_typed_context(),
+        env=env,
+    )
+
+    assert result["status"] == "error"
+    child_env = captured["env"]
+    assert child_env["HERMES_HOME"] == str(profile_root)
+    assert child_env["HERMES_PROFILE"] == "profile-a"
+    assert child_env["HOME"] == str(profile_home)
+    assert child_env["USERPROFILE"] == str(profile_home)
+    assert str(owner_root) not in child_env["PYTHONPATH"]
+    assert child_env["PYTHONPATH"].split(os.pathsep)[:2] == [
+        child_env["TMPDIR"],
+        str(Path(__file__).resolve().parents[2]),
+    ]
+    assert "HERMES_REAL_HOME" not in child_env
+    assert "HERMES_CONFIG" not in child_env
+    assert "HERMES_ENV" not in child_env
+    assert not any(key.startswith("XDG_") for key in child_env)
+    assert "VIRTUAL_ENV" not in child_env
+    assert "CONDA_PREFIX" not in child_env
+    assert child_env["TMPDIR"] == child_env["TMP"] == child_env["TEMP"]
+    assert child_env["TMPDIR"].startswith(os.path.realpath("/tmp"))
+
+
+def test_typed_execute_code_child_env_ignores_passthrough_provider_api_mcp_secrets(
+    monkeypatch, tmp_path
+):
+    """Defect: process-global passthrough could put provider/API/MCP secrets in typed child env."""
+    owner_root = tmp_path / "owner-default-hermes"
+    _make_profile(owner_root)
+    provider_secret = "tenor-provider-secret"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "TERMINAL_ENV": "local",
+        "HERMES_HOME": str(owner_root),
+        "HOME": str(tmp_path / "owner-home"),
+        "TENOR_API_KEY": provider_secret,
+        "OPENAI_API_KEY": "openai-secret",
+        "ANTHROPIC_AUTH_TOKEN": "anthropic-secret",
+        "MCP_SERVER_TOKEN": "mcp-secret",
+    }
+
+    monkeypatch.setattr("tools.env_passthrough.is_env_passthrough", lambda key: key == "TENOR_API_KEY")
+    captured, _result = _capture_local_child_env(
+        monkeypatch,
+        context=_typed_context(),
+        env=env,
+    )
+
+    child_env = captured["env"]
+    for key in ("TENOR_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "MCP_SERVER_TOKEN"):
+        assert key not in child_env
+    assert provider_secret not in json.dumps(child_env, sort_keys=True)
+
+
+def test_typed_execute_code_malformed_context_fails_before_spawn(monkeypatch, tmp_path):
+    """Defect: malformed non-None typed context fell through to legacy child spawn."""
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "TERMINAL_ENV": "local",
+        "HERMES_HOME": str(tmp_path / "owner-default-hermes"),
+        "HOME": str(tmp_path / "owner-home"),
+    }
+    captured, result = _capture_local_child_env(
+        monkeypatch,
+        context={"profile_id": "profile-a"},
+        env=env,
+    )
+
+    assert "env" not in captured
+    assert result["status"] == "error"
+    assert result["tool_calls_made"] == 0
+    assert "malformed resolved access context" in result["error"]
+
+
+def test_typed_execute_code_missing_profile_fails_before_spawn(monkeypatch, tmp_path):
+    """Defect: missing typed profile home must fail before local child spawn."""
+    owner_root = tmp_path / "owner-default-hermes"
+    owner_root.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "TERMINAL_ENV": "local",
+        "HERMES_HOME": str(owner_root),
+        "HOME": str(tmp_path / "owner-home"),
+    }
+    captured, result = _capture_local_child_env(
+        monkeypatch,
+        context=_typed_context("missing-profile"),
+        env=env,
+    )
+
+    assert "env" not in captured
+    assert result["status"] == "error"
+    assert result["tool_calls_made"] == 0
+    assert "resolved access profile" in result["error"]
+
+
+def test_legacy_execute_code_child_env_matches_scrub_apply_contract(monkeypatch, tmp_path):
+    """Legacy no-typed-context path keeps exact scrubber/apply_subprocess_home_env behavior."""
+    import tools.code_execution_tool as cet
+    from gateway.session_context import bind_resolved_access_context
+    from hermes_constants import apply_subprocess_home_env
+
+    owner_root = tmp_path / "owner-default-hermes"
+    (owner_root / "home").mkdir(parents=True)
+    owner_home = tmp_path / "owner-home"
+    owner_home.mkdir()
+    tmpdir = str(tmp_path / "run-tmp")
+    hermes_root = str(Path(cet.__file__).resolve().parents[1])
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "TERMINAL_ENV": "local",
+        "HERMES_HOME": str(owner_root),
+        "HERMES_PROFILE": "default",
+        "HERMES_REAL_HOME": str(owner_home),
+        "HERMES_CONFIG": str(owner_root / "config.yaml"),
+        "HERMES_ENV": str(owner_root / ".env"),
+        "HERMES_TIMEZONE": "Europe/Amsterdam",
+        "HOME": str(owner_home),
+        "PYTHONPATH": str(owner_root / "owner-pythonpath"),
+        "TERMINAL_HOME_MODE": "profile",
+        "TENOR_API_KEY": "legacy-passthrough-secret",
+        "OPENAI_API_KEY": "blocked-secret",
+    }
+    monkeypatch.setattr("tools.env_passthrough.is_env_passthrough", lambda key: key == "TENOR_API_KEY")
+
+    with patch.dict(os.environ, env, clear=True), bind_resolved_access_context(None):
+        expected = cet._scrub_child_env(os.environ)
+        expected["HERMES_RPC_SOCKET"] = "rpc-endpoint"
+        expected["HERMES_RPC_TOKEN"] = "rpc-token"
+        expected["PYTHONDONTWRITEBYTECODE"] = "1"
+        expected["PYTHONIOENCODING"] = "utf-8"
+        expected["PYTHONUTF8"] = "1"
+        expected["PYTHONPATH"] = os.pathsep.join([
+            tmpdir,
+            hermes_root,
+            str(owner_root / "owner-pythonpath"),
+        ])
+        expected["TZ"] = "Europe/Amsterdam"
+        expected.pop("HERMES_TIMEZONE", None)
+        apply_subprocess_home_env(expected)
+
+        actual = cet._build_local_child_env(tmpdir, "rpc-endpoint", "rpc-token")
+
+    assert actual == expected
+    assert actual["HERMES_HOME"] == str(owner_root)
+    assert actual["HOME"] == str(owner_root / "home")
+    assert actual["HERMES_REAL_HOME"] == str(owner_home)
+    assert actual["TENOR_API_KEY"] == "legacy-passthrough-secret"
+    assert "OPENAI_API_KEY" not in actual
 
 
 # ---------------------------------------------------------------------------
