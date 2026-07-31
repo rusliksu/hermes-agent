@@ -8,6 +8,8 @@ import pytest
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
+_MISSING = object()
+
 
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
@@ -97,6 +99,549 @@ class TestSessionLifecycle:
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
+
+
+class TestSessionScopedReads:
+    def _scope(
+        self,
+        *,
+        profile_name="family-alpha",
+        chat_id="chat-a",
+        thread_id="thread-a",
+    ):
+        return {
+            "profile_name": profile_name,
+            "source": "telegram",
+            "chat_type": "dm",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": chat_id,
+            "is_dm": True,
+        }
+
+    def _seed(self, db, session_id, *, profile_name="family-alpha"):
+        db.create_session(
+            session_id,
+            source="telegram",
+            profile_name=profile_name,
+            chat_type="dm",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            user_id="chat-a",
+        )
+        first_id = db.append_message(
+            session_id,
+            role="user",
+            content=f"{session_id} first",
+        )
+        db.append_message(session_id, role="assistant", content=f"{session_id} reply")
+        db.append_message(session_id, role="user", content=f"{session_id} last")
+        db._conn.commit()
+        return first_id
+
+    def _seed_typed_session(
+        self,
+        db,
+        session_id,
+        *,
+        profile_name="family-alpha",
+        parent_session_id=None,
+    ):
+        db.create_session(
+            session_id,
+            source="telegram",
+            profile_name=profile_name,
+            chat_type="dm",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            user_id="chat-a",
+            parent_session_id=parent_session_id,
+        )
+        db.append_message(session_id, role="user", content=f"{session_id} transcript")
+        db._conn.commit()
+
+    def test_scoped_sessiondb_reads_allow_own_and_hide_foreign(self, db):
+        own_anchor = self._seed(db, "own")
+        foreign_anchor = self._seed(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert db.get_session("own", session_scope=scope)["id"] == "own"
+        assert db.get_session("foreign", session_scope=scope) is None
+        assert [m["session_id"] for m in db.get_messages("own", session_scope=scope)] == [
+            "own",
+            "own",
+            "own",
+        ]
+        assert db.get_messages("foreign", session_scope=scope) == []
+        assert db.get_messages_around("own", own_anchor, session_scope=scope)["window"]
+        assert db.get_messages_around("foreign", foreign_anchor, session_scope=scope) == {
+            "window": [],
+            "messages_before": 0,
+            "messages_after": 0,
+        }
+        assert db.get_anchored_view("own", own_anchor, session_scope=scope)["window"]
+        assert db.get_anchored_view("foreign", foreign_anchor, session_scope=scope) == {
+            "window": [],
+            "messages_before": 0,
+            "messages_after": 0,
+            "bookend_start": [],
+            "bookend_end": [],
+        }
+
+    def test_scoped_session_exports_and_lists_hide_foreign_typed_sessions(self, db):
+        self._seed(db, "own")
+        self._seed(db, "foreign", profile_name="family-beta")
+        db.create_session("own-cli", source="cli")
+        scope = self._scope()
+
+        assert [s["id"] for s in db.search_sessions(session_scope=scope)] == ["own"]
+        assert [s["id"] for s in db.search_sessions(source="telegram", session_scope=scope)] == ["own"]
+        assert db.search_sessions(source="cli", session_scope=scope) == []
+
+        own_export = db.export_session("own", session_scope=scope)
+        assert own_export["id"] == "own"
+        assert [m["session_id"] for m in own_export["messages"]] == ["own", "own", "own"]
+        assert db.export_session("foreign", session_scope=scope) is None
+
+        all_exports = db.export_all(session_scope=scope)
+        assert [e["id"] for e in all_exports] == ["own"]
+        assert [m["session_id"] for m in all_exports[0]["messages"]] == ["own", "own", "own"]
+
+    def test_scoped_session_id_search_hides_foreign_typed_sessions(self, db):
+        self._seed(db, "20260731_own")
+        self._seed(db, "20260731_foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert [s["id"] for s in db.search_sessions_by_id("20260731", session_scope=scope)] == [
+            "20260731_own"
+        ]
+        assert db.search_sessions_by_id("20260731_foreign", session_scope=scope) == []
+
+    def test_malformed_session_scope_returns_empty_session_id_search(self, db):
+        self._seed(db, "20260731_own")
+
+        assert db.search_sessions_by_id(
+            "20260731_own",
+            session_scope=["not", "a", "dict"],
+        ) == []
+
+    def test_scoped_compression_lineage_cannot_traverse_foreign_profile(self, db):
+        scope = self._scope()
+
+        self._seed_typed_session(db, "own-root")
+        db.end_session("own-root", "compression")
+        self._seed_typed_session(
+            db,
+            "foreign-child",
+            profile_name="family-beta",
+            parent_session_id="own-root",
+        )
+
+        self._seed_typed_session(db, "foreign-root", profile_name="family-beta")
+        db.end_session("foreign-root", "compression")
+        self._seed_typed_session(db, "own-child", parent_session_id="foreign-root")
+
+        assert db.get_compression_lineage("foreign-root", session_scope=scope) == []
+        assert db.get_compression_lineage("own-root", session_scope=scope) == ["own-root"]
+        assert db.get_compression_lineage("own-child", session_scope=scope) == ["own-child"]
+        assert db.export_session_lineage("foreign-root", session_scope=scope) is None
+        assert db.export_session_lineage("own-child", session_scope=scope)["lineage_session_ids"] == [
+            "own-child"
+        ]
+
+    def test_scoped_session_id_search_cannot_match_foreign_compression_tip(self, db):
+        scope = self._scope()
+
+        self._seed_typed_session(db, "20260731-own-root")
+        db.end_session("20260731-own-root", "compression")
+        self._seed_typed_session(
+            db,
+            "20260731-foreign-tip",
+            profile_name="family-beta",
+            parent_session_id="20260731-own-root",
+        )
+
+        assert db.search_sessions_by_id("foreign-tip", session_scope=scope) == []
+        matches = db.search_sessions_by_id("own-root", session_scope=scope)
+        assert [s["id"] for s in matches] == ["20260731-own-root"]
+
+    def test_malformed_session_scope_returns_empty_shapes(self, db):
+        anchor = self._seed(db, "own")
+        malformed_scope = ["not", "a", "dict"]
+
+        assert db.get_session("own", session_scope=malformed_scope) is None
+        assert db.get_messages("own", session_scope=malformed_scope) == []
+        assert db.get_messages_around("own", anchor, session_scope=malformed_scope) == {
+            "window": [],
+            "messages_before": 0,
+            "messages_after": 0,
+        }
+        assert db.get_anchored_view("own", anchor, session_scope=malformed_scope) == {
+            "window": [],
+            "messages_before": 0,
+            "messages_after": 0,
+            "bookend_start": [],
+            "bookend_end": [],
+        }
+        assert db.search_sessions(session_scope=malformed_scope) == []
+        assert db.export_session("own", session_scope=malformed_scope) is None
+        assert db.export_all(session_scope=malformed_scope) == []
+        assert db.get_compression_lineage("own", session_scope=malformed_scope) == []
+        assert db.export_session_lineage("own", session_scope=malformed_scope) is None
+
+    def test_scoped_delete_session_only_deletes_own_typed_session(self, db):
+        self._seed(db, "own")
+        self._seed(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert db.delete_session("foreign", session_scope=scope) is False
+        assert db.get_session("foreign") is not None
+        assert len(db.get_messages("foreign")) == 3
+
+        assert db.delete_session("own", session_scope=scope) is True
+        assert db.get_session("own") is None
+        assert db.get_session("foreign") is not None
+        assert len(db.get_messages("foreign")) == 3
+
+    def test_scoped_bulk_delete_only_deletes_own_typed_sessions(self, db):
+        self._seed(db, "own-a")
+        self._seed(db, "own-b")
+        self._seed(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert (
+            db.delete_sessions(["own-a", "foreign", "own-b"], session_scope=scope)
+            == 2
+        )
+        assert db.get_session("own-a") is None
+        assert db.get_session("own-b") is None
+        assert db.get_session("foreign") is not None
+        assert len(db.get_messages("foreign")) == 3
+
+    def test_malformed_session_scope_delete_is_noop(self, db):
+        self._seed(db, "own")
+        malformed_scope = ["not", "a", "dict"]
+
+        assert db.delete_session("own", session_scope=malformed_scope) is False
+        assert db.delete_sessions(["own"], session_scope=malformed_scope) == 0
+        assert db.get_session("own") is not None
+        assert len(db.get_messages("own")) == 3
+
+    def test_scoped_end_session_only_ends_own_typed_session(self, db):
+        self._seed(db, "own")
+        self._seed(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert db.end_session("foreign", "user_exit", session_scope=scope) is False
+        assert db.get_session("foreign")["ended_at"] is None
+
+        assert db.end_session("own", "user_exit", session_scope=scope) is True
+        own = db.get_session("own")
+        assert isinstance(own["ended_at"], float)
+        assert own["end_reason"] == "user_exit"
+
+    def test_malformed_session_scope_end_and_promote_are_noops(self, db):
+        self._seed(db, "own")
+        malformed_scope = ["not", "a", "dict"]
+
+        assert db.end_session("own", "user_exit", session_scope=malformed_scope) is False
+        assert db.promote_to_session_reset("own", session_scope=malformed_scope) is False
+        assert db.get_session("own")["ended_at"] is None
+
+    @pytest.mark.parametrize(
+        "is_dm_value",
+        [
+            pytest.param(_MISSING, id="missing"),
+            pytest.param(1, id="integer"),
+            pytest.param("true", id="string"),
+            pytest.param(None, id="none"),
+            pytest.param([], id="list"),
+        ],
+    )
+    def test_malformed_is_dm_scope_cannot_end_append_or_create(self, db, is_dm_value):
+        self._seed_typed_session(db, "own")
+        malformed_scope = self._scope()
+        if is_dm_value is _MISSING:
+            malformed_scope.pop("is_dm")
+        else:
+            malformed_scope["is_dm"] = is_dm_value
+
+        assert db.end_session("own", "user_exit", session_scope=malformed_scope) is False
+        assert db.append_message(
+            "own",
+            role="user",
+            content="must not write",
+            session_scope=malformed_scope,
+        ) == 0
+        assert db.create_session(
+            "malformed-created",
+            source="telegram",
+            session_scope=malformed_scope,
+        ) is False
+
+        assert db.get_session("own")["ended_at"] is None
+        assert [m["content"] for m in db.get_messages("own")] == ["own transcript"]
+        assert db.get_session("own")["message_count"] == 1
+        assert db.get_session("malformed-created") is None
+
+    @pytest.mark.parametrize(
+        ("is_dm", "chat_type", "chat_id", "expected_user_id"),
+        [
+            pytest.param(True, "dm", "chat-a", "chat-a", id="dm"),
+            pytest.param(False, "group", "room-a", "", id="room"),
+        ],
+    )
+    def test_valid_is_dm_bool_scope_can_create_append_and_end(
+        self,
+        db,
+        is_dm,
+        chat_type,
+        chat_id,
+        expected_user_id,
+    ):
+        scope = self._scope(chat_id=chat_id)
+        scope["chat_type"] = chat_type
+        scope["is_dm"] = is_dm
+        if not is_dm:
+            scope.pop("user_id")
+
+        assert db.create_session(
+            "bool-scope-created",
+            source="cli",
+            user_id="wrong",
+            session_scope=scope,
+        ) is True
+
+        row = db.get_session("bool-scope-created")
+        assert row["source"] == "telegram"
+        assert row["chat_type"] == chat_type
+        assert row["chat_id"] == chat_id
+        assert row["user_id"] == expected_user_id
+
+        msg_id = db.append_message(
+            "bool-scope-created",
+            role="user",
+            content="bool scope write",
+            session_scope=scope,
+        )
+        assert msg_id > 0
+        assert db.end_session(
+            "bool-scope-created",
+            "user_exit",
+            session_scope=scope,
+        ) is True
+        assert db.get_session("bool-scope-created")["end_reason"] == "user_exit"
+
+    def test_scoped_promote_to_session_reset_only_promotes_own_session(self, db):
+        self._seed(db, "own")
+        self._seed(db, "foreign", profile_name="family-beta")
+        db.end_session("own", "agent_close")
+        db.end_session("foreign", "agent_close")
+        scope = self._scope()
+
+        assert db.promote_to_session_reset("foreign", session_scope=scope) is False
+        assert db.get_session("foreign")["end_reason"] == "agent_close"
+
+        assert db.promote_to_session_reset("own", session_scope=scope) is True
+        assert db.get_session("own")["end_reason"] == "session_reset"
+
+    def test_scoped_append_message_only_writes_own_typed_session(self, db):
+        self._seed_typed_session(db, "own")
+        self._seed_typed_session(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        assert db.append_message(
+            "foreign",
+            role="user",
+            content="must not write",
+            session_scope=scope,
+        ) == 0
+        assert [m["content"] for m in db.get_messages("foreign")] == [
+            "foreign transcript"
+        ]
+        assert db.get_session("foreign")["message_count"] == 1
+
+        msg_id = db.append_message(
+            "own",
+            role="user",
+            content="own write",
+            session_scope=scope,
+        )
+        assert msg_id > 0
+        assert [m["content"] for m in db.get_messages("own", session_scope=scope)] == [
+            "own transcript",
+            "own write",
+        ]
+        assert db.get_session("own", session_scope=scope)["message_count"] == 2
+
+    def test_malformed_session_scope_append_is_atomic_noop(self, db):
+        self._seed_typed_session(db, "own")
+
+        assert db.append_message(
+            "own",
+            role="user",
+            content="must not write",
+            session_scope=["not", "a", "dict"],
+        ) == 0
+        assert [m["content"] for m in db.get_messages("own")] == ["own transcript"]
+        assert db.get_session("own")["message_count"] == 1
+
+    def test_scoped_create_session_writes_exact_scope_metadata(self, db):
+        scope = self._scope()
+
+        assert db.create_session(
+            "created",
+            source="cli",
+            profile_name="wrong",
+            chat_id="wrong",
+            session_scope=scope,
+        ) is True
+
+        row = db.get_session("created")
+        assert row["source"] == "telegram"
+        assert row["profile_name"] == "family-alpha"
+        assert row["chat_type"] == "dm"
+        assert row["chat_id"] == "chat-a"
+        assert row["thread_id"] == "thread-a"
+        assert row["user_id"] == "chat-a"
+
+    def test_scoped_create_session_rejects_foreign_parent_and_collision(self, db):
+        scope = self._scope()
+        self._seed_typed_session(db, "own-parent")
+        self._seed_typed_session(db, "foreign-parent", profile_name="family-beta")
+        self._seed_typed_session(db, "foreign-collision", profile_name="family-beta")
+
+        assert db.create_session(
+            "child",
+            source="telegram",
+            parent_session_id="foreign-parent",
+            session_scope=scope,
+        ) is False
+        assert db.get_session("child") is None
+
+        assert db.create_session(
+            "foreign-collision",
+            source="telegram",
+            parent_session_id="own-parent",
+            session_scope=scope,
+        ) is False
+        assert db.get_session("foreign-collision")["profile_name"] == "family-beta"
+
+        assert db.create_session(
+            "own-child",
+            source="telegram",
+            parent_session_id="own-parent",
+            session_scope=scope,
+        ) is True
+        assert db.get_session("own-child")["parent_session_id"] == "own-parent"
+
+    def test_malformed_session_scope_create_is_noop(self, db):
+        assert db.create_session(
+            "malformed",
+            source="telegram",
+            session_scope=["not", "a", "dict"],
+        ) is False
+        assert db.get_session("malformed") is None
+
+    def test_scoped_archive_and_compact_updates_own_typed_session(self, db):
+        self._seed(db, "own")
+        scope = self._scope()
+
+        result = db.archive_and_compact(
+            "own",
+            [{"role": "user", "content": "scoped summary"}],
+            session_scope=scope,
+        )
+
+        assert result == 1
+        assert [m["content"] for m in db.get_messages("own", session_scope=scope)] == [
+            "scoped summary"
+        ]
+        inactive = db.get_messages(
+            "own",
+            include_inactive=True,
+            session_scope=scope,
+        )
+        assert len(inactive) == 4
+        assert sum(1 for msg in inactive if msg["active"] == 0 and msg["compacted"] == 1) == 3
+        assert db.get_session("own", session_scope=scope)["message_count"] == 1
+
+    def test_scoped_archive_and_compact_foreign_session_is_atomic_noop(self, db):
+        self._seed(db, "foreign", profile_name="family-beta")
+        scope = self._scope()
+
+        result = db.archive_and_compact(
+            "foreign",
+            [{"role": "user", "content": "must not insert"}],
+            session_scope=scope,
+        )
+
+        assert result == 0
+        assert [m["content"] for m in db.get_messages("foreign")] == [
+            "foreign first",
+            "foreign reply",
+            "foreign last",
+        ]
+        assert [m["active"] for m in db.get_messages("foreign", include_inactive=True)] == [
+            1,
+            1,
+            1,
+        ]
+        assert db.get_session("foreign")["message_count"] == 3
+
+    def test_malformed_session_scope_archive_and_compact_is_atomic_noop(self, db):
+        self._seed(db, "own")
+        malformed_scope = ["not", "a", "dict"]
+
+        result = db.archive_and_compact(
+            "own",
+            [{"role": "user", "content": "must not insert"}],
+            session_scope=malformed_scope,
+        )
+
+        assert result == 0
+        assert [m["content"] for m in db.get_messages("own")] == [
+            "own first",
+            "own reply",
+            "own last",
+        ]
+        assert [m["active"] for m in db.get_messages("own", include_inactive=True)] == [
+            1,
+            1,
+            1,
+        ]
+        assert db.get_session("own")["message_count"] == 3
+
+    def test_scoped_delete_fails_closed_on_foreign_delegate_child(self, db):
+        self._seed_typed_session(db, "parent")
+        db.create_session(
+            "foreign-delegate",
+            source="telegram",
+            profile_name="family-beta",
+            chat_type="dm",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            user_id="chat-a",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.append_message("foreign-delegate", role="user", content="foreign child")
+        db._conn.commit()
+        scope = self._scope()
+
+        assert db.delete_session("parent", session_scope=scope) is False
+        assert db.get_session("parent") is not None
+        child = db.get_session("foreign-delegate")
+        assert child is not None
+        assert child["parent_session_id"] == "parent"
+        assert len(db.get_messages("foreign-delegate")) == 1
+
+        assert db.delete_sessions(["parent"], session_scope=scope) == 0
+        assert db.get_session("parent") is not None
+        child = db.get_session("foreign-delegate")
+        assert child is not None
+        assert child["parent_session_id"] == "parent"
+        assert len(db.get_messages("foreign-delegate")) == 1
 
     def test_create_session_enriches_null_metadata_on_conflict(self, db):
         """Gateway creates a bare row first; the agent's later create_session

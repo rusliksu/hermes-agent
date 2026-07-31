@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 
@@ -63,6 +65,35 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
 
 def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
+
+
+def _scope(profile_name: str = "profile-a"):
+    return {
+        "profile_name": profile_name,
+        "source": "telegram",
+        "chat_type": "dm",
+        "chat_id": "10001",
+        "thread_id": "",
+        "user_id": "10001",
+        "is_dm": True,
+    }
+
+
+def _create_scoped_session(
+    db: SessionDB,
+    session_id: str,
+    *,
+    profile_name: str = "profile-a",
+):
+    db.create_session(
+        session_id,
+        source="telegram",
+        profile_name=profile_name,
+        chat_type="dm",
+        chat_id="10001",
+        thread_id="",
+        user_id="10001",
+    )
 
 
 class TestGoalMigratesOnRotation:
@@ -131,6 +162,83 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+class TestTypedScopeRotation:
+    def test_rotation_creates_child_with_exact_scope_metadata(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TYPED_ROT"
+        scope = _scope()
+        _create_scoped_session(db, parent)
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+        agent._session_scope_required = True
+        agent._session_scope = scope
+        agent._compression_feasibility_checked = True
+
+        agent._compress_context(_msgs(3), "sys", approx_tokens=120_000)
+        child = agent.session_id
+
+        assert child != parent
+        parent_row = db.get_session(parent)
+        assert parent_row["end_reason"] == "compression"
+        child_row = db.get_session(child)
+        assert child_row["parent_session_id"] == parent
+        assert child_row["source"] == "telegram"
+        assert child_row["profile_name"] == "profile-a"
+        assert child_row["chat_type"] == "dm"
+        assert child_row["chat_id"] == "10001"
+        assert child_row["thread_id"] == ""
+        assert child_row["user_id"] == "10001"
+
+    def test_rotation_rejects_foreign_parent_before_session_id_changes(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_FOREIGN_TYPED_ROT"
+        _create_scoped_session(db, parent, profile_name="profile-b")
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+        agent._session_scope_required = True
+        agent._session_scope = _scope("profile-a")
+        agent._compression_feasibility_checked = True
+
+        with pytest.raises(RuntimeError, match="session compression denied by session scope"):
+            agent._compress_context(_msgs(3), "sys", approx_tokens=120_000)
+
+        assert agent.session_id == parent
+        assert db.get_session(parent)["ended_at"] is None
+        assert len(db.search_sessions()) == 1
+
+    def test_rotation_rejects_malformed_scope_before_session_id_changes(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_BAD_SCOPE_TYPED_ROT"
+        _create_scoped_session(db, parent)
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+        agent._session_scope_required = True
+        agent._session_scope = {}
+        agent._compression_feasibility_checked = True
+
+        with pytest.raises(RuntimeError, match="session compression denied by session scope"):
+            agent._compress_context(_msgs(3), "sys", approx_tokens=120_000)
+
+        assert agent.session_id == parent
+        assert db.get_session(parent)["ended_at"] is None
+        assert len(db.search_sessions()) == 1
+
+    def test_rotation_rejects_unprovable_end_before_session_id_changes(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ENDED_TYPED_ROT"
+        scope = _scope()
+        _create_scoped_session(db, parent)
+        db.end_session(parent, "agent_close", session_scope=scope)
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+        agent._session_scope_required = True
+        agent._session_scope = scope
+        agent._compression_feasibility_checked = True
+
+        with pytest.raises(RuntimeError, match="session end denied by session scope"):
+            agent._compress_context(_msgs(3), "sys", approx_tokens=120_000)
+
+        assert agent.session_id == parent
+        assert db.get_session(parent)["end_reason"] == "agent_close"
+        assert len(db.search_sessions()) == 1
 
 
 class TestFallbackStreakFollowsRotation:

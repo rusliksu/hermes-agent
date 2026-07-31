@@ -1,7 +1,17 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import (
+    bind_resolved_access_context,
+    reset_session_vars,
+    set_session_vars,
+)
 
 
 class RecordingMemoryProvider:
@@ -23,6 +33,36 @@ class RecordingMemoryProvider:
 
     def shutdown(self):
         pass
+
+
+def _access_context(role_id="family_standard") -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal",
+        role_id=role_id,
+        profile_id="profile",
+        conversation_scope="private",
+        capabilities=frozenset({"memory_search"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="dm",
+            chat_id="10001",
+        ),
+    )
+
+
+@contextmanager
+def _patched_agent_init(cfg):
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("plugins.memory.load_memory_provider"),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        yield
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():
@@ -94,6 +134,80 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
+def test_typed_non_owner_context_does_not_initialize_external_memory_provider():
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    reset_session_vars()
+
+    with (
+        bind_resolved_access_context(_access_context("family_standard")),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider) as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-family",
+            platform="telegram",
+        )
+
+    reset_session_vars()
+    assert agent._memory_manager is None
+    assert provider.init_kwargs is None
+    load_memory_provider.assert_not_called()
+
+
+def test_builtin_memory_hydration_failure_clears_store_and_flags():
+    cfg = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "provider": "",
+        },
+        "agent": {},
+    }
+
+    class FailingMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def load_from_disk(self):
+            raise RuntimeError("memory_access_denied")
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("tools.memory_tool.MemoryStore", FailingMemoryStore),
+        patch("plugins.memory.load_memory_provider") as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_store is None
+    assert agent._memory_enabled is False
+    assert agent._user_profile_enabled is False
+    load_memory_provider.assert_not_called()
+
+
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""
 
@@ -105,6 +219,313 @@ class CoreShadowProvider:
             {"name": "delegate_task", "description": "shadows built-in delegate"},
             {"name": "honcho_search", "description": "legit memory tool"},
         ]
+
+
+def test_aiagent_requires_memory_context_only_when_multiplex_active():
+    cfg = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "provider": "",
+        },
+        "agent": {},
+    }
+    captured = []
+
+    class RecordingMemoryStore:
+        def __init__(self, **kwargs):
+            captured.append(dict(kwargs))
+
+        def load_from_disk(self):
+            pass
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("tools.memory_tool.MemoryStore", RecordingMemoryStore),
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("plugins.memory.load_memory_provider") as load_memory_provider,
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert captured[0]["require_access_context"] is True
+    load_memory_provider.assert_not_called()
+
+
+def test_aiagent_stores_session_scope_from_resolved_access_context():
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    context = _access_context()
+    set_session_vars(resolved_access_context=context)
+    try:
+        with _patched_agent_init(cfg):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+    finally:
+        reset_session_vars()
+
+    assert agent._session_scope_required is True
+    assert agent._session_scope == {
+        "profile_name": "profile",
+        "source": "telegram",
+        "chat_type": "dm",
+        "chat_id": "10001",
+        "thread_id": "",
+        "user_id": "10001",
+        "is_dm": True,
+    }
+
+
+def test_aiagent_multiplex_missing_context_stores_invalid_scope():
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    reset_session_vars()
+    with _patched_agent_init(cfg):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._session_scope_required is True
+    assert agent._session_scope == {}
+
+
+def test_compression_passes_agent_session_scope_to_archive_and_compact(tmp_path):
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    context = _access_context()
+    expected_scope = {
+        "profile_name": "profile",
+        "source": "telegram",
+        "chat_type": "dm",
+        "chat_id": "10001",
+        "thread_id": "",
+        "user_id": "10001",
+        "is_dm": True,
+    }
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(
+        "session-a",
+        source="telegram",
+        profile_name="profile",
+        chat_type="dm",
+        chat_id="10001",
+        thread_id="",
+        user_id="10001",
+    )
+    db.append_message("session-a", role="user", content="before")
+    db._conn.commit()
+    original_archive = db.archive_and_compact
+    captured = {}
+
+    def archive_spy(*args, **kwargs):
+        captured["session_scope"] = kwargs.get("session_scope")
+        return original_archive(*args, **kwargs)
+
+    db.archive_and_compact = archive_spy
+    set_session_vars(resolved_access_context=context)
+    try:
+        with _patched_agent_init(cfg):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=db,
+                session_id="session-a",
+            )
+    finally:
+        reset_session_vars()
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+    compressor.compression_count = 1
+    compressor._last_compression_made_progress = True
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    agent.context_compressor = compressor
+    agent.compression_in_place = True
+    agent._compression_feasibility_checked = True
+    agent.commit_memory_session = MagicMock()
+
+    compressed, _prompt = agent._compress_context(
+        [{"role": "user", "content": "before"}],
+        "system",
+        approx_tokens=100,
+        force=True,
+    )
+
+    assert compressed == [{"role": "user", "content": "summary"}]
+    assert captured["session_scope"] == expected_scope
+    assert agent._last_compaction_in_place is True
+
+
+def test_multiplex_missing_context_cannot_compact_in_place(tmp_path):
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("session-a", source="telegram")
+    db.append_message("session-a", role="user", content="before")
+    db._conn.commit()
+    reset_session_vars()
+    with _patched_agent_init(cfg):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id="session-a",
+        )
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+    compressor.compression_count = 1
+    compressor._last_compression_made_progress = True
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    agent.context_compressor = compressor
+    agent.compression_in_place = True
+    agent._compression_feasibility_checked = True
+    agent.commit_memory_session = MagicMock()
+
+    with pytest.raises(RuntimeError, match="session compaction denied by session scope"):
+        agent._compress_context(
+            [{"role": "user", "content": "before"}],
+            "system",
+            approx_tokens=100,
+            force=True,
+        )
+
+    assert agent._session_scope == {}
+    assert getattr(agent, "_last_compaction_in_place", False) is False
+    assert [m["content"] for m in db.get_messages("session-a")] == ["before"]
+    assert db.get_session("session-a")["message_count"] == 1
+
+
+def test_required_session_scope_denied_flush_does_not_mark_message_persisted(tmp_path):
+    from hermes_state import SessionDB
+    from run_agent import AIAgent, _DB_PERSISTED_MARKER
+
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(
+        "session-a",
+        source="telegram",
+        profile_name="foreign-profile",
+        chat_type="dm",
+        chat_id="10001",
+        user_id="10001",
+    )
+    context = _access_context()
+    set_session_vars(resolved_access_context=context)
+    try:
+        with _patched_agent_init(cfg):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                platform="telegram",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=db,
+                session_id="session-a",
+            )
+    finally:
+        reset_session_vars()
+
+    msg = {"role": "user", "content": "must not persist"}
+    with pytest.raises(RuntimeError, match="session append denied by session scope"):
+        agent._flush_messages_to_session_db([msg], [])
+
+    assert _DB_PERSISTED_MARKER not in msg
+    assert db.get_messages("session-a") == []
+    assert db.get_session("session-a")["message_count"] == 0
+
+
+def test_close_passes_session_scope_when_required_and_skips_missing_scope():
+    from run_agent import AIAgent
+
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    with _patched_agent_init(cfg):
+        scoped_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id="session-a",
+        )
+        missing_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id="session-b",
+        )
+
+    expected_scope = {
+        "profile_name": "profile",
+        "source": "telegram",
+        "chat_type": "dm",
+        "chat_id": "10001",
+        "thread_id": "",
+        "user_id": "10001",
+        "is_dm": True,
+    }
+    scoped_db = MagicMock()
+    scoped_agent._session_db = scoped_db
+    scoped_agent._session_scope_required = True
+    scoped_agent._session_scope = expected_scope
+
+    missing_db = MagicMock()
+    missing_agent._session_db = missing_db
+    missing_agent._session_scope_required = True
+    missing_agent._session_scope = None
+
+    scoped_agent.close()
+    missing_agent.close()
+
+    scoped_db.end_session.assert_called_once_with(
+        "session-a",
+        "agent_close",
+        session_scope=expected_scope,
+    )
+    missing_db.end_session.assert_not_called()
 
 
 def test_core_tool_names_rejected_from_memory_routing_table():

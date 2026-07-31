@@ -58,6 +58,69 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
+def _session_scope_clause(
+    session_scope: Optional[Dict[str, Any]],
+    alias: str = "s",
+) -> Tuple[str, List[Any]]:
+    """SQL predicate for a trusted gateway-origin session scope.
+
+    ``session_scope`` is intentionally a neutral dict so hermes_state does not
+    import gateway access types. Malformed scopes deny instead of broadening.
+    """
+    if session_scope is None:
+        return "", []
+    if not isinstance(session_scope, dict):
+        return "1 = 0", []
+
+    profile_name = session_scope.get("profile_name")
+    source = session_scope.get("source")
+    chat_type = session_scope.get("chat_type")
+    chat_id = session_scope.get("chat_id")
+    thread_id = session_scope.get("thread_id")
+    user_id = session_scope.get("user_id")
+    is_dm = session_scope.get("is_dm")
+
+    required = (profile_name, source, chat_type, chat_id)
+    if not all(isinstance(value, str) and value for value in required):
+        return "1 = 0", []
+    if not isinstance(is_dm, bool):
+        return "1 = 0", []
+    if thread_id is not None and not isinstance(thread_id, str):
+        return "1 = 0", []
+    if is_dm and not isinstance(user_id, str):
+        return "1 = 0", []
+
+    clauses = [
+        f"{alias}.profile_name = ?",
+        f"{alias}.source = ?",
+        f"{alias}.chat_type = ?",
+        f"{alias}.chat_id = ?",
+        f"COALESCE({alias}.thread_id, '') = ?",
+    ]
+    params: List[Any] = [profile_name, source, chat_type, chat_id, thread_id or ""]
+    if is_dm:
+        clauses.append(f"{alias}.user_id = ?")
+        params.append(user_id)
+    return " AND ".join(clauses), params
+
+
+def _session_scope_metadata(
+    session_scope: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Exact session-row metadata for a trusted scope, or None when invalid."""
+    scope_sql, _ = _session_scope_clause(session_scope)
+    if session_scope is None or scope_sql == "1 = 0":
+        return None
+    return {
+        "profile_name": session_scope["profile_name"],
+        "source": session_scope["source"],
+        "chat_type": session_scope["chat_type"],
+        "chat_id": session_scope["chat_id"],
+        "thread_id": session_scope.get("thread_id") or "",
+        "user_id": session_scope["user_id"] if session_scope.get("is_dm") is True else "",
+    }
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -90,7 +153,11 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
+def _collect_delegate_child_ids(
+    conn,
+    parent_ids: List[str],
+    session_scope: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
     Only rows carrying the ``_delegate_from`` marker (set at creation, and
@@ -98,7 +165,9 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     orphan-don't-delete contract. Walks marker chains recursively so an
     orchestrator subagent's own delegate children go too (FK safety).
     """
-    df = _delegate_from_json()
+    df = _delegate_from_json("s.model_config")
+    scope_sql, scope_params = _session_scope_clause(session_scope, alias="s")
+    scope_clause = f" AND {scope_sql}" if scope_sql else ""
     seeds = {sid for sid in parent_ids if sid}
     # Seed the visited set with the parents themselves. A delegation marker
     # chain can loop back onto a parent — a cycle, or a parent that is also
@@ -112,9 +181,11 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     while frontier:
         ph = ",".join("?" * len(frontier))
         cursor = conn.execute(
-            f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
-            f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
-            frontier + frontier,
+            f"SELECT s.id FROM sessions s "
+            f"WHERE ({df} IN ({ph}) "
+            f"OR (s.parent_session_id IN ({ph}) AND {df} IS NOT NULL))"
+            f"{scope_clause}",
+            frontier + frontier + scope_params,
         )
         frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
         found.update(frontier)
@@ -122,19 +193,49 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     return [sid for sid in found if sid not in seeds]
 
 
-def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
-    ids = _collect_delegate_child_ids(conn, parent_ids)
+def _delete_delegate_children(
+    conn,
+    parent_ids: List[str],
+    session_scope: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    ids = _collect_delegate_child_ids(conn, parent_ids, session_scope=session_scope)
     if ids:
         ph = ",".join("?" * len(ids))
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
+        scope_sql, scope_params = _session_scope_clause(session_scope, alias="s")
+        scope_clause = f" AND {scope_sql}" if scope_sql else ""
         conn.execute(
-            f"UPDATE sessions SET parent_session_id = NULL "
-            f"WHERE parent_session_id IN ({ph})",
-            ids,
+            f"UPDATE sessions AS s SET parent_session_id = NULL "
+            f"WHERE parent_session_id IN ({ph})"
+            f"{scope_clause}",
+            ids + scope_params,
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
+
+
+def _has_scoped_delete_blockers(
+    conn,
+    parent_ids: List[str],
+    session_scope: Optional[Dict[str, Any]],
+) -> bool:
+    if session_scope is None:
+        return False
+    ids = [sid for sid in parent_ids if sid]
+    if not ids:
+        return False
+    ph = ",".join("?" * len(ids))
+    scope_sql, scope_params = _session_scope_clause(session_scope, alias="s")
+    df = _delegate_from_json("s.model_config")
+    cursor = conn.execute(
+        f"SELECT 1 FROM sessions s "
+        f"WHERE (s.parent_session_id IN ({ph}) OR {df} IN ({ph})) "
+        f"AND NOT ({scope_sql}) "
+        f"LIMIT 1",
+        ids + ids + scope_params,
+    )
+    return cursor.fetchone() is not None
 
 T = TypeVar("T")
 
@@ -788,6 +889,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    handoff_context_json TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
@@ -853,14 +955,6 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     entry_json TEXT NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (scope, session_key)
-);
-
-CREATE TABLE IF NOT EXISTS gateway_topic_preferences (
-    scope TEXT NOT NULL DEFAULT '',
-    lane_key TEXT NOT NULL,
-    preferences_json TEXT NOT NULL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (scope, lane_key)
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (
@@ -1932,6 +2026,58 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    def _insert_session_row_txn(
+        self,
+        conn,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: str = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO sessions (
+               id, source, user_id, session_key, chat_id, chat_type, thread_id,
+               model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
+            )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   model = COALESCE(sessions.model, excluded.model),
+                   model_config = COALESCE(sessions.model_config, excluded.model_config),
+                   system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                   session_key = COALESCE(sessions.session_key, excluded.session_key),
+                   chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                   chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                   thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                   parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                   cwd = COALESCE(sessions.cwd, excluded.cwd),
+                   profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
+            (
+                session_id,
+                source,
+                user_id,
+                session_key,
+                chat_id,
+                chat_type,
+                thread_id,
+                model,
+                json.dumps(model_config) if model_config else None,
+                system_prompt,
+                parent_session_id,
+                cwd,
+                profile_name,
+                time.time(),
+            ),
+        )
+
     def _insert_session_row(
         self,
         session_id: str,
@@ -1967,44 +2113,73 @@ class SessionDB:
         no chat/thread to compare).
         """
         def _do(conn):
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
-                )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
-                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
-                       session_key = COALESCE(sessions.session_key, excluded.session_key),
-                       chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
-                       chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
-                       thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
-                       cwd = COALESCE(sessions.cwd, excluded.cwd),
-                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    session_key,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    cwd,
-                    profile_name,
-                    time.time(),
-                ),
+            self._insert_session_row_txn(
+                conn,
+                session_id,
+                source,
+                model=model,
+                model_config=model_config,
+                system_prompt=system_prompt,
+                user_id=user_id,
+                session_key=session_key,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                parent_session_id=parent_session_id,
+                cwd=cwd,
+                profile_name=profile_name,
             )
         self._execute_write(_do)
 
-    def create_session(self, session_id: str, source: str, **kwargs) -> str:
+    def create_session(
+        self,
+        session_id: str,
+        source: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> str:
         """Create a new session record. Returns the session_id."""
+        if session_scope is not None:
+            scope_metadata = _session_scope_metadata(session_scope)
+            if scope_metadata is None:
+                return False
+            scope_clause, scope_params = _session_scope_clause(session_scope)
+            exact_kwargs = dict(kwargs)
+            exact_kwargs.update(scope_metadata)
+
+            def _do_scoped(conn):
+                existing_in_scope = conn.execute(
+                    f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                    [session_id, *scope_params],
+                ).fetchone()
+                any_existing = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if any_existing is not None and existing_in_scope is None:
+                    return False
+
+                parent_id = exact_kwargs.get("parent_session_id")
+                if parent_id:
+                    parent_in_scope = conn.execute(
+                        f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                        [parent_id, *scope_params],
+                    ).fetchone()
+                    if parent_in_scope is None:
+                        return False
+
+                insert_kwargs = dict(exact_kwargs)
+                insert_kwargs.pop("source", None)
+                self._insert_session_row_txn(
+                    conn,
+                    session_id,
+                    scope_metadata["source"],
+                    **insert_kwargs,
+                )
+                return True
+
+            return bool(self._execute_write(_do_scoped))
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
@@ -2145,58 +2320,6 @@ class SessionDB:
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
                 [(scope, k) for k in session_keys],
-            )
-
-        self._execute_write(_do)
-
-    # ── Durable gateway topic preferences ──────────────────────────────
-
-    def save_gateway_topic_preferences(
-        self, lane_key: str, preferences_json: str, *, scope: str = ""
-    ) -> None:
-        """Upsert sanitized model/reasoning preferences for one gateway lane."""
-        if not lane_key or not preferences_json:
-            return
-
-        def _do(conn):
-            conn.execute(
-                """INSERT INTO gateway_topic_preferences
-                       (scope, lane_key, preferences_json, updated_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(scope, lane_key) DO UPDATE SET
-                       preferences_json = excluded.preferences_json,
-                       updated_at = excluded.updated_at""",
-                (scope, lane_key, preferences_json, time.time()),
-            )
-
-        self._execute_write(_do)
-
-    def load_gateway_topic_preferences(
-        self, lane_key: str, *, scope: str = ""
-    ) -> Optional[str]:
-        """Return the preference JSON for one lane, or ``None`` when absent."""
-        if not lane_key:
-            return None
-        with self._lock:
-            row = self._conn.execute(
-                """SELECT preferences_json FROM gateway_topic_preferences
-                   WHERE scope = ? AND lane_key = ?""",
-                (scope, lane_key),
-            ).fetchone()
-        return row["preferences_json"] if row else None
-
-    def delete_gateway_topic_preferences(
-        self, lane_key: str, *, scope: str = ""
-    ) -> None:
-        """Delete the preference row for one lane."""
-        if not lane_key:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "DELETE FROM gateway_topic_preferences "
-                "WHERE scope = ? AND lane_key = ?",
-                (scope, lane_key),
             )
 
         self._execute_write(_do)
@@ -2403,7 +2526,13 @@ class SessionDB:
             ).fetchone()
         return dict(row) if row else None
 
-    def end_session(self, session_id: str, end_reason: str) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        end_reason: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Mark a session as ended.
 
         No-ops when the session is already ended. The first end_reason wins:
@@ -2413,25 +2542,57 @@ class SessionDB:
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
         """
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = ? "
-                "WHERE id = ? AND ended_at IS NULL",
-                (time.time(), end_reason, session_id),
-            )
-        self._execute_write(_do)
+        scope_clause, scope_params = _session_scope_clause(
+            session_scope,
+            alias="sessions",
+        )
+        scope_guard = f" AND {scope_clause}" if scope_clause else ""
 
-    def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                f"WHERE id = ? AND ended_at IS NULL{scope_guard}",
+                [time.time(), end_reason, session_id, *scope_params],
             )
-        self._execute_write(_do)
+            return cursor.rowcount
+
+        rows = self._execute_write(_do)
+        if session_scope is not None:
+            return bool(rows)
+        return None
+
+    def reopen_session(
+        self,
+        session_id: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Clear ended_at/end_reason so a session can be resumed."""
+        scope_clause, scope_params = _session_scope_clause(
+            session_scope,
+            alias="sessions",
+        )
+        scope_guard = f" AND {scope_clause}" if scope_clause else ""
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                f"WHERE id = ?{scope_guard}",
+                [session_id, *scope_params],
+            )
+            return cursor.rowcount
+
+        rows = self._execute_write(_do)
+        if session_scope is not None:
+            return bool(rows)
+        return None
 
     def promote_to_session_reset(
-        self, session_id: str, reason: str = "session_reset"
+        self,
+        session_id: str,
+        reason: str = "session_reset",
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Durably mark a session as ended by an intentional reset boundary.
 
@@ -2463,13 +2624,18 @@ class SessionDB:
         if not session_id:
             return False
         now = time.time()
+        scope_clause, scope_params = _session_scope_clause(
+            session_scope,
+            alias="sessions",
+        )
+        scope_guard = f" AND {scope_clause}" if scope_clause else ""
 
         def _do(conn):
             cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND (ended_at IS NULL "
-                "OR end_reason IN ('agent_close', 'ws_orphan_reap'))",
-                (now, reason, session_id),
+                f"OR end_reason IN ('agent_close', 'ws_orphan_reap')){scope_guard}",
+                [now, reason, session_id, *scope_params],
             )
             return cursor.rowcount
 
@@ -3295,14 +3461,67 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session(
+        self,
+        session_id: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        where = "s.id = ?"
+        params: List[Any] = [session_id]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT s.* FROM sessions s WHERE {where}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def session_in_scope(
+        self,
+        session_id: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return True when a session exists inside a trusted SQL scope."""
+        if session_scope is None:
+            return self.get_session(session_id) is not None
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        if not scope_clause:
+            return self.get_session(session_id) is not None
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                [session_id, *scope_params],
+            ).fetchone()
+        return row is not None
+
+    def get_message_session_in_scope(
+        self,
+        message_id: int,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return a message's session id only when its session matches scope."""
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        where = "m.id = ?"
+        params: List[Any] = [message_id]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT m.session_id
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return row["session_id"] if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -3552,16 +3771,30 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    def get_session_by_title(
+        self,
+        title: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        scope_clause, scope_params = _session_scope_clause(session_scope, alias="sessions")
+        where = "title = ?"
+        params: List[Any] = [title]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE {where}", params
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self,
+        title: str,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -3570,16 +3803,22 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, session_scope=session_scope)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        scope_clause, scope_params = _session_scope_clause(session_scope, alias="sessions")
+        where = "title LIKE ? ESCAPE '\\'"
+        params: List[Any] = [f"{escaped} #%"]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE {where} ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -3625,7 +3864,12 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
@@ -3651,17 +3895,23 @@ class SessionDB:
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
+            scope_clause, scope_params = _session_scope_clause(
+                session_scope,
+                alias="child",
+            )
+            scope_sql = f" AND {scope_clause}" if scope_clause else ""
             with self._lock:
                 cursor = self._conn.execute(
-                    """
+                    f"""
                     SELECT child.id
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {scope_sql}
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -3676,7 +3926,7 @@ class SessionDB:
                       child.id DESC
                     LIMIT 1
                     """,
-                    (current,),
+                    [current, *scope_params],
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -3752,6 +4002,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3794,6 +4045,10 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        if scope_clause:
+            where_clauses.append(scope_clause)
+            params.extend(scope_params)
 
         if not include_children:
             # Show root sessions and branch sessions, while still hiding
@@ -3908,6 +4163,13 @@ class SessionDB:
                 outer_where = (
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
+            child_scope_clause, child_scope_params = _session_scope_clause(
+                session_scope,
+                alias="child",
+            )
+            child_scope_sql = (
+                f" AND {child_scope_clause}" if child_scope_clause else ""
+            )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
@@ -3921,6 +4183,7 @@ class SessionDB:
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {child_scope_sql}
                 ),
                 chain_max AS (
                     SELECT
@@ -3952,8 +4215,9 @@ class SessionDB:
                 LIMIT ? OFFSET ?
             """
             # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            # only applies to the outer select.  Scoped recursive children sit
+            # between those two query sections.
+            params = params + child_scope_params + params + id_params + [limit, offset]
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
@@ -4004,11 +4268,18 @@ class SessionDB:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"],
+                    session_scope=session_scope,
+                )
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id, compact_rows=compact_rows)
+                tip_row = self._get_session_rich_row(
+                    tip_id,
+                    compact_rows=compact_rows,
+                    session_scope=session_scope,
+                )
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -4096,7 +4367,12 @@ class SessionDB:
             runs.append(s)
         return runs
 
-    def _get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        compact_rows: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
@@ -4105,6 +4381,12 @@ class SessionDB:
         ``list_sessions_rich`` for details).
         """
         _sel = self._compact_session_cols() if compact_rows else "s.*"
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+        where = "s.id = ?"
+        params: List[Any] = [session_id]
+        if scope_clause:
+            where += f" AND {scope_clause}"
+            params.extend(scope_params)
         query = f"""
             SELECT {_sel},
                 COALESCE(
@@ -4119,10 +4401,10 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE {where}
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
         if not row:
             return None
@@ -4200,6 +4482,8 @@ class SessionDB:
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -4246,7 +4530,16 @@ class SessionDB:
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
+        scope_clause, scope_params = _session_scope_clause(session_scope)
+
         def _do(conn):
+            if session_scope is not None:
+                row = conn.execute(
+                    f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                    [session_id, *scope_params],
+                ).fetchone()
+                if row is None:
+                    return 0
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -4438,7 +4731,11 @@ class SessionDB:
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -4463,8 +4760,29 @@ class SessionDB:
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. Returns the new active count.
         """
+        scope_clause, scope_params = _session_scope_clause(session_scope)
 
         def _do(conn):
+            if session_scope is not None:
+                row = conn.execute(
+                    f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
+                    [session_id, *scope_params],
+                ).fetchone()
+                if row is None:
+                    return 0
+
+                message_scope_guard = (
+                    " AND EXISTS (SELECT 1 FROM sessions s "
+                    f"WHERE s.id = messages.session_id AND {scope_clause})"
+                )
+                session_scope_guard = (
+                    " AND EXISTS (SELECT 1 FROM sessions s "
+                    f"WHERE s.id = sessions.id AND {scope_clause})"
+                )
+            else:
+                message_scope_guard = ""
+                session_scope_guard = ""
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -4473,8 +4791,8 @@ class SessionDB:
             # loads (active=1 only) still exclude them.
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
+                f"WHERE session_id = ? AND active = 1{message_scope_guard}",
+                [session_id, *scope_params],
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
@@ -4482,8 +4800,9 @@ class SessionDB:
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
             conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                f"WHERE id = ?{session_scope_guard}",
+                [inserted, tool_calls_total, session_id, *scope_params],
             )
             return inserted
 
@@ -4496,6 +4815,7 @@ class SessionDB:
         include_inactive: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -4513,6 +4833,10 @@ class SessionDB:
         ``offset`` alone (without ``limit``) also pages — SQLite requires a
         LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
         """
+        if session_scope is not None and not self.session_in_scope(
+            session_id, session_scope
+        ):
+            return []
         active_clause = "" if include_inactive else " AND active = 1"
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
@@ -4545,6 +4869,7 @@ class SessionDB:
         session_id: str,
         around_message_id: int,
         window: int = 5,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Load a window of messages anchored on a specific message id.
 
@@ -4567,6 +4892,10 @@ class SessionDB:
         """
         if window < 0:
             window = 0
+        if session_scope is not None and not self.session_in_scope(
+            session_id, session_scope
+        ):
+            return {"window": [], "messages_before": 0, "messages_after": 0}
         with self._lock:
             # Confirm the anchor exists in this session.
             anchor_exists = self._conn.execute(
@@ -4625,6 +4954,7 @@ class SessionDB:
         window: int = 5,
         bookend: int = 3,
         keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return an anchored window plus session bookends.
 
@@ -4658,7 +4988,10 @@ class SessionDB:
         # Reuse the primitive — handles anchor-existence, content decoding,
         # tool_calls deserialisation, and boundary counts.
         primitive = self.get_messages_around(
-            session_id, around_message_id, window=window
+            session_id,
+            around_message_id,
+            window=window,
+            session_scope=session_scope,
         )
         window_rows = primitive["window"]
         if not window_rows:
@@ -5307,6 +5640,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -5368,6 +5702,7 @@ class SessionDB:
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
         params: list = [query]
+        scope_clause, scope_params = _session_scope_clause(session_scope)
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
             # are discoverable; only rewind/undo rows (active=0, compacted=0)
@@ -5388,6 +5723,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+        if scope_clause:
+            where_clauses.append(scope_clause)
+            params.extend(scope_params)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -5464,6 +5802,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if scope_clause:
+                    tri_where.append(scope_clause)
+                    tri_params.extend(scope_params)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -5521,6 +5862,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if scope_clause:
+                    like_where.append(scope_clause)
+                    like_params.extend(scope_params)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -5623,6 +5967,8 @@ class SessionDB:
         query: str,
         limit: int = 20,
         include_archived: bool = True,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Search surfaced sessions by exact/prefix/substring session id.
 
@@ -5648,6 +5994,7 @@ class SessionDB:
             include_archived=include_archived,
             order_by_last_active=True,
             id_query=needle,
+            session_scope=session_scope,
         )
 
         def score(row: Dict[str, Any]) -> int:
@@ -5670,6 +6017,8 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
@@ -5685,20 +6034,25 @@ class SessionDB:
             "FROM messages GROUP BY session_id"
             ") m ON m.session_id = s.id "
         )
+        where_clauses = []
+        params: List[Any] = []
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        scope_clause, scope_params = _session_scope_clause(session_scope, alias="s")
+        if scope_clause:
+            where_clauses.append(scope_clause)
+            params.extend(scope_params)
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)} " if where_clauses else ""
+        params.extend([limit, offset])
         with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "WHERE s.source = ? "
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+            cursor = self._conn.execute(
+                f"{select_with_last_active}"
+                f"{where_sql}"
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                params,
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================
@@ -5806,23 +6160,35 @@ class SessionDB:
             return False
         return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
 
-    def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
+    def _is_compression_child_row(
+        self,
+        child: Dict[str, Any],
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         parent_id = child.get("parent_session_id")
         if not parent_id or self._is_branch_child_row(child):
             return False
-        parent = self.get_session(parent_id)
+        parent = self.get_session(parent_id, session_scope=session_scope)
         return bool(parent and parent.get("end_reason") == "compression")
 
-    def get_compression_lineage(self, session_id: str) -> List[str]:
+    def get_compression_lineage(
+        self,
+        session_id: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         """Return compression ancestors through tip in chronological order."""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, session_scope=session_scope)
         if not session or self._is_branch_child_row(session):
             return [session_id] if session else []
 
         root = session
         ancestors = {root["id"]}
-        while self._is_compression_child_row(root):
-            parent = self.get_session(root["parent_session_id"])
+        while self._is_compression_child_row(root, session_scope=session_scope):
+            parent = self.get_session(
+                root["parent_session_id"],
+                session_scope=session_scope,
+            )
             if not parent or parent["id"] in ancestors:
                 break
             root = parent
@@ -5832,14 +6198,20 @@ class SessionDB:
         seen = {root["id"]}
         current = root
         while current.get("end_reason") == "compression":
+            scope_clause, scope_params = _session_scope_clause(session_scope, alias="s")
+            where = "s.parent_session_id = ?"
+            params: List[Any] = [current["id"]]
+            if scope_clause:
+                where += f" AND {scope_clause}"
+                params.extend(scope_params)
             with self._lock:
                 rows = self._conn.execute(
-                    """
-                    SELECT * FROM sessions
-                    WHERE parent_session_id = ?
+                    f"""
+                    SELECT s.* FROM sessions s
+                    WHERE {where}
                     ORDER BY started_at ASC
                     """,
-                    (current["id"],),
+                    params,
                 ).fetchall()
             next_child = None
             for row in rows:
@@ -5858,22 +6230,35 @@ class SessionDB:
                 continue
         return lineage if session_id in lineage else [session_id]
 
-    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def export_session(
+        self,
+        session_id: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Export a single session with all its messages as a dict."""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, session_scope=session_scope)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_messages(session_id, session_scope=session_scope)
         return {**session, "messages": messages}
 
-    def export_session_lineage(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def export_session_lineage(
+        self,
+        session_id: str,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Export a compression lineage as one logical session dict."""
-        lineage_ids = self.get_compression_lineage(session_id)
+        lineage_ids = self.get_compression_lineage(
+            session_id,
+            session_scope=session_scope,
+        )
         if not lineage_ids:
             return None
         segments = []
         for sid in lineage_ids:
-            segment = self.export_session(sid)
+            segment = self.export_session(sid, session_scope=session_scope)
             if segment:
                 segments.append(segment)
         if not segments:
@@ -5886,15 +6271,24 @@ class SessionDB:
         base["messages"] = [msg for seg in segments for msg in (seg.get("messages") or [])]
         return base
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(
+        self,
+        source: str = None,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
         """
-        sessions = self.search_sessions(source=source, limit=100000)
+        sessions = self.search_sessions(
+            source=source,
+            limit=100000,
+            session_scope=session_scope,
+        )
         results = []
         for session in sessions:
-            messages = self.get_messages(session["id"])
+            messages = self.get_messages(session["id"], session_scope=session_scope)
             results.append({**session, "messages": messages})
         return results
 
@@ -6338,6 +6732,8 @@ class SessionDB:
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -6352,17 +6748,37 @@ class SessionDB:
         removed_delegate_ids: List[str] = []
 
         def _do(conn):
+            scope_sql, scope_params = _session_scope_clause(session_scope, alias="s")
+            scope_clause = f" AND {scope_sql}" if scope_sql else ""
             cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT s.id FROM sessions s WHERE s.id = ?{scope_clause}",
+                [session_id] + scope_params,
             )
-            if cursor.fetchone()[0] == 0:
+            if cursor.fetchone() is None:
                 return False
-            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            delegate_ids = _collect_delegate_child_ids(
+                conn,
+                [session_id],
+                session_scope=session_scope,
+            )
+            if _has_scoped_delete_blockers(
+                conn,
+                [session_id] + delegate_ids,
+                session_scope,
+            ):
+                return False
+            removed_delegate_ids.extend(
+                _delete_delegate_children(
+                    conn,
+                    [session_id],
+                    session_scope=session_scope,
+                )
+            )
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
+                f"UPDATE sessions AS s SET parent_session_id = NULL "
+                f"WHERE parent_session_id = ?{scope_clause}",
+                [session_id] + scope_params,
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -6421,6 +6837,8 @@ class SessionDB:
         self,
         session_ids: List[str],
         sessions_dir: Optional[Path] = None,
+        *,
+        session_scope: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Delete every session in *session_ids* in a single transaction.
 
@@ -6460,27 +6878,48 @@ class SessionDB:
 
         def _do(conn):
             placeholders = ",".join("?" * len(unique_ids))
+            scope_sql, scope_params = _session_scope_clause(session_scope, alias="s")
+            scope_clause = f" AND {scope_sql}" if scope_sql else ""
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
             cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
-                unique_ids,
+                f"SELECT s.id FROM sessions s "
+                f"WHERE s.id IN ({placeholders}){scope_clause}",
+                unique_ids + scope_params,
             )
             existing = [row["id"] for row in cursor.fetchall()]
             if not existing:
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
-            removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
+            delegate_ids = _collect_delegate_child_ids(
+                conn,
+                existing,
+                session_scope=session_scope,
+            )
+            if _has_scoped_delete_blockers(
+                conn,
+                existing + delegate_ids,
+                session_scope,
+            ):
+                return 0
+            removed_delegate_ids.extend(
+                _delete_delegate_children(
+                    conn,
+                    existing,
+                    session_scope=session_scope,
+                )
+            )
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
             # is itself in the kill list rather than NULL-ing parents
             # of survivors — the IN list on ``parent_session_id`` does
             # exactly this.
             conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({existing_placeholders})",
-                existing,
+                f"UPDATE sessions AS s SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({existing_placeholders})"
+                f"{scope_clause}",
+                existing + scope_params,
             )
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
@@ -7573,21 +8012,37 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        resolved_access_context: Any = None,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
+        context_json = None
+        if resolved_access_context is not None:
+            from gateway.access_registry import serialize_resolved_access_context
+
+            context_json = json.dumps(
+                serialize_resolved_access_context(resolved_access_context),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
-                "    handoff_error = NULL "
+                "    handoff_error = NULL, "
+                "    handoff_context_json = ? "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
+                (platform, context_json, session_id),
             )
             return cur.rowcount > 0
         return self._execute_write(_do)
@@ -7646,7 +8101,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
-                "handoff_error = NULL WHERE id = ?",
+                "handoff_error = NULL, handoff_context_json = NULL WHERE id = ?",
                 (session_id,),
             )
         self._execute_write(_do)
@@ -7656,7 +8111,7 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
+                "handoff_error = ?, handoff_context_json = NULL WHERE id = ?",
                 (error[:500], session_id),
             )
         self._execute_write(_do)
