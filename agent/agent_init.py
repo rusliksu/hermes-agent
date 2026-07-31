@@ -1421,12 +1421,46 @@ def init_agent(
     agent._aux_compression_context_length_config = None
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    agent._session_scope = None
+    agent._session_scope_required = False
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    _memory_access_context = None
+    _require_memory_access_context = False
+    _typed_memory_context_is_owner = True
+    mem_config = {}
+    try:
+        from agent.secret_scope import is_multiplex_active as _is_multiplex_active
+        from gateway.access_registry import (
+            ResolvedAccessContext as _ResolvedAccessContext,
+            session_scope_from_resolved_access_context as _session_scope_from_resolved_access_context,
+            serialize_resolved_access_context as _serialize_resolved_access_context,
+        )
+        from gateway.session_context import get_resolved_access_context as _get_resolved_access_context
+
+        _require_memory_access_context = bool(_is_multiplex_active())
+        agent._session_scope_required = _require_memory_access_context
+        _memory_access_context = _get_resolved_access_context(None)
+        if _memory_access_context is not None:
+            agent._session_scope = _session_scope_from_resolved_access_context(
+                _memory_access_context
+            )
+        elif agent._session_scope_required:
+            agent._session_scope = {}
+        if _memory_access_context is not None:
+            _typed_memory_context_is_owner = (
+                isinstance(_memory_access_context, _ResolvedAccessContext)
+                and _serialize_resolved_access_context(_memory_access_context)
+                and _memory_access_context.role_id == "owner"
+            )
+    except Exception:
+        if agent._session_scope_required or _memory_access_context is not None:
+            agent._session_scope = {}
+        _typed_memory_context_is_owner = False
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1438,9 +1472,14 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    access_context=_memory_access_context,
+                    require_access_context=_require_memory_access_context,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
+            agent._memory_store = None
+            agent._memory_enabled = False
+            agent._user_profile_enabled = False
             pass  # Memory is optional -- don't break agent init
     
 
@@ -1448,14 +1487,16 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and _typed_memory_context_is_owner:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    resolved_access_context=_memory_access_context
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
@@ -1466,6 +1507,8 @@ def init_agent(
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
                     }
+                    if _memory_access_context is not None:
+                        _init_kwargs["resolved_access_context"] = _memory_access_context
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
                         _init_kwargs["status_callback"] = agent._emit_status

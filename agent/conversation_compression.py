@@ -543,17 +543,6 @@ def compress_context(
     # engine session-switch. The conversation keeps one durable id for life,
     # eliminating the session-rotation bug cluster. Default False during rollout.
     in_place = bool(getattr(agent, "compression_in_place", False))
-    session_scope_required = bool(getattr(agent, "_session_scope_required", False))
-    session_scope = getattr(agent, "_session_scope", None)
-    if session_scope_required and session_scope is None:
-        session_scope = {}
-    if (
-        session_scope_required
-        and not in_place
-        and agent._session_db
-        and not agent._session_db.session_in_scope(agent.session_id, session_scope)
-    ):
-        raise RuntimeError("session compression denied by session scope")
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
@@ -829,13 +818,6 @@ def compress_context(
 
         if agent._session_db:
             try:
-                if session_scope_required and not agent._session_db.session_in_scope(
-                    agent.session_id,
-                    session_scope,
-                ):
-                    if in_place:
-                        raise RuntimeError("session compaction denied by session scope")
-                    raise RuntimeError("session compression denied by session scope")
                 # Trigger memory extraction on the current session before the
                 # transcript is rewritten (runs in BOTH modes — the logical
                 # conversation's pre-compaction turns are about to be summarized
@@ -864,9 +846,12 @@ def compress_context(
                     _compacted_rows = agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
-                        session_scope=session_scope,
+                        session_scope=getattr(agent, "_session_scope", None),
                     )
-                    if not _compacted_rows and session_scope_required:
+                    if (
+                        not _compacted_rows
+                        and getattr(agent, "_session_scope_required", False)
+                    ):
                         raise RuntimeError("session compaction denied by session scope")
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -884,73 +869,14 @@ def compress_context(
                     # session before ending it, so they survive in the preserved
                     # parent transcript (#47202). (In-place skips this — see above.)
                     try:
-                        flushed = agent._flush_messages_to_session_db(messages)
+                        agent._flush_messages_to_session_db(messages)
                     except Exception:
-                        if session_scope_required:
-                            raise
-                        flushed = False
-                    if session_scope_required and not flushed:
-                        raise RuntimeError("session flush denied by session scope")
+                        pass  # best-effort — don't block compression on a flush error
                     # Propagate title to the new session with auto-numbering
+                    old_title = agent._session_db.get_session_title(agent.session_id)
+                    agent._session_db.end_session(agent.session_id, "compression")
                     old_session_id = agent.session_id
-                    old_title = agent._session_db.get_session_title(old_session_id)
-                    if session_scope_required:
-                        ended = agent._session_db.end_session(
-                            old_session_id,
-                            "compression",
-                            session_scope=session_scope,
-                        )
-                        if not ended:
-                            raise RuntimeError("session end denied by session scope")
-                    else:
-                        agent._session_db.end_session(old_session_id, "compression")
-
-                    new_session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                    agent._session_db_created = False
-                    try:
-                        create_kwargs = {
-                            "session_id": new_session_id,
-                            "source": agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                            "model": agent.model,
-                            "model_config": agent._session_init_model_config,
-                            "parent_session_id": old_session_id,
-                        }
-                        if session_scope_required:
-                            if isinstance(session_scope, dict) and session_scope.get("source"):
-                                create_kwargs["source"] = session_scope["source"]
-                            created = agent._session_db.create_session(
-                                **create_kwargs,
-                                session_scope=session_scope,
-                            )
-                            if not created:
-                                raise RuntimeError("session create denied by session scope")
-                        else:
-                            agent._session_db.create_session(**create_kwargs)
-                    except Exception as _cs_err:
-                        # The child row could not be created (e.g. FK constraint,
-                        # contended write, or scoped parent/collision denial). Keep
-                        # the live id on the parent so the conversation stays
-                        # attached to a real, indexed session.
-                        logger.warning(
-                            "Compression child session create failed (%s) — "
-                            "rolling back to parent session %s to avoid an orphan.",
-                            _cs_err, old_session_id,
-                        )
-                        try:
-                            if session_scope_required:
-                                agent._session_db.reopen_session(
-                                    old_session_id,
-                                    session_scope=session_scope,
-                                )
-                            else:
-                                agent._session_db.reopen_session(old_session_id)
-                        except Exception:
-                            pass
-                        old_session_id = None  # no rotation happened
-                        agent._session_db_created = True
-                        raise
-
-                    agent.session_id = new_session_id
+                    agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                     # Ordering contract: the agent thread updates the contextvar here;
                     # the gateway propagates to SessionEntry after run_in_executor returns.
                     try:
@@ -974,6 +900,53 @@ def compress_context(
                         set_session_context(agent.session_id)
                     except Exception:
                         pass
+                    agent._session_db_created = False
+                    try:
+                        agent._session_db.create_session(
+                            session_id=agent.session_id,
+                            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            model=agent.model,
+                            model_config=agent._session_init_model_config,
+                            parent_session_id=old_session_id,
+                        )
+                    except Exception as _cs_err:
+                        # The child row could not be created (e.g. FK constraint,
+                        # contended write). Previously the outer handler simply
+                        # warned and let the agent continue on the NEW id — which
+                        # has no row in state.db, producing an orphan: the parent
+                        # is ended, the child is never indexed, and every
+                        # subsequent message is attributed to a session that
+                        # doesn't exist (#33906/#33907). Roll the live id back to
+                        # the parent so the conversation stays attached to a real,
+                        # indexed session instead of a phantom.
+                        logger.warning(
+                            "Compression child session create failed (%s) — "
+                            "rolling back to parent session %s to avoid an orphan.",
+                            _cs_err, old_session_id,
+                        )
+                        agent.session_id = old_session_id
+                        try:
+                            from gateway.session_context import set_current_session_id
+                            set_current_session_id(agent.session_id)
+                        except Exception:
+                            os.environ["HERMES_SESSION_ID"] = agent.session_id
+                        try:
+                            from hermes_logging import set_session_context
+                            set_session_context(agent.session_id)
+                        except Exception:
+                            pass
+                        # Re-open the parent: it was ended above, but we're
+                        # continuing on it, so it must not stay closed.
+                        try:
+                            agent._session_db.reopen_session(old_session_id)
+                        except Exception:
+                            pass
+                        old_session_id = None  # no rotation happened
+                        # The parent row already exists in state.db, so mark the
+                        # session as created — _ensure_db_session would otherwise
+                        # retry a (harmless INSERT OR IGNORE) create next turn.
+                        agent._session_db_created = True
+                        raise
                     agent._session_db_created = True
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
@@ -999,7 +972,7 @@ def compress_context(
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 agent._last_flushed_db_idx = 0
             except Exception as e:
-                if session_scope_required:
+                if in_place and getattr(agent, "_session_scope_required", False):
                     raise
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
