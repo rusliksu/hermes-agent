@@ -142,6 +142,22 @@ class TestInitialReplyToId:
         metadata = adapter.send.call_args[1]["metadata"]
         assert metadata == {"thread_id": "root_post_123", "expect_edits": True}
 
+    @pytest.mark.asyncio
+    async def test_final_edit_marks_metadata_notify_true(self):
+        """Final streaming edits must expose final-response metadata to adapters."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "root_post_123"},
+        )
+        await consumer._send_or_edit("Preview", finalize=False)
+
+        await consumer._send_or_edit("Final answer", finalize=True)
+
+        metadata = adapter.edit_message.await_args.kwargs["metadata"]
+        assert metadata == {"thread_id": "root_post_123", "notify": True}
+
 
 class TestOverflowFirstMessage:
     """Verify thread routing is preserved when the first message overflows."""
