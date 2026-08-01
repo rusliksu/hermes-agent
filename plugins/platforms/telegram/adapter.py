@@ -584,6 +584,7 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
     _PICKER_TTL_SECONDS = 15 * 60
+    _FEEDBACK_TTL_SECONDS = 24 * 60 * 60
     _RUN_STATUS_TTL_SECONDS = 2 * 60 * 60
     _CALLBACK_STATE_LIMIT = 256
 
@@ -787,6 +788,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         self._settings_picker_state: Dict[str, dict] = {}
+        self._feedback_state: Dict[str, dict] = {}
         self._run_status_state: Dict[str, dict] = {}
         self._run_status_nonce_by_key: Dict[tuple, str] = {}
         # Approval button state: message_id → session_key
@@ -955,6 +957,147 @@ class TelegramAdapter(BasePlatformAdapter):
             raise ValueError("Telegram callback_data exceeds 64 bytes")
         return value
 
+    def _response_feedback_enabled(self) -> bool:
+        """Return whether final Telegram DM responses get feedback controls."""
+        raw = self.config.extra.get("feedback_buttons")
+        if raw is None:
+            return False
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+
+    @staticmethod
+    def _is_direct_message_chat_id(chat_id: object) -> bool:
+        """Telegram private-chat ids are positive; group/channel ids are negative."""
+        try:
+            return int(str(chat_id)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    async def _attach_response_feedback(
+        self,
+        chat_id: str,
+        message_id: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Best-effort attach owner-bound feedback buttons to one final DM reply."""
+        if (
+            not self._bot
+            or not message_id
+            or not (metadata or {}).get("notify")
+            or not self._response_feedback_enabled()
+            or not self._is_direct_message_chat_id(chat_id)
+        ):
+            return
+
+        feedback_state = getattr(self, "_feedback_state", None)
+        if feedback_state is None:
+            feedback_state = self._feedback_state = {}
+        nonce = self._new_callback_nonce()
+        thread_id = self._metadata_thread_id(metadata)
+        feedback_state[nonce] = {
+            "kind": "response_feedback",
+            "chat_id": str(chat_id),
+            "thread_id": thread_id,
+            "user_id": str(chat_id),
+            "message_id": str(message_id),
+            # Required by the shared exact-match guard; kept only in memory.
+            "session_key": f"telegram-feedback:{chat_id}:{thread_id or ''}",
+            "expires_at": time.monotonic() + self._FEEDBACK_TTL_SECONDS,
+            "busy": False,
+        }
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "👍 Полезно", callback_data=self._callback_data("fb", nonce, "good")
+                ),
+                InlineKeyboardButton(
+                    "👎 Не то", callback_data=self._callback_data("fb", nonce, "bad")
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🐢 Медленно", callback_data=self._callback_data("fb", nonce, "slow")
+                ),
+                InlineKeyboardButton(
+                    "🌐 Лишний интернет",
+                    callback_data=self._callback_data("fb", nonce, "web"),
+                ),
+            ],
+        ])
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                message_id=int(message_id),
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            feedback_state.pop(nonce, None)
+            logger.debug(
+                "[%s] Failed to attach Telegram response feedback: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+
+    @staticmethod
+    def _record_response_feedback(value: str, *, has_topic: bool) -> bool:
+        """Append one content-free feedback event to the active profile."""
+        try:
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / "logs" / "response-feedback.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "platform": "telegram",
+                "feedback": value,
+                "has_topic": bool(has_topic),
+            }
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return True
+        except Exception:
+            logger.warning(
+                "[Telegram] Failed to persist response feedback",
+                exc_info=True,
+            )
+            return False
+
+    async def _handle_response_feedback_callback(self, query: Any, data: str) -> None:
+        """Validate, consume, and locally record one Telegram feedback choice."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[2] not in {"good", "bad", "slow", "web"}:
+            try:
+                await query.answer(text="Некорректная оценка.")
+            except Exception:
+                pass
+            return
+
+        nonce, value = parts[1], parts[2]
+        state = await self._bound_callback_state(
+            query,
+            nonce,
+            getattr(self, "_feedback_state", {}),
+            expired_text="Эта кнопка уже недоступна.",
+            consume=True,
+        )
+        if state is None:
+            return
+
+        self._record_response_feedback(
+            value,
+            has_topic=state.get("thread_id") is not None,
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.debug(
+                "[Telegram] Failed to remove consumed feedback buttons",
+                exc_info=True,
+            )
+        logger.info("[Telegram] Response feedback received: %s", value)
+
     def _prune_callback_states(self) -> None:
         """Drop expired callback state and cap each in-memory state bucket."""
         now = time.monotonic()
@@ -962,6 +1105,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._model_picker_state,
             self._choice_picker_state,
             self._settings_picker_state,
+            getattr(self, "_feedback_state", {}),
             self._run_status_state,
         ):
             expired = [
@@ -991,6 +1135,7 @@ class TelegramAdapter(BasePlatformAdapter):
             set(self._model_picker_state)
             | set(self._choice_picker_state)
             | set(self._settings_picker_state)
+            | set(getattr(self, "_feedback_state", {}))
             | set(self._run_status_state)
         )
         while True:
@@ -4237,6 +4382,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
                                 pass  # Typing failures are non-fatal
+                        await self._attach_response_feedback(
+                            chat_id, rich_result.message_id, metadata,
+                        )
                     return rich_result
 
             # Format and split message if needed
@@ -4484,6 +4632,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self.send_typing(chat_id, metadata=metadata)
                 except Exception:
                     pass  # Typing failures are non-fatal
+
+            await self._attach_response_feedback(
+                chat_id,
+                message_ids[-1] if message_ids else None,
+                metadata,
+            )
 
             return SendResult(
                 success=True,
@@ -4837,6 +4991,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id, message_id, content, metadata=metadata,
             )
             if rich_result is not None:
+                if rich_result.success:
+                    await self._attach_response_feedback(
+                        chat_id, rich_result.message_id or message_id, metadata,
+                    )
                 return rich_result
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
@@ -4854,9 +5012,14 @@ class TelegramAdapter(BasePlatformAdapter):
             self._last_overflow_preview.pop(_preview_key, None)
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
             if finalize:
-                return await self._edit_overflow_split(
+                result = await self._edit_overflow_split(
                     chat_id, message_id, content, finalize=finalize, metadata=metadata,
                 )
+                if result.success:
+                    await self._attach_response_feedback(
+                        chat_id, result.message_id or message_id, metadata,
+                    )
+                return result
             content = self._truncate_stream_overflow_preview(content)
             _saturated_preview = True
             # Saturated-preview dedup: past the cap, every progressive edit
@@ -4895,7 +5058,9 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
-                    return SendResult(success=True, message_id=message_id)
+                    result = SendResult(success=True, message_id=message_id)
+                    await self._attach_response_feedback(chat_id, message_id, metadata)
+                    return result
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(
@@ -4909,12 +5074,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=_plain,
                 )
-            return SendResult(success=True, message_id=message_id)
+            result = SendResult(success=True, message_id=message_id)
+            await self._attach_response_feedback(chat_id, message_id, metadata)
+            return result
         except Exception as e:
             err_str = str(e).lower()
             # "Message is not modified" — content identical, treat as success
             if "not modified" in err_str:
-                return SendResult(success=True, message_id=message_id)
+                result = SendResult(success=True, message_id=message_id)
+                await self._attach_response_feedback(chat_id, message_id, metadata)
+                return result
             # Reactive split-and-deliver: parse_mode formatting can inflate
             # the payload past the limit even when the raw text was under
             # (e.g. MarkdownV2 escapes).  Same fix as the pre-flight path.
@@ -4924,9 +5093,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, utf16_len(content), self.MAX_MESSAGE_LENGTH,
                 )
                 if finalize:
-                    return await self._edit_overflow_split(
+                    result = await self._edit_overflow_split(
                         chat_id, message_id, content, finalize=finalize, metadata=metadata,
                     )
+                    if result.success:
+                        await self._attach_response_feedback(
+                            chat_id, result.message_id or message_id, metadata,
+                        )
+                    return result
                 # Mid-stream: truncate and retry instead of splitting (#48648).
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
@@ -4962,7 +5136,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=content,
                     )
-                    return SendResult(success=True, message_id=message_id)
+                    result = SendResult(success=True, message_id=message_id)
+                    await self._attach_response_feedback(chat_id, message_id, metadata)
+                    return result
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
                     logger.error(
@@ -6656,6 +6832,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Owner-bound long-running operation Stop callback ---
         if data.startswith("rs:"):
             await self._handle_run_status_callback(query, data)
+            return
+
+        # --- Owner-bound response feedback callbacks ---
+        if data.startswith("fb:"):
+            await self._handle_response_feedback_callback(query, data)
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---

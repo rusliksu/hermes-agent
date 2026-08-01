@@ -298,14 +298,15 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        edit_metadata = self._metadata_for_send(final=finalize)
+        if edit_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
