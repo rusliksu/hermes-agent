@@ -1,6 +1,7 @@
 """Tests for Telegram model picker thread fallback."""
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -42,6 +43,48 @@ def _make_adapter():
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _allow_test_owner(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345")
+
+
+def _make_query(*, message_id=42, thread_id=None, user_id="12345"):
+    message = SimpleNamespace(
+        chat_id=12345,
+        message_id=message_id,
+        message_thread_id=thread_id,
+        is_topic_message=thread_id is not None,
+        chat=SimpleNamespace(id=12345, type="private", is_forum=False),
+    )
+    return SimpleNamespace(
+        message=message,
+        from_user=SimpleNamespace(id=user_id, first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+
+def _put_model_state(adapter, nonce="nonceNonce12", **overrides):
+    state = {
+        "kind": "model",
+        "message_id": "42",
+        "chat_id": "12345",
+        "thread_id": None,
+        "user_id": "12345",
+        "providers": [],
+        "provider_actions": [],
+        "current_model": "model_1",
+        "current_provider": "openai",
+        "session_key": "s",
+        "on_model_selected": AsyncMock(),
+        "expires_at": time.monotonic() + 60,
+        "busy": False,
+    }
+    state.update(overrides)
+    adapter._model_picker_state[nonce] = state
+    return nonce, state
+
+
 class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
@@ -64,6 +107,7 @@ class TestTelegramModelPicker:
             session_key="s",
             on_model_selected=AsyncMock(),
             metadata={"thread_id": "99999"},
+            initiator_user_id="12345",
         )
 
         assert result.success is True
@@ -74,24 +118,24 @@ class TestTelegramModelPicker:
     @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
-        adapter._model_picker_state["12345"] = {
-            "providers": [{"slug": "provider_one", "name": "Provider One", "total_models": 1, "is_current": True}],
-            "current_model": "model_1",
-            "current_provider": "provider_one",
-            "session_key": "s",
-            "on_model_selected": AsyncMock(),
-            "msg_id": 42,
-        }
+        nonce, _ = _put_model_state(
+            adapter,
+            providers=[
+                {
+                    "slug": "provider_one",
+                    "name": "Provider One",
+                    "total_models": 1,
+                    "is_current": True,
+                }
+            ],
+            current_model="model_1",
+            current_provider="provider_one",
+        )
 
-        query = AsyncMock()
-        query.data = "mb"
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.from_user = MagicMock()
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
-
-        await adapter._handle_model_picker_callback(query, "mb", "12345")
+        query = _make_query()
+        await adapter._handle_model_picker_callback(
+            query, f"mp:{nonce}:b", "12345"
+        )
 
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
@@ -107,34 +151,29 @@ class TestTelegramModelPicker:
         only fired when the callback raised."""
         adapter = _make_adapter()
         callback = AsyncMock(return_value="Switched to `gpt-5`")
-        adapter._model_picker_state["12345"] = {
-            "providers": [
+        nonce, _ = _put_model_state(
+            adapter,
+            providers=[
                 {"slug": "openai", "name": "OpenAI", "total_models": 1, "is_current": True}
             ],
-            "current_model": "model_1",
-            "current_provider": "openai",
-            "session_key": "s",
-            "on_model_selected": callback,
-            "selected_provider": "openai",
-            "model_list": ["gpt-5"],
-            "msg_id": 42,
-        }
+            current_model="model_1",
+            current_provider="openai",
+            on_model_selected=callback,
+            selected_provider="openai",
+            model_list=["gpt-5"],
+        )
 
-        query = AsyncMock()
-        query.data = "mm:0"
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
-
-        await adapter._handle_model_picker_callback(query, "mm:0", "12345")
+        query = _make_query()
+        await adapter._handle_model_picker_callback(
+            query, f"mp:{nonce}:m:0", "12345"
+        )
 
         callback.assert_awaited_once()
         query.edit_message_text.assert_awaited()
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "`gpt-5`" in edit_kwargs["text"]
-        assert "12345" not in adapter._model_picker_state
+        assert nonce not in adapter._model_picker_state
 
     @pytest.mark.asyncio
     async def test_provider_group_folds_and_drills_down(self, monkeypatch):
@@ -185,25 +224,22 @@ class TestTelegramModelPicker:
             session_key="s",
             on_model_selected=AsyncMock(),
             metadata=None,
+            initiator_user_id="12345",
         )
 
-        assert "mpg:minimax" in built
-        assert "mp:xai" in built
-        assert "mp:minimax" not in built
-        assert "mp:minimax-cn" not in built
+        nonce = next(iter(adapter._model_picker_state))
+        group_callback = next(value for value in built if value.startswith(f"mp:{nonce}:g:"))
+        assert any(value.startswith(f"mp:{nonce}:p:") for value in built)
+        assert all(len(value.encode("utf-8")) <= 64 for value in built if value)
 
         built.clear()
-        query = AsyncMock()
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
+        query = _make_query(message_id=101)
 
-        await adapter._handle_model_picker_callback(query, "mpg:minimax", "12345")
+        await adapter._handle_model_picker_callback(query, group_callback, "12345")
 
-        assert "mp:minimax" in built
-        assert "mp:minimax-cn" in built
-        assert "mb" in built
+        member_callbacks = [value for value in built if value.startswith(f"mp:{nonce}:p:")]
+        assert len(member_callbacks) == 2
+        assert f"mp:{nonce}:b" in built
 
     @pytest.mark.asyncio
     async def test_provider_picker_paginates_past_first_ten(self, monkeypatch):
@@ -249,54 +285,59 @@ class TestTelegramModelPicker:
             session_key="s",
             on_model_selected=AsyncMock(),
             metadata=None,
+            initiator_user_id="12345",
         )
 
-        def _callbacks(markup):
+        def _buttons(markup):
             return [
-                button.callback_data
+                button
                 for row in markup.inline_keyboard
                 for button in row
             ]
 
-        first_page = _callbacks(sent["reply_markup"])
-        assert "mp:zai" not in first_page
-        assert "mpv:1" in first_page
+        nonce = next(iter(adapter._model_picker_state))
+        first_page = _buttons(sent["reply_markup"])
+        assert all(button.text != "Z.AI / GLM (1)" for button in first_page)
+        next_callback = next(
+            button.callback_data
+            for button in first_page
+            if button.callback_data == f"mp:{nonce}:v:1"
+        )
 
-        query = AsyncMock()
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
+        query = _make_query(message_id=101)
 
-        await adapter._handle_model_picker_callback(query, "mpv:1", "12345")
+        await adapter._handle_model_picker_callback(query, next_callback, "12345")
 
-        second_page = _callbacks(query.edit_message_text.call_args[1]["reply_markup"])
-        assert "mp:zai" in second_page
-        assert "mpv:0" in second_page
+        second_page = _buttons(query.edit_message_text.call_args[1]["reply_markup"])
+        zai_callback = next(
+            button.callback_data
+            for button in second_page
+            if button.text == "Z.AI / GLM (1)"
+        )
+        assert any(button.callback_data == f"mp:{nonce}:v:0" for button in second_page)
 
-        await adapter._handle_model_picker_callback(query, "mp:zai", "12345")
-        assert adapter._model_picker_state["12345"]["selected_provider"] == "zai"
+        await adapter._handle_model_picker_callback(query, zai_callback, "12345")
+        assert adapter._model_picker_state[nonce]["selected_provider"] == "zai"
 
-        await adapter._handle_model_picker_callback(query, "mb", "12345")
-        back_page = _callbacks(query.edit_message_text.call_args[1]["reply_markup"])
-        assert "mp:zai" in back_page
+        await adapter._handle_model_picker_callback(query, f"mp:{nonce}:b", "12345")
+        back_page = _buttons(query.edit_message_text.call_args[1]["reply_markup"])
+        assert any(button.text == "Z.AI / GLM (1)" for button in back_page)
 
     @pytest.mark.asyncio
     async def test_expensive_model_requires_confirmation(self, monkeypatch):
         adapter = _make_adapter()
         callback = AsyncMock(return_value="Switched to `openai/gpt-5.5-pro`")
-        adapter._model_picker_state["12345"] = {
-            "providers": [
+        nonce, _ = _put_model_state(
+            adapter,
+            providers=[
                 {"slug": "openrouter", "name": "OpenRouter", "total_models": 1, "is_current": True}
             ],
-            "current_model": "model_1",
-            "current_provider": "openrouter",
-            "session_key": "s",
-            "on_model_selected": callback,
-            "selected_provider": "openrouter",
-            "model_list": ["openai/gpt-5.5-pro"],
-            "msg_id": 42,
-        }
+            current_model="model_1",
+            current_provider="openrouter",
+            on_model_selected=callback,
+            selected_provider="openrouter",
+            model_list=["openai/gpt-5.5-pro"],
+        )
         monkeypatch.setattr(
             "hermes_cli.model_cost_guard.expensive_model_warning",
             lambda *_args, **_kwargs: SimpleNamespace(
@@ -304,24 +345,20 @@ class TestTelegramModelPicker:
             ),
         )
 
-        query = AsyncMock()
-        query.message = MagicMock()
-        query.message.chat_id = 12345
-        query.answer = AsyncMock()
-        query.edit_message_text = AsyncMock()
+        query = _make_query()
 
-        await adapter._handle_model_picker_callback(query, "mm:0", "12345")
+        await adapter._handle_model_picker_callback(query, f"mp:{nonce}:m:0", "12345")
 
         callback.assert_not_awaited()
-        assert "12345" in adapter._model_picker_state
+        assert nonce in adapter._model_picker_state
         first_edit = query.edit_message_text.call_args[1]
         assert "EXPENSIVE MODEL WARNING" in first_edit["text"]
         assert first_edit["reply_markup"] is not None
 
-        await adapter._handle_model_picker_callback(query, "mc:0", "12345")
+        await adapter._handle_model_picker_callback(query, f"mp:{nonce}:c:0", "12345")
 
         callback.assert_awaited_once_with("12345", "openai/gpt-5.5-pro", "openrouter")
-        assert "12345" not in adapter._model_picker_state
+        assert nonce not in adapter._model_picker_state
 
     @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):
@@ -348,6 +385,7 @@ class TestTelegramModelPicker:
             session_key="s",
             on_model_selected=AsyncMock(),
             metadata={"thread_id": "99999"},
+            initiator_user_id="12345",
         )
 
         assert result.success is True

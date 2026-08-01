@@ -128,6 +128,17 @@ gateway:
     choice_fast:           "fast — Priority Processing включён"
     choice_normal:         "normal — стандартная обработка"
 
+  settings:
+    card:                  "⚙️ **Настройки чата**\n\n**Модель:** `{model}`\n**Размышления:** `{reasoning}`\n**Fast API:** `{fast}`\n**Область:** текущий Telegram-топик\n\nВыберите одну настройку. Модель и глубина сохраняются для топика; Fast API сбрасывается через `/new`."
+    text_fallback:         "⚙️ Текущие настройки\nМодель: `{model}`\nРазмышления: `{reasoning}`\nFast API: `{fast}`\n\nНа этой платформе карточка недоступна. Используйте `/model`, `/reasoning` и `/fast`."
+    action_all_models:     "Все модели…"
+    action_advanced:       "advanced"
+    action_fast_on:        "Fast API: вкл."
+    action_fast_off:       "Fast API: выкл."
+    action_close:          "Закрыть"
+    stale:                 "Настройки устарели — снова вызовите /settings."
+    error:                 "Не удалось изменить настройку: {error}"
+
   footer:
     status:                "📎 Нижний колонтитул среды выполнения: **{state}**\nПоля: `{fields}`\nПлатформа: `{platform}`"
     usage:                 "Использование: `/footer [on|off|status]`"

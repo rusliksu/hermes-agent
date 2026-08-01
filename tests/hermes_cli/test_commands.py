@@ -86,6 +86,11 @@ class TestCommandRegistry:
             "ultra",
         )
 
+    def test_settings_is_gateway_only(self):
+        settings = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "settings")
+        assert settings.gateway_only is True
+        assert settings.cli_only is False
+
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \
@@ -1244,6 +1249,7 @@ class TestTelegramMenuCommands:
             "new",
             "stop",
             "status",
+            "settings",
         ):
             assert name in names
 

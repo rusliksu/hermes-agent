@@ -208,6 +208,32 @@ async def test_root_telegram_dm_new_shows_create_topic_instruction(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_telegram_new_confirmation_describes_saved_resumable_archive(
+    monkeypatch,
+):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._telegram_topic_mode_enabled = lambda source: False
+    runner._maybe_confirm_destructive_slash = AsyncMock(return_value="confirm")
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("/new", thread_id="17585")
+    )
+
+    assert result == "confirm"
+    detail = runner._maybe_confirm_destructive_slash.await_args.kwargs["detail"]
+    assert "fresh active context" in detail
+    assert "session archive" in detail
+    assert "/resume" in detail
+    assert "discard" not in detail.lower()
+
+
+@pytest.mark.asyncio
 async def test_telegram_topic_prompt_still_runs_agent_when_topic_mode_enabled(monkeypatch):
     import gateway.run as gateway_run
 

@@ -132,6 +132,11 @@ def _make_adapter():
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
+    adapter._model_picker_state = {}
+    adapter._choice_picker_state = {}
+    adapter._settings_picker_state = {}
+    adapter._run_status_state = {}
+    adapter._run_status_nonce_by_key = {}
     adapter.platform = Platform.TELEGRAM
     return adapter
 
@@ -838,6 +843,7 @@ async def test_send_model_picker_uses_metadata_reply_fallback_for_dm_topics():
             "telegram_dm_topic_reply_fallback": True,
             "telegram_reply_to_message_id": "462",
         },
+        initiator_user_id="123",
     )
 
     assert result.success is True

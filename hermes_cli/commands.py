@@ -129,10 +129,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
 
     # Configuration
+    CommandDef("settings", "Choose the model and reasoning level for this chat", "Configuration",
+               gateway_only=True),
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
     CommandDef("model", "Switch model (persists by default)", "Configuration",
-               args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+               args_hint="[model] [--provider name] [--topic|--session|--global] [--refresh]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -153,10 +155,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
-               args_hint="[level|show|hide|full|clamp]",
+               args_hint="[level|show|hide|full|clamp] [--topic|--session|--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
-               args_hint="[normal|fast|status]",
+               args_hint="[normal|fast|status] [--session|--global]",
                subcommands=("normal", "fast", "status", "on", "off")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
@@ -560,6 +562,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "status",
     "resume",
     "sessions",
+    "settings",
     "model",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
@@ -1164,7 +1167,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug"})
+#   - settings: Telegram's inline topic-settings card; Slack can still use
+#     /hermes settings and the typed /model, /reasoning, and /fast commands.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "settings"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -74,6 +74,16 @@ def test_catalog_placeholders_match_english(lang: str):
         )
 
 
+@pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
+def test_settings_multiline_strings_use_real_newlines(lang: str):
+    """Settings cards must render lines, not a visible backslash-n sequence."""
+    settings = _load_raw(lang)["gateway"]["settings"]
+    for key in ("card", "text_fallback"):
+        value = settings[key]
+        assert r"\n" not in value, f"{lang}.yaml gateway.settings.{key} has literal \\n"
+        assert "\n" in value, f"{lang}.yaml gateway.settings.{key} is not multiline"
+
+
 # ---------------------------------------------------------------------------
 # Language resolution
 # ---------------------------------------------------------------------------

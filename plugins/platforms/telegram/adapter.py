@@ -16,7 +16,9 @@ import logging
 import os
 import html as _html
 import re
+import secrets
 import threading
+import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -581,6 +583,9 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+    _PICKER_TTL_SECONDS = 15 * 60
+    _RUN_STATUS_TTL_SECONDS = 2 * 60 * 60
+    _CALLBACK_STATE_LIMIT = 256
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -776,9 +781,14 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
-        # Interactive model picker state per chat
+        # Interactive controls are keyed by opaque nonce, not chat id. Multiple
+        # menus in one chat/topic therefore remain independent, and callbacks
+        # can be bound to the exact message/lane/user that created them.
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
+        self._settings_picker_state: Dict[str, dict] = {}
+        self._run_status_state: Dict[str, dict] = {}
+        self._run_status_nonce_by_key: Dict[tuple, str] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -796,10 +806,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
-        # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
+        # send_or_update_status() bookkeeping: topic/session/operation key ->
+        # bot message_id. This prevents neighbouring Telegram topics from
+        # editing each other's status bubble.
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # Serialize status creation/update per operation. Completed operation
+        # keys remain tombstoned for one callback TTL so fire-and-forget status
+        # futures that start after gateway cleanup cannot recreate a dead bubble.
+        self._status_key_locks: Dict[tuple, asyncio.Lock] = {}
+        self._closed_run_status_keys: Dict[tuple, float] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 4096 preview cap,
         # every subsequent progressive edit truncates to the SAME text; sending
@@ -859,6 +876,7 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id: Optional[str] = None,
         user_name: Optional[str] = None,
         require_elevated: bool = False,
+        allow_shared_lane_control: bool = False,
     ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -897,10 +915,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     getattr(policy, "enabled", False)
                     and policy.shared_scope(source) is not None
                 ):
-                    # Shared rollout exposes no inline admin/control surface.
-                    # Participants invoke the constrained agent via message
-                    # mention/reply/addressed command only.
-                    return False
+                    # Shared chats expose only explicitly marked lane-bound
+                    # controls. Global/admin controls remain unavailable, and
+                    # _bound_callback_state additionally binds the tap to the
+                    # exact user/chat/thread/message that created the control.
+                    if require_elevated or not allow_shared_lane_control:
+                        return False
                 if require_elevated:
                     elevated_auth_fn = getattr(runner, "_is_elevated_user_authorized", None)
                     if callable(elevated_auth_fn):
@@ -926,6 +946,220 @@ class TelegramAdapter(BasePlatformAdapter):
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
+
+    @staticmethod
+    def _callback_data(prefix: str, nonce: str, *parts: object) -> str:
+        """Build bounded Telegram callback data from short opaque tokens."""
+        value = ":".join((prefix, nonce, *(str(part) for part in parts)))
+        if len(value.encode("utf-8")) > 64:
+            raise ValueError("Telegram callback_data exceeds 64 bytes")
+        return value
+
+    def _prune_callback_states(self) -> None:
+        """Drop expired callback state and cap each in-memory state bucket."""
+        now = time.monotonic()
+        for state_map in (
+            self._model_picker_state,
+            self._choice_picker_state,
+            self._settings_picker_state,
+            self._run_status_state,
+        ):
+            expired = [
+                nonce
+                for nonce, state in state_map.items()
+                if float(state.get("expires_at", 0)) <= now
+            ]
+            for nonce in expired:
+                state = state_map.pop(nonce, None)
+                if state_map is self._run_status_state and state:
+                    self._run_status_nonce_by_key.pop(state.get("status_key"), None)
+
+            overflow = len(state_map) - self._CALLBACK_STATE_LIMIT
+            if overflow > 0:
+                oldest = sorted(
+                    state_map,
+                    key=lambda key: float(state_map[key].get("expires_at", 0)),
+                )[:overflow]
+                for nonce in oldest:
+                    state = state_map.pop(nonce, None)
+                    if state_map is self._run_status_state and state:
+                        self._run_status_nonce_by_key.pop(state.get("status_key"), None)
+
+    def _new_callback_nonce(self) -> str:
+        self._prune_callback_states()
+        used = (
+            set(self._model_picker_state)
+            | set(self._choice_picker_state)
+            | set(self._settings_picker_state)
+            | set(self._run_status_state)
+        )
+        while True:
+            nonce = secrets.token_urlsafe(9)
+            if nonce not in used:
+                return nonce
+
+    @classmethod
+    def _callback_thread_id(cls, message: Any) -> Optional[str]:
+        if message is None:
+            return None
+        try:
+            return cls._effective_message_thread_id(message)
+        except Exception:
+            raw = getattr(message, "message_thread_id", None)
+            return str(raw) if raw is not None else None
+
+    @classmethod
+    def _sent_picker_thread_id(
+        cls, message: Any, requested_thread_id: Optional[str]
+    ) -> tuple[Optional[str], bool]:
+        """Return actual picker thread and whether it matches its requested lane.
+
+        PTB's real returned Message exposes chat/topic fields. Lightweight test
+        doubles often expose only message_id, in which case the requested lane
+        is the only available routing evidence.
+        """
+        can_inspect = any(
+            hasattr(message, attr)
+            for attr in ("chat", "chat_id", "is_topic_message", "message_thread_id")
+        )
+        if not can_inspect:
+            return requested_thread_id, True
+        actual = cls._callback_thread_id(message)
+        if requested_thread_id is not None and actual != str(requested_thread_id):
+            return actual, False
+        return actual, True
+
+    async def _bound_callback_state(
+        self,
+        query: Any,
+        nonce: str,
+        state_map: Dict[str, dict],
+        *,
+        expired_text: str,
+        claim: bool = False,
+        consume: bool = False,
+    ) -> Optional[dict]:
+        """Validate and acknowledge an owner/lane-bound Telegram callback.
+
+        All checks are synchronous. The sole await is Telegram's acknowledgement,
+        which happens before any picker I/O or application callback.
+        """
+        self._prune_callback_states()
+        state = state_map.get(nonce)
+        if not state:
+            try:
+                await query.answer(text=expired_text)
+            except Exception:
+                pass
+            return None
+
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None:
+            chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None)
+        thread_id = self._callback_thread_id(message)
+        user = getattr(query, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        chat_type = getattr(chat, "type", None)
+
+        authorized = self._is_callback_user_authorized(
+            user_id,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=thread_id,
+            user_name=getattr(user, "first_name", None),
+            allow_shared_lane_control=bool(
+                state.get("allow_shared_lane_control", False)
+            ),
+        )
+        exact_match = (
+            bool(state.get("session_key"))
+            and user_id == state.get("user_id")
+            and str(chat_id) == state.get("chat_id")
+            and thread_id == state.get("thread_id")
+            and str(message_id) == state.get("message_id")
+        )
+        if not authorized or not exact_match:
+            try:
+                await query.answer(text="This menu is not valid for this chat or user.")
+            except Exception:
+                pass
+            return None
+
+        if state.get("busy"):
+            try:
+                await query.answer(text="This selection is already being processed.")
+            except Exception:
+                pass
+            return None
+
+        if claim or consume:
+            state["busy"] = True
+        try:
+            await query.answer()
+        except Exception:
+            state["busy"] = False
+            return None
+        if consume:
+            state_map.pop(nonce, None)
+        return state
+
+    async def _edit_picker_text(
+        self,
+        query: Any,
+        text: str,
+        *,
+        reply_markup: Any = None,
+    ) -> None:
+        """Best-effort MarkdownV2 edit with a plain-text fallback."""
+        try:
+            await query.edit_message_text(
+                text=self.format_message(str(text)),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text=str(text), parse_mode=None, reply_markup=reply_markup,
+                )
+            except Exception:
+                pass
+
+    async def _callback_state_is_current(
+        self,
+        query: Any,
+        nonce: str,
+        state: dict,
+        state_map: Dict[str, dict],
+        *,
+        stale_text: str,
+    ) -> bool:
+        """Run the gateway-supplied transcript/generation guard after ACK."""
+        validator = state.get("is_state_current")
+        if validator is None:
+            return True
+        try:
+            current = validator()
+            if inspect.isawaitable(current):
+                current = await current
+        except Exception:
+            current = False
+            logger.debug("Telegram callback state-current validator failed", exc_info=True)
+        if current:
+            return True
+        state_map.pop(nonce, None)
+        if state_map is self._run_status_state:
+            status_key = state.get("status_key")
+            lock = self._status_key_locks.setdefault(status_key, asyncio.Lock())
+            async with lock:
+                self._closed_run_status_keys[status_key] = time.monotonic()
+                self._run_status_nonce_by_key.pop(status_key, None)
+                self._status_message_ids.pop(status_key, None)
+        await self._edit_picker_text(query, stale_text, reply_markup=None)
+        return False
 
     def _source_from_message_for_auth(self, message: Message):
         """Build the same Telegram source shape the gateway auth path expects.
@@ -4297,17 +4531,86 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         *,
         metadata: Optional[Dict[str, Any]] = None,
+        session_key: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        on_stop=None,
+        is_state_current=None,
     ) -> SendResult:
         """Send a status message, or edit the previous one with the same key.
 
         Issue #30045: progress/status callbacks (context-pressure, lifecycle,
         compression, etc.) used to append a fresh bubble on every call. With
         this method, the first call sends and the message id is remembered;
-        subsequent calls with the same (chat_id, status_key) edit that same
-        message in place. If the edit fails (message deleted, too old, etc.)
-        we drop the cached id and send fresh.
+        subsequent calls with the same topic/session/operation edit that same
+        message in place. Supplying ``on_stop`` adds an owner-bound Stop button;
+        the callback closure is responsible for delegating to the gateway's
+        existing cancellation path.
         """
-        key = (str(chat_id), str(status_key))
+        thread_id = self._metadata_thread_id(metadata)
+        key = (
+            str(chat_id),
+            thread_id,
+            str(session_key or ""),
+            str(operation_id or status_key),
+        )
+        self._prune_status_coordination()
+        lock = self._status_key_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key in self._closed_run_status_keys:
+                return SendResult(success=True)
+            return await self._send_or_update_status_locked(
+                key,
+                chat_id,
+                content,
+                metadata=metadata,
+                session_key=session_key,
+                owner_user_id=owner_user_id,
+                operation_id=operation_id or status_key,
+                on_stop=on_stop,
+                is_state_current=is_state_current,
+            )
+
+    def _prune_status_coordination(self) -> None:
+        """Bound completed-operation tombstones and idle per-key locks."""
+        cutoff = time.monotonic() - self._RUN_STATUS_TTL_SECONDS
+        expired = [
+            key
+            for key, closed_at in self._closed_run_status_keys.items()
+            if closed_at <= cutoff
+        ]
+        for key in expired:
+            self._closed_run_status_keys.pop(key, None)
+            lock = self._status_key_locks.get(key)
+            if lock is not None and not lock.locked():
+                self._status_key_locks.pop(key, None)
+        overflow = len(self._closed_run_status_keys) - self._CALLBACK_STATE_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                self._closed_run_status_keys,
+                key=self._closed_run_status_keys.get,
+            )[:overflow]
+            for key in oldest:
+                self._closed_run_status_keys.pop(key, None)
+                lock = self._status_key_locks.get(key)
+                if lock is not None and not lock.locked():
+                    self._status_key_locks.pop(key, None)
+
+    async def _send_or_update_status_locked(
+        self,
+        key: tuple,
+        chat_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]],
+        session_key: Optional[str],
+        owner_user_id: Optional[str],
+        operation_id: str,
+        on_stop,
+        is_state_current,
+    ) -> SendResult:
+        """Update one status key while its per-operation lock is held."""
+        thread_id = self._metadata_thread_id(metadata)
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(
@@ -4316,13 +4619,186 @@ class TelegramAdapter(BasePlatformAdapter):
             if result.success:
                 if result.message_id:
                     self._status_message_ids[key] = str(result.message_id)
+                if on_stop is not None:
+                    await self._ensure_run_status_stop(
+                        key,
+                        message_id=str(result.message_id or cached_id),
+                        chat_id=str(chat_id),
+                        thread_id=thread_id,
+                        session_key=str(session_key or ""),
+                        owner_user_id=str(owner_user_id or ""),
+                        operation_id=str(operation_id),
+                        on_stop=on_stop,
+                        is_state_current=is_state_current,
+                    )
                 return result
             # Edit failed — clear the cached id and fall through to a fresh send.
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
             self._status_message_ids[key] = str(result.message_id)
+            if on_stop is not None:
+                await self._ensure_run_status_stop(
+                    key,
+                    message_id=str(result.message_id),
+                    chat_id=str(chat_id),
+                    thread_id=thread_id,
+                    session_key=str(session_key or ""),
+                    owner_user_id=str(owner_user_id or ""),
+                    operation_id=str(operation_id),
+                    on_stop=on_stop,
+                    is_state_current=is_state_current,
+                )
         return result
+
+    async def _ensure_run_status_stop(
+        self,
+        status_key: tuple,
+        *,
+        message_id: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        session_key: str,
+        owner_user_id: str,
+        operation_id: str,
+        on_stop,
+        is_state_current=None,
+    ) -> None:
+        if not self._bot or not owner_user_id or not session_key or not operation_id:
+            return
+        self._prune_callback_states()
+        nonce = self._run_status_nonce_by_key.get(status_key)
+        state = self._run_status_state.get(nonce) if nonce else None
+        if state is None:
+            nonce = self._new_callback_nonce()
+            state = {
+                "kind": "run_status",
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "user_id": owner_user_id,
+                "session_key": session_key,
+                "operation_id": operation_id,
+                "is_state_current": is_state_current,
+                "status_key": status_key,
+                "allow_shared_lane_control": True,
+                "busy": False,
+            }
+            self._run_status_state[nonce] = state
+            self._run_status_nonce_by_key[status_key] = nonce
+        state.update(
+            {
+                "message_id": str(message_id),
+                "on_stop": on_stop,
+                "is_state_current": is_state_current,
+                "expires_at": time.monotonic() + self._RUN_STATUS_TTL_SECONDS,
+            }
+        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⏹ Stop", callback_data=self._callback_data("rs", nonce, "x")
+        )]])
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                message_id=int(message_id),
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.debug("Failed to attach Telegram run Stop button: %s", exc)
+            self._run_status_state.pop(nonce, None)
+            self._run_status_nonce_by_key.pop(status_key, None)
+
+    async def clear_run_status(
+        self,
+        chat_id: str,
+        session_key: str,
+        operation_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Expire a run Stop button after completion/generation change."""
+        thread_id = self._metadata_thread_id(metadata)
+        status_key = (
+            str(chat_id),
+            thread_id,
+            str(session_key),
+            str(operation_id),
+        )
+        self._prune_status_coordination()
+        lock = self._status_key_locks.setdefault(status_key, asyncio.Lock())
+        async with lock:
+            # Mark closed even when the first delayed status coroutine has not
+            # run yet. This is the key late-future guard.
+            self._closed_run_status_keys[status_key] = time.monotonic()
+            nonce = self._run_status_nonce_by_key.pop(status_key, None)
+            state = self._run_status_state.pop(nonce, None) if nonce else None
+            cached_id = self._status_message_ids.pop(status_key, None)
+            message_id = (
+                str(state.get("message_id"))
+                if state and state.get("message_id")
+                else str(cached_id or "")
+            )
+            if message_id and self._bot:
+                try:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        message_id=int(message_id),
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            return bool(state or cached_id)
+
+    async def _handle_run_status_callback(self, query: Any, data: str) -> None:
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "rs" or parts[2] != "x":
+            try:
+                await query.answer(text="This operation is no longer active.")
+            except Exception:
+                pass
+            return
+        nonce = parts[1]
+        pending_state = self._run_status_state.get(nonce)
+        status_key = pending_state.get("status_key") if pending_state else None
+        lock = self._status_key_locks.setdefault(status_key, asyncio.Lock())
+        async with lock:
+            state = await self._bound_callback_state(
+                query,
+                nonce,
+                self._run_status_state,
+                expired_text="This operation is no longer active.",
+                consume=True,
+            )
+            if not state:
+                return
+            # Close the status generation before the potentially asynchronous
+            # transcript validator. A concurrent refresh then observes the
+            # tombstone instead of recreating a Stop nonce after consumption.
+            self._closed_run_status_keys[status_key] = time.monotonic()
+            self._run_status_nonce_by_key.pop(status_key, None)
+            self._status_message_ids.pop(status_key, None)
+        if not await self._callback_state_is_current(
+            query,
+            nonce,
+            state,
+            self._run_status_state,
+            stale_text="This operation is no longer active.",
+        ):
+            return
+        callback = state.get("on_stop")
+        if not callback:
+            await self._edit_picker_text(
+                query, "This operation is no longer active.", reply_markup=None
+            )
+            return
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                result = await result
+            result_text = str(result or "⏹ Stop requested.")
+        except Exception as exc:
+            logger.error("Telegram run Stop callback failed: %s", exc)
+            result_text = f"Unable to stop operation: {_redact_telegram_error_text(exc)}"
+        await self._edit_picker_text(query, result_text, reply_markup=None)
 
     async def edit_message(
         self,
@@ -5181,6 +5657,9 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        initiator_user_id: Optional[str] = None,
+        is_state_current=None,
+        allow_shared_lane_control: bool = False,
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
 
@@ -5189,6 +5668,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        owner_id = str(initiator_user_id or "").strip()
+        if not owner_id or not str(session_key or "").strip():
+            return SendResult(success=False, error="Missing picker owner or session")
 
         try:
             from hermes_cli.providers import get_label
@@ -5197,8 +5679,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         try:
+            nonce = self._new_callback_nonce()
             # Build provider buttons — folds provider groups (display only).
-            keyboard, provider_page_info = self._build_provider_keyboard(providers, 0)
+            keyboard, provider_page_info, provider_actions = self._build_provider_keyboard(
+                providers, nonce, 0
+            )
 
             provider_label = get_label(current_provider)
             text = self.format_message(
@@ -5210,7 +5695,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            thread_id = metadata.get("thread_id") if metadata else None
+            thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
                 chat_id=normalize_telegram_chat_id(chat_id),
@@ -5228,15 +5713,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
-                "msg_id": msg.message_id,
+            actual_thread_id, lane_matches = self._sent_picker_thread_id(msg, thread_id)
+            if not lane_matches:
+                try:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        message_id=msg.message_id,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return SendResult(success=False, error="Picker was sent outside requested thread")
+
+            self._model_picker_state[nonce] = {
+                "kind": "model",
+                "message_id": str(msg.message_id),
+                "chat_id": str(chat_id),
+                "thread_id": actual_thread_id,
+                "user_id": owner_id,
                 "providers": providers,
+                "provider_actions": provider_actions,
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
+                "is_state_current": is_state_current,
+                "allow_shared_lane_control": bool(allow_shared_lane_control),
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "provider_page": 0,
+                "expires_at": time.monotonic() + self._PICKER_TTL_SECONDS,
+                "busy": False,
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -5254,6 +5759,9 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        initiator_user_id: Optional[str] = None,
+        is_state_current=None,
+        allow_shared_lane_control: bool = False,
     ) -> SendResult:
         """Send a flat inline-keyboard choice picker (one tap → one value).
 
@@ -5263,15 +5771,22 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        owner_id = str(initiator_user_id or "").strip()
+        if not owner_id or not str(session_key or "").strip():
+            return SendResult(success=False, error="Missing picker owner or session")
 
         try:
+            nonce = self._new_callback_nonce()
             buttons = []
             for i, choice in enumerate(choices):
                 label = str(choice.get("label") or choice.get("value") or "")
                 if choice.get("is_current"):
                     label = f"✓ {label}"
                 buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"cp:{i}")
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=self._callback_data("cp", nonce, i),
+                    )
                 )
             if not buttons:
                 return SendResult(success=False, error="No choices")
@@ -5280,7 +5795,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
             )
 
-            thread_id = metadata.get("thread_id") if metadata else None
+            thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
                 chat_id=normalize_telegram_chat_id(chat_id),
@@ -5298,11 +5813,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            self._choice_picker_state[str(chat_id)] = {
-                "msg_id": msg.message_id,
+            actual_thread_id, lane_matches = self._sent_picker_thread_id(msg, thread_id)
+            if not lane_matches:
+                try:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        message_id=msg.message_id,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return SendResult(success=False, error="Picker was sent outside requested thread")
+
+            self._choice_picker_state[nonce] = {
+                "kind": "choice",
+                "message_id": str(msg.message_id),
+                "chat_id": str(chat_id),
+                "thread_id": actual_thread_id,
+                "user_id": owner_id,
                 "choices": choices,
                 "session_key": session_key,
                 "on_choice_selected": on_choice_selected,
+                "is_state_current": is_state_current,
+                "allow_shared_lane_control": bool(allow_shared_lane_control),
+                "expires_at": time.monotonic() + self._PICKER_TTL_SECONDS,
+                "busy": False,
             }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5312,70 +5847,288 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_choice_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
-        if not state:
-            await query.answer(text="Picker expired — run the command again.")
+        """Handle owner-bound choice picker taps (cp:<nonce>:<index>)."""
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "cp" or not parts[2].isdigit():
+            try:
+                await query.answer(text="Picker expired — run the command again.")
+            except Exception:
+                pass
             return
-
-        # Same authorization gate as approval buttons: unauthorized users in a
-        # shared group must not flip session/config state via someone else's
-        # picker message.
-        query_message = getattr(query, "message", None)
-        query_chat = getattr(query_message, "chat", None)
-        if not self._is_callback_user_authorized(
-            str(getattr(query.from_user, "id", "")),
-            chat_id=getattr(query_message, "chat_id", None),
-            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
-            thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
-            user_name=getattr(query.from_user, "first_name", None),
+        nonce = parts[1]
+        state = await self._bound_callback_state(
+            query,
+            nonce,
+            self._choice_picker_state,
+            expired_text="Picker expired — run the command again.",
+            claim=True,
+        )
+        if not state:
+            return
+        if not await self._callback_state_is_current(
+            query,
+            nonce,
+            state,
+            self._choice_picker_state,
+            stale_text="This picker belongs to an older session — run the command again.",
         ):
-            await query.answer(text="⛔ You are not authorized to change this setting.")
             return
 
         try:
-            idx = int(data[3:])
+            idx = int(parts[2])
             choice = state["choices"][idx]
-        except (ValueError, IndexError):
-            await query.answer(text="Invalid selection.")
+        except (ValueError, IndexError, TypeError):
+            state["busy"] = False
+            await self._edit_picker_text(query, "Invalid selection.")
             return
 
         callback = state.get("on_choice_selected")
         if not callback:
-            await query.answer(text="Picker expired.")
+            self._choice_picker_state.pop(nonce, None)
+            await self._edit_picker_text(query, "Picker expired.")
+            return
+
+        # Consume before the potentially slow callback so a double tap cannot
+        # apply the same selection twice.
+        self._choice_picker_state.pop(nonce, None)
+        try:
+            result_text = await callback(
+                state["chat_id"], str(choice.get("value") or "")
+            )
+        except Exception as exc:
+            logger.error("Choice picker selection failed: %s", exc)
+            result_text = f"Error applying selection: {_redact_telegram_error_text(exc)}"
+
+        await self._edit_picker_text(query, result_text, reply_markup=None)
+
+    @staticmethod
+    def _settings_actions_with_close(actions: list) -> list:
+        normalized = [dict(action) for action in actions if isinstance(action, dict)]
+        if not any(
+            action.get("close") or str(action.get("value") or "").lower() == "close"
+            for action in normalized
+        ):
+            normalized.append({"value": "close", "label": "✕ Close", "close": True})
+        return normalized
+
+    def _build_settings_keyboard(self, nonce: str, actions: list) -> Any:
+        buttons = []
+        for idx, action in enumerate(actions):
+            label = str(action.get("label") or action.get("value") or "")
+            if action.get("is_current"):
+                label = f"✓ {label}"
+            buttons.append(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=self._callback_data("st", nonce, idx),
+                )
+            )
+        return InlineKeyboardMarkup(
+            [buttons[idx:idx + 2] for idx in range(0, len(buttons), 2)]
+        )
+
+    async def send_settings_picker(
+        self,
+        chat_id: str,
+        title: str,
+        actions: list,
+        session_key: str,
+        on_action_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+        initiator_user_id: Optional[str] = None,
+        is_state_current=None,
+        allow_shared_lane_control: bool = False,
+    ) -> SendResult:
+        """Send a refreshable, owner-bound Telegram settings hub card.
+
+        ``on_action_selected(chat_id, value)`` may return a string (new card
+        title) or ``{"title": ..., "actions": [...], "close": bool}``.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        owner_id = str(initiator_user_id or "").strip()
+        if not owner_id or not str(session_key or "").strip():
+            return SendResult(success=False, error="Missing picker owner or session")
+
+        normalized_actions = self._settings_actions_with_close(actions)
+        if not normalized_actions:
+            return SendResult(success=False, error="No settings actions")
+
+        nonce = self._new_callback_nonce()
+        keyboard = self._build_settings_keyboard(nonce, normalized_actions)
+        thread_id = self._metadata_thread_id(metadata)
+        reply_to_id = self._reply_to_message_id_for_send(
+            None, metadata, reply_to_mode=self._reply_to_mode
+        )
+        try:
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=self.format_message(title),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            actual_thread_id, lane_matches = self._sent_picker_thread_id(msg, thread_id)
+            if not lane_matches:
+                try:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        message_id=msg.message_id,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return SendResult(success=False, error="Settings were sent outside requested thread")
+
+            self._settings_picker_state[nonce] = {
+                "kind": "settings",
+                "message_id": str(msg.message_id),
+                "chat_id": str(chat_id),
+                "thread_id": actual_thread_id,
+                "user_id": owner_id,
+                "session_key": session_key,
+                "title": str(title),
+                "actions": normalized_actions,
+                "on_action_selected": on_action_selected,
+                "is_state_current": is_state_current,
+                "allow_shared_lane_control": bool(allow_shared_lane_control),
+                "expires_at": time.monotonic() + self._PICKER_TTL_SECONDS,
+                "busy": False,
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            safe_error = _redact_telegram_error_text(exc)
+            logger.warning("[%s] send_settings_picker failed: %s", self.name, safe_error)
+            return SendResult(success=False, error=safe_error)
+
+    async def _handle_settings_picker_callback(self, query: Any, data: str) -> None:
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "st" or not parts[2].isdigit():
+            try:
+                await query.answer(text="Settings menu expired — use /settings again.")
+            except Exception:
+                pass
+            return
+        nonce, raw_index = parts[1], parts[2]
+        state = self._settings_picker_state.get(nonce)
+        action = None
+        if state:
+            idx = int(raw_index)
+            actions = state.get("actions", [])
+            if 0 <= idx < len(actions):
+                action = actions[idx]
+        is_close = bool(
+            action
+            and (
+                action.get("close")
+                or str(action.get("value") or "").lower() == "close"
+            )
+        )
+        state = await self._bound_callback_state(
+            query,
+            nonce,
+            self._settings_picker_state,
+            expired_text="Settings menu expired — use /settings again.",
+            claim=not is_close,
+            consume=is_close,
+        )
+        if not state:
+            return
+        if not await self._callback_state_is_current(
+            query,
+            nonce,
+            state,
+            self._settings_picker_state,
+            stale_text="These settings belong to an older session — use /settings again.",
+        ):
+            return
+        actions = state.get("actions", [])
+        idx = int(raw_index)
+        if idx >= len(actions):
+            state["busy"] = False
+            await self._edit_picker_text(query, "Invalid settings action.")
+            return
+        action = actions[idx]
+        if is_close:
+            await self._edit_picker_text(query, "Settings closed.", reply_markup=None)
+            return
+
+        callback = state.get("on_action_selected")
+        if not callback:
+            self._settings_picker_state.pop(nonce, None)
+            await self._edit_picker_text(query, "Settings menu expired.", reply_markup=None)
             return
 
         try:
-            result_text = await callback(chat_id, str(choice.get("value") or ""))
+            result = await callback(
+                state["chat_id"], str(action.get("value") or "")
+            )
         except Exception as exc:
-            logger.error("Choice picker selection failed: %s", exc)
-            result_text = f"Error applying selection: {exc}"
+            logger.error("Settings picker action failed: %s", exc)
+            state["busy"] = False
+            keyboard = self._build_settings_keyboard(nonce, actions)
+            await self._edit_picker_text(
+                query,
+                f"Error applying setting: {_redact_telegram_error_text(exc)}",
+                reply_markup=keyboard,
+            )
+            return
 
-        try:
-            await query.edit_message_text(
-                text=self.format_message(result_text),
-                parse_mode=ParseMode.MARKDOWN_V2,
+        if isinstance(result, dict) and result.get("close"):
+            self._settings_picker_state.pop(nonce, None)
+            await self._edit_picker_text(
+                query,
+                str(result.get("title") or "Settings closed."),
                 reply_markup=None,
             )
-        except Exception:
-            try:
-                await query.edit_message_text(
-                    text=result_text, parse_mode=None, reply_markup=None,
-                )
-            except Exception:
-                pass
-        await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+            return
+
+        if isinstance(result, dict):
+            title = str(result.get("title") or state.get("title") or "Settings")
+            refreshed_actions = result.get("actions")
+            if isinstance(refreshed_actions, list):
+                actions = self._settings_actions_with_close(refreshed_actions)
+        elif result is not None:
+            title = str(result)
+        else:
+            title = str(state.get("title") or "Settings")
+
+        refreshed_nonce = self._new_callback_nonce()
+        state.update(
+            {
+                "title": title,
+                "actions": actions,
+                "expires_at": time.monotonic() + self._PICKER_TTL_SECONDS,
+                "busy": False,
+            }
+        )
+        self._settings_picker_state.pop(nonce, None)
+        self._settings_picker_state[refreshed_nonce] = state
+        await self._edit_picker_text(
+            query,
+            title,
+            reply_markup=self._build_settings_keyboard(refreshed_nonce, actions),
+        )
 
     _MODEL_PAGE_SIZE = 8
 
-    def _build_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
+    def _build_provider_keyboard(
+        self, providers: list, nonce: str, page: int = 0
+    ) -> tuple:
         """Build the paginated top-level provider keyboard, folding groups.
 
         Provider families (Kimi/Moonshot, MiniMax, xAI Grok, ...) collapse to
-        a single ``mpg:<gid>`` button; tapping it drills into a member
-        sub-keyboard. Single providers (and groups with only one authenticated
-        member) render as direct ``mp:<slug>`` buttons. Grouping mirrors the
+        a single button; tapping it drills into a member sub-keyboard. Single
+        providers (and groups with only one authenticated member) render as
+        direct buttons. Grouping mirrors the
         CLI ``hermes model`` picker via the shared ``group_providers`` fold,
         so all surfaces stay consistent.
         """
@@ -5386,14 +6139,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         by_slug = {p.get("slug"): p for p in providers}
 
-        def _provider_button(p):
+        actions: list[dict] = []
+
+        def _provider_action(p):
             count = p.get("total_models", len(p.get("models", [])))
             label = f"{p['name']} ({count})"
             if p.get("is_current"):
                 label = f"✓ {label}"
-            return InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
+            return {"kind": "provider", "provider": p, "label": label}
 
-        buttons: list = []
         if group_providers is not None:
             for row in group_providers([p.get("slug") for p in providers]):
                 if row["kind"] == "group":
@@ -5404,16 +6158,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     label = f"{row['label']} ▸ ({count})"
                     if any(m.get("is_current") for m in members):
                         label = f"✓ {label}"
-                    buttons.append(
-                        InlineKeyboardButton(label, callback_data=f"mpg:{row['group_id']}")
+                    actions.append(
+                        {
+                            "kind": "group",
+                            "group_id": row["group_id"],
+                            "group_label": row["label"],
+                            "members": members,
+                            "label": label,
+                        }
                     )
                 else:
                     p = by_slug.get(row["slug"])
                     if p is not None:
-                        buttons.append(_provider_button(p))
+                        actions.append(_provider_action(p))
         else:
             for p in providers:
-                buttons.append(_provider_button(p))
+                actions.append(_provider_action(p))
+
+        buttons = [
+            InlineKeyboardButton(
+                action["label"],
+                callback_data=self._callback_data(
+                    "mp", nonce, "g" if action["kind"] == "group" else "p", idx
+                ),
+            )
+            for idx, action in enumerate(actions)
+        ]
 
         page_size = self._PROVIDER_PAGE_SIZE
         total = len(buttons)
@@ -5429,18 +6199,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if total_pages > 1:
             nav: list = []
             if page > 0:
-                nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"mpv:{page - 1}"))
-            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="mx:noop"))
+                nav.append(InlineKeyboardButton(
+                    "◀ Prev", callback_data=self._callback_data("mp", nonce, "v", page - 1)
+                ))
+            nav.append(InlineKeyboardButton(
+                f"{page + 1}/{total_pages}",
+                callback_data=self._callback_data("mp", nonce, "n"),
+            ))
             if page < total_pages - 1:
-                nav.append(InlineKeyboardButton("Next ▶", callback_data=f"mpv:{page + 1}"))
+                nav.append(InlineKeyboardButton(
+                    "Next ▶", callback_data=self._callback_data("mp", nonce, "v", page + 1)
+                ))
             rows.append(nav)
 
-        rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+        rows.append([InlineKeyboardButton(
+            "✗ Cancel", callback_data=self._callback_data("mp", nonce, "x")
+        )])
 
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
-        return InlineKeyboardMarkup(rows), page_info
+        return InlineKeyboardMarkup(rows), page_info, actions
 
-    def _build_model_keyboard(self, models: list, page: int) -> tuple:
+    def _build_model_keyboard(self, models: list, nonce: str, page: int) -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
         page_size = self._MODEL_PAGE_SIZE
         total = len(models)
@@ -5458,7 +6237,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if len(short) > 38:
                 short = short[:35] + "..."
             buttons.append(
-                InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
+                InlineKeyboardButton(
+                    short,
+                    callback_data=self._callback_data("mp", nonce, "m", abs_idx),
+                )
             )
 
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
@@ -5467,15 +6249,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if total_pages > 1:
             nav: list = []
             if page > 0:
-                nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"mg:{page - 1}"))
-            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="mx:noop"))
+                nav.append(InlineKeyboardButton(
+                    "◀ Prev", callback_data=self._callback_data("mp", nonce, "d", page - 1)
+                ))
+            nav.append(InlineKeyboardButton(
+                f"{page + 1}/{total_pages}",
+                callback_data=self._callback_data("mp", nonce, "n"),
+            ))
             if page < total_pages - 1:
-                nav.append(InlineKeyboardButton("Next ▶", callback_data=f"mg:{page + 1}"))
+                nav.append(InlineKeyboardButton(
+                    "Next ▶", callback_data=self._callback_data("mp", nonce, "d", page + 1)
+                ))
             rows.append(nav)
 
         rows.append([
-            InlineKeyboardButton("◀ Back", callback_data="mb"),
-            InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+            InlineKeyboardButton("◀ Back", callback_data=self._callback_data("mp", nonce, "b")),
+            InlineKeyboardButton("✗ Cancel", callback_data=self._callback_data("mp", nonce, "x")),
         ])
 
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
@@ -5484,11 +6273,47 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
-        if not state:
-            await query.answer(text="Picker expired — use /model again.")
+        """Handle model picker callbacks (mp:<nonce>:<action>[:index])."""
+        parts = data.split(":")
+        if len(parts) not in {3, 4} or parts[0] != "mp":
+            try:
+                await query.answer(text="Picker expired — use /model again.")
+            except Exception:
+                pass
             return
+        nonce, action = parts[1], parts[2]
+        numeric_actions = {"p", "g", "v", "d", "m", "c"}
+        if (
+            action not in numeric_actions | {"b", "x", "n"}
+            or (action in numeric_actions and (len(parts) != 4 or not parts[3].isdigit()))
+            or (action not in numeric_actions and len(parts) != 3)
+        ):
+            try:
+                await query.answer(text="Picker expired — use /model again.")
+            except Exception:
+                pass
+            return
+
+        state = await self._bound_callback_state(
+            query,
+            nonce,
+            self._model_picker_state,
+            expired_text="Picker expired — use /model again.",
+            claim=action in {"m", "c"},
+            consume=action == "x",
+        )
+        if not state:
+            return
+        if not await self._callback_state_is_current(
+            query,
+            nonce,
+            state,
+            self._model_picker_state,
+            stale_text="This model menu belongs to an older session — use /model again.",
+        ):
+            return
+
+        index = int(parts[3]) if len(parts) == 4 else None
 
         try:
             from hermes_cli.providers import get_label
@@ -5496,16 +6321,15 @@ class TelegramAdapter(BasePlatformAdapter):
             def get_label(slug):
                 return slug
 
-        if data.startswith("mp:"):
+        if action == "p":
             # --- Provider selected: show model buttons (page 0) ---
-            provider_slug = data[3:]
-            provider = next(
-                (p for p in state["providers"] if p["slug"] == provider_slug),
-                None,
-            )
-            if not provider:
-                await query.answer(text="Provider not found.")
+            actions = state.get("provider_actions", [])
+            selected = actions[index] if index is not None and index < len(actions) else None
+            if not selected or selected.get("kind") != "provider":
+                await self._edit_picker_text(query, "Provider not found.")
                 return
+            provider = selected["provider"]
+            provider_slug = provider["slug"]
 
             models = provider.get("models", [])
             state["selected_provider"] = provider_slug
@@ -5513,7 +6337,7 @@ class TelegramAdapter(BasePlatformAdapter):
             state["model_list"] = models
             state["model_page"] = 0
 
-            keyboard, page_info = self._build_model_keyboard(models, 0)
+            keyboard, page_info = self._build_model_keyboard(models, nonce, 0)
 
             pname = provider.get("name", provider_slug)
             total = provider.get("total_models", len(models))
@@ -5531,20 +6355,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard,
             )
-            await query.answer()
 
-        elif data.startswith("mg:"):
+        elif action == "d":
             # --- Page navigation ---
-            try:
-                page = int(data[3:])
-            except ValueError:
-                await query.answer(text="Invalid page.")
-                return
+            page = int(index or 0)
 
             models = state.get("model_list", [])
             state["model_page"] = page
 
-            keyboard, page_info = self._build_model_keyboard(models, page)
+            keyboard, page_info = self._build_model_keyboard(models, nonce, page)
 
             pname = state.get("selected_provider_name", "")
             provider_slug = state.get("selected_provider", "")
@@ -5567,20 +6386,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard,
             )
-            await query.answer()
 
-        elif data.startswith("mpv:"):
+        elif action == "v":
             # --- Provider page navigation ---
-            try:
-                page = int(data[4:])
-            except ValueError:
-                await query.answer(text="Invalid page.")
-                return
+            page = int(index or 0)
 
             state["provider_page"] = page
-            keyboard, provider_page_info = self._build_provider_keyboard(
-                state["providers"], page
+            keyboard, provider_page_info, provider_actions = self._build_provider_keyboard(
+                state["providers"], nonce, page
             )
+            state["provider_actions"] = provider_actions
 
             try:
                 provider_label = get_label(state["current_provider"])
@@ -5599,76 +6414,50 @@ class TelegramAdapter(BasePlatformAdapter):
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard,
             )
-            await query.answer()
 
-        elif data.startswith("mc:"):
+        elif action == "c":
             # --- Expensive model confirmed: perform the switch ---
-            try:
-                idx = int(data[3:])
-            except ValueError:
-                await query.answer(text="Invalid selection.")
-                return
-
             model_list = state.get("model_list", [])
-            if idx < 0 or idx >= len(model_list):
-                await query.answer(text="Invalid model index.")
+            if index is None or index >= len(model_list):
+                state["busy"] = False
+                await self._edit_picker_text(query, "Invalid model index.")
                 return
 
-            model_id = model_list[idx]
+            model_id = model_list[index]
             provider_slug = state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
-                await query.answer(text="Picker expired.")
+                self._model_picker_state.pop(nonce, None)
+                await self._edit_picker_text(query, "Picker expired.")
                 return
 
+            self._model_picker_state.pop(nonce, None)
             switch_failed = False
             try:
-                result_text = await callback(chat_id, model_id, provider_slug)
+                result_text = await callback(state["chat_id"], model_id, provider_slug)
             except Exception as exc:
                 logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
+                result_text = f"Error switching model: {_redact_telegram_error_text(exc)}"
                 switch_failed = True
 
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
-            )
-            self._model_picker_state.pop(chat_id, None)
+            await self._edit_picker_text(query, result_text, reply_markup=None)
 
-        elif data.startswith("mm:"):
+        elif action == "m":
             # --- Model selected: perform the switch ---
-            try:
-                idx = int(data[3:])
-            except ValueError:
-                await query.answer(text="Invalid selection.")
-                return
-
             model_list = state.get("model_list", [])
-            if idx < 0 or idx >= len(model_list):
-                await query.answer(text="Invalid model index.")
+            if index is None or index >= len(model_list):
+                state["busy"] = False
+                await self._edit_picker_text(query, "Invalid model index.")
                 return
 
-            model_id = model_list[idx]
+            model_id = model_list[index]
             provider_slug = state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
-                await query.answer(text="Picker expired.")
+                self._model_picker_state.pop(nonce, None)
+                await self._edit_picker_text(query, "Picker expired.")
                 return
 
             try:
@@ -5685,12 +6474,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 warning = None
             if warning is not None:
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Switch anyway", callback_data=f"mc:{idx}")],
+                    [InlineKeyboardButton(
+                        "Switch anyway",
+                        callback_data=self._callback_data("mp", nonce, "c", index),
+                    )],
                     [
-                        InlineKeyboardButton("◀ Back", callback_data="mb"),
-                        InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+                        InlineKeyboardButton("◀ Back", callback_data=self._callback_data("mp", nonce, "b")),
+                        InlineKeyboardButton("✗ Cancel", callback_data=self._callback_data("mp", nonce, "x")),
                     ],
                 ])
+                state["busy"] = False
                 await query.edit_message_text(
                     text=self.format_message(
                         f"⚠ *Expensive Model Warning*\n\n{warning.message}"
@@ -5698,55 +6491,28 @@ class TelegramAdapter(BasePlatformAdapter):
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=keyboard,
                 )
-                await query.answer(text="Confirm expensive model")
                 return
 
+            self._model_picker_state.pop(nonce, None)
             switch_failed = False
             try:
-                result_text = await callback(chat_id, model_id, provider_slug)
+                result_text = await callback(state["chat_id"], model_id, provider_slug)
             except Exception as exc:
                 logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
+                result_text = f"Error switching model: {_redact_telegram_error_text(exc)}"
                 switch_failed = True
 
-            # Edit message to show confirmation, remove buttons
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                # Markdown parse failure — retry as plain text
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
-            )
+            await self._edit_picker_text(query, result_text, reply_markup=None)
 
-            # Clean up state
-            self._model_picker_state.pop(chat_id, None)
-
-        elif data.startswith("mpg:"):
+        elif action == "g":
             # --- Provider group selected: show member providers ---
-            group_id = data[4:]
-            try:
-                from hermes_cli.models import PROVIDER_GROUPS
-                _label, _desc, member_slugs = PROVIDER_GROUPS.get(group_id, ("", "", []))
-            except Exception:
-                _label, member_slugs = "", []
-
-            by_slug = {p["slug"]: p for p in state["providers"]}
-            members = [by_slug[m] for m in member_slugs if m in by_slug]
-            if not members:
-                await query.answer(text="Group not found.")
+            actions = state.get("provider_actions", [])
+            selected = actions[index] if index is not None and index < len(actions) else None
+            if not selected or selected.get("kind") != "group":
+                await self._edit_picker_text(query, "Group not found.")
                 return
+            members = selected.get("members", [])
+            group_label = selected.get("group_label") or selected.get("group_id") or ""
 
             buttons = []
             for p in members:
@@ -5754,13 +6520,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 label = f"{p['name']} ({count})"
                 if p.get("is_current"):
                     label = f"✓ {label}"
+                provider_index = next(
+                    idx for idx, action_item in enumerate(actions)
+                    if action_item.get("kind") == "provider"
+                    and action_item.get("provider", {}).get("slug") == p.get("slug")
+                ) if any(
+                    action_item.get("kind") == "provider"
+                    and action_item.get("provider", {}).get("slug") == p.get("slug")
+                    for action_item in actions
+                ) else None
+                if provider_index is None:
+                    actions.append({"kind": "provider", "provider": p, "label": label})
+                    provider_index = len(actions) - 1
                 buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=self._callback_data("mp", nonce, "p", provider_index),
+                    )
                 )
+            state["provider_actions"] = actions
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
             rows.append([
-                InlineKeyboardButton("◀ Back", callback_data="mb"),
-                InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+                InlineKeyboardButton("◀ Back", callback_data=self._callback_data("mp", nonce, "b")),
+                InlineKeyboardButton("✗ Cancel", callback_data=self._callback_data("mp", nonce, "x")),
             ])
             keyboard = InlineKeyboardMarkup(rows)
 
@@ -5768,21 +6550,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 text=self.format_message(
                     (
                         f"⚙ *Model Configuration*\n\n"
-                        f"Provider family: *{_label or group_id}*\n\n"
+                        f"Provider family: *{group_label}*\n\n"
                         f"Select a provider:"
                     )
                 ),
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard,
             )
-            await query.answer()
 
-        elif data == "mb":
+        elif action == "b":
             # --- Back to provider list (folds groups) ---
             page = int(state.get("provider_page", 0) or 0)
-            keyboard, provider_page_info = self._build_provider_keyboard(
-                state["providers"], page
+            keyboard, provider_page_info, provider_actions = self._build_provider_keyboard(
+                state["providers"], nonce, page
             )
+            state["provider_actions"] = provider_actions
 
             try:
                 provider_label = get_label(state["current_provider"])
@@ -5801,20 +6583,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard,
             )
-            await query.answer()
 
-        elif data == "mx":
+        elif action == "x":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
-            await query.edit_message_text(
-                text="Model selection cancelled.",
-                reply_markup=None,
+            await self._edit_picker_text(
+                query, "Model selection cancelled.", reply_markup=None
             )
-            await query.answer()
 
         else:
-            # Catch-all (e.g. page counter button "mx:noop")
-            await query.answer()
+            # Page counter/no-op: acknowledgement was already sent.
+            return
 
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
@@ -5868,6 +6646,16 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_choice_picker_callback(query, data, chat_id)
+            return
+
+        # --- Unified Telegram settings hub callbacks ---
+        if data.startswith("st:"):
+            await self._handle_settings_picker_callback(query, data)
+            return
+
+        # --- Owner-bound long-running operation Stop callback ---
+        if data.startswith("rs:"):
+            await self._handle_run_status_callback(query, data)
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---

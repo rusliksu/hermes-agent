@@ -19,6 +19,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +656,7 @@ def build_session_context_prompt(
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+_TOPIC_PREFERENCE_UNSET = object()
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -672,6 +674,71 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
     return cleaned or None
+
+
+def canonical_reasoning_effort(value: Any) -> Optional[str]:
+    """Return the canonical persistable reasoning effort, if valid."""
+    from hermes_constants import parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(value)
+    if parsed is None:
+        return None
+    if parsed.get("enabled") is False:
+        return "none"
+    effort = str(parsed.get("effort") or "").strip().lower()
+    return effort or None
+
+
+def sanitize_topic_preferences(preferences: Any) -> Dict[str, Any]:
+    """Keep only non-secret model fields and a canonical reasoning effort."""
+    if not isinstance(preferences, dict):
+        return {}
+    cleaned: Dict[str, Any] = {}
+    model_override = sanitize_model_override(preferences.get("model_override"))
+    if model_override:
+        base_url = model_override.get("base_url")
+        if base_url:
+            try:
+                parsed_url = urlsplit(base_url)
+                credential_free = (
+                    parsed_url.scheme in {"http", "https"}
+                    and bool(parsed_url.hostname)
+                    and parsed_url.username is None
+                    and parsed_url.password is None
+                    and not parsed_url.query
+                    and not parsed_url.fragment
+                )
+            except (TypeError, ValueError):
+                credential_free = False
+            if not credential_free:
+                model_override.pop("base_url", None)
+        cleaned["model_override"] = model_override
+    reasoning_effort = canonical_reasoning_effort(
+        preferences.get("reasoning_effort")
+    )
+    if reasoning_effort:
+        cleaned["reasoning_effort"] = reasoning_effort
+    return cleaned
+
+
+def build_topic_preference_key(
+    source: SessionSource,
+    *,
+    profile: Optional[str] = None,
+) -> str:
+    """Build a versioned, non-PII lane key for durable topic preferences."""
+    lane = [
+        profile or "default",
+        source.platform.value,
+        source.chat_type or "",
+        str(source.chat_id or ""),
+        str(source.thread_id or ""),
+        str(source.user_id_alt or source.user_id or ""),
+    ]
+    payload = json.dumps(
+        lane, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return "lane:v1:" + hashlib.sha256(payload).hexdigest()
 
 
 @dataclass
@@ -1007,6 +1074,15 @@ class AsyncSessionStore:
     def __init__(self, store: "SessionStore") -> None:
         self._store = store
 
+    async def get_topic_preferences(
+        self, source: SessionSource
+    ) -> Dict[str, Any]:
+        """Return cached preferences inline, offloading a cold SQLite read."""
+        cached, preferences = self._store._cached_topic_preferences(source)
+        if cached:
+            return preferences
+        return await asyncio.to_thread(self._store.get_topic_preferences, source)
+
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
         if not callable(attr):
@@ -1031,6 +1107,11 @@ class SessionStore:
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
+        self._topic_preferences: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._topic_preferences_lock = threading.Lock()
+        # ponytail: one store-wide writer lock is enough for rare picker taps;
+        # shard by lane only if preference writes ever become high-throughput.
+        self._topic_preferences_update_lock = threading.Lock()
         self._loaded = False
         self._lock = threading.Lock()
         # Serialize whole-index persistence without holding ``_lock`` across
@@ -1431,6 +1512,100 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
+
+    def _generate_topic_preference_key(self, source: SessionSource) -> str:
+        """Generate the durable preference key for a normalized source."""
+        return build_topic_preference_key(
+            source, profile=self._resolve_profile_for_key(source)
+        )
+
+    def _cached_topic_preferences(
+        self, source: SessionSource
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Return whether a lane cache entry exists and a defensive copy."""
+        lane_key = self._generate_topic_preference_key(source)
+        with self._topic_preferences_lock:
+            if lane_key not in self._topic_preferences:
+                return False, {}
+            cached = self._topic_preferences[lane_key]
+            return True, dict(cached) if cached else {}
+
+    def get_topic_preferences(self, source: SessionSource) -> Dict[str, Any]:
+        """Load sanitized model/reasoning preferences for a gateway lane."""
+        cached, preferences = self._cached_topic_preferences(source)
+        if cached:
+            return preferences
+
+        lane_key = self._generate_topic_preference_key(source)
+
+        preferences = {}
+        db = getattr(self, "_db", None)
+        if db is not None:
+            loader = getattr(db, "load_gateway_topic_preferences", None)
+            if callable(loader):
+                try:
+                    raw = loader(lane_key, scope=self._routing_scope())
+                    if raw:
+                        preferences = sanitize_topic_preferences(json.loads(raw))
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load gateway topic preferences for %s: %s",
+                        lane_key[:20], exc,
+                    )
+
+        with self._topic_preferences_lock:
+            if lane_key not in self._topic_preferences:
+                self._topic_preferences[lane_key] = (
+                    dict(preferences) if preferences else None
+                )
+            cached = self._topic_preferences[lane_key]
+            return dict(cached) if cached else {}
+
+    def update_topic_preferences(
+        self,
+        source: SessionSource,
+        *,
+        model_override: Any = _TOPIC_PREFERENCE_UNSET,
+        reasoning_effort: Any = _TOPIC_PREFERENCE_UNSET,
+    ) -> Dict[str, Any]:
+        """Patch and persist sanitized preferences for one gateway lane."""
+        # Model and reasoning are independent fields in one JSON row. Serialize
+        # the full read-patch-write so simultaneous picker taps cannot lose one.
+        with self._topic_preferences_update_lock:
+            lane_key = self._generate_topic_preference_key(source)
+            preferences = self.get_topic_preferences(source)
+            if model_override is not _TOPIC_PREFERENCE_UNSET:
+                cleaned_model = sanitize_model_override(model_override)
+                if cleaned_model:
+                    preferences["model_override"] = cleaned_model
+                else:
+                    preferences.pop("model_override", None)
+            if reasoning_effort is not _TOPIC_PREFERENCE_UNSET:
+                cleaned_effort = canonical_reasoning_effort(reasoning_effort)
+                if cleaned_effort:
+                    preferences["reasoning_effort"] = cleaned_effort
+                else:
+                    preferences.pop("reasoning_effort", None)
+            preferences = sanitize_topic_preferences(preferences)
+
+            db = getattr(self, "_db", None)
+            if db is None:
+                raise RuntimeError("SQLite topic preference store is unavailable")
+            if preferences:
+                db.save_gateway_topic_preferences(
+                    lane_key,
+                    json.dumps(preferences, sort_keys=True, separators=(",", ":")),
+                    scope=self._routing_scope(),
+                )
+            else:
+                db.delete_gateway_topic_preferences(
+                    lane_key, scope=self._routing_scope()
+                )
+            with self._topic_preferences_lock:
+                self._topic_preferences[lane_key] = (
+                    dict(preferences) if preferences else None
+                )
+            return dict(preferences)
 
     def _create_entry_from_recovered_row(
         self,
@@ -2178,8 +2353,13 @@ class SessionStore:
             cleaned = sanitize_model_override(override)
             if entry.model_override == cleaned:
                 return
+            previous = entry.model_override
             entry.model_override = cleaned
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                entry.model_override = previous
+                raise
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

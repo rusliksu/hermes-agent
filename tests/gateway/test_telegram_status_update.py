@@ -1,7 +1,7 @@
 """Tests for TelegramAdapter.send_or_update_status (issue #30045).
 
 The status-update path must:
-  1. Send a fresh message on the first call for a (chat_id, status_key) pair.
+  1. Send a fresh message on the first call for a topic/session/operation key.
   2. Edit that same message on subsequent calls with the same key.
   3. Fall back to sending fresh when the cached message edit fails.
   4. Keep distinct keys independent (no cross-talk).
@@ -9,6 +9,7 @@ The status-update path must:
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -64,10 +65,24 @@ def _install_fake_telegram(monkeypatch):
 @pytest.fixture
 def adapter(monkeypatch):
     _install_fake_telegram(monkeypatch)
-    from plugins.platforms.telegram.adapter import TelegramAdapter
+    import plugins.platforms.telegram.adapter as tg
 
-    a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    class _Button:
+        def __init__(self, text, callback_data=None, **_kwargs):
+            self.text = text
+            self.callback_data = callback_data
+
+    class _Markup:
+        def __init__(self, rows):
+            self.inline_keyboard = rows
+
+    monkeypatch.setattr(tg, "InlineKeyboardButton", _Button)
+    monkeypatch.setattr(tg, "InlineKeyboardMarkup", _Markup)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner")
+
+    a = tg.TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
+    a._bot.edit_message_reply_markup = AsyncMock()
     # Patch send / edit_message so tests can drive them directly.
     a.send = AsyncMock()
     a.edit_message = AsyncMock()
@@ -85,7 +100,7 @@ async def test_first_call_sends_and_caches_message_id(adapter):
     assert result.message_id == "100"
     adapter.send.assert_awaited_once()
     adapter.edit_message.assert_not_awaited()
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
+    assert adapter._status_message_ids[("chat-1", None, "", "lifecycle")] == "100"
 
 
 @pytest.mark.asyncio
@@ -107,6 +122,53 @@ async def test_second_call_edits_in_place(adapter):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_first_updates_create_only_one_status_bubble(adapter):
+    """Same operation is serialized so concurrent cache misses cannot double-send."""
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+
+    async def _send(*_args, **_kwargs):
+        first_send_started.set()
+        await release_first_send.wait()
+        return SendResult(success=True, message_id="100")
+
+    adapter.send.side_effect = _send
+    adapter.edit_message.return_value = SendResult(success=True, message_id="100")
+    first = asyncio.create_task(
+        adapter.send_or_update_status(
+            "123", "run", "first", session_key="session-a", operation_id="op-a"
+        )
+    )
+    await first_send_started.wait()
+    second = asyncio.create_task(
+        adapter.send_or_update_status(
+            "123", "run", "second", session_key="session-a", operation_id="op-a"
+        )
+    )
+    release_first_send.set()
+    await asyncio.gather(first, second)
+
+    assert adapter.send.await_count == 1
+    adapter.edit_message.assert_awaited_once()
+    assert adapter._status_message_ids[("123", None, "session-a", "op-a")] == "100"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_tombstone_blocks_late_fire_and_forget_status(adapter):
+    """A status future starting after run cleanup must not recreate a bubble."""
+    assert not await adapter.clear_run_status("123", "session-a", "op-a")
+
+    result = await adapter.send_or_update_status(
+        "123", "run", "late", session_key="session-a", operation_id="op-a"
+    )
+
+    assert result.success
+    adapter.send.assert_not_awaited()
+    adapter.edit_message.assert_not_awaited()
+    assert adapter._status_message_ids == {}
+
+
+@pytest.mark.asyncio
 async def test_edit_failure_falls_back_to_fresh_send(adapter):
     """When edit_message fails the cache is cleared and a new send happens."""
     adapter.send.side_effect = [
@@ -125,7 +187,7 @@ async def test_edit_failure_falls_back_to_fresh_send(adapter):
     assert adapter.send.await_count == 2
     assert adapter.edit_message.await_count == 1
     # Cache now points at the fresh message id.
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "200"
+    assert adapter._status_message_ids[("chat-1", None, "", "lifecycle")] == "200"
 
 
 @pytest.mark.asyncio
@@ -141,8 +203,8 @@ async def test_distinct_status_keys_do_not_collide(adapter):
 
     assert adapter.send.await_count == 2
     adapter.edit_message.assert_not_awaited()
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
-    assert adapter._status_message_ids[("chat-1", "model-switch")] == "200"
+    assert adapter._status_message_ids[("chat-1", None, "", "lifecycle")] == "100"
+    assert adapter._status_message_ids[("chat-1", None, "", "model-switch")] == "200"
 
 
 @pytest.mark.asyncio
@@ -158,5 +220,187 @@ async def test_distinct_chat_ids_do_not_collide(adapter):
 
     assert adapter.send.await_count == 2
     adapter.edit_message.assert_not_awaited()
-    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
-    assert adapter._status_message_ids[("chat-2", "lifecycle")] == "200"
+    assert adapter._status_message_ids[("chat-1", None, "", "lifecycle")] == "100"
+    assert adapter._status_message_ids[("chat-2", None, "", "lifecycle")] == "200"
+
+
+@pytest.mark.asyncio
+async def test_topic_session_and_operation_status_keys_do_not_collide(adapter):
+    adapter.send.side_effect = [
+        SendResult(success=True, message_id="100"),
+        SendResult(success=True, message_id="200"),
+        SendResult(success=True, message_id="300"),
+    ]
+
+    await adapter.send_or_update_status(
+        "123", "run", "topic 7", metadata={"thread_id": "7"},
+        session_key="session-a", operation_id="op-a",
+    )
+    await adapter.send_or_update_status(
+        "123", "run", "topic 8", metadata={"thread_id": "8"},
+        session_key="session-a", operation_id="op-a",
+    )
+    await adapter.send_or_update_status(
+        "123", "run", "new generation", metadata={"thread_id": "7"},
+        session_key="session-a", operation_id="op-b",
+    )
+
+    assert adapter.send.await_count == 3
+    adapter.edit_message.assert_not_awaited()
+    assert set(adapter._status_message_ids) == {
+        ("123", "7", "session-a", "op-a"),
+        ("123", "8", "session-a", "op-a"),
+        ("123", "7", "session-a", "op-b"),
+    }
+
+
+def _stop_query(*, message_id=100, thread_id=7, user_id="owner"):
+    message = SimpleNamespace(
+        chat_id=123,
+        message_id=message_id,
+        message_thread_id=thread_id,
+        is_topic_message=True,
+        chat=SimpleNamespace(id=123, type="private", is_forum=False),
+    )
+    return SimpleNamespace(
+        message=message,
+        from_user=SimpleNamespace(id=user_id, first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_bound_stop_acks_then_cancels_once(adapter):
+    order = []
+    adapter.send.return_value = SendResult(success=True, message_id="100")
+
+    async def _stop():
+        order.append("stop")
+        return "Stopped"
+
+    await adapter.send_or_update_status(
+        "123", "run", "Working", metadata={"thread_id": "7"},
+        session_key="session-a", owner_user_id="owner", operation_id="op-a",
+        on_stop=_stop,
+    )
+    markup = adapter._bot.edit_message_reply_markup.call_args.kwargs["reply_markup"]
+    callback_data = markup.inline_keyboard[0][0].callback_data
+    assert len(callback_data.encode("utf-8")) <= 64
+
+    query = _stop_query()
+
+    async def _answer(**_kwargs):
+        order.append("ack")
+
+    query.answer.side_effect = _answer
+    await adapter._handle_run_status_callback(query, callback_data)
+    await adapter._handle_run_status_callback(query, callback_data)
+
+    assert order == ["ack", "stop", "ack"]
+    assert adapter._run_status_state == {}
+    assert adapter._run_status_nonce_by_key == {}
+    assert adapter._status_message_ids == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_serializes_with_status_refresh_without_orphaning_nonce(adapter):
+    adapter.send.return_value = SendResult(success=True, message_id="100")
+    adapter.edit_message.return_value = SendResult(success=True, message_id="100")
+    stop = AsyncMock(return_value="Stopped")
+    validation_started = asyncio.Event()
+    release_validation = asyncio.Event()
+
+    async def _is_current():
+        validation_started.set()
+        await release_validation.wait()
+        return True
+
+    await adapter.send_or_update_status(
+        "123", "run", "Working", metadata={"thread_id": "7"},
+        session_key="session-a", owner_user_id="owner", operation_id="op-a",
+        on_stop=stop, is_state_current=_is_current,
+    )
+    markup = adapter._bot.edit_message_reply_markup.call_args.kwargs["reply_markup"]
+    callback_data = markup.inline_keyboard[0][0].callback_data
+    query = _stop_query()
+    stop_task = asyncio.create_task(
+        adapter._handle_run_status_callback(query, callback_data)
+    )
+    await validation_started.wait()
+    refresh_task = asyncio.create_task(
+        adapter.send_or_update_status(
+            "123", "run", "Still working", metadata={"thread_id": "7"},
+            session_key="session-a", owner_user_id="owner", operation_id="op-a",
+            on_stop=stop, is_state_current=_is_current,
+        )
+    )
+    await asyncio.sleep(0.01)
+    release_validation.set()
+    await asyncio.gather(stop_task, refresh_task)
+
+    stop.assert_awaited_once_with()
+    assert adapter._run_status_state == {}
+    assert adapter._run_status_nonce_by_key == {}
+    assert adapter._status_message_ids == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_rejects_foreign_user_and_stale_generation(adapter):
+    adapter.send.return_value = SendResult(success=True, message_id="100")
+    stop = AsyncMock(return_value="Stopped")
+    current = AsyncMock(return_value=False)
+    await adapter.send_or_update_status(
+        "123", "run", "Working", metadata={"thread_id": "7"},
+        session_key="session-a", owner_user_id="owner", operation_id="op-a",
+        on_stop=stop, is_state_current=current,
+    )
+    markup = adapter._bot.edit_message_reply_markup.call_args.kwargs["reply_markup"]
+    callback_data = markup.inline_keyboard[0][0].callback_data
+    nonce = callback_data.split(":")[1]
+
+    foreign_query = _stop_query(user_id="foreign")
+    await adapter._handle_run_status_callback(foreign_query, callback_data)
+    stop.assert_not_awaited()
+    current.assert_not_awaited()
+    assert nonce in adapter._run_status_state
+
+    owner_query = _stop_query()
+    order = []
+
+    async def _answer(**_kwargs):
+        order.append("ack")
+
+    async def _current():
+        order.append("validator")
+        return False
+
+    owner_query.answer.side_effect = _answer
+    adapter._run_status_state[nonce]["is_state_current"] = _current
+    await adapter._handle_run_status_callback(owner_query, callback_data)
+
+    assert order == ["ack", "validator"]
+    stop.assert_not_awaited()
+    assert nonce not in adapter._run_status_state
+
+
+@pytest.mark.asyncio
+async def test_clear_run_status_expires_stop_button(adapter):
+    adapter.send.return_value = SendResult(success=True, message_id="100")
+    stop = AsyncMock(return_value="Stopped")
+    await adapter.send_or_update_status(
+        "123", "run", "Working", metadata={"thread_id": "7"},
+        session_key="session-a", owner_user_id="owner", operation_id="op-a",
+        on_stop=stop,
+    )
+    markup = adapter._bot.edit_message_reply_markup.call_args.kwargs["reply_markup"]
+    callback_data = markup.inline_keyboard[0][0].callback_data
+
+    assert await adapter.clear_run_status(
+        "123", "session-a", "op-a", metadata={"thread_id": "7"}
+    )
+    await adapter._handle_run_status_callback(_stop_query(), callback_data)
+
+    stop.assert_not_awaited()
+    assert adapter._run_status_state == {}
+    assert adapter._status_message_ids == {}

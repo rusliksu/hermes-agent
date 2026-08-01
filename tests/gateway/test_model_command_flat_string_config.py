@@ -11,6 +11,10 @@ before mutation, so ``--global`` succeeds and the config is rewritten in
 the proper ``model: {default: ..., provider: ...}`` form.
 """
 
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import yaml
 import pytest
 
@@ -29,11 +33,11 @@ def _make_runner():
     return runner
 
 
-def _make_event(text):
+def _make_event(text, *, platform=Platform.TELEGRAM):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=SessionSource(platform=platform, chat_id="12345", chat_type="dm"),
     )
 
 
@@ -159,11 +163,110 @@ async def test_model_global_persists_when_config_has_proper_dict_model(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_model_no_flag_persists_by_default(tmp_path, monkeypatch):
-    """A plain ``/model X`` (no --global) now persists to config.yaml.
+async def test_model_global_write_failure_leaves_runtime_state_unchanged(
+    tmp_path, monkeypatch
+):
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *args, **kwargs: None,
+    )
 
-    This is the user-facing fix: switching models in one session survives
-    into the next without re-typing the switch every time.
+    runner = _make_runner()
+    event = _make_event("/model gpt-5.5 --global")
+    session_key = runner._session_key_for_source(event.source)
+    old_override = {"model": "session-old", "provider": "openai-codex"}
+    runner._session_model_overrides[session_key] = dict(old_override)
+    runner._pending_model_notes = {session_key: "old note"}
+
+    class _CachedAgent:
+        switch_calls = 0
+
+        def switch_model(self, **kwargs):
+            self.switch_calls += 1
+
+    cached_agent = _CachedAgent()
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {session_key: [cached_agent, None]}
+    update_session_model = AsyncMock()
+    runner._session_db = SimpleNamespace(
+        update_session_model=update_session_model
+    )
+    evicted = []
+    runner._evict_cached_agent = lambda key: evicted.append(key)
+
+    write_attempts = []
+
+    def _fail_write(path, config):
+        write_attempts.append((path, config))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "gateway.slash_commands.atomic_config_write", _fail_write
+    )
+
+    reply = await runner._handle_model_command(event)
+
+    assert "disk full" in reply
+    assert "Saved to config.yaml" not in reply
+    assert len(write_attempts) == 1
+    assert cached_agent.switch_calls == 0
+    assert runner._session_model_overrides[session_key] == old_override
+    assert runner._pending_model_notes[session_key] == "old note"
+    update_session_model.assert_not_awaited()
+    assert evicted == []
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_model_global_success_evicts_without_inplace_cached_switch(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openai-codex"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *args, **kwargs: None,
+    )
+
+    runner = _make_runner()
+    event = _make_event("/model gpt-5.5 --global")
+    session_key = runner._session_key_for_source(event.source)
+
+    class _CachedAgent:
+        switch_calls = 0
+
+        def switch_model(self, **kwargs):
+            self.switch_calls += 1
+            raise AssertionError("global switch must rebuild, not swap in place")
+
+    cached_agent = _CachedAgent()
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {session_key: [cached_agent, None]}
+    evicted = []
+    runner._evict_cached_agent = lambda key: evicted.append(key)
+
+    reply = await runner._handle_model_command(event)
+
+    assert "Saved to config.yaml" in reply
+    assert cached_agent.switch_calls == 0
+    assert evicted == [session_key]
+
+
+@pytest.mark.asyncio
+async def test_model_no_flag_keeps_non_telegram_default(tmp_path, monkeypatch):
+    """A plain non-Telegram ``/model X`` keeps the legacy global default.
+
+    Telegram intentionally defaults to topic scope; the other adapters retain
+    their pre-existing persistence behavior.
     """
     cfg_path = _setup_isolated_home(
         tmp_path,
@@ -172,7 +275,7 @@ async def test_model_no_flag_persists_by_default(tmp_path, monkeypatch):
     )
 
     result = await _make_runner()._handle_model_command(
-        _make_event("/model gpt-5.5")
+        _make_event("/model gpt-5.5", platform=Platform.DISCORD)
     )
 
     assert result is not None

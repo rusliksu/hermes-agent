@@ -143,20 +143,67 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
 
 
 @pytest.mark.asyncio
-async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
+async def test_handle_fast_command_global_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    runner._resolve_session_agent_runtime = MagicMock(return_value=("gpt-5.4", {}))
 
-    response = await runner._handle_fast_command(_make_event("/fast fast"))
+    response = await runner._handle_fast_command(_make_event("/fast fast --global"))
 
     assert "FAST" in response
     assert runner._service_tier == "priority"
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_handle_fast_command_defaults_to_session_and_rejects_topic(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4"
+    )
+    runner._resolve_session_agent_runtime = MagicMock(return_value=("gpt-5.4", {}))
+    source = _make_source()
+    session_key = runner._session_key_for_source(source)
+
+    response = await runner._handle_fast_command(_make_event("/fast fast"))
+
+    assert "FAST" in response
+    assert runner._session_service_tier_overrides[session_key] == "priority"
+    assert not (tmp_path / "config.yaml").exists()
+
+    rejected = await runner._handle_fast_command(_make_event("/fast normal --topic"))
+    assert "not supported" in rejected
+    assert runner._session_service_tier_overrides[session_key] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_fast_support_uses_effective_rehydrated_session_model(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    effective_runtime = MagicMock(return_value=("gpt-5.4", {}))
+    runner._resolve_session_agent_runtime = effective_runtime
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_gateway_model",
+        lambda config=None: "gpt-5.3-codex",
+    )
+
+    response = await runner._handle_fast_command(_make_event("/fast fast"))
+
+    assert "FAST" in response
+    effective_runtime.assert_called_once()
 
 
 @pytest.mark.asyncio

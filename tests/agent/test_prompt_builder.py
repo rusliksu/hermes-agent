@@ -1642,6 +1642,12 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_guidance_allows_direct_elementary_arithmetic(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "non-trivial arithmetic" in text
+        assert "elementary mental arithmetic directly" in text
+        assert "- arithmetic, math, calculations" not in text
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -1699,5 +1705,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
