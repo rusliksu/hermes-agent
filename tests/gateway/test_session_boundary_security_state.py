@@ -194,6 +194,22 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
 
 
 @pytest.mark.asyncio
+async def test_branch_clears_only_current_session_fast_override():
+    runner, session_key = _make_branch_runner()
+    other_key = "agent:main:telegram:dm:other-chat"
+    runner._session_service_tier_overrides = {
+        session_key: "priority",
+        other_key: "priority",
+    }
+
+    result = await runner._handle_branch_command(_make_event("/branch"))
+
+    assert "Branched to" in result
+    assert session_key not in runner._session_service_tier_overrides
+    assert runner._session_service_tier_overrides[other_key] == "priority"
+
+
+@pytest.mark.asyncio
 async def test_branch_preserves_persisted_assistant_metadata():
     runner, _session_key = _make_branch_runner()
     runner.session_store.load_transcript.return_value = [

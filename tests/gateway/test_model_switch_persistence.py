@@ -118,14 +118,14 @@ class TestApplySessionModelOverride:
         assert model == orig_model
         assert rt == orig_rt
 
-    def test_none_values_do_not_overwrite(self):
-        """Override with None api_key/base_url should preserve config defaults."""
+    def test_same_provider_none_values_do_not_overwrite(self):
+        """A partial override may reuse transport state from the same provider."""
         runner = _make_runner()
         sk = build_session_key(_make_source())
 
         runner._session_model_overrides[sk] = {
             "model": "gpt-5.4",
-            "provider": "openai",
+            "provider": "anthropic",
             "api_key": None,
             "base_url": None,
             "api_mode": "chat_completions",
@@ -138,10 +138,42 @@ class TestApplySessionModelOverride:
         )
 
         assert model == "gpt-5.4"
-        assert rt["provider"] == "openai"
+        assert rt["provider"] == "anthropic"
         assert rt["api_key"] == "ant-key"  # preserved — None didn't overwrite
         assert rt["base_url"] == "https://api.anthropic.com"  # preserved
         assert rt["api_mode"] == "chat_completions"  # overwritten (not None)
+
+    def test_cross_provider_none_values_clear_global_transport(self):
+        """A partial override must not inherit another provider's credentials."""
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+
+        runner._session_model_overrides[sk] = {
+            "model": "gpt-5.4",
+            "provider": "openai",
+            "api_key": None,
+            "base_url": None,
+            "api_mode": None,
+            "credential_pool": None,
+        }
+
+        _, rt = runner._apply_session_model_override(
+            sk,
+            "anthropic/claude-sonnet-4",
+            {
+                "provider": "anthropic",
+                "api_key": "ant-key",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+                "credential_pool": {"anthropic": ["account"]},
+            },
+        )
+
+        assert rt["provider"] == "openai"
+        assert rt["api_key"] is None
+        assert rt["base_url"] is None
+        assert rt["api_mode"] is None
+        assert rt["credential_pool"] is None
 
     def test_empty_string_overwrites(self):
         """Empty string is not None — it should overwrite the config value."""

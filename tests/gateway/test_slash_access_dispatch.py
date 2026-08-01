@@ -35,6 +35,7 @@ def _make_source(
     user_id: str = "user1",
     chat_type: str = "dm",
     chat_id: str = "c1",
+    thread_id: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=platform,
@@ -42,6 +43,7 @@ def _make_source(
         chat_id=chat_id,
         user_name=f"name-{user_id}",
         chat_type=chat_type,
+        thread_id=thread_id,
     )
 
 
@@ -184,6 +186,37 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
     # /whoami still works (always-allowed floor)
     whoami_result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
     assert "Tier: user" in whoami_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["settings", "model", "reasoning", "fast"])
+async def test_shared_topic_typed_global_lane_control_is_denied(command):
+    from gateway.single_principal import SinglePrincipalPolicy
+
+    policy = SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": "10001",
+            "telegram_shared_chat_ids": ["-10001"],
+        }
+    )
+    runner = _make_runner(platform=Platform.TELEGRAM)
+    runner._single_principal_policy = policy
+    runner.config.single_principal = policy
+    source = _make_source(
+        platform=Platform.TELEGRAM,
+        user_id="10001",
+        chat_type="group",
+        chat_id="-10001",
+        thread_id="31",
+    )
+
+    result = await runner._handle_message(
+        _make_event(f"/{command} --global", source)
+    )
+
+    assert result is not None
+    assert "unavailable in shared chats" in result
 
 
 # ---------------------------------------------------------------------------

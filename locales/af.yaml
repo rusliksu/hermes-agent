@@ -128,6 +128,17 @@ gateway:
     choice_fast:           "fast — Priority Processing aan"
     choice_normal:         "normal — standaardverwerking"
 
+  settings:
+    card:                  "⚙️ **Chat Settings**\n\n**Model:** `{model}`\n**Reasoning:** `{reasoning}`\n**Fast API:** `{fast}`\n**Scope:** this Telegram topic\n\nChoose one setting. Model and reasoning are saved for this topic; Fast API resets on `/new`."
+    text_fallback:         "⚙️ Current settings\nModel: `{model}`\nReasoning: `{reasoning}`\nFast API: `{fast}`\n\nThis platform cannot show the settings card. Use `/model`, `/reasoning`, and `/fast`."
+    action_all_models:     "All models…"
+    action_advanced:       "advanced"
+    action_fast_on:        "Fast API: on"
+    action_fast_off:       "Fast API: off"
+    action_close:          "Close"
+    stale:                 "Settings expired — run /settings again."
+    error:                 "Could not update the setting: {error}"
+
   footer:
     status:                "📎 Looptyd-voetstuk: **{state}**\nVelde: `{fields}`\nPlatform: `{platform}`"
     usage:                 "Gebruik: `/footer [on|off|status]`"

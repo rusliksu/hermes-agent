@@ -14,6 +14,7 @@ These tests pin the typed path:
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -106,7 +107,9 @@ async def test_typed_model_expensive_prompts_instead_of_switching(tmp_path, monk
 
     runner._request_slash_confirm = _fake_request_slash_confirm
 
-    result = await runner._handle_model_command(_make_event("/model openai/gpt-5.5-pro"))
+    result = await runner._handle_model_command(
+        _make_event("/model openai/gpt-5.5-pro --session")
+    )
 
     assert result is not None
     assert "EXPENSIVE MODEL WARNING" in result
@@ -130,7 +133,9 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
 
     runner._request_slash_confirm = _fake_request_slash_confirm
 
-    await runner._handle_model_command(_make_event("/model openai/gpt-5.5-pro"))
+    await runner._handle_model_command(
+        _make_event("/model openai/gpt-5.5-pro --session")
+    )
     assert runner._session_model_overrides == {}
 
     reply = await captured["handler"]("once")
@@ -178,7 +183,9 @@ async def test_typed_model_cheap_switches_without_prompt(tmp_path, monkeypatch):
 
     runner._request_slash_confirm = _fail_request_slash_confirm
 
-    result = await runner._handle_model_command(_make_event("/model openai/gpt-5.5-pro"))
+    result = await runner._handle_model_command(
+        _make_event("/model openai/gpt-5.5-pro --session")
+    )
 
     assert result is not None
     assert "gpt-5.5-pro" in result
@@ -223,7 +230,9 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     evicted = []
     runner._evict_cached_agent = lambda sk: evicted.append(sk)
 
-    result = await runner._handle_model_command(_make_event("/model openai/gpt-5.5-pro"))
+    result = await runner._handle_model_command(
+        _make_event("/model openai/gpt-5.5-pro --session")
+    )
 
     # Error surfaced to the user, not a success confirmation.
     assert result is not None
@@ -234,3 +243,52 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     assert evicted == []
     # The agent stayed on its old model (rolled back).
     assert agent.model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_typed_session_store_failure_does_not_publish_partial_switch(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_topic_preferences=AsyncMock(return_value={}),
+        set_model_override=AsyncMock(side_effect=OSError("session persist failed")),
+    )
+    event = _make_event("/model openai/gpt-5.5-pro --session")
+    session_key = runner._session_key_for_source(event.source)
+    runner._pending_model_notes = {session_key: "old note"}
+
+    class _CachedAgent:
+        def __init__(self):
+            self.switch_calls = 0
+
+        def switch_model(self, **_kwargs):
+            self.switch_calls += 1
+
+    import threading
+
+    cached_agent = _CachedAgent()
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {session_key: [cached_agent, None]}
+    update_session_model = AsyncMock()
+    runner._session_db = SimpleNamespace(update_session_model=update_session_model)
+    evicted = []
+
+    def _evict(key):
+        evicted.append(key)
+        runner._agent_cache.pop(key, None)
+
+    runner._evict_cached_agent = _evict
+
+    reply = await runner._handle_model_command(event)
+
+    assert "session persist failed" in reply
+    assert runner._session_model_overrides == {}
+    assert runner._pending_model_notes[session_key] == "old note"
+    update_session_model.assert_not_awaited()
+    assert cached_agent.switch_calls == 1
+    assert evicted == [session_key]
+    assert session_key not in runner._agent_cache

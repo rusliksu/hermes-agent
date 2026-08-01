@@ -42,6 +42,13 @@ def _make_runner():
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    runner.session_store = types.SimpleNamespace(
+        get_topic_preferences=lambda _source: {}
+    )
+    runner._async_session_store = types.SimpleNamespace(
+        _store=runner.session_store,
+        update_topic_preferences=AsyncMock(),
+    )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     return runner
 
@@ -104,6 +111,7 @@ class TestReasoningCommand:
         result = await runner._handle_reasoning_command(_make_event("/reasoning"))
 
         assert "**Effort:** `none (disabled)`" in result
+        assert "**Scope:** global config" in result
         assert "**Display:** on ✓" in result
         assert runner._reasoning_config == {"enabled": False}
         assert runner._show_reasoning is True
@@ -137,7 +145,7 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        event = _make_event("/reasoning high")
+        event = _make_event("/reasoning high --session")
         session_key = runner._session_key_for_source(event.source)
 
         result = await runner._handle_reasoning_command(event)
@@ -147,6 +155,29 @@ class TestReasoningCommand:
         assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "high"}
         assert runner._reasoning_config == {"enabled": True, "effort": "high"}
         assert "session only" in result
+
+    @pytest.mark.asyncio
+    async def test_handle_reasoning_command_defaults_to_topic_on_telegram(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: medium\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        event = _make_event("/reasoning high")
+        session_key = runner._session_key_for_source(event.source)
+
+        result = await runner._handle_reasoning_command(event)
+
+        runner._async_session_store.update_topic_preferences.assert_awaited_once_with(
+            event.source, reasoning_effort="high"
+        )
+        assert session_key not in runner._session_reasoning_overrides
+        assert "topic" in result
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])
@@ -161,7 +192,7 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        event = _make_event(f"/reasoning {effort}")
+        event = _make_event(f"/reasoning {effort} --session")
         session_key = runner._session_key_for_source(event.source)
 
         await runner._handle_reasoning_command(event)
@@ -202,7 +233,7 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        event = _make_event("/reasoning reset")
+        event = _make_event("/reasoning reset --session")
         session_key = runner._session_key_for_source(event.source)
         runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "xhigh"}
 

@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -101,6 +101,195 @@ class GatewaySlashCommandsMixin:
         """
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
+
+    @staticmethod
+    def _parse_gateway_scope_args(
+        raw_args: str,
+        *,
+        default_scope: str,
+        allowed_scopes: tuple[str, ...] = ("session", "topic", "global"),
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Strip one mutually-exclusive scope flag from gateway command args."""
+        text = re.sub(
+            r"[\u2012\u2013\u2014\u2015](session|topic|global)",
+            r"--\1",
+            str(raw_args or ""),
+        )
+        try:
+            tokens = shlex.split(text)
+        except ValueError:
+            tokens = text.split()
+        scope_tokens = [
+            token[2:]
+            for token in tokens
+            if token in {"--session", "--topic", "--global"}
+        ]
+        distinct = set(scope_tokens)
+        if len(distinct) > 1:
+            return "", None, "Use only one scope flag: --session, --topic, or --global."
+        scope = scope_tokens[0] if scope_tokens else default_scope
+        if scope not in allowed_scopes:
+            return "", None, f"--{scope} is not supported for this command."
+        cleaned = " ".join(
+            token
+            for token in tokens
+            if token not in {"--session", "--topic", "--global"}
+        ).strip()
+        return cleaned, scope, None
+
+    @staticmethod
+    def _persist_global_model_selection(config_path: Path, result: Any) -> None:
+        """Atomically persist one resolved global model selection.
+
+        This is deliberately the single config write path shared by typed and
+        picker switches. The scope commit coordinator owns rollback and orders
+        live state publication after this write succeeds.
+        """
+        import yaml
+
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as config_file:
+                config = yaml.safe_load(config_file) or {}
+        else:
+            config = {}
+        if not isinstance(config, dict):
+            raise ValueError("config.yaml root must be a mapping")
+
+        raw_model = config.get("model")
+        if isinstance(raw_model, dict):
+            model_config = raw_model
+        elif isinstance(raw_model, str) and raw_model.strip():
+            model_config = {"default": raw_model.strip()}
+            config["model"] = model_config
+        else:
+            model_config = {}
+            config["model"] = model_config
+
+        model_config["default"] = result.new_model
+        model_config["provider"] = result.target_provider
+        is_custom_target = (
+            str(result.target_provider or "").strip().lower() == "custom"
+        )
+        if result.base_url:
+            model_config["base_url"] = result.base_url
+        elif is_custom_target:
+            model_config.pop("base_url", None)
+        if is_custom_target:
+            if result.api_mode:
+                model_config["api_mode"] = result.api_mode
+            else:
+                model_config.pop("api_mode", None)
+        else:
+            clear_model_endpoint_credentials(model_config, clear_base_url=True)
+
+        atomic_config_write(config_path, config)
+
+    async def _apply_model_scope(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        override: dict,
+        scope: str,
+        persist_global: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Persist a resolved model selection at exactly one requested scope."""
+        async_store = None
+        if getattr(self, "session_store", None) is not None:
+            async_store = self.async_session_store
+        if scope == "topic":
+            if async_store is None:
+                raise RuntimeError("Topic preference store is unavailable")
+            await async_store.update_topic_preferences(
+                source, model_override=override
+            )
+            return
+        if scope == "session":
+            if async_store is not None:
+                creator = getattr(async_store, "get_or_create_session", None)
+                if callable(creator):
+                    session_entry = await creator(source)
+                    if getattr(session_entry, "was_auto_reset", False):
+                        session_entry.was_auto_reset = False
+                await async_store.set_model_override(session_key, override)
+            self._session_model_overrides[session_key] = dict(override)
+            return
+        # A global write should not be masked by an older legacy session
+        # override. A durable topic preference intentionally remains higher
+        # priority, per the explicit topic > session > global contract.
+        if persist_global is None:
+            raise RuntimeError("Global model persistence callback is unavailable")
+        commit_lock = getattr(self, "_global_model_commit_lock", None)
+        if commit_lock is None:
+            commit_lock = asyncio.Lock()
+            self._global_model_commit_lock = commit_lock
+        async with commit_lock:
+            previous_override = None
+            clear_attempted = False
+            if async_store is not None:
+                previous_override = await async_store.get_model_override(
+                    session_key
+                )
+            try:
+                if async_store is not None:
+                    clear_attempted = True
+                    await async_store.set_model_override(session_key, None)
+                persist_global()
+            except Exception:
+                if async_store is not None and clear_attempted:
+                    try:
+                        await async_store.set_model_override(
+                            session_key, previous_override
+                        )
+                    except Exception:
+                        logger.error(
+                            "Failed to restore session model override after global commit failure",
+                            exc_info=True,
+                        )
+                raise
+            self._session_model_overrides.pop(session_key, None)
+
+    async def _build_picker_session_validator(self, session_key: str):
+        """Bind a picker callback to the transcript active when it was sent."""
+        store = getattr(self, "session_store", None)
+        if store is None or not callable(getattr(store, "peek_session_id", None)):
+            return None
+        async_store = self.async_session_store
+        try:
+            expected_session_id = await async_store.peek_session_id(session_key)
+        except Exception:
+            logger.debug("Failed to bind picker to session %s", session_key, exc_info=True)
+            return None
+
+        async def _is_state_current() -> bool:
+            try:
+                return (
+                    await async_store.peek_session_id(session_key)
+                    == expected_session_id
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to validate picker session %s", session_key, exc_info=True
+                )
+                return False
+
+        return _is_state_current
+
+    async def _prewarm_topic_preferences_for_source(
+        self, source: SessionSource
+    ) -> dict:
+        """Warm a lane's preference cache without SQLite I/O on the event loop."""
+        if getattr(self, "session_store", None) is None:
+            return {}
+        try:
+            return await self.async_session_store.get_topic_preferences(source)
+        except Exception:
+            logger.debug(
+                "Failed to prewarm topic preferences for %s",
+                source.platform.value,
+                exc_info=True,
+            )
+            return {}
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
@@ -207,6 +396,7 @@ class GatewaySlashCommandsMixin:
         # picks up configured defaults instead of previous session switches.
         self._session_model_overrides.pop(session_key, None)
         self._set_session_reasoning_override(session_key, None)
+        self._set_session_service_tier_override(session_key, None, clear=True)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
@@ -1460,7 +1650,6 @@ class GatewaySlashCommandsMixin:
           /model --provider <provider>        — switch to provider, auto-detect model
         """
         from gateway.run import _hermes_home, _load_gateway_config
-        import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
             resolve_persist_behavior,
@@ -1477,15 +1666,33 @@ class GatewaySlashCommandsMixin:
                 self, "_resolve_profile_home_for_source"
             )(source)
 
-        # Parse --provider, --global, --session, and --refresh flags
+        # Gateway scope is explicit and independent from the CLI persistence
+        # default. Telegram model changes default to the current topic lane.
+        legacy_default_scope = (
+            "global"
+            if resolve_persist_behavior(False, False)
+            else "session"
+        )
+        scoped_args, scope, scope_error = self._parse_gateway_scope_args(
+            raw_args,
+            default_scope=(
+                "topic"
+                if source.platform == Platform.TELEGRAM
+                else legacy_default_scope
+            ),
+        )
+        if scope_error:
+            return scope_error
+
+        # Parse --provider and --refresh after removing gateway scope flags.
         (
             model_input,
             explicit_provider,
-            is_global_flag,
+            _is_global_flag,
             force_refresh,
-            is_session,
-        ) = parse_model_flags(raw_args)
-        persist_global = resolve_persist_behavior(is_global_flag, is_session)
+            _is_session,
+        ) = parse_model_flags(scoped_args)
+        persist_global = scope == "global"
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1526,8 +1733,12 @@ class GatewaySlashCommandsMixin:
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        await self._prewarm_topic_preferences_for_source(source)
         session_key = self._session_key_for_source(source)
-        override = self._session_model_overrides.get(session_key, {})
+        topic_override = self._topic_preferences_for_source(source).get(
+            "model_override"
+        )
+        override = topic_override or self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
@@ -1571,6 +1782,7 @@ class GatewaySlashCommandsMixin:
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
                     _picker_profile_home = _command_profile_home
+                    _picker_source = source
 
                     async def _on_model_selected_scoped(
                         _chat_id: str, model_id: str, provider_slug: str
@@ -1614,14 +1826,21 @@ class GatewaySlashCommandsMixin:
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
-                        # Update cached agent in-place
+                        # Session/topic switches validate against the live
+                        # client before committing. Global switches rebuild
+                        # from durable config instead of swapping in place.
                         cached_entry = None
+                        cached_switched = False
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
                         _cache = getattr(_self, "_agent_cache", None)
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
-                        if cached_entry and cached_entry[0] is not None:
+                        if (
+                            scope != "global"
+                            and cached_entry
+                            and cached_entry[0] is not None
+                        ):
                             try:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
@@ -1630,6 +1849,7 @@ class GatewaySlashCommandsMixin:
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
                                 )
+                                cached_switched = True
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
                                 # OLD working model/client and re-raised.  Abort
@@ -1651,6 +1871,39 @@ class GatewaySlashCommandsMixin:
                                     ),
                                 )
 
+                        _new_override = {
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                            "api_key": result.api_key,
+                            "base_url": result.base_url,
+                            "api_mode": result.api_mode,
+                        }
+                        try:
+                            await _self._apply_model_scope(
+                                source=_picker_source,
+                                session_key=_session_key,
+                                override=_new_override,
+                                scope=scope,
+                                persist_global=(
+                                    lambda: _self._persist_global_model_selection(
+                                        config_path, result
+                                    )
+                                ) if scope == "global" else None,
+                            )
+                        except Exception as exc:
+                            if cached_switched:
+                                _self._evict_cached_agent(_session_key)
+                            logger.debug(
+                                "Failed to persist model scope override",
+                                exc_info=True,
+                            )
+                            error = (
+                                f"Could not save global model selection: {exc}"
+                                if scope == "global"
+                                else str(exc)
+                            )
+                            return t("gateway.model.error_prefix", error=error)
+
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
                         _sess_db = getattr(_self, "_session_db", None)
@@ -1667,7 +1920,7 @@ class GatewaySlashCommandsMixin:
                                     "Failed to persist model switch to DB: %s", exc
                                 )
 
-                        # Store model note + session override
+                        # Store a model note only after the scope commit.
                         if not hasattr(_self, "_pending_model_notes"):
                             _self._pending_model_notes = {}
                         _self._pending_model_notes[_session_key] = (
@@ -1675,77 +1928,10 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
-
-                        # Write-through the non-secret parts to the session
-                        # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
-                            )
-
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
                         _self._evict_cached_agent(_session_key)
-
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
-                        if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                # Named providers always resolve base_url/api_mode fresh,
-                                # so any leftover is cleared unconditionally below. Custom
-                                # providers have no registry entry to re-derive from, so
-                                # they need an explicit set-or-clear here — the previous
-                                # lone `if result.base_url:` left a stale base_url behind
-                                # when switching to a custom provider whose resolver
-                                # returned an empty base_url (#25107).
-                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                elif _is_custom_target:
-                                    _persist_model_cfg.pop("base_url", None)
-                                if _is_custom_target:
-                                    if result.api_mode:
-                                        _persist_model_cfg["api_mode"] = result.api_mode
-                                    else:
-                                        _persist_model_cfg.pop("api_mode", None)
-                                else:
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1780,8 +1966,10 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
                         if result.warning_message:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
-                        if persist_global:
+                        if scope == "global":
                             lines.append(t("gateway.model.saved_global"))
+                        elif scope == "topic":
+                            lines.append("Saved for this topic. Use --session or --global to choose another scope.")
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
@@ -1801,17 +1989,32 @@ class GatewaySlashCommandsMixin:
                             )
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    result = await adapter.send_model_picker(
-                        chat_id=source.chat_id,
-                        providers=providers,
-                        current_model=current_model,
-                        current_provider=current_provider,
-                        session_key=session_key,
-                        on_model_selected=_on_model_selected,
-                        metadata=metadata,
-                    )
-                    if result.success:
-                        return None  # Picker sent — adapter handles the response
+                    picker_security_kwargs = {}
+                    if source.platform == Platform.TELEGRAM:
+                        state_validator = await self._build_picker_session_validator(
+                            session_key
+                        )
+                        if state_validator is None:
+                            picker_security_kwargs = None
+                        else:
+                            picker_security_kwargs = {
+                                "initiator_user_id": source.user_id,
+                                "is_state_current": state_validator,
+                                "allow_shared_lane_control": scope != "global",
+                            }
+                    if picker_security_kwargs is not None:
+                        result = await adapter.send_model_picker(
+                            chat_id=source.chat_id,
+                            providers=providers,
+                            current_model=current_model,
+                            current_provider=current_provider,
+                            session_key=session_key,
+                            on_model_selected=_on_model_selected,
+                            metadata=metadata,
+                            **picker_security_kwargs,
+                        )
+                        if result.success:
+                            return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
@@ -1889,15 +2092,21 @@ class GatewaySlashCommandsMixin:
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
-            # If there's a cached agent, update it in-place
+            # Session/topic switches can validate against the live client. A
+            # global switch rebuilds after the durable config commit instead.
             cached_entry = None
+            cached_switched = False
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
-            if cached_entry and cached_entry[0] is not None:
+            if (
+                scope != "global"
+                and cached_entry
+                and cached_entry[0] is not None
+            ):
                 try:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
@@ -1906,6 +2115,7 @@ class GatewaySlashCommandsMixin:
                         base_url=result.base_url,
                         api_mode=result.api_mode,
                     )
+                    cached_switched = True
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
                     # model/client and re-raised.  Abort the commit: skip DB
@@ -1922,15 +2132,47 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
 
+            model_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            try:
+                await self._apply_model_scope(
+                    source=source,
+                    session_key=session_key,
+                    override=model_override,
+                    scope=scope,
+                    persist_global=(
+                        lambda: self._persist_global_model_selection(
+                            config_path, result
+                        )
+                    ) if scope == "global" else None,
+                )
+            except Exception as exc:
+                if cached_switched:
+                    self._evict_cached_agent(session_key)
+                logger.debug(
+                    "Failed to persist model scope override", exc_info=True
+                )
+                error = (
+                    f"Could not save global model selection: {exc}"
+                    if scope == "global"
+                    else str(exc)
+                )
+                return t("gateway.model.error_prefix", error=error)
+
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
             _sess_db = getattr(self, "_session_db", None)
             if _sess_db is not None:
                 try:
                     _sess_entry = await self.async_session_store.get_or_create_session(source)
-                    # If this session was auto-reset, consume the flag so the
-                    # next regular message's cleanup does not wipe the model
-                    # override just stored below (Closes #48031).
+                    # The session-scope commit already consumes this flag
+                    # before persistence; keep this defensive consume for the
+                    # other scopes and legacy stores (Closes #48031).
                     if getattr(_sess_entry, "was_auto_reset", False):
                         _sess_entry.was_auto_reset = False
                     await _sess_db.update_session_model(
@@ -1951,76 +2193,9 @@ class GatewaySlashCommandsMixin:
                 f"Adjust your self-identification accordingly.]"
             )
 
-            # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "api_key": result.api_key,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-            }
-
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
-            try:
-                await self.async_session_store.set_model_override(
-                    session_key,
-                    self._session_model_overrides[session_key],
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to persist session model override", exc_info=True
-                )
-
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
-
-            # Persist to config (default) unless --session opted out
-            if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    # See the picker handler above for why custom providers need an
-                    # explicit set-or-clear instead of the old lone truthy check (#25107).
-                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    elif _is_custom_target:
-                        model_cfg.pop("base_url", None)
-                    if _is_custom_target:
-                        if result.api_mode:
-                            model_cfg["api_mode"] = result.api_mode
-                        else:
-                            model_cfg.pop("api_mode", None)
-                    else:
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
@@ -2068,8 +2243,10 @@ class GatewaySlashCommandsMixin:
             if result.warning_message:
                 lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
 
-            if persist_global:
+            if scope == "global":
                 lines.append(t("gateway.model.saved_global"))
+            elif scope == "topic":
+                lines.append("Saved for this topic. Use --session or --global to choose another scope.")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 
@@ -2753,12 +2930,13 @@ class GatewaySlashCommandsMixin:
             logger.error("Failed to save config key %s: %s", key_path, e)
             return False
 
-    def _apply_reasoning_selection(
+    async def _apply_reasoning_selection(
         self,
+        source: SessionSource,
         session_key: str,
         platform_key: str,
         value: str,
-        persist_global: bool = False,
+        scope: str,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply.
 
@@ -2785,9 +2963,14 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.display_set_off", platform=platform_key)
 
         if value == "reset":
-            if persist_global:
+            if scope == "global":
                 return t("gateway.reasoning.reset_global_unsupported")
-            self._set_session_reasoning_override(session_key, None)
+            if scope == "topic":
+                await self.async_session_store.update_topic_preferences(
+                    source, reasoning_effort=None
+                )
+            else:
+                self._set_session_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
@@ -2797,7 +2980,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.unknown_arg", arg=value)
 
         self._reasoning_config = parsed
-        if persist_global:
+        if scope == "global":
             if self._save_gateway_config_key("agent.reasoning_effort", value):
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
@@ -2805,6 +2988,13 @@ class GatewaySlashCommandsMixin:
             self._set_session_reasoning_override(session_key, parsed)
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
+
+        if scope == "topic":
+            await self.async_session_store.update_topic_preferences(
+                source, reasoning_effort=value
+            )
+            self._evict_cached_agent(session_key)
+            return f"Reasoning effort `{value}` saved for this topic."
 
         self._set_session_reasoning_override(session_key, parsed)
         self._evict_cached_agent(session_key)
@@ -2845,6 +3035,8 @@ class GatewaySlashCommandsMixin:
         title: str,
         choices: list,
         on_choice_selected,
+        initiator_user_id: Optional[str] = None,
+        allow_shared_lane_control: bool = False,
     ) -> bool:
         """Send an interactive choice picker when the platform supports it.
 
@@ -2863,6 +3055,18 @@ class GatewaySlashCommandsMixin:
             metadata = self._thread_metadata_for_source(
                 event.source, self._reply_anchor_for_event(event)
             )
+            picker_security_kwargs = {}
+            if event.source.platform == Platform.TELEGRAM:
+                state_validator = await self._build_picker_session_validator(
+                    session_key
+                )
+                if state_validator is None:
+                    return False
+                picker_security_kwargs = {
+                    "initiator_user_id": initiator_user_id,
+                    "is_state_current": state_validator,
+                    "allow_shared_lane_control": allow_shared_lane_control,
+                }
             result = await adapter.send_choice_picker(
                 chat_id=event.source.chat_id,
                 title=title,
@@ -2870,11 +3074,232 @@ class GatewaySlashCommandsMixin:
                 session_key=session_key,
                 on_choice_selected=on_choice_selected,
                 metadata=metadata,
+                **picker_security_kwargs,
             )
             return bool(getattr(result, "success", False))
         except Exception as e:
             logger.warning("send_choice_picker failed, falling back to text: %s", e)
             return False
+
+    def _settings_card_payload(
+        self,
+        source: SessionSource,
+        session_key: str,
+    ) -> tuple[str, list[dict]]:
+        """Build the effective Telegram settings card and its next actions."""
+        from gateway.run import _load_gateway_config
+
+        model, _runtime = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=_load_gateway_config(),
+        )
+        reasoning = self._resolve_session_reasoning_config(
+            source=source,
+            session_key=session_key,
+            model=model,
+        )
+        if reasoning is None:
+            effort = "medium"
+        elif reasoning.get("enabled") is False:
+            effort = "none"
+        else:
+            effort = str(reasoning.get("effort") or "medium").lower()
+        reasoning_label = "advanced" if effort == "xhigh" else effort
+
+        tier = self._resolve_session_service_tier(
+            source=source,
+            session_key=session_key,
+        )
+        fast_enabled = tier == "priority"
+        fast_label = (
+            t("gateway.fast.status_fast")
+            if fast_enabled
+            else t("gateway.fast.status_normal")
+        )
+        title = t(
+            "gateway.settings.card",
+            model=model or "unknown",
+            reasoning=reasoning_label,
+            fast=fast_label,
+        )
+        actions = [
+            {
+                "value": "model:gpt-5.6-luna",
+                "label": "Luna",
+                "is_current": model == "gpt-5.6-luna",
+            },
+            {
+                "value": "model:gpt-5.6-terra",
+                "label": "Terra",
+                "is_current": model == "gpt-5.6-terra",
+            },
+            {
+                "value": "model:gpt-5.6-sol",
+                "label": "Sol",
+                "is_current": model == "gpt-5.6-sol",
+            },
+            {
+                "value": "model:all",
+                "label": t("gateway.settings.action_all_models"),
+            },
+            *[
+                {
+                    "value": f"reasoning:{value}",
+                    "label": (
+                        t("gateway.settings.action_advanced")
+                        if value == "xhigh"
+                        else value
+                    ),
+                    "is_current": effort == value,
+                }
+                for value in ("low", "medium", "high", "xhigh")
+            ],
+            {
+                "value": "fast:normal" if fast_enabled else "fast:fast",
+                "label": (
+                    t("gateway.settings.action_fast_off")
+                    if fast_enabled
+                    else t("gateway.settings.action_fast_on")
+                ),
+            },
+            {
+                "value": "close",
+                "label": t("gateway.settings.action_close"),
+                "close": True,
+            },
+        ]
+        return title, actions
+
+    def _settings_text_fallback(
+        self,
+        source: SessionSource,
+        session_key: str,
+    ) -> str:
+        """Render the same effective combination without Telegram controls."""
+        model, _runtime = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=None,
+        )
+        reasoning = self._resolve_session_reasoning_config(
+            source=source,
+            session_key=session_key,
+            model=model,
+        )
+        effort = (
+            "none"
+            if reasoning and reasoning.get("enabled") is False
+            else str((reasoning or {}).get("effort") or "medium")
+        )
+        tier = self._resolve_session_service_tier(
+            source=source, session_key=session_key
+        )
+        return t(
+            "gateway.settings.text_fallback",
+            model=model or "unknown",
+            reasoning="advanced" if effort == "xhigh" else effort,
+            fast=(
+                t("gateway.fast.status_fast")
+                if tier == "priority"
+                else t("gateway.fast.status_normal")
+            ),
+        )
+
+    async def _handle_settings_command(self, event: MessageEvent) -> Optional[str]:
+        """Show a topic-bound Telegram settings hub backed by typed handlers."""
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        await self._prewarm_topic_preferences_for_source(source)
+        session_key = self._session_key_for_source(source)
+        title, actions = self._settings_card_payload(source, session_key)
+
+        adapter = getattr(self, "_adapter_for_source")(source)
+        has_picker = (
+            source.platform == Platform.TELEGRAM
+            and adapter is not None
+            and getattr(type(adapter), "send_settings_picker", None) is not None
+        )
+        if not has_picker:
+            return self._settings_text_fallback(source, session_key)
+
+        synthetic_base = dataclasses.replace(event, source=source)
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+
+        async def _on_settings_action_scoped(_chat_id: str, value: str):
+            result: Optional[str] = None
+            if value.startswith("model:"):
+                target = value.split(":", 1)[1]
+                text = (
+                    "/model --topic"
+                    if target == "all"
+                    else f"/model {target} --provider openai-codex --topic"
+                )
+                result = await self._handle_model_command(
+                    dataclasses.replace(synthetic_base, text=text)
+                )
+            elif value.startswith("reasoning:"):
+                effort = value.split(":", 1)[1]
+                result = await self._handle_reasoning_command(
+                    dataclasses.replace(
+                        synthetic_base,
+                        text=f"/reasoning {effort} --topic",
+                    )
+                )
+            elif value.startswith("fast:"):
+                mode = value.split(":", 1)[1]
+                result = await self._handle_fast_command(
+                    dataclasses.replace(
+                        synthetic_base,
+                        text=f"/fast {mode} --session",
+                    )
+                )
+            else:
+                result = t("gateway.settings.stale")
+
+            refreshed_title, refreshed_actions = self._settings_card_payload(
+                source, session_key
+            )
+            if result:
+                refreshed_title = f"{str(result).strip()}\n\n{refreshed_title}"
+            return {"title": refreshed_title, "actions": refreshed_actions}
+
+        async def _on_settings_action(_chat_id: str, value: str):
+            if profile_home is None:
+                return await _on_settings_action_scoped(_chat_id, value)
+            from gateway.run import _profile_runtime_scope
+
+            with _profile_runtime_scope(profile_home):
+                return await _on_settings_action_scoped(_chat_id, value)
+
+        try:
+            state_validator = await self._build_picker_session_validator(
+                session_key
+            )
+            if state_validator is None:
+                return self._settings_text_fallback(source, session_key)
+            result = await adapter.send_settings_picker(
+                chat_id=source.chat_id,
+                title=title,
+                actions=actions,
+                session_key=session_key,
+                on_action_selected=_on_settings_action,
+                metadata=self._thread_metadata_for_source(
+                    source, self._reply_anchor_for_event(event)
+                ),
+                initiator_user_id=source.user_id,
+                is_state_current=state_validator,
+                allow_shared_lane_control=True,
+            )
+        except Exception as exc:
+            logger.warning("send_settings_picker failed: %s", exc)
+            result = None
+        if result and getattr(result, "success", False):
+            return None
+        return self._settings_text_fallback(source, session_key)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.
@@ -2890,25 +3315,39 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _platform_config_key
 
         raw_args = event.get_command_args().strip()
-        args, persist_global = self._parse_reasoning_command_args(raw_args)
+        args, scope, scope_error = self._parse_gateway_scope_args(
+            raw_args,
+            default_scope=(
+                "topic"
+                if event.source.platform == Platform.TELEGRAM
+                else "session"
+            ),
+        )
+        if scope_error:
+            return scope_error
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        await self._prewarm_topic_preferences_for_source(_reasoning_source)
         session_key = self._session_key_for_source(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
         # config default) so per-model reasoning_overrides display correctly.
+        _topic_preferences = self._topic_preferences_for_source(_reasoning_source)
+        _topic_model = (_topic_preferences.get("model_override") or {}).get("model")
         _session_model = str(
-            ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
+            _topic_model
+            or ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model")
+            or ""
         )
         self._reasoning_config = self._resolve_session_reasoning_config(
-            source=event.source,
+            source=_reasoning_source,
             session_key=session_key,
             model=_session_model,
         )
 
-        if not raw_args:
+        if not args:
             # Show current state
             rc = self._reasoning_config
             if rc is None:
@@ -2925,11 +3364,16 @@ class GatewaySlashCommandsMixin:
                 if self._show_reasoning
                 else t("gateway.reasoning.display_off")
             )
+            has_topic_override = bool(_topic_preferences.get("reasoning_effort"))
             has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
-            scope = (
+            scope_label = (
+                "topic"
+                if has_topic_override
+                else (
                 t("gateway.reasoning.scope_session")
                 if has_session_override
                 else t("gateway.reasoning.scope_global")
+                )
             )
 
             # Interactive picker on platforms that support it (parity with the
@@ -2937,8 +3381,12 @@ class GatewaySlashCommandsMixin:
             _picker_platform_key = _platform_config_key(event.source.platform)
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-                return self._apply_reasoning_selection(
-                    session_key, _picker_platform_key, value
+                return await self._apply_reasoning_selection(
+                    _reasoning_source,
+                    session_key,
+                    _picker_platform_key,
+                    value,
+                    scope,
                 )
 
             picker_sent = await self._try_send_choice_picker(
@@ -2947,11 +3395,13 @@ class GatewaySlashCommandsMixin:
                 title=t(
                     "gateway.reasoning.picker_title",
                     level=level,
-                    scope=scope,
+                    scope=scope_label,
                     display=display_state,
                 ),
                 choices=self._reasoning_picker_choices(current_effort),
                 on_choice_selected=_on_reasoning_choice,
+                initiator_user_id=_reasoning_source.user_id,
+                allow_shared_lane_control=scope != "global",
             )
             if picker_sent:
                 return None  # Picker sent — adapter handles the response
@@ -2959,14 +3409,18 @@ class GatewaySlashCommandsMixin:
             return t(
                 "gateway.reasoning.status",
                 level=level,
-                scope=scope,
+                scope=scope_label,
                 display=display_state,
             )
 
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
-        return self._apply_reasoning_selection(
-            session_key, platform_key, args, persist_global=persist_global
+        return await self._apply_reasoning_selection(
+            _reasoning_source,
+            session_key,
+            platform_key,
+            args,
+            scope,
         )
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:
@@ -3074,40 +3528,71 @@ class GatewaySlashCommandsMixin:
         return out
 
     async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
+        """Handle /fast with transcript scope by default and explicit global scope."""
+        from gateway.run import _load_gateway_config
         from hermes_cli.models import model_supports_fast_mode
 
-        args = event.get_command_args().strip().lower()
-        self._service_tier = self._load_service_tier()
+        raw_args = event.get_command_args().strip().lower()
+        args, scope, scope_error = self._parse_gateway_scope_args(
+            raw_args,
+            default_scope="session",
+            allowed_scopes=("session", "global"),
+        )
+        if scope_error:
+            return scope_error
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        await self._prewarm_topic_preferences_for_source(source)
+        session_key = self._session_key_for_source(source)
+        self._service_tier = self._resolve_session_service_tier(
+            source=source, session_key=session_key
+        )
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
+        model, _runtime = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=user_config,
+        )
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 
         def _apply_fast_selection(value: str) -> str:
             """Apply a /fast argument (typed or picked) and return the reply."""
             if value in {"fast", "on"}:
-                self._service_tier = "priority"
+                tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
             elif value in {"normal", "off"}:
-                self._service_tier = None
+                tier = None
                 saved_value = "normal"
                 label = t("gateway.fast.label_normal")
             else:
                 return t("gateway.fast.unknown_arg", arg=value)
-            if self._save_gateway_config_key("agent.service_tier", saved_value):
-                return t("gateway.fast.saved", label=label)
+
+            self._service_tier = tier
+            if scope == "global":
+                if self._save_gateway_config_key("agent.service_tier", saved_value):
+                    self._set_session_service_tier_override(
+                        session_key, None, clear=True
+                    )
+                    self._evict_cached_agent(session_key)
+                    return t("gateway.fast.saved", label=label)
+                # Preserve the user's requested behavior for this transcript if
+                # the global config write fails.
+                self._set_session_service_tier_override(session_key, tier)
+                self._evict_cached_agent(session_key)
+                return t("gateway.fast.session_only", label=label)
+
+            self._set_session_service_tier_override(session_key, tier)
+            self._evict_cached_agent(session_key)
             return t("gateway.fast.session_only", label=label)
 
         if not args or args == "status":
             is_fast = self._service_tier == "priority"
             status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
-
-            # Interactive picker on platforms that support it.
-            session_key = self._session_key_for_source(event.source)
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
                 return _apply_fast_selection(value)
@@ -3129,6 +3614,8 @@ class GatewaySlashCommandsMixin:
                     },
                 ],
                 on_choice_selected=_on_fast_choice,
+                initiator_user_id=source.user_id,
+                allow_shared_lane_control=scope != "global",
             )
             if picker_sent:
                 return None  # Picker sent — adapter handles the response
@@ -3371,6 +3858,7 @@ class GatewaySlashCommandsMixin:
             from agent.model_metadata import estimate_request_tokens_rough
 
             session_key = self._session_key_for_source(source)
+            await self._prewarm_topic_preferences_for_source(source)
             # Preserve the same platform + stable gateway session identity that a
             # normal gateway turn passes (gateway/run.py main turn), so external
             # context engines bind this temporary compression agent to the
@@ -3516,6 +4004,9 @@ class GatewaySlashCommandsMixin:
                         )
                     session_entry.session_id = new_session_id
                     await self.async_session_store._save()
+                    self._set_session_service_tier_override(
+                        session_key, None, clear=True
+                    )
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
@@ -3893,6 +4384,7 @@ class GatewaySlashCommandsMixin:
         if isinstance(_overrides, dict):
             _overrides.pop(session_key, None)
         self._set_session_reasoning_override(session_key, None)
+        self._set_session_service_tier_override(session_key, None, clear=True)
         _pending_notes = getattr(self, "_pending_model_notes", None)
         if isinstance(_pending_notes, dict):
             _pending_notes.pop(session_key, None)
@@ -4087,6 +4579,7 @@ class GatewaySlashCommandsMixin:
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(session_key)
+        self._set_session_service_tier_override(session_key, None, clear=True)
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)

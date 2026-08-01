@@ -42,8 +42,44 @@ class _PickerAdapter:
         return SendResult(success=self._success, message_id="m1")
 
 
+class _StrictCrossPlatformPickerAdapter:
+    """Mirror the Discord/Matrix choice-picker signature exactly."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send_choice_picker(
+        self,
+        chat_id,
+        title,
+        choices,
+        session_key,
+        on_choice_selected,
+        metadata=None,
+    ):
+        self.calls.append(
+            {
+                "chat_id": chat_id,
+                "title": title,
+                "choices": choices,
+                "session_key": session_key,
+                "on_choice_selected": on_choice_selected,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="m1")
+
+
 class _NoPickerAdapter:
     """Adapter with no choice-picker capability."""
+
+
+class _CurrentSessionStore:
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+    def peek_session_id(self, _session_key):
+        return self.session_id
 
 
 def _make_runner(adapter=None):
@@ -65,6 +101,10 @@ def _make_runner(adapter=None):
     runner._adapter_for_source = lambda source: adapter
     runner._thread_metadata_for_source = lambda source, anchor=None: {}
     runner._reply_anchor_for_event = lambda event: None
+    runner.session_store = _CurrentSessionStore("session-a")
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=("gpt-5.6", {})
+    )
     return runner
 
 
@@ -80,6 +120,7 @@ class TestReasoningChoicePicker:
         assert result is None  # picker sent — adapter owns the response
         assert len(adapter.calls) == 1
         call = adapter.calls[0]
+        assert call["allow_shared_lane_control"] is True
         values = [c["value"] for c in call["choices"]]
         # Full canonical ladder + none + subcommands, in order
         from hermes_constants import VALID_REASONING_EFFORTS
@@ -109,12 +150,50 @@ class TestReasoningChoicePicker:
         assert len(adapter.calls) == 1  # attempted, then fell back
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.MATRIX])
+    async def test_cross_platform_picker_receives_only_supported_kwargs(
+        self, tmp_path, monkeypatch, platform
+    ):
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        adapter = _StrictCrossPlatformPickerAdapter()
+        runner = _make_runner(adapter)
+
+        result = await runner._handle_reasoning_command(
+            _make_event("/reasoning --session", platform=platform)
+        )
+
+        assert result is None
+        assert len(adapter.calls) == 1
+        assert adapter.calls[0]["chat_id"] == "67890"
+
+    @pytest.mark.asyncio
+    async def test_telegram_picker_binding_failure_falls_back_without_sending(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+
+        class _FailingSessionStore(_CurrentSessionStore):
+            def peek_session_id(self, _session_key):
+                raise OSError("session store unavailable")
+
+        runner.session_store = _FailingSessionStore("session-a")
+
+        result = await runner._handle_reasoning_command(_make_event("/reasoning"))
+
+        assert isinstance(result, str)
+        assert adapter.calls == []
+
+    @pytest.mark.asyncio
     async def test_typed_argument_never_sends_picker(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
 
-        result = await runner._handle_reasoning_command(_make_event("/reasoning high"))
+        result = await runner._handle_reasoning_command(
+            _make_event("/reasoning high --session")
+        )
 
         assert isinstance(result, str)
         assert adapter.calls == []
@@ -126,7 +205,7 @@ class TestReasoningChoicePicker:
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
-        event = _make_event("/reasoning")
+        event = _make_event("/reasoning --session")
         session_key = runner._session_key_for_source(event.source)
 
         await runner._handle_reasoning_command(event)
@@ -185,17 +264,36 @@ class TestFastChoicePicker:
         result = await runner._handle_fast_command(_make_event("/fast"))
 
         assert result is None
+        assert adapter.calls[0]["allow_shared_lane_control"] is True
         values = [c["value"] for c in adapter.calls[0]["choices"]]
         assert values == ["fast", "normal"]
 
     @pytest.mark.asyncio
-    async def test_fast_picker_selection_persists_service_tier(self, tmp_path, monkeypatch):
+    async def test_choice_picker_is_bound_to_current_transcript(self, tmp_path, monkeypatch):
         self._patch_fast_support(monkeypatch, tmp_path)
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
-        event = _make_event("/fast")
+        store = _CurrentSessionStore("session-a")
+        runner.session_store = store
+
+        result = await runner._handle_fast_command(_make_event("/fast"))
+
+        assert result is None
+        validator = adapter.calls[0]["is_state_current"]
+        assert validator is not None
+        assert await validator() is True
+        store.session_id = "session-b"
+        assert await validator() is False
+
+    @pytest.mark.asyncio
+    async def test_fast_global_picker_selection_persists_service_tier(self, tmp_path, monkeypatch):
+        self._patch_fast_support(monkeypatch, tmp_path)
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        event = _make_event("/fast --global")
 
         await runner._handle_fast_command(event)
+        assert adapter.calls[0]["allow_shared_lane_control"] is False
         on_choice = adapter.calls[0]["on_choice_selected"]
         await on_choice(event.source.chat_id, "fast")
 

@@ -95,6 +95,7 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
 @pytest.mark.asyncio
 async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
+    runner._prewarm_topic_preferences_for_source = AsyncMock(return_value={})
     runner._run_agent = AsyncMock(return_value={
         "final_response": "[SILENT]",
         "messages": [
@@ -113,6 +114,7 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
     )
 
     assert response == ""
+    runner._prewarm_topic_preferences_for_source.assert_awaited_once()
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]

@@ -70,6 +70,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_SERVICE_TIER_UNSET = object()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -500,7 +501,29 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
-async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
+def _build_auto_reset_notice(reason_text: str) -> str:
+    """Describe a rotated active context without implying archive deletion."""
+    return (
+        f"◐ Session automatically reset ({reason_text}). "
+        "Active context cleared; the previous session was saved.\n"
+        "Use /resume to browse and restore a previous session.\n"
+        "Adjust reset timing in config.yaml under session_reset."
+    )
+
+
+async def _send_or_update_status_coro(
+    adapter,
+    chat_id,
+    status_key,
+    content,
+    metadata,
+    *,
+    session_key=None,
+    owner_user_id=None,
+    operation_id=None,
+    on_stop=None,
+    is_state_current=None,
+):
     """Route a status message through adapter.send_or_update_status when supported.
 
     Issue #30045: adapters that implement send_or_update_status (currently
@@ -509,7 +532,17 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     """
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
-        return await sender(chat_id, status_key, content, metadata=metadata)
+        return await sender(
+            chat_id,
+            status_key,
+            content,
+            metadata=metadata,
+            session_key=session_key,
+            owner_user_id=owner_user_id,
+            operation_id=operation_id,
+            on_stop=on_stop,
+            is_state_current=is_state_current,
+        )
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
@@ -2999,6 +3032,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _startup_restore_in_progress: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -3186,6 +3220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._session_service_tier_overrides: Dict[str, Optional[str]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -4010,9 +4045,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        Priority (highest first): topic preference → legacy session ``/model``
+        override → ``channel_overrides`` → global config/env.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -4021,10 +4055,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 resolved_session_key = None
 
+        topic_override = None
+        if source is not None:
+            preferences = self._topic_preferences_for_source(source)
+            persisted_topic_override = preferences.get("model_override")
+            if persisted_topic_override:
+                topic_override = self._hydrate_persisted_model_override(
+                    persisted_topic_override
+                )
+
         model = _resolve_gateway_model(user_config)
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
-        override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        legacy_override = (
+            self._session_model_overrides.get(resolved_session_key)
+            if resolved_session_key
+            else None
+        )
+        override = topic_override or legacy_override
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -4100,9 +4148,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
 
-        if override and resolved_session_key:
-            model, runtime_kwargs = self._apply_session_model_override(
-                resolved_session_key, model, runtime_kwargs
+        if override:
+            model, runtime_kwargs = self._apply_model_override(
+                override, model, runtime_kwargs
             )
 
         # When the config has no model.default but a provider was resolved
@@ -4149,7 +4197,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        service_tier: Any = _SERVICE_TIER_UNSET,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -4182,8 +4237,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
 
-        service_tier = getattr(self, "_service_tier", None)
-        if not service_tier:
+        effective_service_tier = (
+            getattr(self, "_service_tier", None)
+            if service_tier is _SERVICE_TIER_UNSET
+            else service_tier
+        )
+        if not effective_service_tier:
             route["request_overrides"] = {}
             return route
 
@@ -5127,11 +5186,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides.
+        """Resolve reasoning effort for a session, honoring topic preferences.
 
-        Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
-        ``agent.reasoning_effort``. ``model`` should be the session's
+        Priority: topic preference > legacy session-scoped override > per-model
+        override (``agent.reasoning_overrides``) > global ``agent.reasoning_effort``.
+        ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
         per-model overrides track what the session actually runs — when
         empty, the config's ``model.default`` is used.
@@ -5142,6 +5201,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = self._session_key_for_source(source)
             except Exception:
                 resolved_session_key = None
+
+        if source is not None:
+            effort = self._topic_preferences_for_source(source).get(
+                "reasoning_effort"
+            )
+            if effort:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(effort)
+                if parsed is not None:
+                    return parsed
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
@@ -5162,6 +5232,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+
+    def _topic_preferences_for_source(self, source: SessionSource) -> dict:
+        """Return durable preferences for an already-normalized source."""
+        store = getattr(self, "session_store", None)
+        if store is None or source is None:
+            return {}
+        try:
+            return store.get_topic_preferences(source)
+        except Exception:
+            logger.debug("Failed to read topic preferences", exc_info=True)
+            return {}
+
+    def _resolve_session_service_tier(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve session Fast API override before the global config value."""
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+        overrides = getattr(self, "_session_service_tier_overrides", {}) or {}
+        if resolved_session_key and resolved_session_key in overrides:
+            return overrides[resolved_session_key]
+        return self._load_service_tier()
+
+    def _set_session_service_tier_override(
+        self,
+        session_key: str,
+        service_tier: Optional[str],
+        *,
+        clear: bool = False,
+    ) -> None:
+        """Set priority/normal for one transcript, or clear its override."""
+        if not session_key:
+            return
+        if not hasattr(self, "_session_service_tier_overrides"):
+            self._session_service_tier_overrides = {}
+        if clear:
+            self._session_service_tier_overrides.pop(session_key, None)
+        else:
+            # ``None`` means explicit normal; key presence is significant.
+            self._session_service_tier_overrides[session_key] = service_tier
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -8085,6 +8202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # finalization, /new, and /reset clear them.)
                         self._session_model_overrides.pop(key, None)
                         self._set_session_reasoning_override(key, None)
+                        self._set_session_service_tier_override(key, None, clear=True)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
                         # Clear per-session model cache so a resumed turn
@@ -9729,7 +9847,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
             if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+                _denied = self._check_slash_access(
+                    source,
+                    _cmd_def_inner.name,
+                    command_args=event.get_command_args(),
+                )
                 if _denied is not None:
                     return _denied
 
@@ -10143,7 +10265,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._shared_scope_for_source(source) is not None
             or is_gateway_known_command(canonical)
         ):
-            _denied = self._check_slash_access(source, canonical)
+            _denied = self._check_slash_access(
+                source,
+                canonical,
+                command_args=event.get_command_args(),
+            )
             if _denied is not None:
                 return _denied
 
@@ -10212,8 +10338,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 command="new",
                 title="/new",
                 detail=(
-                    "This starts a fresh session and discards the current "
-                    "conversation history."
+                    "This starts a fresh active context. The current session "
+                    "will be saved in the session archive and can be restored "
+                    "with /resume."
                 ),
                 execute=_do_reset,
             )
@@ -10254,6 +10381,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
+
+        if canonical == "settings":
+            return await self._handle_settings_command(event)
 
         if canonical == "memory":
             return await self._handle_memory_command(event)
@@ -11344,6 +11474,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+        await self._prewarm_topic_preferences_for_source(source)
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
@@ -11455,6 +11586,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # or a queued "/model switched" note.
             self._session_model_overrides.pop(session_key, None)
             self._set_session_reasoning_override(session_key, None)
+            self._set_session_service_tier_override(
+                session_key, None, clear=True
+            )
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
             # Clear per-session model cache so the fresh session resolves
@@ -11558,12 +11692,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             mins = policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
-                        )
+                        notice = _build_auto_reset_notice(reason_text)
                         try:
                             session_info = await asyncio.to_thread(
                                 self._reset_notice_session_info, source
@@ -12362,6 +12491,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="agent-result-compression",
                     )
+                    self._set_session_service_tier_override(
+                        session_key, None, clear=True
+                    )
                 else:
                     logger.info(
                         "Skipping agent-result session split sync for %s because "
@@ -12565,6 +12697,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._evict_cached_agent(session_key)
                 self._session_model_overrides.pop(session_key, None)
                 self._set_session_reasoning_override(session_key, None)
+                self._set_session_service_tier_override(
+                    session_key, None, clear=True
+                )
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
                 # Clear per-session model cache so the post-reset turn
@@ -13079,7 +13214,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     def _check_slash_access(
-        self, source: SessionSource, canonical_cmd: str
+        self,
+        source: SessionSource,
+        canonical_cmd: str,
+        *,
+        command_args: str = "",
     ) -> Optional[str]:
         """Return a denial message if ``source`` cannot run ``canonical_cmd``,
         else None. Used by both the cold and running-agent dispatch paths
@@ -13095,8 +13234,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        if self._shared_scope_for_source(source) is not None:
+        shared_scope = self._shared_scope_for_source(source)
+        if shared_scope is not None:
             if canonical_cmd in {"help", "whoami"}:
+                return None
+            normalized_args = re.sub(
+                r"[\u2012\u2013\u2014\u2015](session|topic|global)",
+                r"--\1",
+                str(command_args or ""),
+            )
+            try:
+                command_tokens = shlex.split(normalized_args)
+            except ValueError:
+                command_tokens = normalized_args.split()
+            if (
+                shared_scope.is_topic
+                and canonical_cmd in {"settings", "model", "reasoning", "fast"}
+                and "--global" not in command_tokens
+                and self._is_user_authorized(source)
+            ):
                 return None
             if canonical_cmd in {"approve", "deny"} and (
                 self._is_elevated_user_authorized(source)
@@ -14048,6 +14204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
         try:
+            await self._prewarm_topic_preferences_for_source(source)
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
@@ -14074,8 +14231,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source, model=model
             )
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            service_tier = self._resolve_session_service_tier(source=source)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, service_tier=service_tier
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -14104,7 +14263,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -16727,6 +16886,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not persisted:
             return
+        override = self._hydrate_persisted_model_override(persisted)
+        self._session_model_overrides[session_key] = override
+        logger.info(
+            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
+            session_key, override.get("model"), override.get("provider") or "",
+        )
+
+    @staticmethod
+    def _hydrate_persisted_model_override(
+        persisted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Re-resolve credentials for a sanitized persisted model override."""
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
@@ -16734,10 +16905,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         provider = persisted.get("provider")
         if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
                 override["api_key"] = runtime.get("api_key")
@@ -16745,33 +16912,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 override["credential_pool"] = runtime.get("credential_pool")
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
-                )
-        self._session_model_overrides[session_key] = override
-        logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
-        )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to resolve credentials for model override provider "
+                    f"{provider!r}"
+                ) from exc
+        return override
 
-    def _apply_session_model_override(
-        self, session_key: str, model: str, runtime_kwargs: dict
+    @staticmethod
+    def _apply_model_override(
+        override: Dict[str, Any], model: str, runtime_kwargs: dict
     ) -> tuple:
-        """Apply /model session overrides if present, returning (model, runtime_kwargs).
-
-        The gateway /model command stores per-session overrides in
-        ``_session_model_overrides``.  These must take precedence over
-        config.yaml defaults so the switched model is actually used for
-        subsequent messages.  Fields with ``None`` values are skipped so
-        partial overrides don't clobber valid config defaults.
-        """
-        override = self._session_model_overrides.get(session_key)
+        """Apply one hydrated model override to a resolved runtime."""
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
+        override_provider = override.get("provider")
+        if override_provider and override_provider != runtime_kwargs.get("provider"):
+            # Provider-specific transport state must never cross a provider
+            # boundary. Missing target credentials then fail closed instead of
+            # silently authenticating against the target with the global key.
+            for key in ("api_key", "base_url", "api_mode", "credential_pool"):
+                runtime_kwargs[key] = None
         for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
             val = override.get(key)
             if val is not None:
@@ -16786,10 +16948,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return model, runtime_kwargs
 
-    def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
-        """Return True if *agent_model* matches an active /model session override."""
+    def _apply_session_model_override(
+        self, session_key: str, model: str, runtime_kwargs: dict
+    ) -> tuple:
+        """Apply /model session overrides if present, returning (model, runtime_kwargs).
+
+        The gateway /model command stores per-session overrides in
+        ``_session_model_overrides``.  These must take precedence over
+        config.yaml defaults so the switched model is actually used for
+        subsequent messages.  Fields with ``None`` values are skipped so
+        partial overrides don't clobber valid config defaults.
+        """
         override = self._session_model_overrides.get(session_key)
-        return override is not None and override.get("model") == agent_model
+        return self._apply_model_override(override or {}, model, runtime_kwargs)
+
+    def _is_intentional_model_switch(
+        self,
+        session_key: str,
+        agent_model: str,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> bool:
+        """Return True when *agent_model* matches an explicit model preference."""
+        override = self._session_model_overrides.get(session_key)
+        if override is not None and override.get("model") == agent_model:
+            return True
+        if source is None:
+            return False
+        topic_override = self._topic_preferences_for_source(source).get(
+            "model_override"
+        )
+        return bool(
+            topic_override and topic_override.get("model") == agent_model
+        )
 
     def _release_running_agent_state(
         self,
@@ -17939,6 +18130,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
+
+        _status_operation_id = (
+            f"run:{run_generation}"
+            if run_generation is not None
+            else f"session:{session_id}"
+        )
+
+        def _status_state_current() -> bool:
+            if not _run_still_current():
+                return False
+            store = getattr(self, "session_store", None)
+            peek = getattr(store, "peek_session_id", None)
+            if not session_key or not session_id or not callable(peek):
+                return True
+            try:
+                return peek(session_key) == session_id
+            except Exception:
+                return False
+
+        async def _stop_current_run_from_status() -> str:
+            if not _status_state_current():
+                return "This operation is no longer active."
+            result = await self._handle_stop_command(
+                MessageEvent(
+                    text="/stop",
+                    message_type=MessageType.COMMAND,
+                    source=source,
+                    message_id=event_message_id,
+                )
+            )
+            return str(result)
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -18850,7 +19072,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(
+                    _status_adapter,
+                    _status_chat_id,
+                    event_type,
+                    prepared_message,
+                    _status_thread_metadata,
+                    session_key=session_key,
+                    owner_user_id=source.user_id,
+                    operation_id=_status_operation_id,
+                    on_stop=_stop_current_run_from_status,
+                    is_state_current=_status_state_current,
+                ),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -18953,7 +19186,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 model=model,
             )
             self._reasoning_config = reasoning_config
-            self._service_tier = self._load_service_tier()
+            service_tier = self._resolve_session_service_tier(
+                source=source, session_key=session_key
+            )
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
@@ -19068,7 +19303,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, service_tier=service_tier
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -19302,7 +19539,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         None if shared_scope is not None else self._prefill_messages or None
                     ),
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -19398,7 +19635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
-            agent.service_tier = self._service_tier
+            agent.service_tier = service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
             _bg_review_release = threading.Event()
@@ -20014,6 +20251,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._sync_telegram_topic_binding(
                         source, entry, reason="agent-run-compression",
                     )
+                    self._set_session_service_tier_override(
+                        session_key, None, clear=True
+                    )
 
             effective_session_id = agent_session_id
             self._sync_session_model_from_agent(effective_session_id, agent)
@@ -20356,14 +20596,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
+            _first_delay = (
+                min(_NOTIFY_INTERVAL, 10.0)
+                if source.platform == Platform.TELEGRAM
+                else _NOTIFY_INTERVAL
+            )
+            _next_delay = _first_delay
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
+                await asyncio.sleep(_next_delay)
+                _next_delay = _NOTIFY_INTERVAL
                 # Stop heartbeating once this run no longer owns the session
                 # slot or the executor has finished — otherwise a stale
                 # "running: delegate_task" bubble can outlive the run that
                 # spawned it (#12029). _executor_task is a closure var bound
                 # just after this task is scheduled; tolerate the brief window
-                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
+                # before then (the first wake is still delayed on every surface).
                 try:
                     _exec_ref = _executor_task
                 except NameError:
@@ -20409,7 +20656,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     _notify_res = None
-                    if _heartbeat_msg_id:
+                    if callable(
+                        getattr(_notify_adapter, "send_or_update_status", None)
+                    ):
+                        _notify_res = await _send_or_update_status_coro(
+                            _notify_adapter,
+                            source.chat_id,
+                            "long_running",
+                            _heartbeat_text,
+                            _non_conversational_metadata(
+                                _status_thread_metadata,
+                                platform=source.platform,
+                            ),
+                            session_key=session_key,
+                            owner_user_id=source.user_id,
+                            operation_id=_status_operation_id,
+                            on_stop=_stop_current_run_from_status,
+                            is_state_current=_status_state_current,
+                        )
+                    elif _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
                                 source.chat_id,
@@ -20419,18 +20684,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
+                    if (
+                        not callable(
+                            getattr(_notify_adapter, "send_or_update_status", None)
+                        )
+                        and not (
+                            _notify_res
+                            and getattr(_notify_res, "success", False)
+                        )
+                    ):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
                             metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
                         )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
+                    if getattr(_notify_res, "success", False) and getattr(
+                        _notify_res, "message_id", None
+                    ):
+                        _heartbeat_msg_id = str(_notify_res.message_id)
+                        if (
+                            _cleanup_progress
+                            and _heartbeat_msg_id not in _cleanup_msg_ids
                         ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                            _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -20662,7 +20938,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cfg_model = normalize_model_for_provider(_cfg_model, _agent_provider)
                 except Exception:
                     pass
-                if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
+                if _agent.model != _cfg_model and not self._is_intentional_model_switch(
+                    session_key, _agent.model, source=source
+                ):
                     # Fallback activated on a successful run — evict cached
                     # agent so the next message retries the primary model.
                     self._evict_cached_agent(session_key)
@@ -20997,6 +21275,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Clean up tracking
             tracking_task.cancel()
+            _status_cleanup_adapter = self._adapter_for_source(source)
+            _clear_run_status = getattr(
+                _status_cleanup_adapter, "clear_run_status", None
+            )
+            if callable(_clear_run_status) and session_key:
+                try:
+                    await _clear_run_status(
+                        source.chat_id,
+                        session_key,
+                        _status_operation_id,
+                        metadata=_status_thread_metadata,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Run status cleanup failed for %s",
+                        session_key,
+                        exc_info=True,
+                    )
             if session_key:
                 # Only release the slot if this run's generation still owns
                 # it.  A /stop or /new that bumped the generation while we

@@ -140,6 +140,25 @@ def test_new_clears_persisted_override(store_factory, tmp_path):
     assert "gpt-5o" not in _sessions_json(tmp_path)
 
 
+def test_failed_override_save_rolls_back_in_memory_entry(store_factory, monkeypatch):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    previous = store.get_model_override(entry.session_key)
+    def _fail_save():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_save", _fail_save)
+
+    with pytest.raises(OSError, match="disk full"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "new-model", "provider": "openai"},
+        )
+
+    assert store.get_model_override(entry.session_key) == previous
+
+
 def _make_runner(store):
     from gateway.run import GatewayRunner
 
@@ -204,8 +223,8 @@ def test_runner_rehydrate_noop_without_persisted_override(store_factory):
     assert runner._session_model_overrides == {}
 
 
-def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
-    """Missing credentials degrade to a credential-less override, not a crash."""
+def test_runner_rehydrate_fails_closed_without_provider_credentials(store_factory):
+    """Missing target credentials must not fall back to another provider."""
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
@@ -216,11 +235,10 @@ def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
         "gateway.run._resolve_runtime_agent_kwargs_for_provider",
         side_effect=RuntimeError("no credentials"),
     ):
-        runner._rehydrate_session_model_override(session_key)
+        with pytest.raises(RuntimeError, match="model override provider 'openai'"):
+            runner._rehydrate_session_model_override(session_key)
 
-    override = runner._session_model_overrides[session_key]
-    assert override["model"] == "gpt-5o"
-    assert override.get("api_key") is None
+    assert session_key not in runner._session_model_overrides
 
 
 def test_sanitize_model_override():

@@ -254,6 +254,66 @@ def test_shared_scope_binds_scoped_memory_with_full_tools_and_denies_admin_comma
         )
 
 
+@pytest.mark.parametrize("command", ["settings", "model", "reasoning", "fast"])
+def test_policy_authorized_shared_topic_allows_lane_controls(command):
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+    runner = _runner(policy)
+    runner.config = GatewayConfig(single_principal=policy)
+
+    assert policy.authorize(source) is True
+    assert runner._check_slash_access(source, command) is None
+
+
+@pytest.mark.parametrize("command", ["settings", "model", "reasoning", "fast"])
+def test_shared_lane_controls_remain_topic_only_and_never_global(command):
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    root_source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+    )
+    topic_source = _source(
+        OWNER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+    runner = _runner(policy)
+    runner.config = GatewayConfig(single_principal=policy)
+
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        root_source, command
+    )
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        topic_source,
+        command,
+        command_args="--global",
+    )
+
+
+def test_shared_topic_lane_controls_require_current_policy_authorization():
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+    runner = _runner(policy)
+    runner.config = GatewayConfig(single_principal=policy)
+    runner._is_user_authorized = lambda _source: False
+
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        source, "settings"
+    )
+
+
 @pytest.mark.asyncio
 async def test_shared_turn_uses_configured_telegram_tool_profile(
     tmp_path, monkeypatch

@@ -50,10 +50,13 @@ def _make_runner(history: list[dict[str, str]]):
     )
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.get_topic_preferences.return_value = {}
+    runner.session_store.get_model_override.return_value = None
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner.session_store._save = MagicMock()
+    runner._session_service_tier_overrides = {}
     runner._session_db = None
     return runner
 
@@ -113,3 +116,38 @@ async def test_compress_no_focus_passes_none():
 
     # No focus line in response
     assert "Focus:" not in result
+
+
+@pytest.mark.asyncio
+async def test_compress_rotation_clears_only_current_session_fast_override():
+    history = _make_history()
+    runner = _make_runner(history)
+    session_key = build_session_key(_make_source())
+    other_key = "agent:main:telegram:dm:other"
+    runner._session_service_tier_overrides = {
+        session_key: "priority",
+        other_key: "priority",
+    }
+    runner._sync_telegram_topic_binding = MagicMock()
+    agent_instance = MagicMock()
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-2"
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "***"},
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch(
+            "agent.model_metadata.estimate_messages_tokens_rough",
+            return_value=100,
+        ),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    runner.session_store.rewrite_transcript.assert_called_once()
+    assert session_key not in runner._session_service_tier_overrides
+    assert runner._session_service_tier_overrides[other_key] == "priority"
