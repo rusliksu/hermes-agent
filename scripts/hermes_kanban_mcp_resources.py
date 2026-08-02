@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 FD_SUBPROCESS_RESERVE = 16
 FD_BWRAP_RESERVE = 16
 FD_FIXED_DATA_OBJECTS = 5  # manifest, harness, anchors, probe args, prod args
+FD_EXECUTABLE_HANDOFF = 1
 ARG_MAX_SAFETY_MARGIN = 32 * 1024
 BWRAP_ARGS_MAX_BYTES = 4 * 1024 * 1024
 TOPOLOGY_MAX_BYTES = 16 * 1024 * 1024
@@ -29,11 +30,13 @@ class SandboxError(RuntimeError):
         message: str,
         *,
         primary: BaseException | None = None,
+        secondary_failures: Sequence[str] = (),
         cleanup_failures: Sequence[str] = (),
         replacement_applied: bool = False,
     ) -> None:
         super().__init__(message)
         self.primary = primary
+        self.secondary_failures = tuple(secondary_failures)
         self.cleanup_failures = tuple(cleanup_failures)
         self.replacement_applied = replacement_applied
 
@@ -120,6 +123,7 @@ class ResourcePlan:
     content_fds: int
     acquisition_temporary_fds: int
     fixed_fds: int
+    handoff_fds: int
     reserve_fds: int
     required_fds: int
     nofile_soft: int
@@ -243,9 +247,10 @@ def plan_resources(
     if soft == resource.RLIM_INFINITY:
         raise ResourceBudgetError("RLIMIT_NOFILE must have a finite soft limit")
     fixed = FD_FIXED_DATA_OBJECTS
+    handoff = FD_EXECUTABLE_HANDOFF
     reserve = FD_SUBPROCESS_RESERVE + FD_BWRAP_RESERVE
-    required = current + content_fds + acquisition_temporary_fds + fixed + reserve
-    if pass_fd_count is not None and pass_fd_count > content_fds + fixed:
+    required = current + content_fds + acquisition_temporary_fds + fixed + handoff + reserve
+    if pass_fd_count is not None and pass_fd_count > content_fds + fixed + handoff:
         raise ResourceBudgetError("pass_fds exceeds planned descriptor ownership")
     if required > soft:
         raise ResourceBudgetError(
@@ -262,6 +267,7 @@ def plan_resources(
         content_fds,
         acquisition_temporary_fds,
         fixed,
+        handoff,
         reserve,
         required,
         soft,

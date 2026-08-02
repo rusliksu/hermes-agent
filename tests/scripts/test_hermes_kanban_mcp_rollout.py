@@ -768,6 +768,92 @@ def test_post_replace_failures_report_applied_state_and_expected_hash(
     assert _rollout_temporary_paths(layout) == ()
 
 
+@pytest.mark.parametrize("failure_point", ("post-install", "session-exit"))
+def test_composite_evidence_survives_replacement_reconstruction_and_cli(
+    layout: Layout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_point: str,
+) -> None:
+    assert rollout.main(layout.prepare_args(apply=True)) == 0
+    capsys.readouterr()
+    expected_hash = _hash((layout.snapshot_path / "wrapper.after").read_bytes())
+    original_read = rollout.state.read_wrapper
+
+    def composite_error() -> rollout.RolloutError:
+        return rollout.RolloutError(
+            "injected composite failure",
+            primary_failure=RuntimeError("primary_failure"),
+            secondary_failures=("secondary_failure",),
+            cleanup_failures=("cleanup_failure",),
+        )
+
+    def fail_installed_read(path: Path) -> rollout.Wrapper:
+        result = original_read(path)
+        if path == layout.stable_wrapper and result.sha256 == expected_hash:
+            raise composite_error()
+        return result
+
+    class FailingSession:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            raise composite_error()
+
+    with monkeypatch.context() as failure:
+        if failure_point == "post-install":
+            failure.setattr(rollout.state, "read_wrapper", fail_installed_read)
+        else:
+            failure.setattr(
+                rollout.coherence,
+                "import_preflight_session",
+                lambda *_args, **_kwargs: FailingSession(),
+            )
+        assert rollout.main(
+            layout.transition_args("switch", layout.wrapper_before_hash, apply=True)
+        ) == 2
+    evidence = json.loads(capsys.readouterr().err)
+    assert evidence["replacement_applied"] is True
+    assert evidence["primary_failure"] == "primary_failure"
+    assert evidence["secondary_failures"] == ["secondary_failure"]
+    assert evidence["cleanup_failures"] == ["cleanup_failure"]
+
+
+def test_generic_rollout_cli_preserves_all_composite_evidence(
+    layout: Layout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        inner = rollout.RolloutError(
+            "TOKEN=must-not-cross-cli-boundary",
+            primary_failure=RuntimeError("primary_failure"),
+            secondary_failures=("secondary_failure",),
+            cleanup_failures=("inner_cleanup_failure",),
+        )
+        outer = rollout.coherence.sealed_bundle.SandboxError(
+            "sandbox close failed",
+            primary=inner,
+            cleanup_failures=("outer_cleanup_failure",),
+        )
+        raise rollout.coherence._rollout_sandbox_error(outer)
+
+    monkeypatch.setattr(rollout, "_run_switch_or_rollback", fail)
+    assert rollout.main(
+        layout.transition_args("rollback", layout.wrapper_before_hash)
+    ) == 2
+    evidence = json.loads(capsys.readouterr().err)
+    assert evidence == {
+        "error": "sandbox close failed",
+        "primary_failure": "primary_failure",
+        "secondary_failures": ["secondary_failure"],
+        "cleanup_failures": ["inner_cleanup_failure", "outer_cleanup_failure"],
+        "replacement_applied": False,
+    }
+    assert "TOKEN=" not in json.dumps(evidence)
+
+
 def test_unified_root_rollout_uses_schema_v3_and_remains_reversible(
     layout: Layout, capsys: pytest.CaptureFixture[str]
 ) -> None:

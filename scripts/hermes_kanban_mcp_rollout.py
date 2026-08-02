@@ -682,23 +682,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "replacement_applied": True,
             "required_action": "inspect/rollback",
         }
+        if exc.primary_failure is not None:
+            failure["primary_failure"] = str(exc.primary_failure)
+        if exc.secondary_failures:
+            failure["secondary_failures"] = list(exc.secondary_failures)
         if exc.cleanup_failures:
             failure["cleanup_failures"] = list(exc.cleanup_failures)
-            failure["primary_failure"] = str(exc.primary_failure)
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 2
     except RolloutError as exc:
-        if exc.cleanup_failures:
+        if exc.primary_failure is not None or exc.secondary_failures or exc.cleanup_failures:
+            failure = {
+                "error": str(exc),
+                "replacement_applied": exc.replacement_applied,
+            }
+            if exc.primary_failure is not None:
+                failure["primary_failure"] = str(exc.primary_failure)
+            if exc.secondary_failures:
+                failure["secondary_failures"] = list(exc.secondary_failures)
+            if exc.cleanup_failures:
+                failure["cleanup_failures"] = list(exc.cleanup_failures)
             print(
-                json.dumps(
-                    {
-                        "error": str(exc),
-                        "primary_failure": str(exc.primary_failure),
-                        "cleanup_failures": list(exc.cleanup_failures),
-                        "replacement_applied": exc.replacement_applied,
-                    },
-                    sort_keys=True,
-                ),
+                json.dumps(failure, sort_keys=True),
                 file=sys.stderr,
             )
         else:

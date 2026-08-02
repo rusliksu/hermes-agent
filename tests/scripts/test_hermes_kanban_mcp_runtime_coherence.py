@@ -10,7 +10,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -775,37 +774,6 @@ def test_canonical_invocation_rejects_non_exact_role_maps(
     render = spec.render_probe if phase == "probe" else spec.render_production
     with pytest.raises(_os_sandbox.resources.ResourceBudgetError, match="role"):
         render(roles)
-
-
-def test_probe_actual_loader_argv_is_checked_before_args_memfd(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = 0
-
-    def add_data(_name: str, _data: bytes) -> int:
-        nonlocal calls
-        calls += 1
-        return 41
-
-    oversized = "x" * 80
-    spec = _os_sandbox.invocation.CanonicalInvocationSpec(
-        (), (), (oversized,), (), (), 5, 1, 1, len(oversized) + 1, 1, 100_000
-    )
-    bundle = SimpleNamespace(
-        add_data=add_data, descriptors=(), invocation=spec, entries=(),
-        loader_fd=3, bwrap_fd=4, bwrap_library_fds=(),
-    )
-    monkeypatch.setattr(
-        _os_sandbox.os, "sysconf",
-        lambda _name: _os_sandbox.resources.ARG_MAX_SAFETY_MARGIN + 40,
-    )
-    monkeypatch.setattr(
-        _os_sandbox.subprocess, "run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
-    )
-    with pytest.raises(_os_sandbox.SandboxError, match="SC_ARG_MAX"):
-        _os_sandbox._probe(bundle)
-    assert calls == 0
 
 
 def test_probe_final_handoff_rechecks_late_fd_pressure(

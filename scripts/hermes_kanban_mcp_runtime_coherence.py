@@ -580,9 +580,7 @@ class _ParentTrustBundle:
         if self.closed:
             raise RolloutError("parent trust bundle was closed more than once")
         try:
-            self.content.close(
-                primary=primary, replacement_applied=replacement_applied
-            )
+            self.content.close(primary=primary, replacement_applied=replacement_applied)
         except sealed_bundle.SandboxError as exc:
             self.closed = True
             raise _rollout_sandbox_error(exc) from exc
@@ -590,10 +588,25 @@ class _ParentTrustBundle:
 
 
 def _rollout_sandbox_error(exc: sealed_bundle.SandboxError) -> RolloutError:
+    primary = exc.primary
+    secondary = exc.secondary_failures
+    cleanup = exc.cleanup_failures
+    while isinstance(primary, (RolloutError, sealed_bundle.SandboxError)):
+        nested_primary = (
+            primary.primary_failure if isinstance(primary, RolloutError) else primary.primary
+        )
+        if nested_primary is None and not (
+            primary.secondary_failures or primary.cleanup_failures
+        ):
+            break
+        secondary = (*primary.secondary_failures, *secondary)
+        cleanup = (*primary.cleanup_failures, *cleanup)
+        primary = nested_primary
     return RolloutError(
         str(exc),
-        primary_failure=exc.primary,
-        cleanup_failures=exc.cleanup_failures,
+        primary_failure=primary,
+        secondary_failures=secondary,
+        cleanup_failures=cleanup,
         replacement_applied=exc.replacement_applied,
     )
 
@@ -657,9 +670,7 @@ def _pyvenv_home_bytes(raw: bytes) -> Path:
 
 def _parent_trust_bundle(runtime: Path, venv_dirname: str) -> _ParentTrustBundle:
     interpreter = runtime / venv_dirname / "bin" / "python"
-    pyvenv_cfg, _digest, site_packages = validate_venv_startup(
-        runtime, venv_dirname
-    )
+    pyvenv_cfg, _digest, site_packages = validate_venv_startup(runtime, venv_dirname)
     resolved, chain = _interpreter_chain(interpreter)
     trusted_interpreter, stdlib_roots = _trusted_python()
     try:
@@ -673,9 +684,7 @@ def _parent_trust_bundle(runtime: Path, venv_dirname: str) -> _ParentTrustBundle
     except sealed_bundle.SandboxError as exc:
         raise _rollout_sandbox_error(exc) from exc
     try:
-        pyvenv_destination = (
-            invocation.SANDBOX_RUNTIME / venv_dirname / "pyvenv.cfg"
-        )
+        pyvenv_destination = invocation.SANDBOX_RUNTIME / venv_dirname / "pyvenv.cfg"
         pyvenv_entry = content.file_entry(pyvenv_destination)
         pyvenv_bytes = content.read_file(pyvenv_destination)
         pyvenv_digest = sha256(pyvenv_bytes)
@@ -708,12 +717,7 @@ def _parent_trust_bundle(runtime: Path, venv_dirname: str) -> _ParentTrustBundle
             source_digest,
             venv_digest,
         )
-        bundle = _ParentTrustBundle(
-            anchors,
-            content,
-            pyvenv_bytes,
-            pyvenv_entry.mode,
-        )
+        bundle = _ParentTrustBundle(anchors, content, pyvenv_bytes, pyvenv_entry.mode)
         bundle.verify()
         return bundle
     except BaseException as exc:
