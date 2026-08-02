@@ -106,6 +106,8 @@ async def test_final_streaming_edit_gets_feedback_controls():
         (True, "123", None),
         (True, "-100123", {"notify": True}),
         (True, "123", {"notify": True, "thread_id": "7"}),
+        (True, "123", {"notify": True, "direct_messages_topic_id": "7"}),
+        (True, "123", {"notify": True, "telegram_direct_messages_topic_id": "7"}),
     ],
 )
 async def test_feedback_is_opt_in_final_dm_only(enabled, chat_id, metadata):

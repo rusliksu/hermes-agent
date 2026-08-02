@@ -1063,6 +1063,7 @@ class TelegramAdapter(BasePlatformAdapter):
             or mode == "off"
             or not self._is_direct_message_chat_id(chat_id)
             or self._metadata_thread_id(metadata) is not None
+            or self._metadata_direct_messages_topic_id(metadata) is not None
         ):
             return
         if mode == "sampled" and not self._sampled_response_feedback_due(
