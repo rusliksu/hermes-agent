@@ -10,8 +10,13 @@ from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+_MISSING = object()
+
+
 def _adapter(*, enabled=True, extra=None):
-    config_extra = {"feedback_buttons": enabled}
+    config_extra = {}
+    if enabled is not _MISSING:
+        config_extra["feedback_buttons"] = enabled
     config_extra.update(extra or {})
     adapter = TelegramAdapter(PlatformConfig(
         enabled=True,
@@ -93,12 +98,14 @@ async def test_final_streaming_edit_gets_feedback_controls():
     ("enabled", "chat_id", "metadata"),
     [
         (False, "123", {"notify": True}),
+        (_MISSING, "123", {"notify": True}),
         (None, "123", {"notify": True}),
         ("false", "123", {"notify": True}),
         ("off", "123", {"notify": True}),
         ("unknown", "123", {"notify": True}),
         (True, "123", None),
         (True, "-100123", {"notify": True}),
+        (True, "123", {"notify": True, "thread_id": "7"}),
     ],
 )
 async def test_feedback_is_opt_in_final_dm_only(enabled, chat_id, metadata):
@@ -119,9 +126,10 @@ async def test_sampled_feedback_appears_on_tenth_eligible_response():
         SimpleNamespace(message_id=index) for index in range(1, 11)
     ]
 
-    for _ in range(10):
+    for index in range(10):
         result = await adapter.send("123", "Ответ", metadata={"notify": True})
         assert result.success is True
+        assert adapter._bot.edit_message_reply_markup.await_count == (index + 1) // 10
 
     adapter._bot.edit_message_reply_markup.assert_awaited_once()
     assert len(adapter._feedback_state) == 1
@@ -152,10 +160,18 @@ async def test_sampled_feedback_respects_cooldown(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_sampling_config_uses_safe_defaults():
+@pytest.mark.parametrize(
+    "cooldown", ["nan", 10**10000], ids=["nan", "huge-integer"],
+)
+async def test_invalid_sampling_config_uses_safe_defaults(cooldown):
     adapter = _adapter(
         enabled="sampled",
-        extra={"feedback_sample_every": "bad", "feedback_cooldown_seconds": "nan"},
+        extra={"feedback_sample_every": "bad", "feedback_cooldown_seconds": cooldown},
+    )
+    assert adapter._feedback_sample_every() == adapter._FEEDBACK_SAMPLE_EVERY_DEFAULT
+    assert (
+        adapter._feedback_cooldown_seconds()
+        == adapter._FEEDBACK_COOLDOWN_SECONDS_DEFAULT
     )
     adapter._bot.send_message.side_effect = [
         SimpleNamespace(message_id=index) for index in range(1, 11)

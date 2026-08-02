@@ -998,7 +998,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(raw, bool):
                 raise ValueError
             value = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return float(self._FEEDBACK_COOLDOWN_SECONDS_DEFAULT)
         if not math.isfinite(value) or not 0 <= value <= self._FEEDBACK_COOLDOWN_SECONDS_MAX:
             return float(self._FEEDBACK_COOLDOWN_SECONDS_DEFAULT)
@@ -1062,6 +1062,7 @@ class TelegramAdapter(BasePlatformAdapter):
             or not (metadata or {}).get("notify")
             or mode == "off"
             or not self._is_direct_message_chat_id(chat_id)
+            or self._metadata_thread_id(metadata) is not None
         ):
             return
         if mode == "sampled" and not self._sampled_response_feedback_due(
