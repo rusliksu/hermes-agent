@@ -13,6 +13,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import html as _html
 import re
@@ -585,6 +586,10 @@ class TelegramAdapter(BasePlatformAdapter):
     _GENERAL_TOPIC_THREAD_ID = "1"
     _PICKER_TTL_SECONDS = 15 * 60
     _FEEDBACK_TTL_SECONDS = 24 * 60 * 60
+    _FEEDBACK_SAMPLE_EVERY_DEFAULT = 10
+    _FEEDBACK_SAMPLE_EVERY_MAX = 1000
+    _FEEDBACK_COOLDOWN_SECONDS_DEFAULT = 30 * 60
+    _FEEDBACK_COOLDOWN_SECONDS_MAX = 24 * 60 * 60
     _RUN_STATUS_TTL_SECONDS = 2 * 60 * 60
     _CALLBACK_STATE_LIMIT = 256
 
@@ -957,14 +962,83 @@ class TelegramAdapter(BasePlatformAdapter):
             raise ValueError("Telegram callback_data exceeds 64 bytes")
         return value
 
-    def _response_feedback_enabled(self) -> bool:
-        """Return whether final Telegram DM responses get feedback controls."""
+    def _response_feedback_mode(self) -> str:
+        """Return ``off``, ``always``, or ``sampled`` for final DM feedback."""
         raw = self.config.extra.get("feedback_buttons")
-        if raw is None:
-            return False
         if isinstance(raw, str):
-            return raw.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(raw)
+            value = raw.strip().lower()
+            if value == "sampled":
+                return "sampled"
+            return "always" if value in {"1", "true", "yes", "on"} else "off"
+        return "always" if bool(raw) else "off"
+
+    def _feedback_sample_every(self) -> int:
+        raw = self.config.extra.get(
+            "feedback_sample_every", self._FEEDBACK_SAMPLE_EVERY_DEFAULT,
+        )
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            value = int(raw)
+            if isinstance(raw, float) and not raw.is_integer():
+                raise ValueError
+            if isinstance(raw, str) and raw.strip() != str(value):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return self._FEEDBACK_SAMPLE_EVERY_DEFAULT
+        if not 1 <= value <= self._FEEDBACK_SAMPLE_EVERY_MAX:
+            return self._FEEDBACK_SAMPLE_EVERY_DEFAULT
+        return value
+
+    def _feedback_cooldown_seconds(self) -> float:
+        raw = self.config.extra.get(
+            "feedback_cooldown_seconds", self._FEEDBACK_COOLDOWN_SECONDS_DEFAULT,
+        )
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return float(self._FEEDBACK_COOLDOWN_SECONDS_DEFAULT)
+        if not math.isfinite(value) or not 0 <= value <= self._FEEDBACK_COOLDOWN_SECONDS_MAX:
+            return float(self._FEEDBACK_COOLDOWN_SECONDS_DEFAULT)
+        return value
+
+    def _sampled_response_feedback_due(self, chat_id: str, message_id: str) -> bool:
+        """Advance bounded in-memory sampling state and return whether to show."""
+        state_by_chat = getattr(self, "_feedback_sampling_state", None)
+        if state_by_chat is None:
+            state_by_chat = self._feedback_sampling_state = {}
+
+        now = time.monotonic()
+        key = str(chat_id)
+        message_key = str(message_id)
+        state = state_by_chat.get(key)
+        if state is not None and state.get("last_message_id") == message_key:
+            return False
+        if state is None:
+            if len(state_by_chat) >= self._CALLBACK_STATE_LIMIT:
+                oldest = min(
+                    state_by_chat,
+                    key=lambda item: float(state_by_chat[item].get("last_seen_at", 0)),
+                )
+                state_by_chat.pop(oldest, None)
+            state = {"count": 0, "last_shown_at": None}
+            state_by_chat[key] = state
+
+        state["count"] += 1
+        state["last_message_id"] = message_key
+        state["last_seen_at"] = now
+        if state["count"] % self._feedback_sample_every():
+            return False
+        last_shown_at = state["last_shown_at"]
+        if (
+            last_shown_at is not None
+            and now - float(last_shown_at) < self._feedback_cooldown_seconds()
+        ):
+            return False
+        state["last_shown_at"] = now
+        return True
 
     @staticmethod
     def _is_direct_message_chat_id(chat_id: object) -> bool:
@@ -981,12 +1055,19 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> None:
         """Best-effort attach owner-bound feedback buttons to one final DM reply."""
+        mode = self._response_feedback_mode()
         if (
             not self._bot
             or not message_id
             or not (metadata or {}).get("notify")
-            or not self._response_feedback_enabled()
+            or mode == "off"
             or not self._is_direct_message_chat_id(chat_id)
+            or self._metadata_thread_id(metadata) is not None
+            or self._metadata_direct_messages_topic_id(metadata) is not None
+        ):
+            return
+        if mode == "sampled" and not self._sampled_response_feedback_due(
+            chat_id, message_id,
         ):
             return
 
