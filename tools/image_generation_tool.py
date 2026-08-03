@@ -26,6 +26,7 @@ import os
 import datetime
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
@@ -69,6 +70,7 @@ from tools.tool_backend_helpers import (
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
+from tools.media_provider_routing import MediaProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -1259,6 +1261,299 @@ def _read_configured_image_provider():
     return None
 
 
+_IMAGE_FALLBACK_PROVIDER_IDS = frozenset({"openai-codex", "fal", "openrouter"})
+_IMAGE_FALLBACK_ERROR_TYPES = {
+    "auth_required": "auth_unavailable",
+    "capability_unsupported": "capability_unavailable",
+    "missing_dependency": "provider_unavailable",
+    "timeout": "timeout",
+    "rate_limit": "rate_limited",
+    "rate_limited": "rate_limited",
+    "api_error": "upstream_5xx",
+    "connection_error": "provider_unavailable",
+    "empty_response": "capability_unavailable",
+    "provider_not_registered": "provider_unavailable",
+    "invalid_argument": "provider_error",
+    "invalid_image_input": "provider_error",
+    "modality_unsupported": "provider_error",
+    "content_policy": "provider_error",
+    "io_error": "provider_error",
+    "ValueError": "provider_unavailable",
+    "Exception": "provider_unavailable",
+}
+
+
+def _read_configured_image_fallbacks() -> Optional[tuple[str, ...]]:
+    """Read an explicit server-side image fallback list.
+
+    Missing fallbacks deliberately returns None so callers retain the
+    legacy single-provider path. Validation is intentionally strict here;
+    task 3.1 will expose the same checks through the config dry-run command.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Could not read image fallback policy: %s", exc)
+        return None
+
+    section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+    if not isinstance(section, dict) or "fallbacks" not in section:
+        return None
+    raw = section.get("fallbacks")
+    if isinstance(raw, dict):
+        raw = raw.get("image_generation")
+        if raw is None:
+            return None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError(
+            "image_gen.fallbacks.image_generation must be a non-empty list"
+        )
+
+    providers: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("image fallback provider id must be a non-empty string")
+        provider_id = item.strip()
+        if provider_id not in _IMAGE_FALLBACK_PROVIDER_IDS:
+            raise ValueError(f"unsupported image fallback provider: {provider_id}")
+        if provider_id not in providers:
+            providers.append(provider_id)
+    if not providers:
+        raise ValueError("image fallback provider list is empty")
+    return tuple(providers)
+
+
+def _image_access_context():
+    """Return the trusted typed context; never infer it from arguments/env."""
+    from gateway.access_registry import ResolvedAccessContext
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    return context if isinstance(context, ResolvedAccessContext) else None
+
+
+def _image_profile_home(context) -> Path:
+    from tools.media_provider_routing import MediaProviderError
+    try:
+        from agent.runtime_cwd import bound_profile_home
+
+        profile_home = bound_profile_home()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+    if profile_home is None:
+        raise MediaProviderError("invalid_context")
+    try:
+        return profile_home.resolve()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+
+
+def _image_provider_error(provider_id: str, result: Any) -> MediaProviderError:
+    from tools.media_provider_routing import MediaProviderError
+    error_type = result.get("error_type") if isinstance(result, dict) else None
+    error_class = _IMAGE_FALLBACK_ERROR_TYPES.get(
+        error_type if isinstance(error_type, str) else "",
+        "provider_error",
+    )
+    return MediaProviderError(error_class, provider_id)
+
+
+def _invoke_image_provider(provider, provider_id: str, context, input_handle: dict, _secret):
+    """Call an existing image plugin under the resolved profile home."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError, MediaResult
+
+    profile_home = _image_profile_home(context)
+    override_token = set_hermes_home_override(profile_home)
+    try:
+        if provider_id == "openai-codex":
+            try:
+                available = bool(provider.is_available())
+            except Exception:
+                available = False
+            if not available:
+                try:
+                    import importlib
+
+                    codex_plugin = importlib.import_module(
+                        "plugins.image_gen.openai-codex"
+                    )
+                    token_reader = getattr(codex_plugin, "_read_codex_access_token", None)
+                    error_class = (
+                        "auth_unavailable"
+                        if not callable(token_reader) or not token_reader()
+                        else "capability_unavailable"
+                    )
+                except Exception:
+                    error_class = "auth_unavailable"
+                raise MediaProviderError(error_class, provider_id)
+
+        result = provider.generate(**input_handle)
+    finally:
+        reset_hermes_home_override(override_token)
+
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise _image_provider_error(provider_id, result)
+
+    image_ref = result.get("image")
+    if not isinstance(image_ref, str) or not image_ref.strip():
+        raise MediaProviderError("provider_unavailable", provider_id)
+    image_ref = image_ref.strip()
+
+    if image_ref.startswith(("http://", "https://")):
+        try:
+            from agent.image_gen_provider import save_url_image
+
+            image_ref = str(
+                save_url_image(image_ref, prefix=f"{provider_id.replace('-', '_')}_fallback")
+            )
+        except Exception as exc:
+            raise MediaProviderError("provider_unavailable", provider_id) from exc
+
+    image_path = Path(image_ref).expanduser()
+    if not image_path.is_absolute():
+        raise MediaProviderError("provider_error", provider_id)
+    try:
+        image_path = image_path.resolve()
+        image_path.relative_to(profile_home)
+    except Exception as exc:
+        raise MediaProviderError("provider_error", provider_id) from exc
+    try:
+        if not image_path.is_file() or image_path.stat().st_size <= 0:
+            raise MediaProviderError("provider_unavailable", provider_id)
+    except OSError as exc:
+        raise MediaProviderError("provider_unavailable", provider_id) from exc
+
+    return MediaResult(
+        image_path=str(image_path),
+        metadata={"provider": provider_id},
+    )
+
+
+def _registered_image_provider(provider_id: str):
+    from agent.image_gen_registry import get_provider
+    from hermes_cli.plugins import _ensure_plugins_discovered
+
+    _ensure_plugins_discovered()
+    provider = get_provider(provider_id)
+    if provider is None:
+        _ensure_plugins_discovered(force=True)
+        provider = get_provider(provider_id)
+    return provider
+
+
+def _image_provider_audit(event) -> None:
+    """Emit only the redacted fields defined by MediaProviderAuditEvent."""
+    logger.info(
+        "media_provider_attempt operation=%s provider=%s error_class=%s "
+        "elapsed_ms=%s profile_ref=%s success=%s",
+        event.operation,
+        event.provider_id,
+        event.error_class or "",
+        event.elapsed_ms,
+        event.profile_ref,
+        event.success,
+    )
+
+
+def _dispatch_to_image_fallback_chain(
+    prompt: str,
+    aspect_ratio: str,
+    image_url: Optional[str] = None,
+    reference_image_urls: Optional[list] = None,
+):
+    """Run the explicit, profile-bound image provider chain, if configured."""
+    try:
+        provider_order = _read_configured_image_fallbacks()
+    except ValueError:
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": "invalid media provider policy",
+            "error_type": "invalid_policy",
+        })
+    if provider_order is None:
+        return None
+
+    context = _image_access_context()
+    if context is None:
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": "invalid media access context",
+            "error_type": "invalid_context",
+        })
+
+    from tools.media_provider_routing import (
+        MediaProviderError,
+        MediaProviderExecutor,
+        MediaProviderPolicy,
+    )
+
+    handlers = {}
+    for provider_id in provider_order:
+        provider = _registered_image_provider(provider_id)
+        if provider is None:
+            handlers[provider_id] = (
+                lambda _context, _input, _secret, provider_id=provider_id:
+                (_ for _ in ()).throw(
+                    MediaProviderError("provider_unavailable", provider_id)
+                )
+            )
+        else:
+            handlers[provider_id] = (
+                lambda bound_context, input_handle, secret_handle,
+                provider=provider, provider_id=provider_id:
+                _invoke_image_provider(
+                    provider, provider_id, bound_context, input_handle, secret_handle
+                )
+            )
+
+    input_handle: dict[str, Any] = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+    }
+    configured_model = _read_configured_image_model()
+    if configured_model:
+        input_handle["model"] = configured_model
+    if isinstance(image_url, str) and image_url.strip():
+        input_handle["image_url"] = image_url.strip()
+    if reference_image_urls is not None:
+        from agent.image_gen_provider import normalize_reference_images
+
+        normalized = normalize_reference_images(reference_image_urls)
+        if normalized:
+            input_handle["reference_image_urls"] = normalized
+
+    policy = MediaProviderPolicy(
+        provider_order={"image_generation": provider_order},
+        required_capabilities={"image_generation": "image_generation"},
+        secret_references={},
+        secret_required=frozenset(),
+    )
+    try:
+        result = MediaProviderExecutor(
+            handlers,
+            audit_sink=_image_provider_audit,
+        ).execute("image_generation", context, input_handle, policy)
+    except MediaProviderError as error:
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": error.message,
+            "error_type": error.error_class,
+        })
+    provider_id = result.metadata.get("provider", "") if result.metadata else ""
+    return json.dumps({
+        "success": True,
+        "image": result.image_path,
+        "provider": provider_id,
+        "modality": "image" if input_handle.get("image_url") else "text",
+    })
+
+
 def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
@@ -1280,6 +1575,15 @@ def _dispatch_to_plugin_provider(
     they are forwarded to the provider's ``generate()`` so the backend can
     route to its edit endpoint.
     """
+    chained = _dispatch_to_image_fallback_chain(
+        prompt,
+        aspect_ratio,
+        image_url=image_url,
+        reference_image_urls=reference_image_urls,
+    )
+    if chained is not None:
+        return chained
+
     configured = _read_configured_image_provider()
     if not configured or configured == "fal":
         return None  # unset/explicit FAL keeps the legacy FAL path

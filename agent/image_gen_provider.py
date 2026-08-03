@@ -228,10 +228,16 @@ def normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 
 def _images_cache_dir() -> Path:
-    """Return ``$HERMES_HOME/cache/images/``, creating parents as needed."""
+    """Return the current profile cache/images directory."""
     from hermes_constants import get_hermes_home
 
-    path = get_hermes_home() / "cache" / "images"
+    # A typed gateway context wins over process-global environment state. The
+    # helper raises for malformed profiles, so generated artifacts cannot
+    # silently land in the owner/default cache.
+    from agent.runtime_cwd import bound_profile_home
+
+    profile_home = bound_profile_home()
+    path = (profile_home or get_hermes_home()) / "cache" / "images"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
