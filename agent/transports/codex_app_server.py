@@ -94,6 +94,19 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
+        # Hermes owns the sandbox boundary for every Gurra Codex runtime.
+        # Append these after caller-provided args so a shared/global admin
+        # Codex config (or an extra_args override) cannot relax user sessions.
+        app_server_args.extend(
+            [
+                "-c",
+                'sandbox_mode="workspace-write"',
+                "-c",
+                "sandbox_workspace_write.network_access=false",
+                "-c",
+                "sandbox_workspace_write.writable_roots=[]",
+            ]
+        )
         # Kanban workers must be able to write their handoff/status back to
         # the board DB, which lives outside the per-task workspace. Keep the
         # Codex sandbox on, but add the Kanban root as the only extra writable
@@ -115,11 +128,7 @@ class CodexAppServerClient:
             app_server_args.extend(
                 [
                     "-c",
-                    'sandbox_mode="workspace-write"',
-                    "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
-                    "-c",
-                    "sandbox_workspace_write.network_access=false",
                 ]
             )
 

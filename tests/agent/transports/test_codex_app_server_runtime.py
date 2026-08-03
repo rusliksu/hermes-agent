@@ -241,6 +241,61 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
+    def test_normal_runtime_enforces_sandbox_after_caller_overrides(self, monkeypatch):
+        """A global/admin or caller override cannot relax Gurra sessions."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            extra_args=[
+                "-c",
+                'sandbox_mode="danger-full-access"',
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                'sandbox_workspace_write.writable_roots=["/home/openclaw"]',
+            ],
+        )
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert cmd[:2] == ["codex", "app-server"]
+        assert cmd[-6:] == [
+            "-c",
+            'sandbox_mode="workspace-write"',
+            "-c",
+            "sandbox_workspace_write.network_access=false",
+            "-c",
+            "sandbox_workspace_write.writable_roots=[]",
+        ]
+
     def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
         """Codex-runtime Kanban workers need to write board state outside
         their scratch/worktree workspace, but should not fall back to
@@ -283,7 +338,17 @@ class TestSpawnEnvIsolation:
             "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
         )
 
-        client = cas.CodexAppServerClient(codex_bin="codex")
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            extra_args=[
+                "-c",
+                'sandbox_mode="danger-full-access"',
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                'sandbox_workspace_write.writable_roots=["/home/openclaw"]',
+            ],
+        )
         client._closed = True
 
         cmd = captured["cmd"]
@@ -294,7 +359,21 @@ class TestSpawnEnvIsolation:
             in cmd
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
-        assert all("danger" not in part for part in cmd)
+        assert cmd.count('sandbox_mode="workspace-write"') == 1
+        assert cmd.count("sandbox_workspace_write.network_access=false") == 1
+        assert cmd.index('sandbox_mode="danger-full-access"') < cmd.index(
+            'sandbox_mode="workspace-write"'
+        )
+        assert cmd.index("sandbox_workspace_write.network_access=true") < cmd.index(
+            "sandbox_workspace_write.network_access=false"
+        )
+        assert cmd.index(
+            'sandbox_workspace_write.writable_roots=["/home/openclaw"]'
+        ) < cmd.index("sandbox_workspace_write.writable_roots=[]")
+        assert cmd[-2:] == [
+            "-c",
+            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]',
+        ]
 
 
 class TestSpawnEnvSecretStripping:
