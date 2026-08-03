@@ -24,6 +24,8 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
+from agent.i18n import t
+
 logger = logging.getLogger(__name__)
 
 
@@ -6165,7 +6167,13 @@ class TelegramAdapter(BasePlatformAdapter):
             action.get("close") or str(action.get("value") or "").lower() == "close"
             for action in normalized
         ):
-            normalized.append({"value": "close", "label": "✕ Close", "close": True})
+            normalized.append(
+                {
+                    "value": "close",
+                    "label": f"✕ {t('gateway.settings.action_close')}",
+                    "close": True,
+                }
+            )
         return normalized
 
     def _build_settings_keyboard(self, nonce: str, actions: list) -> Any:
@@ -6270,7 +6278,7 @@ class TelegramAdapter(BasePlatformAdapter):
         parts = data.split(":")
         if len(parts) != 3 or parts[0] != "st" or not parts[2].isdigit():
             try:
-                await query.answer(text="Settings menu expired — use /settings again.")
+                await query.answer(text=t("gateway.settings.stale"))
             except Exception:
                 pass
             return
@@ -6293,7 +6301,7 @@ class TelegramAdapter(BasePlatformAdapter):
             query,
             nonce,
             self._settings_picker_state,
-            expired_text="Settings menu expired — use /settings again.",
+            expired_text=t("gateway.settings.stale"),
             claim=not is_close,
             consume=is_close,
         )
@@ -6304,24 +6312,28 @@ class TelegramAdapter(BasePlatformAdapter):
             nonce,
             state,
             self._settings_picker_state,
-            stale_text="These settings belong to an older session — use /settings again.",
+            stale_text=t("gateway.settings.stale"),
         ):
             return
         actions = state.get("actions", [])
         idx = int(raw_index)
         if idx >= len(actions):
             state["busy"] = False
-            await self._edit_picker_text(query, "Invalid settings action.")
+            await self._edit_picker_text(query, t("gateway.settings.stale"))
             return
         action = actions[idx]
         if is_close:
-            await self._edit_picker_text(query, "Settings closed.", reply_markup=None)
+            await self._edit_picker_text(
+                query, t("gateway.settings.action_close"), reply_markup=None
+            )
             return
 
         callback = state.get("on_action_selected")
         if not callback:
             self._settings_picker_state.pop(nonce, None)
-            await self._edit_picker_text(query, "Settings menu expired.", reply_markup=None)
+            await self._edit_picker_text(
+                query, t("gateway.settings.stale"), reply_markup=None
+            )
             return
 
         try:
@@ -6334,7 +6346,10 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = self._build_settings_keyboard(nonce, actions)
             await self._edit_picker_text(
                 query,
-                f"Error applying setting: {_redact_telegram_error_text(exc)}",
+                t(
+                    "gateway.settings.error",
+                    error=_redact_telegram_error_text(exc),
+                ),
                 reply_markup=keyboard,
             )
             return
@@ -6343,20 +6358,24 @@ class TelegramAdapter(BasePlatformAdapter):
             self._settings_picker_state.pop(nonce, None)
             await self._edit_picker_text(
                 query,
-                str(result.get("title") or "Settings closed."),
+                str(result.get("title") or t("gateway.settings.action_close")),
                 reply_markup=None,
             )
             return
 
         if isinstance(result, dict):
-            title = str(result.get("title") or state.get("title") or "Settings")
+            title = str(
+                result.get("title")
+                or state.get("title")
+                or t("gateway.settings.stale")
+            )
             refreshed_actions = result.get("actions")
             if isinstance(refreshed_actions, list):
                 actions = self._settings_actions_with_close(refreshed_actions)
         elif result is not None:
             title = str(result)
         else:
-            title = str(state.get("title") or "Settings")
+            title = str(state.get("title") or t("gateway.settings.stale"))
 
         refreshed_nonce = self._new_callback_nonce()
         state.update(

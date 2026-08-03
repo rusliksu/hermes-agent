@@ -7,8 +7,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.i18n import reset_language_cache
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+@pytest.fixture(autouse=True)
+def _reset_i18n_language_cache():
+    reset_language_cache()
+    yield
+    reset_language_cache()
 
 
 def _adapter(monkeypatch) -> TelegramAdapter:
@@ -145,6 +153,7 @@ async def test_settings_close_consumes_only_its_card(monkeypatch):
     callback.assert_not_awaited()
     assert nonce not in adapter._settings_picker_state
     assert query.edit_message_text.call_args.kwargs["reply_markup"] is None
+    assert query.edit_message_text.call_args.kwargs["text"] == "Close"
 
 
 @pytest.mark.asyncio
@@ -168,3 +177,73 @@ async def test_settings_wrong_topic_is_rejected_without_action(monkeypatch):
 
     callback.assert_not_awaited()
     assert nonce in adapter._settings_picker_state
+
+
+@pytest.mark.asyncio
+async def test_settings_picker_localizes_russian_chrome_and_callback_states(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    reset_language_cache()
+    adapter = _adapter(monkeypatch)
+    callback = AsyncMock(side_effect=RuntimeError("boom"))
+    await adapter.send_settings_picker(
+        chat_id="100",
+        title="",
+        actions=[{"value": "model", "label": "Модель"}],
+        session_key="telegram:100:7",
+        on_action_selected=callback,
+        metadata={"thread_id": "7"},
+        initiator_user_id="100",
+    )
+    nonce, state = next(iter(adapter._settings_picker_state.items()))
+    sent_buttons = _buttons(adapter._bot.send_message.call_args.kwargs["reply_markup"])
+    assert sent_buttons[-1].text == "✕ Закрыть"
+
+    malformed = _query()
+    await adapter._handle_settings_picker_callback(malformed, "st:broken")
+    malformed.answer.assert_awaited_once_with(
+        text="Настройки устарели — снова вызовите /settings."
+    )
+
+    invalid = _query()
+    await adapter._handle_settings_picker_callback(invalid, f"st:{nonce}:99")
+    assert "Настройки устарели" in invalid.edit_message_text.call_args.kwargs["text"]
+
+    failed = _query()
+    await adapter._handle_settings_picker_callback(failed, f"st:{nonce}:0")
+    assert "Не удалось изменить настройку" in failed.edit_message_text.call_args.kwargs[
+        "text"
+    ]
+    assert "boom" in failed.edit_message_text.call_args.kwargs["text"]
+
+    close_index = next(
+        index for index, action in enumerate(state["actions"]) if action.get("close")
+    )
+    closed = _query()
+    await adapter._handle_settings_picker_callback(
+        closed, f"st:{nonce}:{close_index}"
+    )
+    assert closed.edit_message_text.call_args.kwargs["text"] == "Закрыть"
+
+
+@pytest.mark.asyncio
+async def test_settings_picker_localizes_russian_generic_title(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    reset_language_cache()
+    adapter = _adapter(monkeypatch)
+    await adapter.send_settings_picker(
+        chat_id="100",
+        title="",
+        actions=[{"value": "model", "label": "Модель"}],
+        session_key="telegram:100:7",
+        on_action_selected=AsyncMock(return_value={}),
+        metadata={"thread_id": "7"},
+        initiator_user_id="100",
+    )
+    nonce = next(iter(adapter._settings_picker_state))
+
+    query = _query()
+    await adapter._handle_settings_picker_callback(query, f"st:{nonce}:0")
+
+    assert "Настройки устарели" in query.edit_message_text.call_args.kwargs["text"]
