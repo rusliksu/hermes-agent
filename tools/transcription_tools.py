@@ -29,6 +29,7 @@ Usage::
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1034,6 +1035,372 @@ def _dispatch_to_plugin_provider(
 
 
 # ---------------------------------------------------------------------------
+# Scoped STT provider fallback dispatch
+# ---------------------------------------------------------------------------
+
+
+_STT_FALLBACK_PROVIDER_IDS = frozenset({"local", "mistral", "openai", "elevenlabs"})
+_STT_FALLBACK_SECRET_ENV = {
+    "mistral": "MISTRAL_API_KEY",
+    "openai": "VOICE_TOOLS_OPENAI_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+}
+_STT_FALLBACK_ERROR_CLASSES = frozenset({
+    "provider_unavailable",
+    "auth_unavailable",
+    "capability_unavailable",
+    "timeout",
+    "rate_limited",
+    "upstream_5xx",
+    "provider_error",
+})
+
+
+def _read_configured_stt_fallbacks() -> Optional[tuple[tuple[str, ...], Dict[str, str]]]:
+    """Read an explicit server-side STT fallback policy.
+
+    A missing ``stt.fallbacks`` key deliberately returns ``None`` so the
+    existing single-provider dispatcher remains the default.  The optional
+    mapping form is accepted for parity with the media policy contract::
+
+        stt:
+          fallbacks:
+            stt: [local, mistral, openai, elevenlabs]
+            secret_references:
+              mistral: profile://stt/mistral
+
+    For the compact form, references live next to ``fallbacks`` under
+    ``stt.secret_references``.  References are opaque labels only; their
+    values are never used as credentials.
+    """
+    stt_config = _load_stt_config()
+    if not isinstance(stt_config, dict) or "fallbacks" not in stt_config:
+        return None
+
+    raw = stt_config.get("fallbacks")
+    nested_references: Any = None
+    if isinstance(raw, dict):
+        nested_references = raw.get("secret_references")
+        raw = raw.get("stt")
+    if raw is None:
+        raise ValueError("stt.fallbacks.stt must be a non-empty list")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("stt.fallbacks.stt must be a non-empty list")
+
+    providers: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("STT fallback provider id must be a non-empty string")
+        provider_id = item.strip()
+        if provider_id not in _STT_FALLBACK_PROVIDER_IDS:
+            raise ValueError(f"unsupported STT fallback provider: {provider_id}")
+        if provider_id not in providers:
+            providers.append(provider_id)
+
+    references = (
+        nested_references
+        if nested_references is not None
+        else stt_config.get("secret_references", {})
+    )
+    if references is None:
+        references = {}
+    if not isinstance(references, dict):
+        raise ValueError("stt secret_references must be a mapping")
+
+    normalized_references: Dict[str, str] = {}
+    for raw_provider, raw_reference in references.items():
+        if raw_provider not in providers or raw_provider not in _STT_FALLBACK_SECRET_ENV:
+            raise ValueError(f"secret reference is not allowed for STT provider: {raw_provider}")
+        if not isinstance(raw_reference, str) or not raw_reference.strip():
+            raise ValueError(f"secret reference for {raw_provider} must be non-empty")
+        normalized_references[raw_provider] = raw_reference.strip()
+
+    return tuple(providers), normalized_references
+
+
+def _stt_access_context():
+    """Return only the trusted typed context; never infer it from arguments."""
+    from gateway.access_registry import ResolvedAccessContext
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    return context if isinstance(context, ResolvedAccessContext) else None
+
+
+def _stt_profile_home(context) -> Path:
+    from tools.media_provider_routing import MediaProviderError
+
+    try:
+        from agent.runtime_cwd import bound_profile_home
+
+        profile_home = bound_profile_home()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+    if profile_home is None:
+        raise MediaProviderError("invalid_context")
+    try:
+        return profile_home.resolve()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+
+
+def _stt_input_path(context, file_path: str) -> Path:
+    from tools.media_provider_routing import MediaProviderError
+
+    profile_home = _stt_profile_home(context)
+    try:
+        audio_path = Path(file_path).expanduser().resolve()
+        audio_path.relative_to(profile_home)
+        if not audio_path.is_file():
+            raise MediaProviderError("provider_error")
+    except MediaProviderError:
+        raise
+    except Exception as exc:
+        raise MediaProviderError("provider_error") from exc
+    return audio_path
+
+
+def _stt_provider_error(provider_id: str, result: Any):
+    """Normalize legacy STT error envelopes into fallback-safe classes."""
+    from tools.media_provider_routing import MediaProviderError
+
+    raw_error_type = result.get("error_type") if isinstance(result, dict) else None
+    if isinstance(raw_error_type, str) and raw_error_type in _STT_FALLBACK_ERROR_CLASSES:
+        return MediaProviderError(raw_error_type, provider_id)
+
+    message = str(result.get("error", "")) if isinstance(result, dict) else ""
+    lowered = message.lower()
+    if "timeout" in lowered or "timed out" in lowered:
+        error_class = "timeout"
+    elif "rate limit" in lowered or "rate_limited" in lowered or "429" in lowered:
+        error_class = "rate_limited"
+    elif re.search(r"\b5\d{2}\b", lowered) or "upstream 5xx" in lowered:
+        error_class = "upstream_5xx"
+    elif (
+        "not set" in lowered
+        or "no credentials" in lowered
+        or "authentication" in lowered
+        or "api key" in lowered
+    ):
+        error_class = "auth_unavailable"
+    elif (
+        "not installed" in lowered
+        or "unavailable" in lowered
+        or "connection error" in lowered
+        or "connection failed" in lowered
+    ):
+        error_class = "provider_unavailable"
+    else:
+        error_class = "provider_error"
+    return MediaProviderError(error_class, provider_id)
+
+
+def _stt_provider_model(provider_id: str, requested_model: Optional[str]) -> str:
+    if requested_model:
+        return str(requested_model)
+    stt_config = _load_stt_config()
+    provider_config = stt_config.get(provider_id) if isinstance(stt_config, dict) else None
+    provider_config = provider_config if isinstance(provider_config, dict) else {}
+    if provider_id == "local":
+        return _normalize_local_model(provider_config.get("model", DEFAULT_LOCAL_MODEL))
+    if provider_id == "mistral":
+        return str(provider_config.get("model", DEFAULT_MISTRAL_STT_MODEL))
+    if provider_id == "openai":
+        return str(provider_config.get("model", DEFAULT_STT_MODEL))
+    if provider_id == "elevenlabs":
+        return str(provider_config.get("model_id", DEFAULT_ELEVENLABS_STT_MODEL))
+    raise ValueError(f"unsupported STT provider: {provider_id}")
+
+
+def _resolve_profile_stt_secret(context, provider_id: str, reference: str):
+    """Resolve a provider-specific credential from the current profile only."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError
+
+    env_name = _STT_FALLBACK_SECRET_ENV.get(provider_id)
+    if not env_name or not isinstance(reference, str) or not reference.strip():
+        raise MediaProviderError("auth_unavailable", provider_id)
+    profile_home = _stt_profile_home(context)
+    override_token = set_hermes_home_override(profile_home)
+    try:
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+        except Exception:
+            get_env_value_prefer_dotenv = None
+
+        if not callable(get_env_value_prefer_dotenv):
+            return None
+        if provider_id == "openai":
+            # Resolve both supported direct key names through the profile
+            # config loader.  The prefer-dotenv helper applies the active
+            # profile secret scope to any environment fallback; do not enter
+            # the managed OAuth gateway implicitly.
+            value = (
+                get_env_value_prefer_dotenv("VOICE_TOOLS_OPENAI_KEY")
+                or get_env_value_prefer_dotenv("OPENAI_API_KEY")
+            )
+        else:
+            value = get_env_value_prefer_dotenv(env_name)
+    finally:
+        reset_hermes_home_override(override_token)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _invoke_stt_provider(provider_id: str, context, input_handle: dict, secret_handle: Any):
+    """Invoke one existing STT adapter under the bound profile home."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError, MediaResult
+
+    profile_home = _stt_profile_home(context)
+    audio_path = _stt_input_path(context, input_handle.get("file_path", ""))
+    model_name = _stt_provider_model(provider_id, input_handle.get("model"))
+    if provider_id in _STT_FALLBACK_SECRET_ENV and not isinstance(secret_handle, str):
+        raise MediaProviderError("auth_unavailable", provider_id)
+
+    override_token = set_hermes_home_override(profile_home)
+    try:
+        if provider_id == "local":
+            result = _transcribe_local(str(audio_path), _normalize_local_model(model_name))
+        elif provider_id == "mistral":
+            result = _transcribe_mistral(str(audio_path), model_name, api_key=secret_handle)
+        elif provider_id == "openai":
+            openai_config = _load_stt_config().get("openai") or {}
+            base_url = openai_config.get("base_url") or OPENAI_BASE_URL
+            result = _transcribe_openai(
+                str(audio_path),
+                model_name,
+                api_key=secret_handle,
+                base_url=base_url,
+            )
+        elif provider_id == "elevenlabs":
+            result = _transcribe_elevenlabs(
+                str(audio_path),
+                model_name,
+                api_key=secret_handle,
+            )
+        else:
+            raise MediaProviderError("invalid_policy", provider_id)
+    finally:
+        reset_hermes_home_override(override_token)
+
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise _stt_provider_error(provider_id, result)
+    transcript = result.get("transcript")
+    if not isinstance(transcript, str) or not transcript.strip():
+        raise MediaProviderError("capability_unavailable", provider_id)
+    return MediaResult(
+        text=transcript.strip(),
+        metadata={"provider": provider_id},
+    )
+
+
+def _stt_provider_audit(event) -> None:
+    """Emit only the redacted fields defined by MediaProviderAuditEvent."""
+    logger.info(
+        "media_provider_attempt operation=%s provider=%s error_class=%s "
+        "elapsed_ms=%s profile_ref=%s success=%s",
+        event.operation,
+        event.provider_id,
+        event.error_class or "",
+        event.elapsed_ms,
+        event.profile_ref,
+        event.success,
+    )
+
+
+def _dispatch_to_stt_fallback_chain(
+    file_path: str,
+    model: Optional[str] = None,
+):
+    """Run the explicit, profile-bound STT chain, if configured."""
+    try:
+        configured = _read_configured_stt_fallbacks()
+    except ValueError:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "invalid media provider policy",
+            "error_type": "invalid_policy",
+        }
+    if configured is None:
+        return None
+    provider_order, secret_references = configured
+
+    context = _stt_access_context()
+    if context is None:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "invalid media access context",
+            "error_type": "invalid_context",
+        }
+
+    from tools.media_provider_routing import (
+        MediaProviderError,
+        MediaProviderExecutor,
+        MediaProviderPolicy,
+    )
+
+    try:
+        # Canonicalize and validate before any provider is called.  This also
+        # rejects a path that resolves through a symlink into another profile.
+        audio_path = _stt_input_path(context, file_path)
+    except MediaProviderError as error:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": error.message,
+            "error_type": error.error_class,
+        }
+
+    handlers = {
+        provider_id: (
+            lambda bound_context, input_handle, secret_handle,
+            provider_id=provider_id: _invoke_stt_provider(
+                provider_id, bound_context, input_handle, secret_handle
+            )
+        )
+        for provider_id in provider_order
+    }
+    policy = MediaProviderPolicy(
+        provider_order={"stt": provider_order},
+        required_capabilities={"stt": "attachments"},
+        secret_references=secret_references,
+        secret_required=frozenset(
+            provider_id for provider_id in provider_order
+            if provider_id in _STT_FALLBACK_SECRET_ENV
+        ),
+    )
+    try:
+        result = MediaProviderExecutor(
+            handlers,
+            secret_resolver=_resolve_profile_stt_secret,
+            audit_sink=_stt_provider_audit,
+        ).execute(
+            "stt",
+            context,
+            {"file_path": str(audio_path), "model": model},
+            policy,
+        )
+    except MediaProviderError as error:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": error.message,
+            "error_type": error.error_class,
+        }
+
+    provider_id = result.metadata.get("provider", "") if result.metadata else ""
+    return {
+        "success": True,
+        "transcript": result.text or "",
+        "provider": provider_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Shared validation
 # ---------------------------------------------------------------------------
 
@@ -1419,13 +1786,19 @@ def _transcribe_openai(
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_mistral(
+    file_path: str,
+    model_name: str,
+    *,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Transcribe using Mistral Voxtral Transcribe API.
 
     Uses the ``mistralai`` Python SDK to call ``/v1/audio/transcriptions``.
     Requires ``MISTRAL_API_KEY`` environment variable.
     """
-    api_key = get_env_value("MISTRAL_API_KEY")
+    if api_key is None:
+        api_key = get_env_value("MISTRAL_API_KEY")
     if not api_key:
         return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
 
@@ -1570,9 +1943,15 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
+def _transcribe_elevenlabs(
+    file_path: str,
+    model_name: str,
+    *,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Transcribe using ElevenLabs Scribe STT API."""
-    api_key = get_env_value("ELEVENLABS_API_KEY")
+    if api_key is None:
+        api_key = get_env_value("ELEVENLABS_API_KEY")
     if not api_key:
         return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
 
@@ -1741,6 +2120,13 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "transcript": "",
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
+
+    # An explicit server-side fallback policy takes precedence over the
+    # legacy single-provider selector.  Missing ``fallbacks`` keeps the exact
+    # current local/cloud dispatch below, including its local default.
+    chained = _dispatch_to_stt_fallback_chain(file_path, model)
+    if chained is not None:
+        return chained
 
     provider = _get_provider(stt_config)
 
