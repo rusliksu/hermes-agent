@@ -85,6 +85,11 @@
   },
   "rollback": {
     "gate": "explicit-live-configuration-approval",
+    "legacy_provider_order": {
+      "image_generation": ["openai-codex"],
+      "stt": ["local"],
+      "tts": ["edge"]
+    },
     "steps": [
       "Restore the pre-change redacted policy snapshot for operator comparison.",
       "Remove only the image_gen.fallbacks, stt.fallbacks, and tts.fallbacks keys under the approved live change procedure.",

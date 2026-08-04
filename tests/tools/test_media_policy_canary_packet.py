@@ -29,6 +29,19 @@ def test_redacted_fixture_matches_packet_and_dry_run():
         assert report["operations"][operation]["provider_order"] == providers
     assert "profile://synthetic" not in json.dumps(report, sort_keys=True)
 
+    legacy = {
+        "image_gen": {"provider": "openai-codex"},
+        "stt": {"provider": "local"},
+        "tts": {"provider": "edge"},
+    }
+    restored = dry_run_media_policy(legacy)
+    assert restored["valid"] is True
+    assert restored["mode"] == "legacy"
+    assert {
+        operation: restored["operations"][operation]["provider_order"]
+        for operation in ("image_generation", "stt", "tts")
+    } == packet["rollback"]["legacy_provider_order"]
+
 
 def test_packet_is_non_mutating_and_has_fail_closed_matrix():
     packet = json.loads(PACKET.read_text(encoding="utf-8"))
