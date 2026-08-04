@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, cast
@@ -53,7 +53,35 @@ _LEGACY_REQUIRED_CAPABILITIES = MappingProxyType({
     "stt": "attachments",
     "tts": "voice_generation",
 })
+_MEDIA_SECTION_BY_OPERATION = MappingProxyType({
+    "image_generation": "image_gen",
+    "stt": "stt",
+    "tts": "tts",
+})
+_MEDIA_PROVIDER_IDS = MappingProxyType({
+    "image_generation": frozenset({"openai-codex", "fal", "openrouter"}),
+    "stt": frozenset({"local", "mistral", "openai", "elevenlabs"}),
+    "tts": frozenset({"edge", "openai", "elevenlabs"}),
+})
+_MEDIA_SECRET_REQUIRED = MappingProxyType({
+    "image_generation": frozenset(),
+    "stt": frozenset({"mistral", "openai", "elevenlabs"}),
+    "tts": frozenset({"openai", "elevenlabs"}),
+})
+_KNOWN_MEDIA_ROLES = frozenset({
+    "owner",
+    "family_standard",
+    "family_sandbox",
+    "shared_room",
+})
+_MISSING = object()
+_MEDIA_POLICY_SCHEMA = "media-policy-dry-run/v1"
 _PROFILE_REF_LENGTH = 12
+_MEDIA_OPERATION_ORDER: tuple[MediaOperation, ...] = (
+    "image_generation",
+    "stt",
+    "tts",
+)
 
 
 def _safe_error_class(value: Any) -> str:
@@ -185,6 +213,489 @@ class MediaProviderPolicy:
             secret_references={},
             secret_required=frozenset(),
         )
+
+
+@dataclass(frozen=True)
+class MediaPolicyDiagnostic:
+    """Safe, machine-readable finding from the media-policy dry run."""
+
+    code: str
+    path: str
+    message: str
+    severity: Literal["error", "warning"] = "error"
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "path": self.path,
+            "message": self.message,
+            "severity": self.severity,
+        }
+
+
+@dataclass(frozen=True)
+class MediaPolicyValidation:
+    """Validated policy plus a credential-safe dry-run report."""
+
+    policy: MediaProviderPolicy | None
+    report: Mapping[str, Any]
+    diagnostics: tuple[MediaPolicyDiagnostic, ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.report.get("valid"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.report)
+
+
+def _policy_diagnostic(
+    diagnostics: list[MediaPolicyDiagnostic],
+    code: str,
+    path: str,
+    message: str,
+    *,
+    severity: Literal["error", "warning"] = "error",
+) -> None:
+    diagnostics.append(
+        MediaPolicyDiagnostic(
+            code=code,
+            path=path,
+            message=message,
+            severity=severity,
+        )
+    )
+
+
+def _normalized_policy_provider(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _section_for_operation(
+    raw_config: Mapping[str, Any],
+    operation: MediaOperation,
+    diagnostics: list[MediaPolicyDiagnostic],
+) -> tuple[Mapping[str, Any], str]:
+    section_name = _MEDIA_SECTION_BY_OPERATION[operation]
+    section = raw_config.get(section_name)
+    if section is None:
+        return {}, section_name
+    if not isinstance(section, Mapping):
+        _policy_diagnostic(
+            diagnostics,
+            "section_not_mapping",
+            section_name,
+            "media operation section must be a mapping",
+        )
+        return {}, section_name
+    return section, section_name
+
+
+def _parse_operation_fallbacks(
+    section: Mapping[str, Any],
+    operation: MediaOperation,
+    section_name: str,
+    diagnostics: list[MediaPolicyDiagnostic],
+) -> tuple[tuple[str, ...] | None, Mapping[str, Any]]:
+    """Parse one operation while keeping raw secret values out of diagnostics."""
+    if "fallbacks" not in section:
+        return None, {}
+
+    fallback_path = f"{section_name}.fallbacks"
+    raw = section.get("fallbacks")
+    nested_references: Any = _MISSING
+    if isinstance(raw, Mapping):
+        nested_references = raw.get("secret_references", _MISSING)
+        raw_candidates = (
+            raw.get(operation, _MISSING),
+            raw.get(section_name, _MISSING),
+        )
+        raw = next((candidate for candidate in raw_candidates if candidate is not _MISSING), _MISSING)
+        if raw is _MISSING:
+            _policy_diagnostic(
+                diagnostics,
+                "missing_provider_order",
+                f"{fallback_path}.{operation}",
+                "fallback mapping must contain an operation provider list",
+            )
+            return (), nested_references if nested_references is not _MISSING else {}
+    if not isinstance(raw, (list, tuple)) or not raw:
+        _policy_diagnostic(
+            diagnostics,
+            "invalid_provider_order",
+            f"{fallback_path}.{operation}",
+            "fallback provider order must be a non-empty list",
+        )
+        return (), nested_references if nested_references is not _MISSING else {}
+
+    allowed = _MEDIA_PROVIDER_IDS[operation]
+    providers: list[str] = []
+    for index, item in enumerate(raw):
+        provider_id = _normalized_policy_provider(item)
+        item_path = f"{fallback_path}.{operation}[{index}]"
+        if not provider_id:
+            _policy_diagnostic(
+                diagnostics,
+                "invalid_provider_id",
+                item_path,
+                "provider id must be a non-empty string",
+            )
+            continue
+        if provider_id not in allowed:
+            _policy_diagnostic(
+                diagnostics,
+                "unknown_provider",
+                item_path,
+                f"provider is not allowed for {operation}",
+            )
+            continue
+        if provider_id not in providers:
+            providers.append(provider_id)
+    if not providers:
+        _policy_diagnostic(
+            diagnostics,
+            "empty_provider_order",
+            f"{fallback_path}.{operation}",
+            "fallback provider order has no allowed providers",
+        )
+    return tuple(providers), nested_references if nested_references is not _MISSING else {}
+
+
+def _parse_secret_references(
+    section: Mapping[str, Any],
+    nested_references: Mapping[str, Any],
+    operation: MediaOperation,
+    section_name: str,
+    providers: tuple[str, ...],
+    diagnostics: list[MediaPolicyDiagnostic],
+) -> dict[str, str]:
+    references: Any = nested_references
+    if references == {} and "secret_references" in section:
+        references = section.get("secret_references")
+    if references is None:
+        references = {}
+    if not isinstance(references, Mapping):
+        _policy_diagnostic(
+            diagnostics,
+            "invalid_secret_references",
+            f"{section_name}.secret_references",
+            "secret references must be a mapping",
+        )
+        return {}
+
+    required = _MEDIA_SECRET_REQUIRED[operation]
+    normalized: dict[str, str] = {}
+    for raw_provider, raw_reference in references.items():
+        provider_id = _normalized_policy_provider(raw_provider)
+        path = f"{section_name}.secret_references"
+        if provider_id not in providers or provider_id not in required:
+            _policy_diagnostic(
+                diagnostics,
+                "secret_reference_not_allowed",
+                path,
+                f"secret reference is not allowed for {operation} provider",
+            )
+            continue
+        if not isinstance(raw_reference, str) or not raw_reference.strip():
+            _policy_diagnostic(
+                diagnostics,
+                "invalid_secret_reference",
+                path,
+                "secret reference must be a non-empty opaque label",
+            )
+            continue
+        normalized[provider_id] = raw_reference.strip()
+    return normalized
+
+
+def _parse_media_policy(
+    raw_config: Any,
+    *,
+    legacy_provider_by_operation: Mapping[str, str] | None = None,
+) -> tuple[MediaProviderPolicy | None, dict[MediaOperation, dict[str, Any]], tuple[MediaPolicyDiagnostic, ...]]:
+    diagnostics: list[MediaPolicyDiagnostic] = []
+    if not isinstance(raw_config, Mapping):
+        _policy_diagnostic(
+            diagnostics,
+            "config_not_mapping",
+            "config",
+            "media policy must be a mapping",
+        )
+        return None, {}, tuple(diagnostics)
+
+    legacy_overrides = legacy_provider_by_operation or {}
+    provider_order: dict[MediaOperation, tuple[str, ...]] = {}
+    required_capabilities: dict[MediaOperation, str] = {}
+    secret_references: dict[str, str] = {}
+    secret_required: set[str] = set()
+    operation_details: dict[MediaOperation, dict[str, Any]] = {}
+    explicit_fallback = False
+
+    for operation in _MEDIA_OPERATION_ORDER:
+        section, section_name = _section_for_operation(raw_config, operation, diagnostics)
+        required_capability = _LEGACY_REQUIRED_CAPABILITIES[operation]
+        required_capabilities[operation] = required_capability
+        providers, nested_references = _parse_operation_fallbacks(
+            section,
+            operation,
+            section_name,
+            diagnostics,
+        )
+        if providers is None:
+            legacy_provider = legacy_overrides.get(operation, section.get("provider"))
+            normalized_legacy = _normalized_policy_provider(legacy_provider)
+            if normalized_legacy:
+                provider_order[operation] = (normalized_legacy,)
+                report_order = [normalized_legacy]
+            else:
+                report_order = []
+            operation_mode = "legacy"
+            references = {}
+        else:
+            explicit_fallback = True
+            if not providers:
+                report_order = []
+                operation_mode = "fallback"
+                references = {}
+            else:
+                provider_order[operation] = providers
+                report_order = list(providers)
+                operation_mode = "fallback"
+                references = _parse_secret_references(
+                    section,
+                    nested_references,
+                    operation,
+                    section_name,
+                    providers,
+                    diagnostics,
+                )
+                secret_references.update(references)
+                secret_required.update(
+                    provider_id
+                    for provider_id in providers
+                    if provider_id in _MEDIA_SECRET_REQUIRED[operation]
+                )
+
+        operation_details[operation] = {
+            "mode": operation_mode,
+            "provider_order": report_order,
+            "required_capability": required_capability,
+            "secret_reference_status": {
+                provider_id: ("configured" if provider_id in references else "missing")
+                for provider_id in report_order
+                if provider_id in _MEDIA_SECRET_REQUIRED[operation]
+            },
+        }
+
+    if any(item.severity == "error" for item in diagnostics):
+        return None, operation_details, tuple(diagnostics)
+    try:
+        policy = MediaProviderPolicy(
+            provider_order=provider_order,
+            required_capabilities=required_capabilities,
+            secret_references=secret_references,
+            secret_required=frozenset(secret_required),
+        )
+    except Exception:
+        _policy_diagnostic(
+            diagnostics,
+            "invalid_policy",
+            "media_policy",
+            "media provider policy failed validation",
+        )
+        return None, operation_details, tuple(diagnostics)
+    for details in operation_details.values():
+        details["mode"] = "fallback" if explicit_fallback and details["mode"] == "fallback" else details["mode"]
+    return policy, operation_details, tuple(diagnostics)
+
+
+def parse_media_provider_policy(
+    raw_config: Mapping[str, Any],
+    *,
+    legacy_provider_by_operation: Mapping[str, str] | None = None,
+) -> MediaProviderPolicy:
+    """Parse server-side YAML/config data into a validated media policy.
+
+    The parser never reads files, environment credentials, or profile state.
+    Missing ``fallbacks`` is deliberately represented as a legacy single
+    provider, so existing adapter dispatch remains unchanged.
+    """
+    policy, _details, diagnostics = _parse_media_policy(
+        raw_config,
+        legacy_provider_by_operation=legacy_provider_by_operation,
+    )
+    errors = [item for item in diagnostics if item.severity == "error"]
+    if policy is None or errors:
+        raise ValueError(errors[0].message if errors else "invalid media provider policy")
+    return policy
+
+
+def _context_validation(
+    context: Any,
+    *,
+    known_principal_ids: Iterable[str] | None = None,
+    access_registry: Any = None,
+) -> tuple[str, str | None, MediaPolicyDiagnostic | None]:
+    if context is None:
+        return "not_evaluated", None, None
+    try:
+        validated = _validated_context(context)
+    except MediaProviderError:
+        return (
+            "invalid",
+            None,
+            MediaPolicyDiagnostic(
+                code="invalid_context",
+                path="context",
+                message="resolved access context is malformed",
+            ),
+        )
+    if validated.role_id not in _KNOWN_MEDIA_ROLES:
+        return (
+            "invalid",
+            None,
+            MediaPolicyDiagnostic(
+                code="unknown_role",
+                path="context.role_id",
+                message="resolved access context role is not registered",
+            ),
+        )
+    if known_principal_ids is not None and validated.principal_id not in set(known_principal_ids):
+        return (
+            "invalid",
+            None,
+            MediaPolicyDiagnostic(
+                code="unknown_identity",
+                path="context.principal_id",
+                message="resolved access context principal is not registered",
+            ),
+        )
+    if access_registry is not None:
+        validator = getattr(access_registry, "validate_resolved_context", None)
+        if not callable(validator):
+            return (
+                "invalid",
+                None,
+                MediaPolicyDiagnostic(
+                    code="invalid_registry",
+                    path="context",
+                    message="access registry cannot validate the resolved context",
+                ),
+            )
+        try:
+            validator(validated)
+        except Exception:
+            return (
+                "invalid",
+                None,
+                MediaPolicyDiagnostic(
+                    code="unknown_identity",
+                    path="context",
+                    message="resolved access context is not registered",
+                ),
+            )
+    try:
+        profile_ref = canonical_access_context_fingerprint(validated)[:_PROFILE_REF_LENGTH]
+    except Exception:
+        return (
+            "invalid",
+            None,
+            MediaPolicyDiagnostic(
+                code="invalid_context",
+                path="context",
+                message="resolved access context cannot be fingerprinted",
+            ),
+        )
+    return "valid", profile_ref, None
+
+
+def validate_media_policy_config(
+    raw_config: Any,
+    *,
+    context: ResolvedAccessContext | None = None,
+    known_principal_ids: Iterable[str] | None = None,
+    access_registry: Any = None,
+    legacy_provider_by_operation: Mapping[str, str] | None = None,
+) -> MediaPolicyValidation:
+    """Return a credential-safe report without changing live configuration."""
+    policy, details, parse_diagnostics = _parse_media_policy(
+        raw_config,
+        legacy_provider_by_operation=legacy_provider_by_operation,
+    )
+    diagnostics = list(parse_diagnostics)
+    context_status, profile_ref, context_diagnostic = _context_validation(
+        context,
+        known_principal_ids=known_principal_ids,
+        access_registry=access_registry,
+    )
+    if context_diagnostic is not None:
+        diagnostics.append(context_diagnostic)
+
+    valid_context = context_status == "valid"
+    for operation, operation_details in details.items():
+        required = operation_details["required_capability"]
+        if context is None:
+            capability_status = "not_evaluated"
+        elif valid_context and required in context.capabilities:
+            capability_status = "available"
+        elif valid_context:
+            capability_status = "unavailable"
+        else:
+            capability_status = "invalid_context"
+        operation_details["capability_status"] = capability_status
+        operation_details["providers"] = [
+            {
+                "provider_id": provider_id,
+                "status": (
+                    "legacy"
+                    if operation_details["mode"] == "legacy"
+                    else (
+                        "capability_unavailable"
+                        if capability_status == "unavailable"
+                        else "invalid_context"
+                        if capability_status == "invalid_context"
+                        else operation_details["secret_reference_status"].get(
+                            provider_id,
+                            "ready" if capability_status == "available" else capability_status,
+                        )
+                    )
+                ),
+            }
+            for provider_id in operation_details["provider_order"]
+        ]
+
+    report: dict[str, Any] = {
+        "schema": _MEDIA_POLICY_SCHEMA,
+        "valid": policy is not None
+        and not any(item.severity == "error" for item in diagnostics),
+        "mode": "fallback"
+        if any(details_item["mode"] == "fallback" for details_item in details.values())
+        else "legacy",
+        "context": {
+            "status": context_status,
+            **({"profile_ref": profile_ref} if profile_ref else {}),
+        },
+        "operations": {
+            operation: details[operation]
+            for operation in _MEDIA_OPERATION_ORDER
+        },
+        "diagnostics": [item.as_dict() for item in diagnostics],
+    }
+    return MediaPolicyValidation(
+        policy=policy,
+        report=report,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def dry_run_media_policy(
+    raw_config: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """JSON-ready alias used by CLI and synthetic policy checks."""
+    return validate_media_policy_config(raw_config, **kwargs).as_dict()
 
 
 @dataclass(frozen=True)
