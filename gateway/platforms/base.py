@@ -1053,6 +1053,13 @@ _MEDIA_DELIVERY_CACHE_SUBDIRS = (
     "documents",
     "screenshots",
 )
+_MEDIA_DELIVERY_LEGACY_CACHE_SUBDIRS = (
+    "image_cache",
+    "audio_cache",
+    "video_cache",
+    "document_cache",
+    "browser_screenshots",
+)
 
 
 def _profile_cache_roots() -> List[Path]:
@@ -1080,6 +1087,66 @@ def _profile_cache_roots() -> List[Path]:
     return roots
 
 
+def _multiplex_media_delivery_scope() -> tuple[bool, Optional[Path]]:
+    """Return ``(multiplex_active, active_profile_home)`` for media egress.
+
+    The gateway process can see every profile's cache directory, but a model
+    turn may deliver only from the profile bound to its trusted six-field
+    access context.  Missing, malformed, or mismatched context is represented
+    as ``(True, None)`` so callers fail closed instead of falling back to the
+    process/default HERMES_HOME.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplex_active = bool(is_multiplex_active())
+    except Exception:
+        # If the guard cannot determine deployment mode, fail closed rather
+        # than silently widening a multiplexed gateway.
+        return True, None
+    if not multiplex_active:
+        return False, None
+
+    try:
+        from gateway.access_registry import serialize_resolved_access_context
+        from gateway.session_context import get_resolved_access_context
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
+        from hermes_constants import get_hermes_home
+
+        context = get_resolved_access_context(None)
+        payload = serialize_resolved_access_context(context)
+        profile_id = payload["profile_id"]
+        canonical = normalize_profile_name(profile_id)
+        validate_profile_name(canonical)
+        if canonical != profile_id or not profile_exists(canonical):
+            raise ValueError("malformed resolved access profile")
+
+        expected_home = get_profile_dir(canonical).expanduser().resolve(strict=False)
+        active_home = get_hermes_home().expanduser().resolve(strict=False)
+        if active_home != expected_home or not active_home.is_dir():
+            raise ValueError("resolved access profile home mismatch")
+        return True, active_home
+    except Exception:
+        return True, None
+
+
+def _profile_media_delivery_roots(profile_home: Path) -> List[Path]:
+    """Return canonical cache roots belonging only to ``profile_home``."""
+    roots = [
+        profile_home / "cache" / subdir
+        for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS
+    ]
+    roots.extend(
+        profile_home / subdir for subdir in _MEDIA_DELIVERY_LEGACY_CACHE_SUBDIRS
+    )
+    return roots
+
+
 def _kanban_attachment_roots() -> List[Path]:
     """Return durable Kanban attachment roots without importing kanban_db."""
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
@@ -1104,6 +1171,32 @@ def _kanban_attachment_roots() -> List[Path]:
 
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
+    multiplex_active, profile_home = _multiplex_media_delivery_scope()
+    if multiplex_active:
+        if profile_home is None:
+            return []
+
+        # In multiplex mode never expose the all-profile enumeration or a
+        # process-wide operator root. Explicit roots are accepted only when
+        # they are physically inside the currently bound profile home.
+        roots = _profile_media_delivery_roots(profile_home)
+        candidate_roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+        candidate_roots.extend(_kanban_attachment_roots())
+        extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
+        for chunk in extra_roots.split(os.pathsep):
+            for raw_root in chunk.split(","):
+                raw_root = raw_root.strip()
+                if raw_root:
+                    candidate_roots.append(Path(os.path.expanduser(raw_root)))
+        for root in candidate_roots:
+            try:
+                resolved_root = root.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if _path_is_within(resolved_root, profile_home):
+                roots.append(resolved_root)
+        return roots
+
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
     roots.extend(_profile_cache_roots())
     roots.extend(_kanban_attachment_roots())
@@ -1313,6 +1406,16 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     if not resolved.is_file():
+        return None
+
+    # A multiplexed gateway must bind attachment egress to the same trusted
+    # profile as the current turn. This check precedes both the allowlist and
+    # non-strict fallback so a guessed path in another profile can never be
+    # delivered through the default path.
+    multiplex_active, profile_home = _multiplex_media_delivery_scope()
+    if multiplex_active and (
+        profile_home is None or not _path_is_within(resolved, profile_home)
+    ):
         return None
 
     # Cache / operator allowlist is always honored — these are unconditionally
