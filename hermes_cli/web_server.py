@@ -13330,6 +13330,87 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
     return profiles
 
 
+def _access_users_payload(registry, profile_infos: List[Any]) -> Dict[str, Any]:
+    """Build a redacted, read-only dashboard view of the access registry.
+
+    Transport identities, delivery targets, filesystem paths, and secret
+    values are intentionally not part of this payload.  The dashboard needs
+    enough information to show who is bound to which role/profile and whether
+    the profile is healthy, but it must not become another identity dump.
+    """
+    from gateway.access_registry import PrincipalBinding, SharedScopeBinding
+
+    profile_by_name = {
+        str(_profile_attr(info, "name", "")): info
+        for info in profile_infos
+        if _profile_attr(info, "name", "")
+    }
+    validation = registry.validate()
+    rows: List[Dict[str, Any]] = []
+    bindings = tuple(registry.principal_bindings) + tuple(registry.shared_scope_bindings)
+    for binding in bindings:
+        if not isinstance(binding, (PrincipalBinding, SharedScopeBinding)):
+            continue
+        profile_id = str(binding.profile_id)
+        role = registry.roles.get(binding.role_id)
+        profile_info = profile_by_name.get(profile_id)
+        profile_present = profile_info is not None
+        role_active = bool(getattr(role, "active", False))
+        scope_registered = binding.conversation_scope in registry.scope_capabilities
+        healthy = bool(
+            validation.valid
+            and binding.active
+            and profile_id in registry.profiles
+            and profile_present
+            and role_active
+            and scope_registered
+        )
+        rows.append(
+            {
+                "principal_id": binding.principal_id,
+                "role_id": binding.role_id,
+                "profile_id": profile_id,
+                "binding_kind": (
+                    "shared_room"
+                    if isinstance(binding, SharedScopeBinding)
+                    else "principal"
+                ),
+                "active": bool(binding.active),
+                "effective_capabilities": sorted(
+                    registry.effective_capabilities(
+                        binding.role_id,
+                        binding.conversation_scope,
+                    )
+                ),
+                "profile_health": {
+                    "registered": profile_id in registry.profiles,
+                    "directory_present": profile_present,
+                    "gateway_running": bool(
+                        _profile_attr(profile_info, "gateway_running", False)
+                    ),
+                },
+                "isolation": {
+                    "status": "healthy" if healthy else "degraded",
+                    "context_contract": "six_fields",
+                    "transport_ids_redacted": True,
+                    "secret_values_exposed": False,
+                },
+            }
+        )
+    return {
+        "enabled": True,
+        "validation": validation.as_dict(),
+        "redaction": {
+            "transport_ids_exposed": False,
+            "delivery_targets_exposed": False,
+            "filesystem_paths_exposed": False,
+            "secret_values_exposed": False,
+        },
+        "users": [row for row in rows if row["binding_kind"] == "principal"],
+        "rooms": [row for row in rows if row["binding_kind"] == "shared_room"],
+    }
+
+
 def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
@@ -13462,6 +13543,35 @@ async def list_profiles_endpoint():
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
+
+
+@app.get("/api/access/users")
+async def list_access_users_endpoint():
+    """Return a redacted access/role/profile view for the dashboard."""
+    try:
+        from gateway.config import load_gateway_config
+        from hermes_cli import profiles as profiles_mod
+
+        registry = load_gateway_config().access_registry
+        if registry is None:
+            return {
+                "enabled": False,
+                "users": [],
+                "rooms": [],
+                "validation": {"verdict": "not_configured", "conflicts": []},
+                "redaction": {
+                    "transport_ids_exposed": False,
+                    "delivery_targets_exposed": False,
+                    "filesystem_paths_exposed": False,
+                    "secret_values_exposed": False,
+                },
+            }
+        loop = asyncio.get_running_loop()
+        profile_infos = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        return _access_users_payload(registry, profile_infos)
+    except Exception:
+        _log.exception("GET /api/access/users failed")
+        raise HTTPException(status_code=503, detail="Access registry unavailable")
 
 
 @app.post("/api/profiles")
