@@ -2852,8 +2852,21 @@ def delegate_task(
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
     if background:
-        from tools.async_delegation import dispatch_async_delegation_batch
+        from tools.async_delegation import (
+            capture_resolved_access_context_payload,
+            dispatch_async_delegation_batch,
+        )
         from tools.approval import get_current_session_key
+
+        try:
+            _resolved_access_context = capture_resolved_access_context_payload()
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if getattr(parent_agent, "_session_scope_required", False) is True and _resolved_access_context is None:
+            # Multiplexed profiles must never create an ownerless detached
+            # child whose completion could later fall through to a default
+            # session.
+            return tool_error("missing_resolved_access_context")
 
         # Stateless request/response sessions (the API server / WebUI path)
         # cannot route a detached subagent result back to the agent after the
@@ -2964,6 +2977,7 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            resolved_access_context=_resolved_access_context,
         )
 
         if dispatch.get("status") == "dispatched":
