@@ -107,9 +107,9 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T016 Add redacted migration planner/report and profile/room fixture setup under `tests/fixtures/` and `docs/ops/`.
-- [ ] T017 Preserve session IDs/timestamps only for unambiguous DM ownership; route ambiguous rows to a closed read-only archive.
-- [ ] T018 [P] Add migration hash/count and no-global-memory tests; do not read or copy credential/auth files.
+- [x] T016 Add redacted migration planner/report and profile/room fixture setup under `tests/fixtures/` and `docs/ops/`.
+- [x] T017 Preserve session IDs/timestamps only for unambiguous DM ownership; route ambiguous rows to a closed read-only archive.
+- [x] T018 [P] Add migration hash/count and no-global-memory tests; do not read or copy credential/auth files.
 
 ### Dependencies
 
