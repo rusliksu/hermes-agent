@@ -87,7 +87,7 @@ description: "Work package task list for live-derived Gurra access and media iso
 ### Included Subtasks
 
 - [x] T013 Extend `hermes_cli/config.py` and `hermes_cli/subcommands/config.py` with policy parse/check/dry-run and redacted output.
-- [ ] T014 Add dashboard `Access / Users` endpoints/UI integration on existing localhost/SSH-authenticated surface; no new external listener.
+- [x] T014 Add dashboard `Access / Users` endpoints/UI integration on existing localhost/SSH-authenticated surface; no new external listener.
 - [ ] T015 [P] Add lease/audit tests proving no bulk search/export, no model delivery and manual early revoke.
 
 ### Dependencies
