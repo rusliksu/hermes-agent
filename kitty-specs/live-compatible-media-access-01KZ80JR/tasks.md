@@ -44,7 +44,7 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 - [x] T005 Bind the context in `gateway/session_context.py` and `gateway/run.py` at ingress and clear it at turn completion/cancellation.
 - [x] T006 Remove default/active `HERMES_HOME` fallback for a rejected or missing profile; make foreign `profile_id`/session namespace arguments fail closed.
-- [ ] T007 [P] Update `tools/session_search_tool.py`, `tools/memory_tool.py` and file/attachment guards to derive namespace only from trusted runtime context.
+- [x] T007 [P] Update `tools/session_search_tool.py`, `tools/memory_tool.py` and file/attachment guards to derive namespace only from trusted runtime context.
 - [ ] T008 [P] Add negative tests for callbacks, background tasks, cron delivery, delegation, compaction/reset/restart and simultaneous profiles.
 
 ### Dependencies
