@@ -37,6 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
+from contextlib import contextmanager
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -92,6 +93,14 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+
+# Trusted server-side authorization result for the current turn.  This is
+# deliberately not part of ``_VAR_MAP``: it must never fall back to an
+# environment variable, and the gateway wrapper owns its lifetime with a
+# stack-safe ContextVar token.
+_RESOLVED_ACCESS_CONTEXT: ContextVar = ContextVar(
+    "HERMES_RESOLVED_ACCESS_CONTEXT", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -299,6 +308,27 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def get_resolved_access_context(default: Any = None) -> Any:
+    """Return the trusted six-field access context bound to this task.
+
+    Unlike legacy session values, an unbound context never consults
+    ``os.environ``.  ``default`` is returned only when the task has no
+    registry context.
+    """
+    value = _RESOLVED_ACCESS_CONTEXT.get()
+    return default if value is _UNSET else value
+
+
+@contextmanager
+def bind_resolved_access_context(context: Any):
+    """Bind a server-resolved access context for one async turn."""
+    token = _RESOLVED_ACCESS_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _RESOLVED_ACCESS_CONTEXT.reset(token)
 
 
 def get_session_env(name: str, default: str = "") -> str:

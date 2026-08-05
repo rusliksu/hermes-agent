@@ -3043,6 +3043,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
         self._single_principal_policy = self.config.single_principal
+        # Optional server-built access registry.  It is deliberately kept
+        # outside user YAML parsing in this compatibility slice: when absent,
+        # legacy single-profile behavior remains unchanged; when present, all
+        # user ingress and profile-home resolution become fail-closed.
+        self.access_registry = getattr(self.config, "access_registry", None)
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -5703,7 +5708,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    def _resolve_access_context_for_source(self, source: SessionSource):
+        """Resolve and validate the server-owned six-field access context."""
+        registry = getattr(self, "access_registry", None)
+        if registry is None:
+            return None
+        from gateway.access_registry import (
+            AccessDeniedError,
+            RedactedAuditMetadata,
+            TransportIdentity,
+        )
+
+        account = getattr(source, "route_account", None)
+        identity = TransportIdentity.from_session_source(source, account=account)
+        context = registry.resolve(identity)
+        stamped_profile = (getattr(source, "profile", None) or "").strip()
+        if stamped_profile and stamped_profile != context.profile_id:
+            raise AccessDeniedError(
+                "profile_route_mismatch",
+                RedactedAuditMetadata.from_transport("profile_route_mismatch", identity),
+            )
+        return registry.validate_resolved_context(context)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # The adapter's busy path runs before ``_handle_message``.  Apply the
+        # same registry gate here so an unauthorized sender cannot inject into
+        # an active queue/approval/interrupt path.
+        if getattr(self, "access_registry", None) is not None and not bool(
+            getattr(event, "internal", False)
+        ):
+            try:
+                self._resolve_access_context_for_source(event.source)
+            except Exception as exc:
+                from gateway.access_registry import AccessDeniedError
+
+                if isinstance(exc, AccessDeniedError):
+                    logger.warning(
+                        "Access-registry busy ingress denied: reason=%s audit=%s",
+                        exc.reason,
+                        exc.audit.as_dict(),
+                    )
+                else:
+                    logger.warning(
+                        "Access-registry busy ingress failed closed: error=%s",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -9430,6 +9482,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Resolve trusted ingress authority before the normal message turn.
+
+        The registry is intentionally an opt-in server-side boundary for the
+        staged rollout.  Once attached, unknown or malformed identities are
+        rejected before plugins, sessions, memory, models, or tools observe
+        the event; no owner/default profile fallback is possible.
+        """
+        registry = getattr(self, "access_registry", None)
+        if registry is None or bool(getattr(event, "internal", False)):
+            return await self._handle_message_inner(event)
+        if not bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            logger.error(
+                "Access registry configured while multiplex_profiles is disabled; "
+                "rejecting ingress rather than running in the owner profile"
+            )
+            return None
+
+        try:
+            context = self._resolve_access_context_for_source(event.source)
+        except Exception as exc:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+
+            if isinstance(exc, AccessDeniedError):
+                logger.warning(
+                    "Access-registry ingress denied: reason=%s audit=%s",
+                    exc.reason,
+                    exc.audit.as_dict(),
+                )
+            else:
+                logger.warning(
+                    "Access-registry ingress failed closed: error=%s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+            return None
+
+        from gateway.session_context import bind_resolved_access_context
+
+        with bind_resolved_access_context(context):
+            return await self._handle_message_inner(event)
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -18001,7 +18095,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         routes = getattr(config, "profile_routes", None)
         if not routes:
             return None
-        from gateway.profile_routing import match_profile_route
+        from gateway.profile_routing import ProfileRoutingError, match_profile_route
         try:
             matched = match_profile_route(
                 routes,
@@ -18010,8 +18104,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                account=getattr(source, "route_account", None),
+                peer_kind=getattr(source, "chat_type", None),
+                user_id=getattr(source, "user_id", None),
             )
+        except ProfileRoutingError:
+            # Exact Telegram DM routes are an authorization boundary, not a
+            # best-effort hint.  Preserve the typed denial so callers cannot
+            # silently select the owner/default profile.
+            raise
         except Exception:
+            if getattr(self, "access_registry", None) is not None:
+                raise ProfileRoutingError("route_resolution_failed")
             logger.warning(
                 "Profile route matching failed for %s/%s, falling back to default",
                 source.platform, source.chat_id, exc_info=True,
@@ -18036,12 +18140,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              fallback for sources that bypass ``build_source``.
           3. The active profile (the multiplexer's own home).
         """
-        from hermes_cli.profiles import (
-            get_active_profile_name,
-            get_profile_dir,
-            profile_exists,
-        )
+        from hermes_cli.profiles import get_profile_dir, profile_exists
         from hermes_constants import get_hermes_home
+
+        registry = getattr(self, "access_registry", None)
+        if registry is not None:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+            from gateway.session_context import get_resolved_access_context
+
+            context = get_resolved_access_context()
+            if context is None:
+                stamped_profile = (getattr(source, "profile", None) or "").strip()
+                if not stamped_profile:
+                    raise AccessDeniedError(
+                        "missing_resolved_access_context",
+                        RedactedAuditMetadata(event="profile_home"),
+                    )
+                context = registry.resolve_exact_profile_context(stamped_profile)
+            context = registry.validate_resolved_context(context)
+            name = context.profile_id
+            if (getattr(source, "profile", None) or "").strip() not in {"", name}:
+                raise AccessDeniedError(
+                    "profile_route_mismatch",
+                    RedactedAuditMetadata(event="profile_home"),
+                )
+            if not profile_exists(name):
+                raise AccessDeniedError(
+                    "missing_profile",
+                    RedactedAuditMetadata(event="profile_home"),
+                )
+            return get_profile_dir(name)
         
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
@@ -18054,6 +18182,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if name:
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
+                from hermes_cli.profiles import get_active_profile_name
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)

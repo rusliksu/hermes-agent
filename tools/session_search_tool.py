@@ -642,6 +642,33 @@ def session_search(
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
     """
+    # A registry-bound turn may search only its server-resolved profile.  The
+    # model cannot elevate this scope by passing ``profile=`` or a foreign
+    # ``@session:<profile>/<id>`` link.  Legacy turns without a trusted access
+    # context keep the historical explicit cross-profile read behavior.
+    access_context_profile = None
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        access_context = get_resolved_access_context()
+    except Exception:
+        access_context = None
+    if access_context is not None:
+        access_context_profile = getattr(access_context, "profile_id", None)
+        if not isinstance(access_context_profile, str) or not access_context_profile.strip():
+            return tool_error("session search denied: missing profile scope", success=False)
+        access_context_profile = access_context_profile.strip()
+
+    embedded_profile = None
+    if isinstance(session_id, str) and "/" in session_id:
+        embedded_profile, _, _ = session_id.partition("/")
+        embedded_profile = embedded_profile.strip() or None
+        if access_context_profile and embedded_profile != access_context_profile:
+            return tool_error("session search denied: foreign profile scope", success=False)
+    if access_context_profile and profile is not None:
+        if not isinstance(profile, str) or profile.strip() != access_context_profile:
+            return tool_error("session search denied: foreign profile scope", success=False)
+
     if db is None:
         try:
             from hermes_state import SessionDB
@@ -660,13 +687,17 @@ def session_search(
         emb_profile, _, emb_id = session_id.partition("/")
         if emb_id:
             session_id = emb_id
-            if emb_profile and (profile is None or not str(profile).strip()):
+            if (
+                emb_profile
+                and not access_context_profile
+                and (profile is None or not str(profile).strip())
+            ):
                 profile = emb_profile
 
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
+    if profile is not None and str(profile).strip() and not access_context_profile:
         try:
             profile_db = _resolve_profile_db(profile)
         except Exception as e:
@@ -695,6 +726,8 @@ def session_search(
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
+        if access_context_profile:
+            return result
         located, owner = _locate_session_db(sid)
         if located is not None:
             try:

@@ -183,6 +183,11 @@ class SessionSource:
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
 
+    # Server-owned transport account discriminator used by exact ingress
+    # routing.  This is intentionally separate from user-facing names and is
+    # populated from adapter configuration, never from model/user input.
+    route_account: Optional[str] = None
+
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
     # rename them after the first agent turn using the generated session title.
@@ -264,6 +269,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.route_account:
+            d["route_account"] = self.route_account
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +296,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            route_account=data.get("route_account"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )

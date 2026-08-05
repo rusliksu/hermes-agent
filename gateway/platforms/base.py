@@ -5522,6 +5522,22 @@ class BasePlatformAdapter(ABC):
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
     
+    def _route_account(self) -> Optional[str]:
+        """Return the server-owned account label for exact ingress routing.
+
+        Account labels are configuration, not identity guesses: usernames,
+        display names, and bot handles must never become routing authority.
+        ``account_id`` remains supported for Weixin because that adapter's
+        stable transport discriminator already uses that name.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        value = extra.get("account")
+        if value is None and self.platform == Platform.WEIXIN:
+            value = extra.get("account_id")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
+
     def build_source(
         self,
         chat_id: str,
@@ -5556,6 +5572,7 @@ class BasePlatformAdapter(ABC):
 
         # Resolve profile from configured routes (None when no match / no routes)
         profile = None
+        route_account = self._route_account()
         runner = getattr(self, "gateway_runner", None)
         if runner is not None:
             try:
@@ -5572,12 +5589,25 @@ class BasePlatformAdapter(ABC):
                         user_id_alt=user_id_alt,
                         chat_id_alt=chat_id_alt,
                         is_bot=is_bot,
+                        route_account=route_account,
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                # Access-enabled gateways must never turn malformed/unknown
+                # route identities into the active owner profile.  Preserve
+                # the historical compatibility fallback only when the new
+                # server-side registry is absent.
+                if getattr(runner, "access_registry", None) is not None:
+                    raise
+                try:
+                    from gateway.profile_routing import ProfileRoutingError
+                    if isinstance(exc, ProfileRoutingError):
+                        raise
+                except ImportError:
+                    pass
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
@@ -5600,6 +5630,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            route_account=route_account,
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
