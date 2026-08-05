@@ -1,0 +1,12 @@
+project:
+  uuid: c4b6ee76-b16a-4191-91ca-d8d8d8e69901
+  slug: hermes-agent
+  node_id: f1da69b66ab4
+  build_id: 3e9f8eb5-69b1-56a4-be49-73eb796e3695
+vcs:
+  type: git
+agents:
+  available:
+  - codex
+  auto_commit: true
+  lint_on_edit: false
