@@ -503,6 +503,10 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
     re.MULTILINE,
 )
+_RICH_PREFORMATTED_REGION_RE = re.compile(
+    r"<pre\b[^>]*>[\s\S]*?</pre>",
+    re.IGNORECASE,
+)
 
 
 def _rich_normalize_linebreaks(text: str) -> str:
@@ -515,18 +519,28 @@ def _rich_normalize_linebreaks(text: str) -> str:
     forces a hard line break (``<br>``) in the rendered output.
 
     Paragraph breaks (``\\n\\n``), fenced code blocks, and GFM pipe-table
-    blocks are left untouched: tables render natively in the rich path and a
-    hard break injected into a row separator would corrupt the table.
+    blocks and HTML ``<pre>`` blocks are left untouched: tables and
+    preformatted content render natively in the rich path, and injected hard
+    breaks would corrupt their source.
     """
     if not text or '\n' not in text:
         return text
 
     out: list[str] = []
-    # Split off protected regions (fenced code OR table blocks) and only inject
-    # hard breaks in the prose between them. Boundary newlines are handled by
+    # Split off protected regions and only inject hard breaks in prose between
+    # them. Boundary newlines are handled by
     # the original single-\n regex, which sees each prose run as a whole string.
     pos = 0
-    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
+    protected_matches = sorted(
+        [
+            *list(_RICH_PROTECTED_REGION_RE.finditer(text)),
+            *list(_RICH_PREFORMATTED_REGION_RE.finditer(text)),
+        ],
+        key=lambda match: match.start(),
+    )
+    for m in protected_matches:
+        if m.start() < pos:
+            continue
         prose = text[pos:m.start()]
         out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
         out.append(m.group(0))  # protected region kept verbatim
@@ -2019,6 +2033,39 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return bool(content and self._RICH_CJK_RE.search(content))
 
+    def _has_display_math_outside_protected_regions(self, content: str) -> bool:
+        """Return True for non-empty paired ``$$...$$`` in renderable prose."""
+        if not content or "$$" not in content:
+            return False
+
+        protected = sorted(
+            [
+                *list(_RICH_PROTECTED_REGION_RE.finditer(content)),
+                *list(_RICH_PREFORMATTED_REGION_RE.finditer(content)),
+            ],
+            key=lambda match: match.start(),
+        )
+
+        def segment_has_math(segment: str) -> bool:
+            start = segment.find("$$")
+            while start != -1:
+                end = segment.find("$$", start + 2)
+                if end == -1:
+                    return False
+                if segment[start + 2:end].strip():
+                    return True
+                start = segment.find("$$", end + 2)
+            return False
+
+        pos = 0
+        for match in protected:
+            if match.start() < pos:
+                continue
+            if segment_has_math(content[pos:match.start()]):
+                return True
+            pos = match.end()
+        return segment_has_math(content[pos:])
+
     def _needs_rich_rendering(self, content: str) -> bool:
         """Return True for markdown constructs that the legacy path degrades.
 
@@ -2041,9 +2088,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return False
 
-    def _rich_delivery_enabled(self) -> bool:
-        """Whether rich delivery is allowed (``rich_messages`` opt-in)."""
-        return bool(getattr(self, "_rich_messages_enabled", True))
+    def _rich_delivery_enabled(self, content: str) -> bool:
+        """Whether rich delivery is allowed for this message."""
+        return bool(
+            getattr(self, "_rich_messages_enabled", True)
+            or self._has_display_math_outside_protected_regions(content)
+        )
 
     def _rich_eligible(self, content: str) -> bool:
         """Capability/content eligibility for rich, ignoring ``expect_edits``.
@@ -2055,7 +2105,7 @@ class TelegramAdapter(BasePlatformAdapter):
         FINAL edit should still upgrade to rich when the content warrants it.
         """
         return bool(
-            self._rich_delivery_enabled()
+            self._rich_delivery_enabled(content)
             and not getattr(self, "_rich_send_disabled", False)
             and content
             and content.strip()

@@ -33,6 +33,12 @@ TABLE_ONLY_CONTENT = (
     "| Red Sox | 36 | 34 | 6.0 |\n"
     "| Dodgers | 40 | 30 | 2.0 |"
 )
+DISPLAY_MATH_CONTENT = "Solution:\n\n$$\nx = \\frac{12}{3}\n$$"
+FENCED_MATH_CONTENT = "Copy this:\n\n```latex\n$$\nx = \\frac{12}{3}\n$$\n```"
+PREFORMATTED_MATH_CONTENT = "<pre>$$\nx = 12\n$$</pre>"
+DISPLAY_MATH_WITH_PRE_CONTENT = (
+    "Rendered:\n\n$$x = 12$$\n\n<pre>literal\nsecond line</pre>"
+)
 DANGEROUS_DETAILS_MATH = (
     "<details><summary>Complex proof</summary>\n\n"
     "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\n"
@@ -214,6 +220,80 @@ async def test_rich_messages_opt_out_accepts_string_false():
     assert bot is not None
     bot.do_api_request.assert_not_called()
     bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_opt_out_still_renders_display_math():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", DISPLAY_MATH_CONTENT)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert "$$" in api_kwargs["rich_message"]["markdown"]
+    assert "\\frac{12}{3}" in api_kwargs["rich_message"]["markdown"]
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_display_math_opt_out_preserves_reply_and_thread_metadata():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send(
+        "-100123",
+        DISPLAY_MATH_CONTENT,
+        reply_to="999",
+        metadata={"thread_id": "5"},
+    )
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["message_thread_id"] == 5
+    assert api_kwargs["reply_parameters"] == {"message_id": 999}
+
+
+@pytest.mark.asyncio
+async def test_fenced_display_math_stays_on_legacy_path_when_opted_out():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", FENCED_MATH_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preformatted_display_math_stays_on_legacy_path_when_opted_out():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", PREFORMATTED_MATH_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_display_math_rich_path_preserves_preformatted_neighbor():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", DISPLAY_MATH_WITH_PRE_CONTENT)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert "<pre>literal\nsecond line</pre>" in api_kwargs["rich_message"]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_unclosed_display_math_stays_on_legacy_path_when_opted_out():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    result = await adapter.send("12345", "Broken block:\n\n$$\nx = 12")
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
