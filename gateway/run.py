@@ -7225,6 +7225,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+            if getattr(entry, "resolved_access_context", None) is not None:
+                # SessionSource intentionally omits trusted authz state from
+                # its wire form. Reattach the durable SessionEntry context
+                # before dispatching the synthetic restart turn so a restart
+                # cannot fall back to route/default owner resolution.
+                source.resolved_access_context = entry.resolved_access_context
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(

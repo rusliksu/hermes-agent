@@ -1456,6 +1456,72 @@ class TestHasAnySessions:
         assert store.has_any_sessions() is False
 
 
+class TestSessionEntryAccessContext:
+    def _context(self):
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+        return ResolvedAccessContext(
+            principal_id="principal-42",
+            role_id="family_standard",
+            profile_id="family-42",
+            conversation_scope="private:principal-42",
+            capabilities=frozenset({"memory_read", "public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="main-bot",
+                peer_kind="dm",
+                chat_id="42",
+            ),
+        )
+
+    def test_context_round_trips_as_exact_six_field_payload(self):
+        from datetime import datetime
+        from gateway.session import SessionEntry, SessionSource
+
+        context = self._context()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            user_id="42",
+            resolved_access_context=context,
+        )
+        entry = SessionEntry(
+            session_key="agent:family-42:telegram:dm:42",
+            session_id="session-42",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            resolved_access_context=context,
+        )
+
+        payload = entry.to_dict()
+        assert set(payload["resolved_access_context"]) == {
+            "principal_id",
+            "role_id",
+            "profile_id",
+            "conversation_scope",
+            "capabilities",
+            "delivery_target",
+        }
+        assert "resolved_access_context" not in source.to_dict()
+        restored = SessionEntry.from_dict(payload)
+        assert restored.resolved_access_context == context
+
+    def test_malformed_persisted_context_is_rejected(self):
+        from gateway.session import SessionEntry
+
+        with pytest.raises(ValueError, match="malformed_resolved_access_context"):
+            SessionEntry.from_dict(
+                {
+                    "session_key": "session-key",
+                    "session_id": "session-id",
+                    "created_at": "2025-01-01T00:00:00",
+                    "updated_at": "2025-01-01T00:00:00",
+                    "resolved_access_context": {"principal_id": "wrong"},
+                }
+            )
+
+
 class TestLastPromptTokens:
     """Tests for the last_prompt_tokens field — actual API token tracking."""
 
