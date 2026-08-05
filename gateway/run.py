@@ -3824,6 +3824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         role_capability_toolsets = {
             "family_standard": {
+                "memory_search": "memory",
                 "public_web": "web",
                 "vision": "vision",
                 "image_generation": "image_gen",
@@ -3832,6 +3833,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "self_reminder": "cronjob",
             },
             "family_sandbox": {
+                "memory_search": "memory",
                 "public_web": "web",
                 "vision": "vision",
                 "image_generation": "image_gen",
@@ -14438,7 +14440,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._toolsets_for_resolved_access_context(
+                configured_toolsets,
+                getattr(source, "resolved_access_context", None),
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
