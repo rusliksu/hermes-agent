@@ -1521,6 +1521,29 @@ class TestSessionEntryAccessContext:
                 }
             )
 
+    def test_explicit_reset_preserves_the_bound_access_context(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        store._loaded = True
+        context = self._context()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            user_id="42",
+            chat_type="dm",
+            profile="family-42",
+            resolved_access_context=context,
+        )
+
+        current = store.get_or_create_session(source)
+        reset = store.reset_session(current.session_key)
+
+        assert reset is not None
+        assert reset.resolved_access_context == context
+        assert reset.origin.resolved_access_context == context
+
 
 class TestLastPromptTokens:
     """Tests for the last_prompt_tokens field — actual API token tracking."""

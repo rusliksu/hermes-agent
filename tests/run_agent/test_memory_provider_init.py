@@ -438,6 +438,75 @@ def test_multiplex_missing_context_cannot_compact_in_place(tmp_path):
     assert db.get_session("session-a")["message_count"] == 1
 
 
+def test_multiplex_compaction_cannot_target_a_foreign_profile_session(tmp_path):
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    cfg = {"memory": {"provider": ""}, "agent": {}}
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(
+        "session-a",
+        source="telegram",
+        profile_name="profile",
+        chat_type="dm",
+        chat_id="10001",
+        user_id="10001",
+    )
+    db.create_session(
+        "session-b",
+        source="telegram",
+        profile_name="other-profile",
+        chat_type="dm",
+        chat_id="20002",
+        user_id="20002",
+    )
+    db.append_message("session-a", role="user", content="private-a")
+    db.append_message("session-b", role="user", content="private-b")
+    db._conn.commit()
+
+    context = _access_context()
+    set_session_vars(resolved_access_context=context)
+    try:
+        with _patched_agent_init(cfg):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=db,
+                session_id="session-b",
+            )
+    finally:
+        reset_session_vars()
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+    compressor.compression_count = 1
+    compressor._last_compression_made_progress = True
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    agent.context_compressor = compressor
+    agent.compression_in_place = True
+    agent._compression_feasibility_checked = True
+    agent.commit_memory_session = MagicMock()
+
+    with pytest.raises(RuntimeError, match="session compaction denied by session scope"):
+        agent._compress_context(
+            [{"role": "user", "content": "private-b"}],
+            "system",
+            approx_tokens=100,
+            force=True,
+        )
+
+    assert [m["content"] for m in db.get_messages("session-a")] == ["private-a"]
+    assert [m["content"] for m in db.get_messages("session-b")] == ["private-b"]
+    assert db.get_session("session-b")["message_count"] == 1
+
+
 def test_core_tool_names_rejected_from_memory_routing_table():
     """Memory tools shadowing core tool names are rejected at registration (#40466).
 

@@ -1,5 +1,6 @@
 """Focused ingress tests for the staged access-registry boundary."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,57 @@ def _runner() -> GatewayRunner:
     runner.access_registry = _registry()
     runner.config = SimpleNamespace(multiplex_profiles=True)
     return runner
+
+
+def _multi_profile_registry() -> AccessRegistry:
+    bindings = []
+    scope_capabilities = {}
+    for user_id in ("42", "43"):
+        principal_id = f"principal-{user_id}"
+        profile_id = f"family-{user_id}"
+        scope = f"private:{principal_id}"
+        bindings.append(
+            PrincipalBinding(
+                principal_id=principal_id,
+                role_id="family_standard",
+                profile_id=profile_id,
+                transport_identity=TransportIdentity(
+                    platform="telegram",
+                    account="main-bot",
+                    peer_kind="dm",
+                    user_id=user_id,
+                    chat_id=user_id,
+                ),
+                conversation_scope=scope,
+                delivery_target=DeliveryTarget(
+                    platform="telegram",
+                    account="main-bot",
+                    peer_kind="dm",
+                    chat_id=user_id,
+                ),
+            )
+        )
+        scope_capabilities[scope] = frozenset({"memory_read"})
+    return AccessRegistry(
+        roles={"family_standard": RolePolicy("family_standard", frozenset({"memory_read"}))},
+        profiles=frozenset({"family-42", "family-43"}),
+        principal_bindings=tuple(bindings),
+        scope_capabilities=scope_capabilities,
+        backend_capabilities=frozenset({"memory_read"}),
+    )
+
+
+def _dm_event(user_id: str) -> MessageEvent:
+    return MessageEvent(
+        text=f"hello-{user_id}",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=user_id,
+            user_id=user_id,
+            chat_type="dm",
+            route_account="main-bot",
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -118,6 +170,43 @@ async def test_unknown_or_mismatched_identity_is_rejected_before_inner():
     assert await runner._handle_message(unknown) is None
     assert await runner._handle_message(mismatched) is None
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_profile_turns_keep_access_contexts_pairwise_isolated():
+    runner = _runner()
+    runner.access_registry = _multi_profile_registry()
+    ready = asyncio.Event()
+    calls = 0
+    seen = {}
+
+    async def inner(event):
+        nonlocal calls
+        context = get_resolved_access_context()
+        assert context is not None
+        seen[context.principal_id] = (context.profile_id, event.source.chat_id)
+        calls += 1
+        if calls == 2:
+            ready.set()
+        await ready.wait()
+        # Both tasks remain suspended at the same time; resuming one must not
+        # observe the sibling's profile or delivery target.
+        current = get_resolved_access_context()
+        assert current is context
+        return context.profile_id
+
+    runner._handle_message_inner = inner
+    results = await asyncio.gather(
+        runner._handle_message(_dm_event("42")),
+        runner._handle_message(_dm_event("43")),
+    )
+
+    assert results == ["family-42", "family-43"]
+    assert seen == {
+        "principal-42": ("family-42", "42"),
+        "principal-43": ("family-43", "43"),
+    }
+    assert get_resolved_access_context() is None
 
 
 def test_route_account_round_trips_as_server_owned_source_field():
