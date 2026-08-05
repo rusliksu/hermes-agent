@@ -868,6 +868,31 @@ class TestTypedSessionScope:
         assert result["success"] is False
         assert "caller-supplied SessionDB" in result["error"]
 
+    def test_multiplex_missing_context_fails_closed(self, monkeypatch):
+        class NoIoDB:
+            def __getattr__(self, name):
+                pytest.fail(f"unexpected db read: {name}")
+
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+        result = json.loads(session_search(query="anything", db=NoIoDB()))
+
+        assert result["success"] is False
+        assert "access context unavailable" in result["error"]
+
+    def test_malformed_delivery_target_fails_closed(self):
+        context = _access_context()
+        object.__setattr__(context, "delivery_target", None)
+
+        class NoIoDB:
+            def __getattr__(self, name):
+                pytest.fail(f"unexpected db read: {name}")
+
+        with _bound_context(context):
+            result = json.loads(session_search(query="anything", db=NoIoDB()))
+
+        assert result["success"] is False
+        assert "malformed resolved access context" in result["error"]
+
     def test_none_context_preserves_lazy_sessiondb_fallback(self, monkeypatch):
         class LazyDB:
             def list_sessions_rich(self, **_kwargs):

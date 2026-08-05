@@ -59,36 +59,47 @@ _DISCOVER_SCAN_LIMIT = 300
 def _session_scope_from_resolved_context() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Return a trusted SQL scope from task-local gateway context.
 
-    ``None`` context is the legacy CLI/cron path and is not an error. Any
-    present-but-invalid context fails closed before DB creation or reads.
+    ``None`` context is the legacy CLI/cron path only when multiplexing is
+    inactive. A multiplexed gateway must never fall back to the process/default
+    SessionDB namespace. Any present-but-invalid context fails closed before
+    DB creation or reads.
     """
     try:
+        from agent.secret_scope import is_multiplex_active
         from gateway.session_context import get_resolved_access_context
 
+        multiplex_active = bool(is_multiplex_active())
         context = get_resolved_access_context(None)
     except Exception:
         logging.debug("session_search could not read resolved access context", exc_info=True)
         return None, "session_search denied: resolved access context unavailable"
     if context is None:
+        if multiplex_active:
+            return None, "session_search denied: resolved access context unavailable"
         return None, None
 
     try:
         from gateway.access_registry import (
             ResolvedAccessContext,
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
             session_scope_from_resolved_access_context,
         )
     except Exception:
         logging.debug("session_search could not import access registry types", exc_info=True)
         return None, "session_search denied: access registry unavailable"
 
-    target = getattr(context, "delivery_target", None)
     if not isinstance(context, ResolvedAccessContext):
         return None, "session_search denied: malformed resolved access context"
     try:
+        # Round-trip through the strict six-field codec before inspecting any
+        # field. This rejects malformed dataclass instances (for example a
+        # forged delivery_target) instead of raising AttributeError below.
+        context = deserialize_resolved_access_context(
+            serialize_resolved_access_context(context)
+        )
         session_scope = session_scope_from_resolved_access_context(context)
-    except ValueError:
-        return None, "session_search denied: malformed resolved access context"
-    if not isinstance(context.capabilities, frozenset):
+    except Exception:
         return None, "session_search denied: malformed resolved access context"
 
     role_id = context.role_id.strip()
@@ -101,6 +112,7 @@ def _session_scope_from_resolved_context() -> Tuple[Optional[Dict[str, Any]], Op
     else:
         return None, "session_search denied: role is not allowed to use session_search"
 
+    target = context.delivery_target
     peer_kind = target.peer_kind.strip()
     if peer_kind != "dm":
         return None, "session_search denied: typed access context requires DM delivery target"
