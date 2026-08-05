@@ -188,6 +188,91 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
 }
 
 
+def _multiplex_profile_read_scope() -> tuple[bool, Optional[Path], Optional[str]]:
+    """Return the trusted profile namespace for file reads.
+
+    The read guard deliberately derives the active namespace from the
+    server-owned six-field access context, then verifies that the task-local
+    HERMES_HOME points at the same profile. A missing/malformed context yields
+    ``(True, None, None)`` so profile-state reads fail closed instead of
+    falling back to the owner/default home.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplex_active = bool(is_multiplex_active())
+    except Exception:
+        return True, None, None
+    if not multiplex_active:
+        return False, None, None
+
+    try:
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+        from gateway.session_context import get_resolved_access_context
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        context = get_resolved_access_context(None)
+        payload = serialize_resolved_access_context(context)
+        context = deserialize_resolved_access_context(payload)
+        profile_id = context.profile_id
+        canonical = normalize_profile_name(profile_id)
+        validate_profile_name(canonical)
+        if canonical != profile_id:
+            raise ValueError("non-canonical profile id")
+
+        root = _hermes_root_path().expanduser().resolve(strict=False)
+        expected_home = (
+            root if canonical == "default" else root / "profiles" / canonical
+        ).resolve(strict=False)
+        active_home = _hermes_home_path().expanduser().resolve(strict=False)
+        if active_home != expected_home or not active_home.is_dir():
+            raise ValueError("profile home mismatch")
+        return True, root, canonical
+    except Exception:
+        return True, None, None
+
+
+def get_multiplex_profile_read_block_error(path: str) -> Optional[str]:
+    """Return a deny message for another profile's Hermes state in multiplex."""
+    multiplex_active, root, active_profile = _multiplex_profile_read_scope()
+    if not multiplex_active:
+        return None
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return "Access denied: profile-scoped read path is malformed."
+
+    if root is None or active_profile is None:
+        try:
+            resolved.relative_to(_hermes_root_path().expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            # Non-Hermes project files remain available to the owner/role
+            # policy; only profile-state paths require a typed namespace.
+            return None
+        return "Access denied: resolved access context unavailable."
+
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if not parts:
+        return None
+    if parts[0] == "profiles":
+        if len(parts) < 2:
+            return "Access denied: Hermes profile namespace is not addressable."
+        target_profile = parts[1]
+    else:
+        # The root-level Hermes home is the default profile's state.
+        target_profile = "default"
+    if target_profile == active_profile:
+        return None
+    return "Access denied: path belongs to another Hermes profile."
+
+
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
@@ -203,6 +288,8 @@ def get_read_block_error(path: str) -> Optional[str]:
         OAuth tokens, and HMAC secrets that the agent never needs to read
         directly — provider tools / gateway adapters consume them through
         internal channels.
+      * In multiplex mode, profile-scoped Hermes state belonging to another
+        profile (or any Hermes state without a trusted context).
       * Project-local environment files anywhere on disk: ``.env``,
         ``.env.local``, ``.env.development``, ``.env.production``,
         ``.env.test``, ``.env.staging``, ``.envrc``. These routinely hold
@@ -234,6 +321,10 @@ def get_read_block_error(path: str) -> Optional[str]:
     terminal cwd differs from the process cwd.
     """
     resolved = Path(path).expanduser().resolve()
+
+    profile_error = get_multiplex_profile_read_block_error(str(resolved))
+    if profile_error:
+        return profile_error
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also
