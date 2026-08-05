@@ -308,6 +308,20 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _resolved_access_context_payload() -> Optional[Dict[str, Any]]:
+    """Return the trusted six-field context for a newly-created cron job."""
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    try:
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        raise ValueError("malformed_resolved_access_context") from exc
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -709,6 +723,18 @@ def cronjob(
                 if scan_error:
                     return tool_error(scan_error, success=False)
 
+            try:
+                _access_context_payload = _resolved_access_context_payload()
+                from agent.secret_scope import is_multiplex_active
+                _multiplex_active = bool(is_multiplex_active())
+            except ValueError as exc:
+                return tool_error(str(exc), success=False)
+            except Exception:
+                return tool_error("access_context_unavailable", success=False)
+
+            if _multiplex_active and _access_context_payload is None:
+                return tool_error("missing_resolved_access_context", success=False)
+
             # Validate script path before storing
             if script:
                 script_error = _validate_cron_script_path(script)
@@ -733,24 +759,27 @@ def cronjob(
                             success=False,
                         )
 
-            job = create_job(
-                prompt=prompt or "",
-                schedule=schedule,
-                name=name,
-                repeat=repeat,
-                deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
-                skills=canonical_skills,
-                model=_normalize_optional_job_value(model),
-                provider=_normalize_optional_job_value(provider),
-                base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
-                script=_normalize_optional_job_value(script),
-                context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
-                workdir=_normalize_optional_job_value(workdir),
-                no_agent=_no_agent,
-                attach_to_session=attach_to_session,
-            )
+            create_kwargs = {
+                "prompt": prompt or "",
+                "schedule": schedule,
+                "name": name,
+                "repeat": repeat,
+                "deliver": _normalize_deliver_param(deliver),
+                "origin": _origin_from_env(),
+                "skills": canonical_skills,
+                "model": _normalize_optional_job_value(model),
+                "provider": _normalize_optional_job_value(provider),
+                "base_url": _normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                "script": _normalize_optional_job_value(script),
+                "context_from": context_from,
+                "enabled_toolsets": enabled_toolsets or None,
+                "workdir": _normalize_optional_job_value(workdir),
+                "no_agent": _no_agent,
+                "attach_to_session": attach_to_session,
+            }
+            if _access_context_payload is not None:
+                create_kwargs["resolved_access_context"] = _access_context_payload
+            job = create_job(**create_kwargs)
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
