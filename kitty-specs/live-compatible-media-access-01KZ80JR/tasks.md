@@ -128,9 +128,9 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T019 Build candidate from current live HEAD on the task-owned branch; record changed-file manifest and SHA-256 evidence without credentials.
-- [ ] T020 Run owner/Юля/мама/other-family/room/unknown synthetic canaries plus media policy dry-run and service health checks.
-- [ ] T021 [P] Document backup, rollback and separate live restart/Telegram canary gate in `docs/ops/media-access-canary-rollback.md`.
+- [x] T019 Build candidate from current live HEAD on the task-owned branch; record changed-file manifest and SHA-256 evidence without credentials.
+- [x] T020 Run owner/Юля/мама/other-family/room/unknown synthetic canaries plus media policy dry-run and service health checks.
+- [x] T021 [P] Document backup, rollback and separate live restart/Telegram canary gate in `docs/ops/media-access-canary-rollback.md`.
 - [ ] T022 Stop before live mutation; execute config apply/restart only after a new explicit user approval.
 
 ### Dependencies
