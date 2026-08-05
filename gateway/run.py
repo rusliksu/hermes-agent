@@ -9607,8 +9607,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the event; no owner/default profile fallback is possible.
         """
         registry = getattr(self, "access_registry", None)
-        if registry is None or bool(getattr(event, "internal", False)):
+        if registry is None:
             return await self._handle_message_inner(event)
+        if bool(getattr(event, "internal", False)):
+            # Internal synthetic turns (completion/watch/delegation) still
+            # need the originating profile's context. Only legacy internal
+            # events without a typed context use the unscoped compatibility
+            # path; process events are rejected earlier if the payload is
+            # missing or malformed.
+            context = getattr(event.source, "resolved_access_context", None)
+            if context is None:
+                return await self._handle_message_inner(event)
+            try:
+                context = registry.validate_resolved_context(context)
+            except Exception:
+                logger.warning("Access-registry internal event context rejected", exc_info=True)
+                return None
+            from gateway.session_context import bind_resolved_access_context
+
+            with bind_resolved_access_context(context):
+                return await self._handle_message_inner(event)
         if not bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
             logger.error(
                 "Access registry configured while multiplex_profiles is disabled; "
@@ -9673,7 +9691,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Registry-backed user turns were reset in _handle_message before the
         # trusted context was bound. Resetting here would erase that context;
         # legacy and internal paths still need the inheritance guard.
-        if getattr(self, "access_registry", None) is None or getattr(event, "internal", False):
+        if getattr(self, "access_registry", None) is None or (
+            getattr(event, "internal", False)
+            and getattr(source, "resolved_access_context", None) is None
+        ):
             try:
                 from gateway.session_context import reset_session_vars
                 reset_session_vars()
@@ -16435,6 +16456,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
+        def _with_persisted_access_context(source):
+            payload = evt.get("resolved_access_context")
+            registry = getattr(self, "access_registry", None)
+            # Once the access registry is active, a durable completion/watch
+            # event must carry the server-owned context. Re-resolving an
+            # ambiguous or missing identity here would be an owner/default
+            # fallback, so reject it before adapter delivery.
+            if registry is not None and payload is None:
+                logger.warning(
+                    "Dropping synthetic process event without access context: %s",
+                    evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                )
+                return None
+            if payload is None:
+                return source
+            try:
+                from gateway.access_registry import deserialize_resolved_access_context
+
+                context = deserialize_resolved_access_context(payload)
+                if registry is not None:
+                    context = registry.validate_resolved_context(context)
+                    # The persisted payload must still belong to this exact
+                    # source. This prevents a guessed session key or stale
+                    # watcher record from routing another profile's result.
+                    expected = self._resolve_access_context_for_source(source)
+                    if expected != context:
+                        logger.warning(
+                            "Dropping synthetic process event with context/source mismatch: %s",
+                            evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                        )
+                        return None
+                source.resolved_access_context = context
+                return source
+            except Exception:
+                logger.warning(
+                    "Dropping synthetic process event with malformed access context: %s",
+                    evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                    exc_info=True,
+                )
+                return None
+
         session_key = str(evt.get("session_key") or "").strip()
         derived_platform = ""
         derived_chat_type = ""
@@ -16445,7 +16507,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _with_persisted_access_context(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -16455,7 +16517,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _with_persisted_access_context(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -16495,14 +16557,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        return SessionSource(
+        return _with_persisted_access_context(SessionSource(
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
-        )
+        ))
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
@@ -16831,6 +16893,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                     }
+                    if getattr(session, "resolved_access_context", None) is not None:
+                        completion_evt["resolved_access_context"] = session.resolved_access_context
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break

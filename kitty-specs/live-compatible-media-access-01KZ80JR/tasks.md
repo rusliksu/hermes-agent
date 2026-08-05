@@ -19,10 +19,10 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T001 Add `gateway/access_registry.py` with exactly six serialized context fields, immutable bindings and redacted deny reasons.
-- [ ] T002 Extend `gateway/profile_routing.py` for exact DM identity and explicit room/topic matching; reject ambiguous routes and missing profiles.
-- [ ] T003 Bridge `gateway/authz_mixin.py` and ingress call sites so unknown/malformed sources are denied before model/session/tools with no owner/default fallback.
-- [ ] T004 [P] Add `tests/gateway/test_access_registry.py` and `tests/gateway/test_profile_routing_fail_closed.py` with the full principal/room/unknown matrix.
+- [x] T001 Add `gateway/access_registry.py` with exactly six serialized context fields, immutable bindings and redacted deny reasons.
+- [x] T002 Extend `gateway/profile_routing.py` for exact DM identity and explicit room/topic matching; reject ambiguous routes and missing profiles.
+- [x] T003 Bridge `gateway/authz_mixin.py` and ingress call sites so unknown/malformed sources are denied before model/session/tools with no owner/default fallback.
+- [x] T004 [P] Add `tests/gateway/test_access_registry.py` and `tests/gateway/test_profile_routing_fail_closed.py` with the full principal/room/unknown matrix.
 
 ### Dependencies
 
@@ -42,8 +42,8 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T005 Bind the context in `gateway/session_context.py` and `gateway/run.py` at ingress and clear it at turn completion/cancellation.
-- [ ] T006 Remove default/active `HERMES_HOME` fallback for a rejected or missing profile; make foreign `profile_id`/session namespace arguments fail closed.
+- [x] T005 Bind the context in `gateway/session_context.py` and `gateway/run.py` at ingress and clear it at turn completion/cancellation.
+- [x] T006 Remove default/active `HERMES_HOME` fallback for a rejected or missing profile; make foreign `profile_id`/session namespace arguments fail closed.
 - [ ] T007 [P] Update `tools/session_search_tool.py`, `tools/memory_tool.py` and file/attachment guards to derive namespace only from trusted runtime context.
 - [ ] T008 [P] Add negative tests for callbacks, background tasks, cron delivery, delegation, compaction/reset/restart and simultaneous profiles.
 
@@ -64,10 +64,10 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T009 Add `tools/media_provider_routing.py` with typed image/STT/TTS policies, capability intersection and retry/error normalization.
-- [ ] T010 Integrate `tools/image_generation_tool.py`, `tools/transcription_tools.py` and `tools/tts_tool.py` through the facade without copying secrets into tool environment or prompts.
-- [ ] T011 [P] Add `tests/test_media_provider_routing.py` and redaction tests for provider outcomes, secret references and unknown tools.
-- [ ] T012 Verify the current legacy provider paths remain unchanged when the compatibility policy is disabled.
+- [x] T009 Add `tools/media_provider_routing.py` with typed image/STT/TTS policies, capability intersection and retry/error normalization.
+- [x] T010 Integrate `tools/image_generation_tool.py`, `tools/transcription_tools.py` and `tools/tts_tool.py` through the facade without copying secrets into tool environment or prompts.
+- [x] T011 [P] Add `tests/test_media_provider_routing.py` and redaction tests for provider outcomes, secret references and unknown tools.
+- [x] T012 Verify the current legacy provider paths remain unchanged when the compatibility policy is disabled.
 
 ### Dependencies
 
@@ -86,7 +86,7 @@ description: "Work package task list for live-derived Gurra access and media iso
 
 ### Included Subtasks
 
-- [ ] T013 Extend `hermes_cli/config.py` and `hermes_cli/subcommands/config.py` with policy parse/check/dry-run and redacted output.
+- [x] T013 Extend `hermes_cli/config.py` and `hermes_cli/subcommands/config.py` with policy parse/check/dry-run and redacted output.
 - [ ] T014 Add dashboard `Access / Users` endpoints/UI integration on existing localhost/SSH-authenticated surface; no new external listener.
 - [ ] T015 [P] Add lease/audit tests proving no bulk search/export, no model delivery and manual early revoke.
 
