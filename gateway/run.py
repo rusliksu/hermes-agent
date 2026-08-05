@@ -3865,7 +3865,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Build the room-only tool profile from trusted room capabilities."""
         context = getattr(source, "resolved_access_context", None)
         if context is None:
-            return ["memory"], frozenset({"memory"})
+            # Legacy single-principal shared rooms have no typed registry
+            # context yet. Preserve their configured tool surface while the
+            # typed path below remains strict; the binder still requires the
+            # shared memory tool when it is present.
+            return sorted(str(toolset) for toolset in (configured_toolsets or ["memory"])), frozenset()
         if (
             not isinstance(context, ResolvedAccessContext)
             or context.role_id != "shared_room"
@@ -3893,11 +3897,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scope: Any,
         memory_config: dict,
         *,
-        expected_tool_names: frozenset[str] = frozenset({"memory"}),
+        expected_tool_names: frozenset[str] | None = None,
     ) -> None:
         from tools.memory_tool import MemoryStore
 
-        if set(getattr(agent, "valid_tool_names", set())) != set(expected_tool_names):
+        valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        if expected_tool_names:
+            valid = valid_tool_names == set(expected_tool_names)
+        else:
+            valid = "memory" in valid_tool_names
+        if not valid:
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -18425,7 +18434,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     configured_toolsets=configured_toolsets,
                 )
             )
-            disabled_toolsets = ["kanban"]
+            if getattr(source, "resolved_access_context", None) is not None:
+                disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
