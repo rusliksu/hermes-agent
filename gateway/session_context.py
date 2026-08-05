@@ -36,8 +36,8 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -94,12 +94,13 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
-# Trusted server-side authorization result for the current turn.  This is
-# deliberately not part of ``_VAR_MAP``: it must never fall back to an
-# environment variable, and the gateway wrapper owns its lifetime with a
-# stack-safe ContextVar token.
+# Server-owned access context for configured principal/role routing. This is
+# intentionally not an env-var compatibility bridge: model/tool code must read
+# the in-process object via get_resolved_access_context(), and it must never
+# fall back to os.environ or cross a wire format implicitly.
 _RESOLVED_ACCESS_CONTEXT: ContextVar = ContextVar(
-    "HERMES_RESOLVED_ACCESS_CONTEXT", default=_UNSET
+    "HERMES_RESOLVED_ACCESS_CONTEXT",
+    default=_UNSET,
 )
 
 # Whether the current session's delivery channel can route an ASYNC completion
@@ -178,6 +179,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    resolved_access_context: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -214,6 +216,12 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
+    # The gateway wrapper owns the access-context binding.  Direct callers
+    # (tests, one-shot adapters, and background handoffs) may provide an
+    # explicit context; an omitted argument must preserve an already-bound
+    # wrapper context rather than clearing it.
+    if resolved_access_context is not _UNSET:
+        tokens.append(_RESOLVED_ACCESS_CONTEXT.set(resolved_access_context))
     try:
         from agent.runtime_cwd import set_session_cwd
 
@@ -254,6 +262,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -302,33 +311,13 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
     except Exception:
         pass
-
-
-def get_resolved_access_context(default: Any = None) -> Any:
-    """Return the trusted six-field access context bound to this task.
-
-    Unlike legacy session values, an unbound context never consults
-    ``os.environ``.  ``default`` is returned only when the task has no
-    registry context.
-    """
-    value = _RESOLVED_ACCESS_CONTEXT.get()
-    return default if value is _UNSET else value
-
-
-@contextmanager
-def bind_resolved_access_context(context: Any):
-    """Bind a server-resolved access context for one async turn."""
-    token = _RESOLVED_ACCESS_CONTEXT.set(context)
-    try:
-        yield context
-    finally:
-        _RESOLVED_ACCESS_CONTEXT.reset(token)
 
 
 def get_session_env(name: str, default: str = "") -> str:
@@ -355,6 +344,28 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_resolved_access_context(default: Any = None) -> Any:
+    """Return the task-local server-owned access context, if one is bound.
+
+    Unlike get_session_env(), this getter has no legacy os.environ fallback by
+    design. A missing or cleared context returns *default*.
+    """
+    value = _RESOLVED_ACCESS_CONTEXT.get()
+    if value is _UNSET:
+        return default
+    return value
+
+
+@contextmanager
+def bind_resolved_access_context(resolved_access_context: Any):
+    """Temporarily bind only the task-local server-owned access context."""
+    token = _RESOLVED_ACCESS_CONTEXT.set(resolved_access_context)
+    try:
+        yield
+    finally:
+        _RESOLVED_ACCESS_CONTEXT.reset(token)
 
 
 def declare_stateless_channel() -> None:

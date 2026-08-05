@@ -794,6 +794,7 @@ class TestTypedSessionScope:
         assert discover["results"][0]["session_id"] == "own-family"
         expected_scope = {
             "profile_name": "family-alpha",
+            "account": "bot-a",
             "source": "telegram",
             "chat_type": "dm",
             "chat_id": "chat-a",

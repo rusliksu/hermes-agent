@@ -284,6 +284,7 @@ def test_aiagent_stores_session_scope_from_resolved_access_context():
     assert agent._session_scope_required is True
     assert agent._session_scope == {
         "profile_name": "profile",
+        "account": "bot-a",
         "source": "telegram",
         "chat_type": "dm",
         "chat_id": "10001",
@@ -319,6 +320,7 @@ def test_compression_passes_agent_session_scope_to_archive_and_compact(tmp_path)
     context = _access_context()
     expected_scope = {
         "profile_name": "profile",
+        "account": "bot-a",
         "source": "telegram",
         "chat_type": "dm",
         "chat_id": "10001",

@@ -17,11 +17,14 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional, Any
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from gateway.access_registry import ResolvedAccessContext
 
 
 def _now() -> datetime:
@@ -187,6 +190,15 @@ class SessionSource:
     # routing.  This is intentionally separate from user-facing names and is
     # populated from adapter configuration, never from model/user input.
     route_account: Optional[str] = None
+
+    # Server-resolved authorization context for this in-process turn.  It is
+    # deliberately repr/compare disabled and never serialized: the six-field
+    # object is trusted runtime state, not a client-controlled wire field.
+    resolved_access_context: Optional["ResolvedAccessContext"] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can

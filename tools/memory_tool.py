@@ -48,6 +48,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class MemoryAccessDenied(RuntimeError):
+    """Categorical memory authorization failure; message is safe for tools."""
+
+    reason = "memory_access_denied"
+
+    def __init__(self) -> None:
+        super().__init__(self.reason)
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -57,6 +66,7 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+_TELEGRAM_ROOM_PEER_KINDS = frozenset({"group", "supergroup", "channel"})
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +90,152 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return _first_threat_message(content, scope="strict")
 
 
-def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
+def _strict_access_context(context: Any) -> Any:
+    try:
+        from gateway.access_registry import (
+            ResolvedAccessContext,
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+
+        if not isinstance(context, ResolvedAccessContext):
+            raise MemoryAccessDenied()
+        return deserialize_resolved_access_context(
+            serialize_resolved_access_context(context)
+        )
+    except MemoryAccessDenied:
+        raise
+    except Exception as exc:
+        raise MemoryAccessDenied() from exc
+
+
+def _strict_current_and_bound_context(store: "MemoryStore") -> tuple[Any, Any]:
+    try:
+        from gateway.session_context import get_resolved_access_context
+
+        current = get_resolved_access_context(None)
+    except Exception as exc:
+        raise MemoryAccessDenied() from exc
+
+    bound = getattr(store, "access_context", None)
+    if current is None and bound is None:
+        if getattr(store, "require_access_context", False):
+            raise MemoryAccessDenied()
+        return None, None
+    if current is None or bound is None:
+        raise MemoryAccessDenied()
+
+    current = _strict_access_context(current)
+    bound = _strict_access_context(bound)
+    if bound != current:
+        raise MemoryAccessDenied()
+    return current, bound
+
+
+def _reject_symlink_components(profile_home: Path, expected_path: Path) -> None:
+    try:
+        relative = expected_path.relative_to(profile_home)
+    except ValueError as exc:
+        raise MemoryAccessDenied() from exc
+    cursor = profile_home
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise MemoryAccessDenied()
+
+
+def _require_exact_memory_path(memory_dir: Path, expected_path: Path) -> None:
+    profile_home = get_hermes_home()
+    if memory_dir != expected_path:
+        raise MemoryAccessDenied()
+    _reject_symlink_components(profile_home, expected_path)
+    try:
+        expected_path.resolve(strict=False).relative_to(profile_home.resolve(strict=False))
+    except (OSError, ValueError) as exc:
+        raise MemoryAccessDenied() from exc
+
+
+def _typed_non_owner_context(store: "MemoryStore") -> bool:
+    try:
+        current, _bound = _strict_current_and_bound_context(store)
+    except MemoryAccessDenied:
+        return False
+    return current is not None and current.role_id != "owner"
+
+
+def _pending_scope_key_for_store(store: "MemoryStore") -> Optional[str]:
+    current, _bound = _strict_current_and_bound_context(store)
+    if current is None:
+        return None
+    try:
+        from gateway.access_registry import canonical_access_context_fingerprint
+
+        return canonical_access_context_fingerprint(current)
+    except ValueError as exc:
+        raise MemoryAccessDenied() from exc
+
+
+def _require_memory_access(store: "MemoryStore", target: Optional[str] = None) -> None:
+    """Authorize a store against the current task-local access context.
+
+    No task-local context and no bound store context is the legacy path and is
+    intentionally allowed. Once either side is typed, both must exist, pass the
+    strict six-field codec, and match exactly.
+    """
+    current, _bound = _strict_current_and_bound_context(store)
+    if current is None:
+        return
+
+    delivery_target = getattr(current, "delivery_target", None)
+    platform = getattr(delivery_target, "platform", None)
+    peer_kind = getattr(delivery_target, "peer_kind", None)
+    memory_dir = Path(getattr(store, "memory_dir", get_memory_dir()))
+    profile_memories = get_hermes_home() / "memories"
+
+    role_id = current.role_id
+    capabilities = current.capabilities
+    if role_id == "owner":
+        if (
+            platform != "telegram"
+            or peer_kind != "dm"
+        ):
+            raise MemoryAccessDenied()
+        _require_exact_memory_path(memory_dir, profile_memories)
+        return
+
+    if role_id in {"family_standard", "family_sandbox"}:
+        if (
+            platform != "telegram"
+            or peer_kind != "dm"
+            or "memory_search" not in capabilities
+        ):
+            raise MemoryAccessDenied()
+        _require_exact_memory_path(memory_dir, profile_memories)
+        return
+
+    if role_id == "shared_room":
+        try:
+            from gateway.access_registry import shared_memory_namespace_for_access_context
+
+            namespace = shared_memory_namespace_for_access_context(current)
+        except ValueError as exc:
+            raise MemoryAccessDenied() from exc
+        expected_shared_dir = profile_memories / "shared" / namespace
+        if (
+            platform != "telegram"
+            or peer_kind not in _TELEGRAM_ROOM_PEER_KINDS
+            or "room_memory" not in capabilities
+            or target == "user"
+            or getattr(store, "allow_user_profile", True)
+        ):
+            raise MemoryAccessDenied()
+        _require_exact_memory_path(memory_dir, expected_shared_dir)
+        return
+
+    raise MemoryAccessDenied()
+
+
+def _drift_error(path: "Path", bak_path: str, *, redacted: bool = False) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
     The on-disk memory file contains content that wouldn't round-trip
@@ -89,6 +244,8 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     or sister-session write. We refuse the mutation, point the operator at
     the .bak.<ts> snapshot we took, and tell them what to do next.
     """
+    if redacted:
+        return {"success": False, "error": "memory_drift_detected"}
     return {
         "success": False,
         "error": (
@@ -134,6 +291,8 @@ class MemoryStore:
         *,
         memory_dir: Optional[Path] = None,
         allow_user_profile: bool = True,
+        access_context: Any = None,
+        require_access_context: bool = False,
     ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
@@ -141,6 +300,8 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         self.memory_dir = Path(memory_dir) if memory_dir is not None else get_memory_dir()
         self.allow_user_profile = allow_user_profile
+        self.access_context = access_context
+        self.require_access_context = require_access_context
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -191,6 +352,7 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
+        _require_memory_access(self)
         mem_dir = self.memory_dir
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -318,8 +480,15 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
+        _require_memory_access(self, target)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        try:
+            self._write_file(self._path_for(target), self._entries_for(target))
+        except Exception:
+            if _typed_non_owner_context(self):
+                logger.warning("Typed non-owner memory write failed", exc_info=True)
+                raise RuntimeError("memory_write_failed") from None
+            raise
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -345,6 +514,7 @@ class MemoryStore:
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
+        _require_memory_access(self, target)
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -397,6 +567,7 @@ class MemoryStore:
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
+        _require_memory_access(self, target)
         old_text = old_text.strip()
         new_content = new_content.strip()
         if not old_text:
@@ -412,7 +583,11 @@ class MemoryStore:
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(
+                    self._path_for(target),
+                    bak,
+                    redacted=_typed_non_owner_context(self),
+                )
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -466,6 +641,7 @@ class MemoryStore:
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
+        _require_memory_access(self, target)
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
@@ -473,7 +649,11 @@ class MemoryStore:
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(
+                    self._path_for(target),
+                    bak,
+                    redacted=_typed_non_owner_context(self),
+                )
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -517,6 +697,7 @@ class MemoryStore:
         the net result would exceed the char limit, NOTHING is written and an
         error is returned describing the first failure plus the live state.
         """
+        _require_memory_access(self, target)
         if not operations:
             return {"success": False, "error": "operations list is empty."}
 
@@ -533,7 +714,11 @@ class MemoryStore:
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(
+                    self._path_for(target),
+                    bak,
+                    redacted=_typed_non_owner_context(self),
+                )
 
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
@@ -632,6 +817,7 @@ class MemoryStore:
 
         Returns None if the snapshot is empty (no entries at load time).
         """
+        _require_memory_access(self, target)
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 
@@ -798,7 +984,13 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
-def load_on_disk_store() -> "MemoryStore":
+def load_on_disk_store(
+    *,
+    memory_dir: Optional[Path] = None,
+    allow_user_profile: bool = True,
+    access_context: Any = None,
+    require_access_context: bool = False,
+) -> "MemoryStore":
     """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
 
     Use this from any context that has no live agent (the messaging gateway, the
@@ -825,12 +1017,16 @@ def load_on_disk_store() -> "MemoryStore":
     store = MemoryStore(
         memory_char_limit=memory_char_limit,
         user_char_limit=user_char_limit,
+        memory_dir=memory_dir,
+        allow_user_profile=allow_user_profile,
+        access_context=access_context,
+        require_access_context=require_access_context,
     )
     store.load_from_disk()
     return store
 
 
-def _apply_write_gate(action: str, target: str, content: Optional[str],
+def _apply_write_gate(store: "MemoryStore", action: str, target: str, content: Optional[str],
                       old_text: Optional[str]) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
@@ -879,6 +1075,7 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
+        scope_key=_pending_scope_key_for_store(store),
     )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
@@ -887,7 +1084,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
+def _apply_batch_write_gate(
+    store: "MemoryStore",
+    target: str,
+    operations: List[Dict[str, Any]],
+) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
     Returns a JSON tool-result string when the batch should NOT proceed
@@ -926,6 +1127,7 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
+        scope_key=_pending_scope_key_for_store(store),
     )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
@@ -992,6 +1194,10 @@ def memory_tool(
     # still use the documented default store instead of failing validation.
     if target is None:
         target = "memory"
+    try:
+        _require_memory_access(store, target if isinstance(target, str) else None)
+    except MemoryAccessDenied as exc:
+        return tool_error(exc.reason, success=False)
 
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
@@ -1005,10 +1211,16 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        gate_result = _apply_batch_write_gate(store, target, operations)
         if gate_result is not None:
             return gate_result
-        result = store.apply_batch(target, operations)
+        try:
+            result = store.apply_batch(target, operations)
+        except Exception:
+            if _typed_non_owner_context(store):
+                logger.warning("Typed non-owner memory batch failed", exc_info=True)
+                return tool_error("memory_write_failed", success=False)
+            raise
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1030,21 +1242,27 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    gate_result = _apply_write_gate(store, action, target, content, old_text)
     if gate_result is not None:
         return gate_result
 
-    if action == "add":
-        result = store.add(target, content)
+    try:
+        if action == "add":
+            result = store.add(target, content)
 
-    elif action == "replace":
-        result = store.replace(target, old_text, content)
+        elif action == "replace":
+            result = store.replace(target, old_text, content)
 
-    elif action == "remove":
-        result = store.remove(target, old_text)
+        elif action == "remove":
+            result = store.remove(target, old_text)
 
-    else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        else:
+            return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+    except Exception:
+        if _typed_non_owner_context(store):
+            logger.warning("Typed non-owner memory write failed", exc_info=True)
+            return tool_error("memory_write_failed", success=False)
+        raise
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1062,6 +1280,10 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     """
     action = payload.get("action")
     target = payload.get("target", "memory")
+    try:
+        _require_memory_access(store, target if isinstance(target, str) else None)
+    except MemoryAccessDenied as exc:
+        return {"success": False, "error": exc.reason}
     if target == "user" and not getattr(store, "allow_user_profile", True):
         return {
             "success": False,
@@ -1069,14 +1291,20 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         }
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
-    if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
-        return store.remove(target, old_text)
+    try:
+        if action == "batch":
+            return store.apply_batch(target, payload.get("operations") or [])
+        if action == "add":
+            return store.add(target, content)
+        if action == "replace":
+            return store.replace(target, old_text, content)
+        if action == "remove":
+            return store.remove(target, old_text)
+    except Exception:
+        if _typed_non_owner_context(store):
+            logger.warning("Typed non-owner pending memory write failed", exc_info=True)
+            return {"success": False, "error": "memory_write_failed"}
+        raise
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
@@ -1166,5 +1394,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-

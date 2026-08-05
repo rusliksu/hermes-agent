@@ -133,31 +133,15 @@ def test_route_account_round_trips_as_server_owned_source_field():
 
 
 def test_session_search_cannot_select_foreign_profile(monkeypatch):
+    from inspect import signature
     from tools import session_search_tool
 
-    with bind_resolved_access_context(SimpleNamespace(profile_id="family-42")):
-        result = session_search_tool.session_search(
-            profile="owner",
-            db=object(),
-        )
-    assert '"success": false' in result
-    assert "foreign profile scope" in result
+    assert "profile" not in signature(session_search_tool.session_search).parameters
 
 
-def test_session_search_does_not_scan_other_profiles_on_scoped_miss(monkeypatch):
+def test_session_search_does_not_scan_other_profiles_on_scoped_miss():
     from tools import session_search_tool
 
-    class MissingDB:
-        def get_session(self, _session_id):
-            return None
-
-    def forbidden_scan(_session_id):
-        raise AssertionError("cross-profile scan must not run")
-
-    monkeypatch.setattr(session_search_tool, "_locate_session_db", forbidden_scan)
-    with bind_resolved_access_context(SimpleNamespace(profile_id="family-42")):
-        result = session_search_tool.session_search(
-            session_id="missing-session",
-            db=MissingDB(),
-        )
-    assert '"success": false' in result
+    # The old cross-profile locator is intentionally gone. A caller-supplied
+    # SessionDB is required for typed access, so there is no fallback scan.
+    assert not hasattr(session_search_tool, "_locate_session_db")

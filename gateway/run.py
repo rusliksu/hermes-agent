@@ -5710,6 +5710,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _resolve_access_context_for_source(self, source: SessionSource):
         """Resolve and validate the server-owned six-field access context."""
+        # Drop inherited session/access state before resolving this event. The
+        # registry context is rebound below after this reset; legacy/internal
+        # paths are reset again by the inner handler.
+        try:
+            from gateway.session_context import reset_session_vars
+            reset_session_vars()
+        except Exception:
+            logger.debug("reset_session_vars failed at ingress", exc_info=True)
+
         registry = getattr(self, "access_registry", None)
         if registry is None:
             return None
@@ -9501,6 +9510,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             context = self._resolve_access_context_for_source(event.source)
+            # Keep the trusted result on the in-process source object so
+            # session/background lifecycle code can carry it without exposing
+            # it through the wire/persistence serializers.
+            event.source.resolved_access_context = context
         except Exception as exc:
             from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
 
@@ -9549,11 +9562,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # set-to-foreign, not _UNSET. Reset to _UNSET now so that window strips
         # safe (no session) instead of leaking the sibling's. See
         # gateway/session_context.reset_session_vars + the inheritance test.
-        try:
-            from gateway.session_context import reset_session_vars
-            reset_session_vars()
-        except Exception:
-            logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+        # Registry-backed user turns were reset in _handle_message before the
+        # trusted context was bound. Resetting here would erase that context;
+        # legacy and internal paths still need the inheritance guard.
+        if getattr(self, "access_registry", None) is None or getattr(event, "internal", False):
+            try:
+                from gateway.session_context import reset_session_vars
+                reset_session_vars()
+            except Exception:
+                logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
