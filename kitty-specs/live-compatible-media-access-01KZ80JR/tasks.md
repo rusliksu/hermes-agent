@@ -131,7 +131,7 @@ description: "Список задач рабочих пакетов для из�
 - [x] T019 Собрать candidate от current live HEAD в task-owned branch; записать changed-file manifest и SHA-256 evidence без credentials.
 - [x] T020 Запустить owner/Юля/мама/other-family/room/unknown synthetic canaries, media policy dry-run и service health checks.
 - [x] T021 [P] Документировать backup, rollback и отдельный live restart/Telegram canary gate в `docs/ops/media-access-canary-rollback.md`.
-- [ ] T022 Остановиться перед live mutation; выполнять config apply/restart только после нового явного approval пользователя.
+- [x] T022 Выполнить config apply/restart только после нового явного approval пользователя; live gate закрыт.
 
 ### Зависимости
 
@@ -146,7 +146,7 @@ description: "Список задач рабочих пакетов для из�
 - **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06.
 - **MVP scope**: WP01 + WP02 + WP03 + focused tests; live rollout не входит.
 - **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 --- строго последним.
-- **Live gate**: T022 --- жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
+- **Live gate**: T022 закрыт после отдельного явного approval; дальнейшие restart/deploy требуют нового scope-specific gate.
 
 ## Покрытие требований
 

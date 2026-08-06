@@ -65,3 +65,19 @@ Rollback не удаляет legacy sessions, archive или memory и не во
 T022 остаётся отдельным gate. Никакого `systemctl restart`, live symlink/config
 switch, DB mutation, Telegram canary или credential rotation без нового явного
 разрешения Руслана.
+
+## Live evidence 2026-08-06
+
+- Live cutover happened after a separate explicit approval.
+- The first attempt was automatically rolled back because the source check incorrectly searched `/proc/<pid>/maps` for Python source; the retry fixed the staging editable-path and succeeded.
+- No sessions, memory, Telegram messages, or user data were deleted or migrated.
+- Retry metadata backup: `/home/openclaw/backups/gurra-live-compatible-media-cutover/20260806T182906Z` (directory mode `0700`, files mode `0600`).
+- Live config SHA-256: `cdbe4919dd88ef8b1a83d977f85e062df7757352d481f703ca166d8c34674cbe`; redacted policy validation passed, owner `1`, family `9`, shared rooms `2`.
+- Candidate artifact: `/home/openclaw/staging/hermes-deploy-live-compatible-25d5031b-20260806T202000Z`, candidate ref `25d5031bef7862f39303a47dd4f35c71305fd96d`.
+- Gateway drop-in SHA-256: `863e767993099a05f90b723896ecd96bf3f7e133929c1cd3ee7a837e87088421d`, mode `664`; metadata records mode `600`.
+- The old symlink target was preserved for rollback and the new target is the candidate artifact.
+- Focused post-update suite: 18 files, 1039 tests passed; artifact synthetic canary: 4 passed; dashboard loopback HTTP 200.
+- Final gateway and dashboard are active/running, `Result=success`, `NRestarts=0`, and the gateway `ExecStart`/import path matches the candidate.
+- The Telegram canary was not run in this scope.
+
+T022 закрыт. Следующий live cutover требует отдельного scope-specific approval.
