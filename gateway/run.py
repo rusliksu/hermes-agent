@@ -1655,6 +1655,29 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     return False
 
 
+def _access_registry_routes_platform(registry: Any, platform: "Platform") -> bool:
+    """Return whether the typed registry owns ingress for *platform*.
+
+    A shared transport (one Telegram bot in the current rollout) must be
+    polled exactly once by the primary gateway adapter. Secondary profile
+    adapters still exist for genuinely separate credentials, but a registry
+    route means the primary adapter already dispatches those turns by trusted
+    identity and starting another poller would race or fail on empty profiles.
+    """
+    if registry is None:
+        return False
+    platform_name = getattr(platform, "value", str(platform))
+    bindings = tuple(getattr(registry, "principal_bindings", ())) + tuple(
+        getattr(registry, "shared_scope_bindings", ())
+    )
+    for binding in bindings:
+        for attr in ("transport_identity", "room_identity"):
+            identity = getattr(binding, attr, None)
+            if getattr(identity, "platform", None) == platform_name:
+                return True
+    return False
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -9258,6 +9281,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
+                continue
+            if _access_registry_routes_platform(
+                getattr(self, "access_registry", None), platform
+            ):
+                logger.info(
+                    "Skipping secondary profile '%s' platform '%s': "
+                    "shared access registry owns this transport",
+                    profile_name,
+                    platform.value,
+                )
                 continue
             # Relay is shared process-level ingress in multiplex mode. The
             # active profile owns the one connection; connector-stamped
