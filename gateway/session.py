@@ -17,11 +17,14 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional, Any
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from gateway.access_registry import ResolvedAccessContext
 
 
 def _now() -> datetime:
@@ -120,6 +123,20 @@ def _is_path_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+def _canonical_resolved_access_context(
+    context: Any,
+) -> Optional["ResolvedAccessContext"]:
+    """Validate and canonicalize the server-owned six-field context."""
+    if context is None:
+        return None
+    from gateway.access_registry import (
+        deserialize_resolved_access_context,
+        serialize_resolved_access_context,
+    )
+
+    return deserialize_resolved_access_context(serialize_resolved_access_context(context))
+
+
 def _is_session_key_unsafe(value: object) -> bool:
     """Return True if ``value`` could be a real traversal vector in a session_key.
 
@@ -182,6 +199,20 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+
+    # Server-owned transport account discriminator used by exact ingress
+    # routing.  This is intentionally separate from user-facing names and is
+    # populated from adapter configuration, never from model/user input.
+    route_account: Optional[str] = None
+
+    # Server-resolved authorization context for this in-process turn.  It is
+    # deliberately repr/compare disabled and never serialized: the six-field
+    # object is trusted runtime state, not a client-controlled wire field.
+    resolved_access_context: Optional["ResolvedAccessContext"] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -264,6 +295,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.route_account:
+            d["route_account"] = self.route_account
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +322,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            route_account=data.get("route_account"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
@@ -820,6 +854,16 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Server-owned access context that created this routing entry.  It is
+    # persisted separately from ``SessionSource`` (whose wire representation
+    # intentionally excludes trusted authz state) so restart/reset/resume
+    # paths can re-bind the exact principal/profile without owner fallback.
+    resolved_access_context: Optional["ResolvedAccessContext"] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -855,6 +899,12 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.resolved_access_context is not None:
+            from gateway.access_registry import serialize_resolved_access_context
+
+            result["resolved_access_context"] = serialize_resolved_access_context(
+                self.resolved_access_context
+            )
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -899,6 +949,14 @@ class SessionEntry:
                 "Invalid session_key: potential directory traversal detected"
             )
 
+        resolved_access_context = None
+        if "resolved_access_context" in data:
+            from gateway.access_registry import deserialize_resolved_access_context
+
+            resolved_access_context = _canonical_resolved_access_context(
+                deserialize_resolved_access_context(data["resolved_access_context"])
+            )
+
         return cls(
             session_key=session_key,
             session_id=session_id,
@@ -926,6 +984,7 @@ class SessionEntry:
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             model_override=sanitize_model_override(data.get("model_override")),
+            resolved_access_context=resolved_access_context,
         )
 
 
@@ -1629,6 +1688,9 @@ class SessionStore:
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
+            resolved_access_context=_canonical_resolved_access_context(
+                source.resolved_access_context
+            ),
         )
 
     def _recover_session_from_db(
@@ -2090,6 +2152,9 @@ class SessionStore:
         protects only ``_entries`` / ``_loaded`` mutations.
         """
         session_key = self._generate_session_key(source)
+        _source_access_context = _canonical_resolved_access_context(
+            source.resolved_access_context
+        )
         now = _now()
 
         db_end_session_id = None
@@ -2167,6 +2232,20 @@ class SessionStore:
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
+                if _source_access_context is not None:
+                    if (
+                        entry.resolved_access_context is not None
+                        and entry.resolved_access_context != _source_access_context
+                    ):
+                        raise ValueError("resolved_access_context_mismatch")
+                    if entry.resolved_access_context is None:
+                        entry.resolved_access_context = _source_access_context
+                        _needs_save = True
+                elif entry.resolved_access_context is not None:
+                    # Rehydrated restart/resume callers may only have the
+                    # persisted routing source. Restore the trusted context
+                    # onto that source before the caller dispatches the turn.
+                    source.resolved_access_context = entry.resolved_access_context
                 self._heal_compression_tip_locked(
                     entry, existing_session_id, canonical_existing_session_id
                 )
@@ -2249,6 +2328,9 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                resolved_access_context=_canonical_resolved_access_context(
+                    _source_access_context
+                ),
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -2548,6 +2630,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                resolved_access_context=old_entry.resolved_access_context,
             )
 
             self._entries[session_key] = new_entry
@@ -2627,6 +2710,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                resolved_access_context=old_entry.resolved_access_context,
             )
 
             self._entries[session_key] = new_entry

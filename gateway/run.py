@@ -56,6 +56,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from gateway.access_registry import ResolvedAccessContext
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -3035,7 +3036,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _startup_restore_in_progress: bool = False
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(
+        self,
+        config: Optional[GatewayConfig] = None,
+        access_registry: Optional[Any] = None,
+    ):
         global _gateway_runner_ref
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
@@ -3043,6 +3048,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
         self._single_principal_policy = self.config.single_principal
+        # Optional server-built access registry.  It is deliberately kept
+        # outside user YAML parsing in this compatibility slice: when absent,
+        # legacy single-profile behavior remains unchanged; when present, all
+        # user ingress and profile-home resolution become fail-closed.
+        self.access_registry = (
+            access_registry
+            if access_registry is not None
+            else getattr(self.config, "access_registry", None)
+        )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -3792,10 +3806,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return policy.shared_scope(source)
 
     @staticmethod
-    def _bind_shared_memory(agent: Any, scope: Any, memory_config: dict) -> None:
+    def _toolsets_for_resolved_access_context(
+        configured_toolsets: list[str],
+        context: Any,
+    ) -> list[str]:
+        """Intersect configured toolsets with the trusted role capabilities."""
+        if context is None:
+            return list(configured_toolsets)
+        if not isinstance(context, ResolvedAccessContext):
+            return []
+        role_id = context.role_id
+        capabilities = context.capabilities
+        if not isinstance(role_id, str) or not isinstance(capabilities, frozenset):
+            return []
+        if role_id == "owner":
+            return list(configured_toolsets)
+
+        role_capability_toolsets = {
+            "family_standard": {
+                "memory_search": "memory",
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+            },
+            "family_sandbox": {
+                "memory_search": "memory",
+                "public_web": "web",
+                "vision": "vision",
+                "image_generation": "image_gen",
+                "voice_generation": "tts",
+                "session_search": "session_search",
+                "self_reminder": "cronjob",
+                "delegation": "delegation",
+            },
+            "shared_room": {
+                "public_web": "web",
+                "vision": "vision",
+            },
+        }
+        capability_toolsets = role_capability_toolsets.get(role_id)
+        if capability_toolsets is None:
+            return []
+
+        configured = {str(toolset) for toolset in configured_toolsets}
+        allowed = {
+            toolset
+            for capability, toolset in capability_toolsets.items()
+            if capability in capabilities and toolset in configured
+        }
+        return sorted(allowed)
+
+    @staticmethod
+    def _shared_tool_profile_for_source(
+        source: SessionSource,
+        configured_toolsets: list[str] | None = None,
+    ) -> tuple[list[str], frozenset[str]]:
+        """Build the room-only tool profile from trusted room capabilities."""
+        context = getattr(source, "resolved_access_context", None)
+        if context is None:
+            # Legacy single-principal shared rooms have no typed registry
+            # context yet. Preserve their configured tool surface while the
+            # typed path below remains strict; the binder still requires the
+            # shared memory tool when it is present.
+            return sorted(str(toolset) for toolset in (configured_toolsets or ["memory"])), frozenset()
+        if (
+            not isinstance(context, ResolvedAccessContext)
+            or context.role_id != "shared_room"
+            or not isinstance(context.capabilities, frozenset)
+        ):
+            return [], frozenset()
+
+        configured = {str(toolset) for toolset in (configured_toolsets or [])}
+        toolsets: list[str] = []
+        expected_tools: set[str] = set()
+        if "room_memory" in context.capabilities and "memory" in configured:
+            toolsets.append("memory")
+            expected_tools.add("memory")
+        if "public_web" in context.capabilities and "web" in configured:
+            toolsets.append("web")
+            expected_tools.update({"web_search", "web_extract"})
+        if "vision" in context.capabilities and "vision" in configured:
+            toolsets.append("vision")
+            expected_tools.add("vision_analyze")
+        return sorted(toolsets), frozenset(expected_tools)
+
+    @staticmethod
+    def _bind_shared_memory(
+        agent: Any,
+        scope: Any,
+        memory_config: dict,
+        *,
+        expected_tool_names: frozenset[str] | None = None,
+    ) -> None:
         from tools.memory_tool import MemoryStore
 
-        if "memory" not in set(getattr(agent, "valid_tool_names", set())):
+        valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        if expected_tool_names:
+            valid = valid_tool_names == set(expected_tool_names)
+        else:
+            valid = "memory" in valid_tool_names
+        if not valid:
             raise RuntimeError("shared capability profile validation failed")
         memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
         store = MemoryStore(
@@ -5703,7 +5816,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    def _resolve_access_context_for_source(self, source: SessionSource):
+        """Resolve and validate the server-owned six-field access context."""
+        # Drop inherited session/access state before resolving this event. The
+        # registry context is rebound below after this reset; legacy/internal
+        # paths are reset again by the inner handler.
+        try:
+            from gateway.session_context import reset_session_vars
+            reset_session_vars()
+        except Exception:
+            logger.debug("reset_session_vars failed at ingress", exc_info=True)
+
+        registry = getattr(self, "access_registry", None)
+        if registry is None:
+            return None
+        from gateway.access_registry import (
+            AccessDeniedError,
+            RedactedAuditMetadata,
+            TransportIdentity,
+        )
+
+        account = getattr(source, "route_account", None)
+        identity = TransportIdentity.from_session_source(source, account=account)
+        context = registry.resolve(identity)
+        stamped_profile = (getattr(source, "profile", None) or "").strip()
+        if stamped_profile and stamped_profile != context.profile_id:
+            raise AccessDeniedError(
+                "profile_route_mismatch",
+                RedactedAuditMetadata.from_transport("profile_route_mismatch", identity),
+            )
+        return registry.validate_resolved_context(context)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # The adapter's busy path runs before ``_handle_message``.  Apply the
+        # same registry gate here so an unauthorized sender cannot inject into
+        # an active queue/approval/interrupt path.
+        if getattr(self, "access_registry", None) is not None and not bool(
+            getattr(event, "internal", False)
+        ):
+            try:
+                self._resolve_access_context_for_source(event.source)
+            except Exception as exc:
+                from gateway.access_registry import AccessDeniedError
+
+                if isinstance(exc, AccessDeniedError):
+                    logger.warning(
+                        "Access-registry busy ingress denied: reason=%s audit=%s",
+                        exc.reason,
+                        exc.audit.as_dict(),
+                    )
+                else:
+                    logger.warning(
+                        "Access-registry busy ingress failed closed: error=%s",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -7056,6 +7225,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+            if getattr(entry, "resolved_access_context", None) is not None:
+                # SessionSource intentionally omits trusted authz state from
+                # its wire form. Reattach the durable SessionEntry context
+                # before dispatching the synthetic restart turn so a restart
+                # cannot fall back to route/default owner resolution.
+                source.resolved_access_context = entry.resolved_access_context
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -9430,6 +9605,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Resolve trusted ingress authority before the normal message turn.
+
+        The registry is intentionally an opt-in server-side boundary for the
+        staged rollout.  Once attached, unknown or malformed identities are
+        rejected before plugins, sessions, memory, models, or tools observe
+        the event; no owner/default profile fallback is possible.
+        """
+        registry = getattr(self, "access_registry", None)
+        if registry is None:
+            return await self._handle_message_inner(event)
+        if bool(getattr(event, "internal", False)):
+            # Internal synthetic turns (completion/watch/delegation) still
+            # need the originating profile's context. Only legacy internal
+            # events without a typed context use the unscoped compatibility
+            # path; process events are rejected earlier if the payload is
+            # missing or malformed.
+            context = getattr(event.source, "resolved_access_context", None)
+            if context is None:
+                return await self._handle_message_inner(event)
+            try:
+                context = registry.validate_resolved_context(context)
+            except Exception:
+                logger.warning("Access-registry internal event context rejected", exc_info=True)
+                return None
+            from gateway.session_context import bind_resolved_access_context
+
+            with bind_resolved_access_context(context):
+                return await self._handle_message_inner(event)
+        if not bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            logger.error(
+                "Access registry configured while multiplex_profiles is disabled; "
+                "rejecting ingress rather than running in the owner profile"
+            )
+            return None
+
+        try:
+            context = self._resolve_access_context_for_source(event.source)
+            # Keep the trusted result on the in-process source object so
+            # session/background lifecycle code can carry it without exposing
+            # it through the wire/persistence serializers.
+            event.source.resolved_access_context = context
+        except Exception as exc:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+
+            if isinstance(exc, AccessDeniedError):
+                logger.warning(
+                    "Access-registry ingress denied: reason=%s audit=%s",
+                    exc.reason,
+                    exc.audit.as_dict(),
+                )
+            else:
+                logger.warning(
+                    "Access-registry ingress failed closed: error=%s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+            return None
+
+        from gateway.session_context import bind_resolved_access_context
+
+        with bind_resolved_access_context(context):
+            return await self._handle_message_inner(event)
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -9455,11 +9694,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # set-to-foreign, not _UNSET. Reset to _UNSET now so that window strips
         # safe (no session) instead of leaking the sibling's. See
         # gateway/session_context.reset_session_vars + the inheritance test.
-        try:
-            from gateway.session_context import reset_session_vars
-            reset_session_vars()
-        except Exception:
-            logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+        # Registry-backed user turns were reset in _handle_message before the
+        # trusted context was bound. Resetting here would erase that context;
+        # legacy and internal paths still need the inheritance guard.
+        if getattr(self, "access_registry", None) is None or (
+            getattr(event, "internal", False)
+            and getattr(source, "resolved_access_context", None) is None
+        ):
+            try:
+                from gateway.session_context import reset_session_vars
+                reset_session_vars()
+            except Exception:
+                logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -14221,7 +14467,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._toolsets_for_resolved_access_context(
+                configured_toolsets,
+                getattr(source, "resolved_access_context", None),
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -16212,6 +16462,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
+        def _with_persisted_access_context(source):
+            payload = evt.get("resolved_access_context")
+            registry = getattr(self, "access_registry", None)
+            # Once the access registry is active, a durable completion/watch
+            # event must carry the server-owned context. Re-resolving an
+            # ambiguous or missing identity here would be an owner/default
+            # fallback, so reject it before adapter delivery.
+            if registry is not None and payload is None:
+                logger.warning(
+                    "Dropping synthetic process event without access context: %s",
+                    evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                )
+                return None
+            if payload is None:
+                return source
+            try:
+                from gateway.access_registry import deserialize_resolved_access_context
+
+                context = deserialize_resolved_access_context(payload)
+                if registry is not None:
+                    context = registry.validate_resolved_context(context)
+                    # The persisted payload must still belong to this exact
+                    # source. This prevents a guessed session key or stale
+                    # watcher record from routing another profile's result.
+                    expected = self._resolve_access_context_for_source(source)
+                    if expected != context:
+                        logger.warning(
+                            "Dropping synthetic process event with context/source mismatch: %s",
+                            evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                        )
+                        return None
+                source.resolved_access_context = context
+                return source
+            except Exception:
+                logger.warning(
+                    "Dropping synthetic process event with malformed access context: %s",
+                    evt.get("session_id") or evt.get("delegation_id") or "unknown",
+                    exc_info=True,
+                )
+                return None
+
         session_key = str(evt.get("session_key") or "").strip()
         derived_platform = ""
         derived_chat_type = ""
@@ -16222,7 +16513,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _with_persisted_access_context(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -16232,7 +16523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _with_persisted_access_context(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -16272,14 +16563,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        return SessionSource(
+        return _with_persisted_access_context(SessionSource(
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
-        )
+        ))
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
@@ -16608,6 +16899,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                     }
+                    if getattr(session, "resolved_access_context", None) is not None:
+                        completion_evt["resolved_access_context"] = session.resolved_access_context
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -18001,7 +18294,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         routes = getattr(config, "profile_routes", None)
         if not routes:
             return None
-        from gateway.profile_routing import match_profile_route
+        from gateway.profile_routing import ProfileRoutingError, match_profile_route
         try:
             matched = match_profile_route(
                 routes,
@@ -18010,8 +18303,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                account=getattr(source, "route_account", None),
+                peer_kind=getattr(source, "chat_type", None),
+                user_id=getattr(source, "user_id", None),
             )
+        except ProfileRoutingError:
+            # Exact Telegram DM routes are an authorization boundary, not a
+            # best-effort hint.  Preserve the typed denial so callers cannot
+            # silently select the owner/default profile.
+            raise
         except Exception:
+            if getattr(self, "access_registry", None) is not None:
+                raise ProfileRoutingError("route_resolution_failed")
             logger.warning(
                 "Profile route matching failed for %s/%s, falling back to default",
                 source.platform, source.chat_id, exc_info=True,
@@ -18036,12 +18339,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              fallback for sources that bypass ``build_source``.
           3. The active profile (the multiplexer's own home).
         """
-        from hermes_cli.profiles import (
-            get_active_profile_name,
-            get_profile_dir,
-            profile_exists,
-        )
+        from hermes_cli.profiles import get_profile_dir, profile_exists
         from hermes_constants import get_hermes_home
+
+        registry = getattr(self, "access_registry", None)
+        if registry is not None:
+            from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+            from gateway.session_context import get_resolved_access_context
+
+            context = get_resolved_access_context()
+            if context is None:
+                stamped_profile = (getattr(source, "profile", None) or "").strip()
+                if not stamped_profile:
+                    raise AccessDeniedError(
+                        "missing_resolved_access_context",
+                        RedactedAuditMetadata(event="profile_home"),
+                    )
+                context = registry.resolve_exact_profile_context(stamped_profile)
+            context = registry.validate_resolved_context(context)
+            name = context.profile_id
+            if (getattr(source, "profile", None) or "").strip() not in {"", name}:
+                raise AccessDeniedError(
+                    "profile_route_mismatch",
+                    RedactedAuditMetadata(event="profile_home"),
+                )
+            if not profile_exists(name):
+                raise AccessDeniedError(
+                    "missing_profile",
+                    RedactedAuditMetadata(event="profile_home"),
+                )
+            return get_profile_dir(name)
         
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
@@ -18054,6 +18381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if name:
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
+                from hermes_cli.profiles import get_active_profile_name
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)
@@ -18166,10 +18494,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        configured_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._toolsets_for_resolved_access_context(
+            configured_toolsets,
+            getattr(source, "resolved_access_context", None),
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
+        shared_expected_tool_names = frozenset()
+        if shared_scope is not None:
+            enabled_toolsets, shared_expected_tool_names = (
+                self._shared_tool_profile_for_source(
+                    source,
+                    configured_toolsets=configured_toolsets,
+                )
+            )
+            if getattr(source, "resolved_access_context", None) is not None:
+                disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -19564,9 +19906,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                if shared_scope is not None:
+                if shared_scope is not None and "memory" in enabled_toolsets:
                     memory_config = user_config.get("memory") or {}
-                    self._bind_shared_memory(agent, shared_scope, memory_config)
+                    self._bind_shared_memory(
+                        agent,
+                        shared_scope,
+                        memory_config,
+                        expected_tool_names=shared_expected_tool_names,
+                    )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for

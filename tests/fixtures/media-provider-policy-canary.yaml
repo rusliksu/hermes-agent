@@ -1,0 +1,27 @@
+# Synthetic redacted policy fixture. It is not a live Hermes configuration.
+# All secret references are opaque labels; no credential values are present.
+image_gen:
+  fallbacks:
+    image_generation:
+      - openai-codex
+      - fal
+      - openrouter
+stt:
+  fallbacks:
+    - local
+    - mistral
+    - openai
+    - elevenlabs
+  secret_references:
+    mistral: profile://synthetic/stt/mistral
+    openai: profile://synthetic/stt/openai
+    elevenlabs: profile://synthetic/stt/elevenlabs
+tts:
+  fallbacks:
+    tts:
+      - edge
+      - openai
+      - elevenlabs
+    secret_references:
+      openai: profile://synthetic/tts/openai
+      elevenlabs: profile://synthetic/tts/elevenlabs

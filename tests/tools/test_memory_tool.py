@@ -302,6 +302,22 @@ def test_scoped_memory_directories_are_isolated_and_user_profile_is_disabled(tmp
     assert not (tmp_path / "scope-a" / "USER.md").exists()
 
 
+def test_multiplex_memory_without_trusted_context_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+    store = MemoryStore(memory_dir=tmp_path / "unbound")
+
+    result = json.loads(memory_tool(
+        action="add",
+        target="memory",
+        content="must not be written without a profile context",
+        store=store,
+    ))
+
+    assert result["success"] is False
+    assert result["error"] == "memory_access_denied"
+    assert not (tmp_path / "unbound" / "MEMORY.md").exists()
+
+
 class TestMemoryStoreAdd:
     def test_add_entry(self, store):
         result = store.add("memory", "Python 3.12 project")

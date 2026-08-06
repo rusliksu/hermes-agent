@@ -847,6 +847,61 @@ class TestMediaDeliveryPathValidation:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
+    def test_multiplex_media_delivery_is_bound_to_active_profile(self, tmp_path, monkeypatch):
+        """A model cannot guess another profile's cache or workspace path."""
+        active_home = tmp_path / "profiles" / "owner-profile"
+        foreign_home = tmp_path / "profiles" / "family-profile"
+        active_cache = active_home / "cache" / "images" / "owned.png"
+        foreign_cache = foreign_home / "cache" / "images" / "private.png"
+        active_workspace = active_home / "workspace" / "report.pdf"
+        foreign_workspace = foreign_home / "workspace" / "notes.pdf"
+        for path in (active_cache, foreign_cache, active_workspace, foreign_workspace):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"data")
+
+        monkeypatch.setattr(
+            "gateway.platforms.base._multiplex_media_delivery_scope",
+            lambda: (True, active_home.resolve()),
+        )
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", ())
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(active_cache)) == str(
+            active_cache.resolve()
+        )
+        assert BasePlatformAdapter.validate_media_delivery_path(str(active_workspace)) == str(
+            active_workspace.resolve()
+        )
+        assert BasePlatformAdapter.validate_media_delivery_path(str(foreign_cache)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(foreign_workspace)) is None
+
+    def test_multiplex_media_delivery_denies_missing_context(self, tmp_path, monkeypatch):
+        """No typed context means no attachment egress in multiplex mode."""
+        import gateway.platforms.base as base
+
+        candidate = tmp_path / "profiles" / "owner-profile" / "cache" / "images" / "owned.png"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_bytes(b"data")
+        monkeypatch.setattr(
+            "gateway.platforms.base._multiplex_media_delivery_scope",
+            lambda: (True, None),
+        )
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(candidate)) is None
+
+    def test_multiplex_scope_helper_fails_closed_without_context(self, monkeypatch):
+        import gateway.platforms.base as base
+
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+        monkeypatch.setattr(
+            "gateway.session_context.get_resolved_access_context",
+            lambda default=None: None,
+        )
+
+        assert base._multiplex_media_delivery_scope() == (True, None)
+
     def test_rejects_symlink_escape_from_safe_root(self, tmp_path, monkeypatch):
         root = tmp_path / "media-cache"
         root.mkdir()

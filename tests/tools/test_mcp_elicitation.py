@@ -194,6 +194,19 @@ class TestElicitationHandlerContextBridge:
     it before invoking the approval router so gateway-session detection
     survives the task hop. Regression tests for that bridge."""
 
+    def test_multiplex_missing_access_context_declines_before_prompt(self):
+        """A callback without the typed context cannot fall back to a user."""
+        from tools.approval import request_elicitation_consent
+
+        with (
+            patch("agent.secret_scope.is_multiplex_active", return_value=True),
+            patch("tools.approval.prompt_dangerous_approval") as prompt,
+        ):
+            result = request_elicitation_consent("confirm", "test")
+
+        assert result == "decline"
+        prompt.assert_not_called()
+
     def test_captured_context_is_replayed_in_consent_call(self):
         """The captured context's contextvar values must be observable
         when ``request_elicitation_consent`` runs -- otherwise the

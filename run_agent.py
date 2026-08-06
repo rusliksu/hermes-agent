@@ -606,18 +606,33 @@ class AIAgent:
                     _profile_for_session = None
             except Exception:
                 _profile_for_session = None
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=source,
-                model=self.model,
-                model_config=self._session_init_model_config,
-                system_prompt=self._cached_system_prompt,
-                user_id=None,
-                parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
-                profile_name=_profile_for_session,
-            )
-            self._session_db_created = True
+            create_kwargs = {
+                "session_id": self.session_id,
+                "source": source,
+                "model": self.model,
+                "model_config": self._session_init_model_config,
+                "system_prompt": self._cached_system_prompt,
+                "user_id": None,
+                "parent_session_id": self._parent_session_id,
+                "cwd": _launch_cwd_for_session(source),
+                "profile_name": _profile_for_session,
+            }
+            if getattr(self, "_session_scope_required", False):
+                scope = getattr(self, "_session_scope", None)
+                if scope is None:
+                    scope = {}
+                if isinstance(scope, dict) and scope.get("source"):
+                    create_kwargs["source"] = scope["source"]
+                created = self._session_db.create_session(
+                    **create_kwargs,
+                    session_scope=scope,
+                )
+                self._session_db_created = bool(created)
+                if not created:
+                    raise RuntimeError("session create denied by session scope")
+            else:
+                self._session_db.create_session(**create_kwargs)
+                self._session_db_created = True
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
@@ -1970,29 +1985,45 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
-                    session_id=self.session_id,
-                    role=role,
-                    content=content,
-                    tool_name=msg.get("tool_name"),
-                    tool_calls=tool_calls_data,
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning") if role == "assistant" else None,
-                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
-                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
-                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
-                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
-                    timestamp=_row_timestamp,
-                )
+                append_kwargs = {
+                    "session_id": self.session_id,
+                    "role": role,
+                    "content": content,
+                    "tool_name": msg.get("tool_name"),
+                    "tool_calls": tool_calls_data,
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "finish_reason": msg.get("finish_reason"),
+                    "reasoning": msg.get("reasoning") if role == "assistant" else None,
+                    "reasoning_content": msg.get("reasoning_content") if role == "assistant" else None,
+                    "reasoning_details": msg.get("reasoning_details") if role == "assistant" else None,
+                    "codex_reasoning_items": msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    "codex_message_items": msg.get("codex_message_items") if role == "assistant" else None,
+                    "timestamp": _row_timestamp,
+                }
+                if getattr(self, "_session_scope_required", False):
+                    scope = getattr(self, "_session_scope", None)
+                    if scope is None:
+                        scope = {}
+                    msg_id = self._session_db.append_message(
+                        **append_kwargs,
+                        session_scope=scope,
+                    )
+                    if not msg_id:
+                        raise RuntimeError("session append denied by session scope")
+                else:
+                    self._session_db.append_message(**append_kwargs)
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            if getattr(self, "_session_scope_required", False):
+                raise
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -3632,7 +3663,16 @@ class AIAgent:
                 session_db = getattr(self, "_session_db", None)
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
+                    if getattr(self, "_session_scope_required", False):
+                        scope = getattr(self, "_session_scope", None)
+                        if scope is not None:
+                            session_db.end_session(
+                                session_id,
+                                "agent_close",
+                                session_scope=scope,
+                            )
+                    else:
+                        session_db.end_session(session_id, "agent_close")
         except Exception:
             pass
 

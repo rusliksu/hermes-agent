@@ -80,6 +80,20 @@ _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
 
 
+def capture_resolved_access_context_payload() -> Optional[Dict[str, Any]]:
+    """Capture the immutable six-field context for a detached delegation."""
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    try:
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        raise ValueError("malformed_resolved_access_context") from exc
+
+
 def _db_path():
     return get_hermes_home() / "state.db"
 
@@ -133,7 +147,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in (
+            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "resolved_access_context",
+        )
         if key in record
     }
     with _DB_LOCK, _connect() as conn:
@@ -248,6 +265,7 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "resolved_access_context": task.get("resolved_access_context"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -448,6 +466,7 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    resolved_access_context: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -499,6 +518,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "resolved_access_context": resolved_access_context,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -630,6 +650,7 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        "resolved_access_context": record.get("resolved_access_context"),
     }
     _persist_completion(evt, result)
     try:
@@ -655,6 +676,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    resolved_access_context: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -699,6 +721,7 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "resolved_access_context": resolved_access_context,
     }
     with _records_lock:
         running = sum(
@@ -809,6 +832,7 @@ def _finalize_batch(
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
+        "resolved_access_context": event_record.get("resolved_access_context"),
     }
     _persist_completion(evt, combined)
     try:

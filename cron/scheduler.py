@@ -48,6 +48,31 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _resolve_cron_access_context(job: dict):
+    """Deserialize the job-owned context and reject unscoped multiplex runs."""
+    payload = job.get("resolved_access_context")
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplex_active = bool(is_multiplex_active())
+    except Exception as exc:
+        # A scheduler that cannot determine whether it is running in the
+        # multiplexed gateway must not silently downgrade to the legacy,
+        # unscoped path.  That would make a missing context indistinguishable
+        # from a valid single-profile job.
+        raise RuntimeError("Cron job blocked: multiplex_state_unavailable") from exc
+    if payload is None:
+        if multiplex_active:
+            raise RuntimeError("Cron job blocked: missing_resolved_access_context")
+        return None
+    try:
+        from gateway.access_registry import deserialize_resolved_access_context
+
+        return deserialize_resolved_access_context(payload)
+    except Exception as exc:
+        raise RuntimeError("Cron job blocked: malformed_resolved_access_context") from exc
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -2677,6 +2702,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _cron_access_context = _resolve_cron_access_context(job)
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2962,6 +2988,7 @@ def run_job(
         # inline/synchronous path, so results return within the job's own turn.
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
+        resolved_access_context=_cron_access_context,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
