@@ -1,4 +1,5 @@
 import pytest
+import yaml
 
 from gateway.access_registry import (
     AccessRegistry,
@@ -8,7 +9,12 @@ from gateway.access_registry import (
     SharedScopeBinding,
     TransportIdentity,
 )
-from gateway.config import AccessRegistryConfigError, GatewayConfig, Platform
+from gateway.config import (
+    AccessRegistryConfigError,
+    GatewayConfig,
+    Platform,
+    load_gateway_config,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -147,6 +153,27 @@ def test_minimal_dm_access_registry_parses_to_immutable_types_and_runner_uses_co
     ).access_registry
     explicit_runner = GatewayRunner(config=config, access_registry=explicit)
     assert explicit_runner.access_registry is explicit
+
+
+def test_nested_gateway_access_registry_is_loaded_from_config_yaml(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "gateway": {
+                    "multiplex_profiles": True,
+                    "access_registry": _minimal_dm_registry(),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    config = load_gateway_config()
+
+    assert config.multiplex_profiles is True
+    assert config.access_registry is not None
 
 
 def test_shared_room_public_web_registry_resolves_to_memory_and_web_profile():

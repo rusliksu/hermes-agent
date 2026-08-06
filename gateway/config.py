@@ -1480,6 +1480,11 @@ def load_gateway_config() -> GatewayConfig:
 
             if "access_registry" in yaml_cfg:
                 gw_data["access_registry"] = yaml_cfg["access_registry"]
+            elif isinstance(gateway_section, dict) and "access_registry" in gateway_section:
+                # Keep the user-facing gateway namespace consistent with
+                # multiplex_profiles while still feeding the flattened
+                # GatewayConfig schema used by the runtime.
+                gw_data["access_registry"] = gateway_section["access_registry"]
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
