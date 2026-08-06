@@ -133,7 +133,7 @@ def bound_profile_terminal_config() -> dict[str, Any] | None:
 
         config_path = home / "config.yaml"
         if not config_path.exists():
-            raise ValueError("typed terminal config unavailable")
+            return {}
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
     except ValueError:
