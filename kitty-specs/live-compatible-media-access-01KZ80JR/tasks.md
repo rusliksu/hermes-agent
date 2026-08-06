@@ -1,157 +1,157 @@
 ---
-description: "Work package task list for live-derived Gurra access and media isolation"
+description: "Список задач рабочих пакетов для изоляции доступа и media в Gurra на основе текущего live-состояния"
 ---
 
-# Work Packages: Live-compatible Gurra access and media isolation
+# Рабочие пакеты: совместимый доступ Gurra и изоляция media
 
-**Inputs**: `spec.md`, `plan.md`, `research.md`, `data-model.md`, `contracts/`
-**Prerequisites**: current live-derived branch `a4096896ed92d1edb3dd02e62876dc0fc1ce140a`; no implementation from the divergent experimental branch may be copied wholesale.
-**Tests**: every behavior package includes contract/negative tests; all canaries use synthetic/redacted fixtures and never read credential contents.
+**Входы**: `spec.md`, `plan.md`, `research.md`, `data-model.md`, `contracts/`
+**Предварительные условия**: текущая live-derived ветка `a4096896ed92d1edb3dd02e62876dc0fc1ce140a`; реализацию из расходящейся экспериментальной ветки нельзя переносить целиком.
+**Тесты**: каждый пакет поведения содержит contract/negative tests; все canary используют synthetic/redacted fixtures и никогда не читают содержимое credential-файлов.
 
 ---
 
-## Work Package WP01: Six-field access contract and fail-closed resolver (Priority: P0)
+## Рабочий пакет WP01: контракт доступа с шестью полями и fail-closed resolver (приоритет P0)
 
-**Goal**: Add the immutable six-field `ResolvedAccessContext`, typed role/principal/room bindings, capability intersection and exact identity resolver without changing live behavior until the feature gate is enabled.
-**Independent Test**: Unit/contract matrix resolves Руслан(owner), all private family role labels with the same capability set, two rooms(shared_room), unknown and malformed identities to the expected context or a deny result before model/session/tools.
-**Prompt**: `/tasks/WP01-access-contract.md`
-**Requirement Refs**: FR-001, FR-002, FR-004, FR-007
+**Цель**: добавить неизменяемый шестиполевой `ResolvedAccessContext`, типизированные role/principal/room bindings, пересечение capabilities и точный identity resolver без изменения live-поведения до включения feature gate.
+**Независимая проверка**: unit/contract matrix должна разрешать Руслана(`owner`), все private family role labels с одинаковым набором capabilities, две комнаты(`shared_room`), а unknown и malformed identities — выдавать ожидаемый context либо deny до model/session/tools.
+**Промпт**: `/tasks/WP01-access-contract.md`
+**Ссылки на требования**: FR-001, FR-002, FR-004, FR-007
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T001 Add `gateway/access_registry.py` with exactly six serialized context fields, immutable bindings and redacted deny reasons.
-- [x] T002 Extend `gateway/profile_routing.py` for exact DM identity and explicit room/topic matching; reject ambiguous routes and missing profiles.
-- [x] T003 Bridge `gateway/authz_mixin.py` and ingress call sites so unknown/malformed sources are denied before model/session/tools with no owner/default fallback.
-- [x] T004 [P] Add `tests/gateway/test_access_registry.py` and `tests/gateway/test_profile_routing_fail_closed.py` with the full principal/room/unknown matrix.
+- [x] T001 Добавить `gateway/access_registry.py` с ровно шестью serialized context fields, immutable bindings и redacted deny reasons.
+- [x] T002 Расширить `gateway/profile_routing.py` для точной DM identity и явного room/topic matching; отклонять ambiguous routes и missing profiles.
+- [x] T003 Связать `gateway/authz_mixin.py` и ingress call sites так, чтобы unknown/malformed sources отклонялись до model/session/tools без owner/default fallback.
+- [x] T004 [P] Добавить `tests/gateway/test_access_registry.py` и `tests/gateway/test_profile_routing_fail_closed.py` с полной principal/room/unknown matrix.
 
-### Dependencies
+### Зависимости
 
-- None (starting package).
+- Нет (стартовый пакет).
 
-### Risks & Mitigations
+### Риски и меры
 
-- Legacy adapters may omit trusted account/user metadata; reject rather than infer from username/display name.
-- Existing single-principal/group policy must remain readable; put the new resolver behind an explicit compatibility gate and test both modes.
+- Старые adapters могут не передавать доверенные account/user metadata; в таком случае отклонять запрос, а не выводить identity из username/display name.
+- Существующая single-principal/group policy должна оставаться читаемой; новый resolver размещается за явным compatibility gate, оба режима покрываются тестами.
 
-## Work Package WP02: Profile, session and background isolation (Priority: P0)
+## Рабочий пакет WP02: изоляция profile, session и фоновых задач (приоритет P0)
 
-**Goal**: Carry one resolved context through profile home, session key, memory/session search, attachments, callbacks, cron, compaction/reset/restart and delegation.
-**Independent Test**: Pairwise canaries with guessed session IDs, filenames and memory keys show zero observations across two family profiles, owner, sandbox and rooms while concurrent turns remain isolated.
-**Prompt**: `/tasks/WP02-runtime-isolation.md`
-**Requirement Refs**: FR-003, FR-005, FR-007
+**Цель**: провести один resolved context через profile home, session key, memory/session search, attachments, callbacks, cron, compaction/reset/restart и delegation.
+**Независимая проверка**: pairwise canaries с guessed session IDs, filenames и memory keys должны показать нулевые наблюдения между двумя family profiles, owner, sandbox и rooms при одновременных turns.
+**Промпт**: `/tasks/WP02-runtime-isolation.md`
+**Ссылки на требования**: FR-003, FR-005, FR-007
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T005 Bind the context in `gateway/session_context.py` and `gateway/run.py` at ingress and clear it at turn completion/cancellation.
-- [x] T006 Remove default/active `HERMES_HOME` fallback for a rejected or missing profile; make foreign `profile_id`/session namespace arguments fail closed.
-- [x] T007 [P] Update `tools/session_search_tool.py`, `tools/memory_tool.py` and file/attachment guards to derive namespace only from trusted runtime context.
-- [x] T008 [P] Add negative tests for callbacks, background tasks, cron delivery, delegation, compaction/reset/restart and simultaneous profiles.
+- [x] T005 Привязать context в `gateway/session_context.py` и `gateway/run.py` на ingress и очищать его после завершения/cancellation turn.
+- [x] T006 Удалить default/active `HERMES_HOME` fallback для rejected или missing profile; foreign `profile_id`/session namespace arguments должны fail closed.
+- [x] T007 [P] Обновить `tools/session_search_tool.py`, `tools/memory_tool.py` и file/attachment guards, чтобы namespace выводился только из trusted runtime context.
+- [x] T008 [P] Добавить negative tests для callbacks, background tasks, cron delivery, delegation, compaction/reset/restart и simultaneous profiles.
 
-### Dependencies
+### Зависимости
 
-- Depends on WP01.
+- Зависит от WP01.
 
-### Risks & Mitigations
+### Риски и меры
 
-- ContextVars can be lost in thread/executor bridges; add explicit propagation tests and ensure subprocess environment has no process-global identity fallback.
+- ContextVars могут теряться на thread/executor bridges; добавить явные propagation tests и проверить, что subprocess environment не использует process-global identity fallback.
 
-## Work Package WP03: Scoped image/STT/TTS provider facade (Priority: P1)
+## Рабочий пакет WP03: scoped image/STT/TTS provider facade (приоритет P1)
 
-**Goal**: Add ordered media provider policy with capability checks, retry classification, opaque secret references and redacted audit while retaining current provider implementations.
-**Independent Test**: Synthetic providers verify image `openai-codex → fal → openrouter`, STT `local → mistral → openai → elevenlabs`, TTS `edge → openai → elevenlabs`, one attempt per provider and permanent-error stop.
-**Prompt**: `/tasks/WP03-media-provider-facade.md`
-**Requirement Refs**: FR-006, FR-007
+**Цель**: добавить ordered media provider policy с capability checks, retry classification, opaque secret references и redacted audit, сохранив текущие provider implementations.
+**Независимая проверка**: synthetic providers должны подтвердить порядок image `openai-codex → fal → openrouter`, STT `local → mistral → openai → elevenlabs`, TTS `edge → openai → elevenlabs`, одну попытку на provider и остановку при permanent error.
+**Промпт**: `/tasks/WP03-media-provider-facade.md`
+**Ссылки на требования**: FR-006, FR-007
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T009 Add `tools/media_provider_routing.py` with typed image/STT/TTS policies, capability intersection and retry/error normalization.
-- [x] T010 Integrate `tools/image_generation_tool.py`, `tools/transcription_tools.py` and `tools/tts_tool.py` through the facade without copying secrets into tool environment or prompts.
-- [x] T011 [P] Add `tests/test_media_provider_routing.py` and redaction tests for provider outcomes, secret references and unknown tools.
-- [x] T012 Verify the current legacy provider paths remain unchanged when the compatibility policy is disabled.
+- [x] T009 Добавить `tools/media_provider_routing.py` с typed image/STT/TTS policies, capability intersection и retry/error normalization.
+- [x] T010 Подключить `tools/image_generation_tool.py`, `tools/transcription_tools.py` и `tools/tts_tool.py` через facade без копирования secrets в tool environment или prompts.
+- [x] T011 [P] Добавить `tests/test_media_provider_routing.py` и redaction tests для provider outcomes, secret references и unknown tools.
+- [x] T012 Проверить, что текущие legacy provider paths не меняются при отключённой compatibility policy.
 
-### Dependencies
+### Зависимости
 
-- Depends on WP01.
+- Зависит от WP01.
 
-### Risks & Mitigations
+### Риски и меры
 
-- Providers return incompatible error/result shapes; normalize to a small internal result and log only provider name, status and class.
+- Providers возвращают несовместимые result/error shapes; нормализовать их к небольшой internal result и писать в log только provider name, status и class.
 
-## Work Package WP04: Policy validation, dry-run and dashboard audit surface (Priority: P1)
+## Рабочий пакет WP04: проверка policy, dry-run и dashboard audit surface (приоритет P1)
 
-**Goal**: Validate role/principal/room/media configuration, expose redacted effective policy preview and enforce the break-glass lease contract without transmitting inspected data to the model.
-**Independent Test**: CLI/dash dry-run rejects malformed policies, shows effective capabilities for Руслан/Юля/маму/rooms, and lease tests require reason, expire at 15 minutes and produce metadata-only audit.
-**Prompt**: `/tasks/WP04-policy-dry-run-audit.md`
-**Requirement Refs**: FR-004, FR-006, FR-008
+**Цель**: проверять role/principal/room/media configuration, показывать redacted preview effective policy и обеспечивать break-glass lease contract без передачи просмотренных данных в model.
+**Независимая проверка**: CLI/dash dry-run отклоняет malformed policies, показывает effective capabilities Руслана/Юли/мамы/rooms, а lease tests требуют reason, истекают через 15 минут и создают metadata-only audit.
+**Промпт**: `/tasks/WP04-policy-dry-run-audit.md`
+**Ссылки на требования**: FR-004, FR-006, FR-008
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T013 Extend `hermes_cli/config.py` and `hermes_cli/subcommands/config.py` with policy parse/check/dry-run and redacted output.
-- [x] T014 Add dashboard `Access / Users` endpoints/UI integration on existing localhost/SSH-authenticated surface; no new external listener.
-- [x] T015 [P] Add lease/audit tests proving no bulk search/export, no model delivery and manual early revoke.
+- [x] T013 Расширить `hermes_cli/config.py` и `hermes_cli/subcommands/config.py` для policy parse/check/dry-run и redacted output.
+- [x] T014 Добавить dashboard `Access / Users` endpoints/UI integration на существующей localhost/SSH-authenticated surface; новый внешний listener не создавать.
+- [x] T015 [P] Добавить lease/audit tests, подтверждающие отсутствие bulk search/export и model delivery, а также manual early revoke.
 
-### Dependencies
+### Зависимости
 
-- Depends on WP01 and WP03.
+- Зависит от WP01 и WP03.
 
-### Risks & Mitigations
+### Риски и меры
 
-- Legacy config keys can accidentally broaden access; validate unknown keys and treat malformed policy as deny.
+- Legacy config keys могут случайно расширить доступ; проверять unknown keys и считать malformed policy deny-условием.
 
-## Work Package WP05: Migration and profile/room fixture tooling (Priority: P1)
+## Рабочий пакет WP05: migration и profile/room fixture tooling (приоритет P1)
 
-**Goal**: Provide dry-run migration report, per-principal DM ownership mapping, isolated profile/room fixture setup and read-only ambiguous legacy archive.
-**Independent Test**: Synthetic migration counts/hashes are stable; no global memory or ambiguous record appears in a family profile; rollback leaves source records intact.
-**Prompt**: `/tasks/WP05-migration-fixtures.md`
-**Requirement Refs**: FR-003, FR-009
+**Цель**: подготовить dry-run migration report, mapping DM ownership по principal, isolated profile/room fixture setup и read-only archive для ambiguous legacy записей.
+**Независимая проверка**: synthetic migration counts/hashes стабильны; global memory и ambiguous record не попадают в family profile; rollback оставляет исходные records нетронутыми.
+**Промпт**: `/tasks/WP05-migration-fixtures.md`
+**Ссылки на требования**: FR-003, FR-009
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T016 Add redacted migration planner/report and profile/room fixture setup under `tests/fixtures/` and `docs/ops/`.
-- [x] T017 Preserve session IDs/timestamps only for unambiguous DM ownership; route ambiguous rows to a closed read-only archive.
-- [x] T018 [P] Add migration hash/count and no-global-memory tests; do not read or copy credential/auth files.
+- [x] T016 Добавить redacted migration planner/report и profile/room fixture setup в `tests/fixtures/` и `docs/ops/`.
+- [x] T017 Сохранять session IDs/timestamps только для unambiguous DM ownership; ambiguous rows направлять в закрытый read-only archive.
+- [x] T018 [P] Добавить migration hash/count и no-global-memory tests; не читать и не копировать credential/auth files.
 
-### Dependencies
+### Зависимости
 
-- Depends on WP01 and WP02.
+- Зависит от WP01 и WP02.
 
-### Risks & Mitigations
+### Риски и меры
 
-- Ownership cannot be inferred safely from names or content; classify as ambiguous and leave it archived.
+- Ownership нельзя безопасно выводить из имён или содержимого; классифицировать такие записи как ambiguous и оставлять в archive.
 
-## Work Package WP06: Staging canary, rollback and live gate packet (Priority: P1)
+## Рабочий пакет WP06: staging canary, rollback и live gate packet (приоритет P1)
 
-**Goal**: Produce a live-derived compatibility release, synthetic gateway/dashboard canary, redacted evidence, rollback rehearsal and explicit live-cutover checklist.
-**Independent Test**: Staging services remain healthy, dashboard is loopback-only, all privacy/media canaries pass, and rollback restores the captured live code/config surfaces.
-**Prompt**: `/tasks/WP06-staging-canary-rollback.md`
-**Requirement Refs**: FR-010
+**Цель**: подготовить live-derived compatibility release, synthetic gateway/dashboard canary, redacted evidence, rollback rehearsal и явный live-cutover checklist.
+**Независимая проверка**: staging services остаются healthy, dashboard доступен только через loopback, все privacy/media canaries проходят, rollback восстанавливает captured live code/config surfaces.
+**Промпт**: `/tasks/WP06-staging-canary-rollback.md`
+**Ссылки на требования**: FR-010
 
-### Included Subtasks
+### Включённые подзадачи
 
-- [x] T019 Build candidate from current live HEAD on the task-owned branch; record changed-file manifest and SHA-256 evidence without credentials.
-- [x] T020 Run owner/Юля/мама/other-family/room/unknown synthetic canaries plus media policy dry-run and service health checks.
-- [x] T021 [P] Document backup, rollback and separate live restart/Telegram canary gate in `docs/ops/media-access-canary-rollback.md`.
-- [ ] T022 Stop before live mutation; execute config apply/restart only after a new explicit user approval.
+- [x] T019 Собрать candidate от current live HEAD в task-owned branch; записать changed-file manifest и SHA-256 evidence без credentials.
+- [x] T020 Запустить owner/Юля/мама/other-family/room/unknown synthetic canaries, media policy dry-run и service health checks.
+- [x] T021 [P] Документировать backup, rollback и отдельный live restart/Telegram canary gate в `docs/ops/media-access-canary-rollback.md`.
+- [ ] T022 Остановиться перед live mutation; выполнять config apply/restart только после нового явного approval пользователя.
 
-### Dependencies
+### Зависимости
 
-- Depends on WP01, WP02, WP03, WP04 and WP05.
+- Зависит от WP01, WP02, WP03, WP04 и WP05.
 
-### Risks & Mitigations
+### Риски и меры
 
-- Live branch has deployment-specific assumptions; compare service state before/after and keep exact prior code/config references for rollback.
+- В live branch могут быть deployment-specific assumptions; сравнить service state до/после и сохранить точные code/config references для rollback.
 
-## Dependency & Execution Summary
+## Сводка зависимостей и порядка выполнения
 
-- **Sequence**: WP01 → WP02 and WP03 (parallel after contract) → WP04 and WP05 → WP06.
-- **MVP Scope**: WP01 + WP02 + WP03 + focused tests; no live rollout.
-- **Parallelization**: WP02 and WP03 touch disjoint primary modules after WP01. WP04 and WP05 can proceed after their listed prerequisites; WP06 is strictly last.
-- **Live gate**: T022 is a hard stop until a separate explicit approval; implementation approval does not imply restart/deploy permission.
+- **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06.
+- **MVP scope**: WP01 + WP02 + WP03 + focused tests; live rollout не входит.
+- **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 — строго последним.
+- **Live gate**: T022 — жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
 
-## Requirements Coverage Summary
+## Покрытие требований
 
-| Requirement ID | Covered By Work Package(s) |
-|----------------|----------------------------|
+| ID требования | Рабочие пакеты |
+|---------------|----------------|
 | FR-001 | WP01 |
 | FR-002 | WP01 |
 | FR-003 | WP02, WP05 |
@@ -163,15 +163,15 @@ description: "Work package task list for live-derived Gurra access and media iso
 | FR-009 | WP05 |
 | FR-010 | WP06 |
 
-## Subtask Index (Reference)
+## Индекс подзадач (справочно)
 
-| Subtask ID | Summary | Work Package | Priority | Parallel? |
-|------------|---------|--------------|----------|-----------|
-| T001 | Six-field context | WP01 | P0 | No |
-| T004 | Identity matrix tests | WP01 | P0 | Yes |
-| T005 | Context binding | WP02 | P0 | No |
-| T009 | Media facade | WP03 | P1 | No |
-| T013 | Policy dry-run | WP04 | P1 | No |
-| T016 | Migration planner | WP05 | P1 | No |
-| T019 | Staging artifact | WP06 | P1 | No |
-| T022 | Live gate stop | WP06 | P1 | No |
+| ID | Краткое описание | Пакет | Приоритет | Параллельная? |
+|----|------------------|-------|-----------|---------------|
+| T001 | Контекст с шестью полями | WP01 | P0 | Нет |
+| T004 | Identity matrix | WP01 | P0 | Да |
+| T005 | Context binding | WP02 | P0 | Нет |
+| T009 | Media facade | WP03 | P1 | Нет |
+| T013 | Policy dry-run | WP04 | P1 | Нет |
+| T016 | Migration planner | WP05 | P1 | Нет |
+| T019 | Staging artifact | WP06 | P1 | Нет |
+| T022 | Остановка на live gate | WP06 | P1 | Нет |
