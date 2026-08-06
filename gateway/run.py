@@ -9646,6 +9646,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session/background lifecycle code can carry it without exposing
             # it through the wire/persistence serializers.
             event.source.resolved_access_context = context
+            # Session keys and a few legacy routing helpers consume the
+            # explicit source profile. Stamp it from the already validated
+            # context so registry-routed turns cannot fall back to the active
+            # (owner) profile namespace.
+            event.source.profile = context.profile_id
         except Exception as exc:
             from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
 

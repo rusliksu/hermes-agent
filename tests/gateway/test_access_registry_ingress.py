@@ -132,6 +132,7 @@ async def test_registry_wrapper_binds_exact_context_and_restores_it():
     assert await runner._handle_message(event) == "ok"
     assert seen[0].principal_id == "principal-42"
     assert seen[0].role_id == "family_standard"
+    assert event.source.profile == "family-42"
     assert get_resolved_access_context() is None
 
 
