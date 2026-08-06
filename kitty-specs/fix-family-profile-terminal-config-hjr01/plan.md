@@ -33,5 +33,5 @@ python -m pytest -q tests/agent/test_runtime_cwd.py
 
 1. Initial approval на implementation.
 2. Targeted tests и diff review.
-3. Проверенный task-owned commit; push/PR только поверх доказанного remote integration base.
+3. Проверенный task-owned commit и draft PR `#24` поверх доказанного remote integration base.
 4. Отдельный live deploy/restart gate с preflight и post-restart canary.

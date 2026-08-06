@@ -3,7 +3,7 @@
 **Mission**: `fix-family-profile-terminal-config-hjr01`
 **Branch**: `codex/fix-family-profile-terminal-config`
 **Bead**: `HERMES-jir`
-**Статус**: implementation проверена; task-owned commit готов, push/PR ожидают remote integration base
+**Статус**: implementation проверена; draft PR `#24` открыт, merge/live gate не выполнялись
 
 ## Проблема
 
