@@ -811,6 +811,31 @@ def test_gateway_config_parses_single_principal_policy():
     assert GatewayConfig.from_dict(config.to_dict()).single_principal == policy
 
 
+def test_validator_accepts_multiplex_only_with_typed_access_registry():
+    policy = _policy()
+
+    legacy = SimpleNamespace(
+        multiplex_profiles=True,
+        access_registry=None,
+        platforms={},
+    )
+    assert dict(
+        validate_single_principal_policy(policy, gateway_config=legacy, environ={}).conflicts
+    ) == {"multiplex_not_supported": 1}
+
+    registry_config = SimpleNamespace(
+        multiplex_profiles=True,
+        access_registry=object(),
+        platforms={},
+    )
+    report = validate_single_principal_policy(
+        policy,
+        gateway_config=registry_config,
+        environ={},
+    )
+    assert report.verdict == "pass"
+
+
 def test_validator_rejects_pairing_drift_and_unsupported_ingress():
     pairing_store = MagicMock()
     pairing_store.list_approved.return_value = [

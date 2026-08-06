@@ -464,7 +464,9 @@ def validate_single_principal_policy(
         )
 
     if gateway_config is not None:
-        if getattr(gateway_config, "multiplex_profiles", False):
+        if getattr(gateway_config, "multiplex_profiles", False) and not getattr(
+            gateway_config, "access_registry", None
+        ):
             add("multiplex_not_supported")
         for platform, config in getattr(gateway_config, "platforms", {}).items():
             if not getattr(config, "enabled", False):
