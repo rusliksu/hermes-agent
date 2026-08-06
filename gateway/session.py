@@ -1510,6 +1510,10 @@ class SessionStore:
             return None
         if source is not None and source.profile:
             return source.profile
+        if source is not None:
+            context = getattr(source, "resolved_access_context", None)
+            if context is not None:
+                return context.profile_id
         try:
             from hermes_cli.profiles import get_active_profile_name
             return get_active_profile_name() or "default"

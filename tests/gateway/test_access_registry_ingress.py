@@ -235,3 +235,30 @@ def test_session_search_does_not_scan_other_profiles_on_scoped_miss():
     # The old cross-profile locator is intentionally gone. A caller-supplied
     # SessionDB is required for typed access, so there is no fallback scan.
     assert not hasattr(session_search_tool, "_locate_session_db")
+
+
+def test_session_key_uses_resolved_context_profile_without_legacy_source_route(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    runner = _runner()
+    config = GatewayConfig.from_dict({"multiplex_profiles": True})
+    store = SessionStore(tmp_path, config)
+    context = runner.access_registry.resolve(
+        TransportIdentity(
+            platform="telegram",
+            account="main-bot",
+            peer_kind="dm",
+            user_id="42",
+            chat_id="42",
+        )
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="42",
+        chat_type="dm",
+        user_id="42",
+        resolved_access_context=context,
+    )
+
+    assert store._generate_session_key(source).startswith("agent:family-42:")
