@@ -33,12 +33,12 @@ def _registry() -> AccessRegistry:
         chat_id="42",
     )
     return AccessRegistry(
-        roles={"family_standard": RolePolicy("family_standard", frozenset({"memory_read"}))},
+        roles={"family": RolePolicy("family", frozenset({"memory_read"}))},
         profiles=frozenset({"family-42"}),
         principal_bindings=(
             PrincipalBinding(
                 principal_id="principal-42",
-                role_id="family_standard",
+                role_id="family",
                 profile_id="family-42",
                 transport_identity=identity,
                 conversation_scope="private:principal-42",
@@ -67,7 +67,7 @@ def _multi_profile_registry() -> AccessRegistry:
         bindings.append(
             PrincipalBinding(
                 principal_id=principal_id,
-                role_id="family_standard",
+                role_id="family",
                 profile_id=profile_id,
                 transport_identity=TransportIdentity(
                     platform="telegram",
@@ -87,7 +87,7 @@ def _multi_profile_registry() -> AccessRegistry:
         )
         scope_capabilities[scope] = frozenset({"memory_read"})
     return AccessRegistry(
-        roles={"family_standard": RolePolicy("family_standard", frozenset({"memory_read"}))},
+        roles={"family": RolePolicy("family", frozenset({"memory_read"}))},
         profiles=frozenset({"family-42", "family-43"}),
         principal_bindings=tuple(bindings),
         scope_capabilities=scope_capabilities,
@@ -131,7 +131,7 @@ async def test_registry_wrapper_binds_exact_context_and_restores_it():
 
     assert await runner._handle_message(event) == "ok"
     assert seen[0].principal_id == "principal-42"
-    assert seen[0].role_id == "family_standard"
+    assert seen[0].role_id == "family"
     assert event.source.profile == "family-42"
     assert get_resolved_access_context() is None
 

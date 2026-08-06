@@ -134,11 +134,11 @@ def test_owner_context_returns_configured_toolsets_unchanged():
     ) == CONFIGURED_TOOLSETS
 
 
-def test_family_standard_uses_capability_and_config_intersection():
+def test_family_uses_capability_and_config_intersection():
     toolsets = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _context(
-            "family_standard",
+            "family",
             {
                 "public_web",
                 "vision",
@@ -176,28 +176,28 @@ def test_family_standard_uses_capability_and_config_intersection():
     } & set(toolsets)
 
 
-def test_family_standard_capability_cannot_enable_disabled_platform_toolset():
+def test_family_capability_cannot_enable_disabled_platform_toolset():
     assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         ["web"],
-        _context("family_standard", {"public_web", "vision"}),
+        _context("family", {"public_web", "vision"}),
     ) == ["web"]
 
 
-def test_family_sandbox_delegation_only_with_capability_and_config():
+def test_family_delegation_only_with_capability_and_config():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _context(
-            "family_sandbox",
+            "family",
             {"public_web", "delegation", "wolfram", "terminal", "browser"},
         ),
     )
     without_capability = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
-        _context("family_sandbox", {"public_web"}),
+        _context("family", {"public_web"}),
     )
     without_config = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         ["web"],
-        _context("family_sandbox", {"public_web", "delegation"}),
+        _context("family", {"public_web", "delegation"}),
     )
 
     assert allowed == ["delegation", "web", "wolfram"]
@@ -259,7 +259,7 @@ def test_malformed_and_unknown_roles_fail_closed_to_empty_toolsets():
 def test_empty_toolset_result_stays_empty_list_not_default_all():
     assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         ["terminal"],
-        _context("family_standard", {"public_web"}),
+        _context("family", {"public_web"}),
     ) == []
 
 

@@ -121,7 +121,7 @@ class TestMultiplexProfileReadBlocking:
     def _context(profile_id: str) -> ResolvedAccessContext:
         return ResolvedAccessContext(
             principal_id=f"principal-{profile_id}",
-            role_id="family_standard",
+            role_id="family",
             profile_id=profile_id,
             conversation_scope="private",
             capabilities=frozenset({"memory_search"}),

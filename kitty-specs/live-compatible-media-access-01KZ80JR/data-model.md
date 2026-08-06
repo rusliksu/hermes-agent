@@ -7,7 +7,7 @@ An immutable value created once after ingress authorization. Serialization is an
 | Field | Shape | Meaning | Trust rule |
 |---|---|---|---|
 | `principal_id` | opaque string | server-known principal | never derived from display name |
-| `role_id` | enum | `owner`, `family_standard`, `family_sandbox`, `shared_room` | only binding/config may assign |
+| `role_id` | enum | `owner`, `family`, `shared_room` | only binding/config may assign |
 | `profile_id` | normalized string | Hermes profile/home namespace | must exist and be binding-owned |
 | `conversation_scope` | private/room namespace | personal DM or explicit room/topic | room membership cannot elevate role |
 | `capabilities` | frozen set | effective role ∩ scope ∩ backend capabilities | unknown values denied |
@@ -17,7 +17,7 @@ No other field is part of the contract. Raw usernames, message text, credentials
 
 ## Bindings
 
-- `RolePolicy`: read-only role prompt, capability allowlist, sandbox limits and delivery restrictions. `family_standard` and `family_sandbox` are equal-capability private execution classes; the latter label is retained only for rollout compatibility.
+- `RolePolicy`: read-only role prompt, capability allowlist, sandbox limits and delivery restrictions. `family` is the single equal-capability private role; `family_standard` and `family_sandbox` are input aliases accepted only during migration and are never emitted.
 - `PrincipalBinding`: opaque principal, profile, role and confirmed `platform/account/peer_kind/user_id` identities.
 - `SharedScopeBinding`: exact platform/account/chat/topic, room profile and member principal set.
 - `MediaProviderPolicy`: ordered provider IDs per media kind, retry classes and opaque secret references.

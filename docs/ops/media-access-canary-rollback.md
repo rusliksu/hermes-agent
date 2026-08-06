@@ -24,7 +24,7 @@ python -m pytest -q tests/test_media_access_canary.py -s
 
 Canary проверяет:
 
-- owner Руслана, Юлю (`family_sandbox`) и остальные 8 family principals;
+- owner Руслана и 9 `family` principals (включая Юлю);
 - два `shared_room` профиля с membership без повышения личной роли;
 - unknown principal, Telegram `user_id != chat_id` и guessed foreign profile;
 - fail-closed access registry и ровно configured media-provider order для image,
@@ -32,8 +32,7 @@ Canary проверяет:
 - dashboard `/api/access/users` через существующую auth boundary с redacted
   payload.
 
-Признаки успеха: rollout shape `1 owner + 8 family_standard + 1
-family_sandbox + 2 rooms`, неизвестные/malformed identities отклонены до
+Признаки успеха: rollout shape `1 owner + 9 family + 2 rooms`, неизвестные/malformed identities отклонены до
 model/session/tools, secret references не попали в report, dashboard не отдаёт
 transport identity или delivery target.
 

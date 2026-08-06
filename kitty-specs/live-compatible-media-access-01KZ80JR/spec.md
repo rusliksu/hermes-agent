@@ -9,7 +9,7 @@
 
 ### User Story 1 - Private principal routing (Priority: P1)
 
-Руслан, Юля, мама и остальные подтверждённые пользователи получают ответы в своих изолированных профилях одного Telegram-бота. Руслан остаётся `owner`; семейные principals могут сохранять метки `family_standard`/`family_sandbox` для совместимости, но получают одинаковый безопасный пользовательский набор инструментов. Отдельные зарегистрированные темы работают как `shared_room`.
+Руслан, Юля, мама и остальные подтверждённые пользователи получают ответы в своих изолированных профилях одного Telegram-бота. Руслан остаётся `owner`; все девять семейных principals получают роль `family` и одинаковый безопасный пользовательский набор инструментов. На границе миграции старые `family_standard`/`family_sandbox` принимаются как алиасы, но наружу никогда не выдаются. Отдельные зарегистрированные темы работают как `shared_room`.
 
 **Why this priority**: Ошибка маршрутизации может раскрыть историю, память, файлы или credentials другого человека. Изоляция важнее удобства и должна быть включена до расширения media tools.
 
@@ -31,7 +31,7 @@
 
 **Acceptance Scenarios**:
 
-1. **Given** `family_standard` с разрешённой image capability, **When** Codex provider временно недоступен, **Then** выполняется только следующий разрешённый provider, а результат остаётся в его profile namespace.
+1. **Given** `family` с разрешённой image capability, **When** Codex provider временно недоступен, **Then** выполняется только следующий разрешённый provider, а результат остаётся в его profile namespace.
 2. **Given** STT input с повреждённым/неподдерживаемым форматом, **When** первый provider отвечает permanent error, **Then** цепочка не делает бессмысленный retry и возвращает безопасную ошибку без передачи секретов.
 3. **Given** shared_room без явного server-configured media provider, **When** запрошена генерация, **Then** доступ запрещается (fail-closed), а не наследуется от личной роли участника.
 
@@ -79,7 +79,7 @@
 | FR-001 | Six-field access contract | As the gateway, I want one immutable `ResolvedAccessContext` containing exactly `principal_id`, `role_id`, `profile_id`, `conversation_scope`, `capabilities`, and `delivery_target` so that every downstream operation has one trusted identity. | High | Open |
 | FR-002 | Fail-closed ingress | As the gateway, I want exact `platform + account + peer_kind + user_id` DM and room routing with Telegram identity consistency checks so that unknown or malformed traffic is rejected before model/session/tools and never falls back to owner. | High | Open |
 | FR-003 | Profile and namespace isolation | As a principal, I want separate Hermes home, memory, sessions, prompts, skills and workspace so that another principal cannot read or guess my state. | High | Open |
-| FR-004 | Role and scope resolution | As an operator, I want `owner`, equal-capability private family execution classes, and `shared_room` policies intersected with explicit room bindings so that room membership never elevates a personal role and sandbox labels do not create family privilege tiers. | High | Open |
+| FR-004 | Role and scope resolution | As an operator, I want `owner`, one equal-capability `family` policy, and `shared_room` policies intersected with explicit room bindings so that room membership never elevates a personal role and legacy sandbox labels do not create family privilege tiers. | High | Open |
 | FR-005 | Context propagation | As the runtime, I want the same access context attached to sessions, memory, prompts, tools, callbacks, cron and delegation so that background work cannot cross profile boundaries. | High | Open |
 | FR-006 | Scoped media fallback | As an authorized user, I want image, STT and TTS providers tried in server-configured order with one attempt per provider and scoped opaque secret references so that media works without exposing credentials to tools. | High | Open |
 | FR-007 | Model-controlled tool deny-by-default | As the authorization layer, I want unknown tools and model-supplied foreign namespaces denied unless capability and backend policy both allow them. | High | Open |
@@ -96,7 +96,7 @@
 | NFR-003 | Context shape | Serialized access context must contain exactly six contract fields; extra fields fail validation. | Compatibility | High | Open |
 | NFR-004 | Provider safety | Provider secrets are never copied into tool environment or redacted evidence; audit contains provider/status/error class only. | Security | High | Open |
 | NFR-005 | Availability | A transient provider failure may advance at most once to the next configured provider; permanent errors must not fan out. | Reliability | High | Open |
-| NFR-006 | Resource limits | Every private family execution class enforces 2 vCPU, 2 GiB RAM, 256 PIDs, 5 GiB workspace, no host mounts and terminal network disabled. | Security | High | Open |
+| NFR-006 | Resource limits | Every `family` profile enforces 2 vCPU, 2 GiB RAM, 256 PIDs, 5 GiB workspace, no host mounts and terminal network disabled. | Security | High | Open |
 | NFR-007 | Observability | Every deny, fallback and break-glass event has a redacted audit record with no session contents or credentials. | Auditability | Medium | Open |
 | NFR-008 | Rollback | A failed canary can restore previous code/config surfaces without destructive data cleanup. | Reliability | High | Open |
 

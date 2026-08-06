@@ -22,7 +22,7 @@ from tools.media_provider_routing import (
 
 def _context(
     *,
-    role_id: str = "family_standard",
+    role_id: str = "family",
     capabilities: frozenset[str] = frozenset({"voice_generation"}),
 ) -> ResolvedAccessContext:
     return ResolvedAccessContext(

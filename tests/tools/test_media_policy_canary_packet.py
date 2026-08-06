@@ -58,8 +58,8 @@ def test_packet_is_non_mutating_and_has_fail_closed_matrix():
         assert forbidden not in command_text
     assert [item["principal"] for item in packet["matrix"]] == [
         "owner",
-        "family_standard",
-        "family_sandbox",
+        "family_yulia",
+        "family_other",
         "shared_room",
         "unknown",
     ]

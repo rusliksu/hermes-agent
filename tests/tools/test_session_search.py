@@ -39,7 +39,7 @@ def _clear_resolved_access_context():
 
 def _access_context(
     *,
-    role_id="family_standard",
+    role_id="family",
     profile_id="family-alpha",
     chat_id="chat-a",
     thread_id="thread-a",
@@ -644,7 +644,7 @@ class TestProfileIsolation:
 
 
 class TestTypedSessionScope:
-    @pytest.mark.parametrize("role_id", ["family_standard", "family_sandbox"])
+    @pytest.mark.parametrize("role_id", ["family", "family_standard", "family_sandbox"])
     def test_family_browse_discover_title_read_and_scroll_own_scope(self, db, role_id):
         anchor = _seed_scoped_session(
             db,

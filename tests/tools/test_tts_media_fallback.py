@@ -9,7 +9,7 @@ from gateway.session_context import bind_resolved_access_context
 def _context() -> ResolvedAccessContext:
     return ResolvedAccessContext(
         principal_id="principal-a",
-        role_id="family_standard",
+        role_id="family",
         profile_id="profile-a",
         conversation_scope="dm:principal-a",
         capabilities=frozenset({"voice_generation"}),

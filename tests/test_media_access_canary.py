@@ -43,7 +43,6 @@ PRIVATE_CAPS = frozenset({
     "wolfram",
 })
 OWNER_CAPS = PRIVATE_CAPS | frozenset({"cron", "host_shell", "owner_admin"})
-SANDBOX_CAPS = PRIVATE_CAPS
 ROOM_CAPS = frozenset({"attachments", "documents", "public_web", "room_memory", "room_session_search", "vision"})
 
 
@@ -80,8 +79,7 @@ def _registry() -> AccessRegistry:
     fixture = _fixture()
     roles = {
         "owner": RolePolicy("owner", OWNER_CAPS),
-        "family_standard": RolePolicy("family_standard", PRIVATE_CAPS),
-        "family_sandbox": RolePolicy("family_sandbox", SANDBOX_CAPS),
+        "family": RolePolicy("family", PRIVATE_CAPS),
         "shared_room": RolePolicy("shared_room", ROOM_CAPS),
     }
     profiles = {row["profile_id"] for row in fixture["principals"]}
@@ -90,8 +88,7 @@ def _registry() -> AccessRegistry:
     scope_capabilities = {}
     role_caps = {
         "owner": OWNER_CAPS,
-        "family_standard": PRIVATE_CAPS,
-        "family_sandbox": SANDBOX_CAPS,
+        "family": PRIVATE_CAPS,
     }
     for row in fixture["principals"]:
         identity = _identity(row["principal_id"])
@@ -140,7 +137,7 @@ def _registry() -> AccessRegistry:
         principal_bindings=tuple(principal_bindings),
         shared_scope_bindings=tuple(shared_bindings),
         scope_capabilities=scope_capabilities,
-        backend_capabilities=OWNER_CAPS | SANDBOX_CAPS | ROOM_CAPS,
+        backend_capabilities=OWNER_CAPS | PRIVATE_CAPS | ROOM_CAPS,
     )
 
 

@@ -25,7 +25,7 @@ from tools.media_provider_routing import (
 def _context(profile_id: str, chat_id: str, *, capability: str) -> ResolvedAccessContext:
     return ResolvedAccessContext(
         principal_id=f"principal-{profile_id}",
-        role_id="family_standard",
+        role_id="family",
         profile_id=profile_id,
         conversation_scope=f"dm:{chat_id}",
         capabilities=frozenset({capability}),

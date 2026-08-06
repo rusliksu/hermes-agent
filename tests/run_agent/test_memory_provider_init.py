@@ -35,7 +35,7 @@ class RecordingMemoryProvider:
         pass
 
 
-def _access_context(role_id="family_standard") -> ResolvedAccessContext:
+def _access_context(role_id="family") -> ResolvedAccessContext:
     return ResolvedAccessContext(
         principal_id="principal",
         role_id=role_id,
@@ -140,7 +140,7 @@ def test_typed_non_owner_context_does_not_initialize_external_memory_provider():
     reset_session_vars()
 
     with (
-        bind_resolved_access_context(_access_context("family_standard")),
+        bind_resolved_access_context(_access_context("family")),
         patch("hermes_cli.config.load_config", return_value=cfg),
         patch("plugins.memory.load_memory_provider", return_value=provider) as load_memory_provider,
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),

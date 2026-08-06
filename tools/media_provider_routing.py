@@ -70,8 +70,7 @@ _MEDIA_SECRET_REQUIRED = MappingProxyType({
 })
 _KNOWN_MEDIA_ROLES = frozenset({
     "owner",
-    "family_standard",
-    "family_sandbox",
+    "family",
     "shared_room",
 })
 _MISSING = object()

@@ -1462,7 +1462,7 @@ class TestSessionEntryAccessContext:
 
         return ResolvedAccessContext(
             principal_id="principal-42",
-            role_id="family_standard",
+            role_id="family",
             profile_id="family-42",
             conversation_scope="private:principal-42",
             capabilities=frozenset({"memory_read", "public_web"}),

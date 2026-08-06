@@ -3846,18 +3846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return list(configured_toolsets)
 
         role_capability_toolsets = {
-            "family_standard": {
-                "memory_search": "memory",
-                "public_web": "web",
-                "vision": "vision",
-                "image_generation": "image_gen",
-                "voice_generation": "tts",
-                "session_search": "session_search",
-                "self_reminder": "cronjob",
-                "delegation": "delegation",
-                "wolfram": "wolfram",
-            },
-            "family_sandbox": {
+            "family": {
                 "memory_search": "memory",
                 "public_web": "web",
                 "vision": "vision",

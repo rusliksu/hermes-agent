@@ -205,7 +205,7 @@ def _require_memory_access(store: "MemoryStore", target: Optional[str] = None) -
         _require_exact_memory_path(memory_dir, profile_memories)
         return
 
-    if role_id in {"family_standard", "family_sandbox"}:
+    if role_id == "family":
         if (
             platform != "telegram"
             or peer_kind != "dm"

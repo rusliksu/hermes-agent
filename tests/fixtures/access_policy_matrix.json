@@ -9,47 +9,47 @@
     },
     {
       "principal_id": "principal-yulia",
-      "role_id": "family_sandbox",
+      "role_id": "family",
       "profile_id": "profile-yulia"
     },
     {
       "principal_id": "principal-family-01",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-01"
     },
     {
       "principal_id": "principal-family-02",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-02"
     },
     {
       "principal_id": "principal-family-03",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-03"
     },
     {
       "principal_id": "principal-family-04",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-04"
     },
     {
       "principal_id": "principal-family-05",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-05"
     },
     {
       "principal_id": "principal-family-06",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-06"
     },
     {
       "principal_id": "principal-family-07",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-07"
     },
     {
       "principal_id": "principal-family-08",
-      "role_id": "family_standard",
+      "role_id": "family",
       "profile_id": "profile-family-08"
     }
   ],

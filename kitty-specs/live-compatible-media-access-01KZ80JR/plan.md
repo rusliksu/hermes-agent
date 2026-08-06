@@ -37,7 +37,7 @@
 3. **Runtime propagation** --- `gateway/session_context.py`, session key/profile-home helpers, memory/session search and background paths receive the resolved context once. Model-supplied profile/session namespaces are ignored or denied; no exception path calls active/default `HERMES_HOME` for a rejected request.
 4. **Media facade** --- `tools/media_provider_routing.py` provides typed ordered image/STT/TTS policies, retry classification, one-attempt-per-provider execution and opaque secret references. Existing `tools/image_generation_tool.py`, `tools/transcription_tools.py`, `tools/tts_tool.py` remain provider implementations and are called through the facade only when capability/backend policy allows.
 5. **Config/CLI surface** --- `hermes_cli/config.py` and `hermes_cli/subcommands/config.py` add parse/validate/dry-run support without exposing secrets. Existing legacy config remains accepted in compatibility mode; new policy is opt-in until canary evidence is complete.
-6. **Validation and operations** --- focused tests/fixtures and a redacted canary packet exercise owner, family, sandbox, room, unknown and malformed cases. Backup, staging artifact hash, rollback command and live gate are documented; no live service mutation belongs in implementation WPs.
+6. **Validation and operations** --- focused tests/fixtures and a redacted canary packet exercise owner, family, room, unknown and malformed cases. Backup, staging artifact hash, rollback command and live gate are documented; no live service mutation belongs in implementation WPs.
 
 ## Project Structure
 
@@ -101,8 +101,8 @@ The object is immutable, has strict field-count validation on serialization/dese
 ### Role policies
 
 - `owner`: Руслан's current full profile, subject to existing backend safety controls.
-- `family_standard` and `family_sandbox`: the same private user-tool policy — private memory/session search, documents, attachments, vision, public web, image/voice generation, self-only reminders, Wolfram, same-profile delegation, personal Docker workspace and isolated public browser. Both execution classes forbid host mounts/credentials, keep terminal network disabled and enforce 2 vCPU/2 GiB/256 PID/5 GiB limits.
-- `family_sandbox` remains a rollout-compatible execution-class label, not a trust or capability elevation; existing bindings may retain it while all private family principals receive the same safe capability set.
+- `family`: one private user-tool policy for all nine family principals — private memory/session search, documents, attachments, vision, public web, image/voice generation, self-only reminders, Wolfram, same-profile delegation, personal Docker workspace and isolated public browser. The profile/backend policy forbids host mounts/credentials, keeps terminal network disabled and enforces 2 vCPU/2 GiB/256 PID/5 GiB limits.
+- `family_standard` and `family_sandbox` are accepted only as migration-boundary aliases, normalize to `family`, and are never emitted by the resolver or dashboard. The old sandbox label is not a trust or capability tier.
 - `shared_room`: room profile only; shared session/memory, documents/vision/public web; no private memory, cron, private delivery, shell or cross-user search. Wolfram is not inherited and is enabled only by an explicit room policy entry.
 
 Effective capabilities are the intersection of role policy, scope policy and backend policy. Unknown capabilities/tools are denied.

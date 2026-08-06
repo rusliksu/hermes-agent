@@ -28,7 +28,7 @@ Rollback выполняется только после отдельного п�
 
 ## Synthetic canary
 
-Матрица содержит `owner`, `family_standard`, `family_sandbox`, `shared_room` и
+Матрица содержит `owner`, `family`, `shared_room` и
 `unknown`. Первые четыре проверяют только зарегистрированный scope; unknown
 должен быть отклонён. Команды packet помечены `mutates: false`, не читают
 credential-файлы, не используют owner fallback и не запускают restart/systemd

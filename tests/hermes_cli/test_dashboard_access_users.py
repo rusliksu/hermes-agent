@@ -30,8 +30,8 @@ def _registry() -> AccessRegistry:
     )
     return AccessRegistry(
         roles={
-            "family_standard": RolePolicy(
-                "family_standard",
+            "family": RolePolicy(
+                "family",
                 frozenset({"memory_read", "public_web"}),
             )
         },
@@ -39,7 +39,7 @@ def _registry() -> AccessRegistry:
         principal_bindings=(
             PrincipalBinding(
                 principal_id="principal-42",
-                role_id="family_standard",
+                role_id="family",
                 profile_id="family-42",
                 transport_identity=identity,
                 conversation_scope="private:principal-42",
@@ -100,7 +100,7 @@ def test_access_users_returns_redacted_role_profile_health(
     assert len(body["users"]) == 1
     user = body["users"][0]
     assert user["principal_id"] == "principal-42"
-    assert user["role_id"] == "family_standard"
+    assert user["role_id"] == "family"
     assert user["profile_id"] == "family-42"
     assert user["effective_capabilities"] == ["memory_read", "public_web"]
     assert user["profile_health"] == {

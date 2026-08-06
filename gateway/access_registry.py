@@ -10,6 +10,19 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 
+_LEGACY_ROLE_ALIASES = {
+    "family_standard": "family",
+    "family_sandbox": "family",
+}
+
+
+def canonical_role_id(role_id: Any) -> Any:
+    """Return the canonical role name while accepting rollout-era aliases."""
+    if not isinstance(role_id, str):
+        return role_id
+    return _LEGACY_ROLE_ALIASES.get(role_id, role_id)
+
+
 def _immutable_capabilities(values: Any) -> frozenset[str]:
     if values is None:
         return frozenset()
@@ -160,6 +173,7 @@ class ResolvedAccessContext:
     delivery_target: DeliveryTarget
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "role_id", canonical_role_id(self.role_id))
         object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
 
 
@@ -364,6 +378,7 @@ class RolePolicy:
     active: bool = True
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "role_id", canonical_role_id(self.role_id))
         object.__setattr__(self, "capabilities", _immutable_capabilities(self.capabilities))
 
 
@@ -411,6 +426,9 @@ class PrincipalBinding:
     delivery_target: DeliveryTarget
     active: bool = True
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role_id", canonical_role_id(self.role_id))
+
 
 @dataclass(frozen=True)
 class SharedScopeBinding:
@@ -424,6 +442,7 @@ class SharedScopeBinding:
     active: bool = True
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "role_id", canonical_role_id(self.role_id))
         object.__setattr__(self, "participant_identities", tuple(self.participant_identities))
 
 
@@ -572,8 +591,18 @@ class AccessRegistry:
             if not isinstance(role, RolePolicy):
                 add("malformed_role")
                 continue
-            if key != role.role_id:
+            if canonical_role_id(key) != role.role_id:
                 add("mismatched_role_key")
+
+        role_aliases: dict[str, set[tuple[frozenset[str], bool]]] = {}
+        for key, role in self.roles.items():
+            if isinstance(role, RolePolicy):
+                role_aliases.setdefault(canonical_role_id(key), set()).add(
+                    (role.capabilities, role.active)
+                )
+        for policies in role_aliases.values():
+            if len(policies) > 1:
+                add("conflicting_role_alias")
 
         principal_keys: dict[tuple[str, str, str, str], int] = {}
         principal_ids: dict[str, int] = {}
@@ -674,11 +703,10 @@ class AccessRegistry:
             for binding in self.shared_scope_bindings
             if isinstance(binding, SharedScopeBinding) and binding.active
         ]
-        owner_count = sum(binding.role_id == "owner" for binding in active_principals)
-        standard_count = sum(binding.role_id == "family_standard" for binding in active_principals)
-        sandbox_count = sum(binding.role_id == "family_sandbox" for binding in active_principals)
+        owner_count = sum(canonical_role_id(binding.role_id) == "owner" for binding in active_principals)
+        family_count = sum(canonical_role_id(binding.role_id) == "family" for binding in active_principals)
         shared_count = sum(binding.role_id == "shared_room" for binding in active_rooms)
-        allowed_private_roles = {"owner", "family_standard", "family_sandbox"}
+        allowed_private_roles = {"owner", "family"}
         expected = {
             "active_principal_binding_count": (len(active_principals), 10),
             "invalid_private_role_count": (
@@ -686,8 +714,7 @@ class AccessRegistry:
                 0,
             ),
             "owner_count": (owner_count, 1),
-            "family_standard_count": (standard_count, 8),
-            "family_sandbox_count": (sandbox_count, 1),
+            "family_count": (family_count, 9),
             "active_shared_scope_binding_count": (len(active_rooms), 2),
             "shared_room_count": (shared_count, 2),
         }
@@ -779,11 +806,25 @@ class AccessRegistry:
         role_id: str,
         conversation_scope: str,
     ) -> frozenset[str]:
-        role = self.roles.get(role_id)
+        role = self._role_for_id(role_id)
         if not isinstance(role, RolePolicy) or not role.active:
             return frozenset()
         scope_caps = self.scope_capabilities.get(conversation_scope, frozenset())
         return role.capabilities & scope_caps & self.backend_capabilities
+
+    def _role_for_id(self, role_id: str) -> Optional[RolePolicy]:
+        canonical = canonical_role_id(role_id)
+        role = self.roles.get(role_id) or self.roles.get(canonical)
+        if isinstance(role, RolePolicy):
+            return role
+        return next(
+            (
+                candidate
+                for key, candidate in self.roles.items()
+                if canonical_role_id(key) == canonical and isinstance(candidate, RolePolicy)
+            ),
+            None,
+        )
 
     def _resolve_dm(
         self,
@@ -962,8 +1003,9 @@ class AccessRegistry:
         if not all(_is_nonempty_str(value) for value in (principal_id, role_id, profile_id, conversation_scope)):
             add("malformed_binding_authority")
             return
-        role = self.roles.get(role_id)
-        if not isinstance(role, RolePolicy) or role.role_id != role_id or not role.active:
+        canonical = canonical_role_id(role_id)
+        role = self._role_for_id(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != canonical or not role.active:
             add("unknown_role")
         if profile_id not in self.profiles:
             add("unknown_profile")
@@ -977,8 +1019,9 @@ class AccessRegistry:
         conversation_scope: str,
         audit: RedactedAuditMetadata,
     ) -> None:
-        role = self.roles.get(role_id)
-        if not isinstance(role, RolePolicy) or role.role_id != role_id or not role.active:
+        canonical = canonical_role_id(role_id)
+        role = self._role_for_id(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != canonical or not role.active:
             raise AccessDeniedError("unknown_role", audit)
         if profile_id not in self.profiles:
             raise AccessDeniedError("unknown_profile", audit)

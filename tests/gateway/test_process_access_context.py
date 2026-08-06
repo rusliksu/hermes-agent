@@ -44,11 +44,11 @@ def _access_registry() -> AccessRegistry:
         chat_id="42",
     )
     return AccessRegistry(
-        roles={"family_standard": RolePolicy("family_standard", frozenset({"memory_read"}))},
+        roles={"family": RolePolicy("family", frozenset({"memory_read"}))},
         profiles=frozenset({"family-42"}),
         principal_bindings=(PrincipalBinding(
             principal_id="principal-42",
-            role_id="family_standard",
+            role_id="family",
             profile_id="family-42",
             transport_identity=identity,
             conversation_scope="private:principal-42",
@@ -62,7 +62,7 @@ def _access_registry() -> AccessRegistry:
 def test_completion_event_carries_only_canonical_access_payload(isolated_registry):
     payload = {
         "principal_id": "principal-42",
-        "role_id": "family_standard",
+        "role_id": "family",
         "profile_id": "family-42",
         "conversation_scope": "private:principal-42",
         "capabilities": ["memory_read"],
@@ -101,7 +101,7 @@ def test_completion_event_carries_only_canonical_access_payload(isolated_registr
 def test_checkpoint_preserves_access_payload_for_recovery(isolated_registry):
     payload = {
         "principal_id": "principal-42",
-        "role_id": "family_standard",
+        "role_id": "family",
         "profile_id": "family-42",
         "conversation_scope": "private:principal-42",
         "capabilities": ["memory_read"],

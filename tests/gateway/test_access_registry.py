@@ -57,10 +57,6 @@ FAMILY_CAPS = frozenset({
     "voice_generation",
     "wolfram",
 })
-# Keep the legacy role labels for rollout compatibility, but do not make
-# family_sandbox a permission elevation: every private family role gets the
-# same user-tool capability set.
-SANDBOX_CAPS = FAMILY_CAPS
 ROOM_CAPS = frozenset({
     "attachments",
     "documents",
@@ -71,7 +67,7 @@ ROOM_CAPS = frozenset({
 })
 BACKEND_CAPS = (
     OWNER_CAPS
-    | SANDBOX_CAPS
+    | FAMILY_CAPS
     | ROOM_CAPS
     | frozenset({"backend_only", "scope_unknown", "wolfram"})
 )
@@ -121,8 +117,7 @@ def _registry(
     shared_bindings = shared_bindings if shared_bindings is not None else _shared_bindings()
     roles = roles if roles is not None else {
         "owner": RolePolicy("owner", OWNER_CAPS | {"unknown_owner_cap"}),
-        "family_standard": RolePolicy("family_standard", FAMILY_CAPS),
-        "family_sandbox": RolePolicy("family_sandbox", SANDBOX_CAPS | {"not_backend"}),
+        "family": RolePolicy("family", FAMILY_CAPS),
         "shared_room": RolePolicy("shared_room", ROOM_CAPS | {"not_backend"}),
     }
     profiles = profiles if profiles is not None else frozenset(
@@ -131,7 +126,7 @@ def _registry(
         + [f"room-profile-{index}" for index in range(2)]
     )
     scope_capabilities = scope_capabilities if scope_capabilities is not None else {
-        "private": OWNER_CAPS | FAMILY_CAPS | SANDBOX_CAPS | {"not_backend"},
+        "private": OWNER_CAPS | FAMILY_CAPS | {"not_backend"},
         "room-0": ROOM_CAPS | {"not_backend"},
         "room-1": ROOM_CAPS,
     }
@@ -161,7 +156,7 @@ def _principal_bindings() -> tuple[PrincipalBinding, ...]:
         bindings.append(
             PrincipalBinding(
                 principal_id=f"principal-family-{index}",
-                role_id="family_sandbox" if index == 0 else "family_standard",
+                role_id="family",
                 profile_id=f"family-profile-{index}",
                 transport_identity=_dm_identity(user_id),
                 conversation_scope="private",
@@ -248,10 +243,10 @@ def test_exact_telegram_dm_success_and_capability_intersection():
 
     assert context == ResolvedAccessContext(
         principal_id="principal-family-0",
-        role_id="family_sandbox",
+        role_id="family",
         profile_id="family-profile-0",
         conversation_scope="private",
-        capabilities=SANDBOX_CAPS,
+        capabilities=FAMILY_CAPS,
         delivery_target=_target(_dm_identity("opaque-family-0")),
     )
     assert "not_backend" not in context.capabilities
@@ -259,7 +254,49 @@ def test_exact_telegram_dm_success_and_capability_intersection():
     assert context.delivery_target.chat_id == "opaque-family-0"
 
 
-def test_all_family_standard_bindings_get_common_family_tool_policy():
+def test_legacy_family_role_aliases_normalize_to_canonical_family():
+    assert RolePolicy("family_standard", FAMILY_CAPS).role_id == "family"
+    assert replace(_principal_bindings()[1], role_id="family_sandbox").role_id == "family"
+    context = ResolvedAccessContext(
+        principal_id="principal-family-0",
+        role_id="family_standard",
+        profile_id="family-profile-0",
+        conversation_scope="private",
+        capabilities=FAMILY_CAPS,
+        delivery_target=_target(_dm_identity("opaque-family-0")),
+    )
+    encoded = serialize_resolved_access_context(context)
+    assert context.role_id == "family"
+    assert encoded["role_id"] == "family"
+
+    legacy_registry = _registry(
+        roles={"family_standard": RolePolicy("family_standard", FAMILY_CAPS)},
+        principal_bindings=(replace(_principal_bindings()[1], role_id="family_standard"),),
+        shared_bindings=(),
+        profiles=frozenset({"family-profile-0"}),
+    )
+    assert legacy_registry.resolve(_dm_identity("opaque-family-0")).role_id == "family"
+
+
+def test_conflicting_legacy_family_aliases_fail_closed():
+    registry = _registry(
+        roles={
+            "family": RolePolicy("family", FAMILY_CAPS),
+            "family_sandbox": RolePolicy("family_sandbox", FAMILY_CAPS | {"extra_cap"}),
+        },
+        principal_bindings=(_principal_bindings()[1],),
+        shared_bindings=(),
+        profiles=frozenset({"family-profile-0"}),
+    )
+
+    conflicts = dict(registry.validate().conflicts)
+    assert conflicts["conflicting_role_alias"] == 1
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.resolve(_dm_identity("opaque-family-0"))
+    assert exc.value.reason == "registry_validation_failed"
+
+
+def test_all_family_bindings_get_common_family_tool_policy():
     registry = _registry()
 
     contexts = [
@@ -267,15 +304,14 @@ def test_all_family_standard_bindings_get_common_family_tool_policy():
         for index in range(1, 9)
     ]
 
-    assert all(context.role_id == "family_standard" for context in contexts)
+    assert all(context.role_id == "family" for context in contexts)
     assert all(context.capabilities == FAMILY_CAPS for context in contexts)
 
 
 @pytest.mark.parametrize(
     "role_id,role_caps",
     [
-        ("family_standard", FAMILY_CAPS),
-        ("family_sandbox", SANDBOX_CAPS),
+        ("family", FAMILY_CAPS),
     ],
 )
 @pytest.mark.parametrize("missing_from", ["role", "scope", "backend"])
@@ -317,7 +353,7 @@ def test_family_wolfram_requires_role_scope_and_backend(
 def test_shared_room_does_not_inherit_family_wolfram_policy():
     registry = _registry(
         roles={
-            "family_standard": RolePolicy("family_standard", FAMILY_CAPS),
+            "family": RolePolicy("family", FAMILY_CAPS),
             "shared_room": RolePolicy("shared_room", ROOM_CAPS),
         },
         scope_capabilities={
@@ -336,10 +372,10 @@ def test_shared_room_does_not_inherit_family_wolfram_policy():
     assert "wolfram" not in context.capabilities
 
 
-def test_family_roles_use_common_wolfram_and_sandbox_capabilities():
+def test_family_role_uses_common_wolfram_capabilities():
     binding = replace(
         _principal_bindings()[1],
-        role_id="family_sandbox",
+        role_id="family",
     )
     registry = _registry(
         principal_bindings=(binding,),
@@ -378,7 +414,7 @@ def test_resolved_access_context_codec_roundtrips_exact_six_field_shape():
         "chat_id",
         "thread_id",
     ]
-    assert encoded["capabilities"] == sorted(SANDBOX_CAPS)
+    assert encoded["capabilities"] == sorted(FAMILY_CAPS)
     assert deserialize_resolved_access_context(encoded) == context
 
 
@@ -686,8 +722,7 @@ def test_resolve_denies_when_active_registry_validation_fails():
 def test_validation_rejects_role_key_mismatch_malformed_role_and_binding_without_crashing():
     roles = {
         "owner": object(),
-        "family_standard": RolePolicy("not-family-standard", FAMILY_CAPS),
-        "family_sandbox": RolePolicy("family_sandbox", SANDBOX_CAPS),
+        "family": RolePolicy("not-family", FAMILY_CAPS),
         "shared_room": RolePolicy("shared_room", ROOM_CAPS),
     }
     registry = _registry(
@@ -796,14 +831,13 @@ def test_rollout_shape_accepts_one_owner_nine_family_and_two_rooms():
     bindings = _principal_bindings()
     roles = [binding.role_id for binding in bindings]
     assert roles.count("owner") == 1
-    assert roles.count("family_sandbox") == 1
-    assert roles.count("family_standard") == 8
+    assert roles.count("family") == 9
 
 
 def test_rollout_shape_rejects_extra_active_private_principal_binding():
     extra = PrincipalBinding(
         principal_id="principal-extra",
-        role_id="family_standard",
+        role_id="family",
         profile_id="family-profile-extra",
         transport_identity=_dm_identity("opaque-extra"),
         conversation_scope="private",
@@ -823,7 +857,7 @@ def test_rollout_shape_rejects_extra_active_private_principal_binding():
 
     conflicts = dict(exc.value.report.conflicts)
     assert conflicts["active_principal_binding_count"] == 1
-    assert conflicts["family_standard_count"] == 1
+    assert conflicts["family_count"] == 1
 
 
 def test_rollout_shape_rejects_extra_active_private_role():

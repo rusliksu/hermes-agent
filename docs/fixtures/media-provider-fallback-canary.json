@@ -53,14 +53,14 @@
       "expected": "allow"
     },
     {
-      "principal": "family_standard",
-      "role": "family_standard",
+      "principal": "family_yulia",
+      "role": "family",
       "scope": "private",
       "expected": "allow"
     },
     {
-      "principal": "family_sandbox",
-      "role": "family_sandbox",
+      "principal": "family_other",
+      "role": "family",
       "scope": "private",
       "expected": "allow"
     },

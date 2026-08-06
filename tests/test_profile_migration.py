@@ -124,11 +124,10 @@ def test_fixture_roster_is_opaque_and_complete():
     assert len(policy["rooms"]) == 2
     assert {row["role_id"] for row in policy["principals"]} == {
         "owner",
-        "family_sandbox",
-        "family_standard",
+        "family",
     }
     assert next(row for row in policy["principals"] if row["role_id"] == "owner")["profile_id"] == "profile-owner"
-    assert next(row for row in policy["principals"] if row["role_id"] == "family_sandbox")["principal_id"] == "principal-yulia"
+    assert next(row for row in policy["principals"] if row["principal_id"] == "principal-yulia")["role_id"] == "family"
     assert all("transport" not in json.dumps(row) for row in policy["principals"])
 
 

@@ -11,7 +11,7 @@ from tools.process_registry import process_registry
 def _payload():
     return {
         "principal_id": "principal-42",
-        "role_id": "family_sandbox",
+        "role_id": "family",
         "profile_id": "family-42",
         "conversation_scope": "private:principal-42",
         "capabilities": ["memory_read", "delegation"],

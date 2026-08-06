@@ -17,7 +17,7 @@ _ALL_MEDIA_CAPABILITIES = frozenset(
 
 def _context(
     *,
-    role_id: str = "family_standard",
+    role_id: str = "family",
     principal_id: str = "principal-family",
     capabilities: frozenset[str] = _ALL_MEDIA_CAPABILITIES,
     peer_kind: str = "dm",
@@ -125,8 +125,7 @@ def test_invalid_policy_is_reported_without_constructing_a_policy(raw, code):
     ("role_id", "peer_kind"),
     [
         ("owner", "dm"),
-        ("family_standard", "dm"),
-        ("family_sandbox", "dm"),
+        ("family", "dm"),
         ("shared_room", "group"),
     ],
 )

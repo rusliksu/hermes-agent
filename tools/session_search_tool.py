@@ -104,7 +104,7 @@ def _session_scope_from_resolved_context() -> Tuple[Optional[Dict[str, Any]], Op
 
     role_id = context.role_id.strip()
     capabilities = context.capabilities
-    if role_id == "family_standard" or role_id == "family_sandbox":
+    if role_id == "family":
         if "session_search" not in capabilities:
             return None, "session_search denied: role lacks session_search capability"
     elif role_id == "owner":
