@@ -29,8 +29,11 @@ MEDIA_FIXTURE = ROOT / "tests" / "fixtures" / "media-provider-policy-canary.yaml
 
 PRIVATE_CAPS = frozenset({
     "attachments",
+    "delegation",
     "documents",
+    "docker_terminal",
     "image_generation",
+    "isolated_browser",
     "memory_search",
     "public_web",
     "self_reminder",
@@ -40,7 +43,7 @@ PRIVATE_CAPS = frozenset({
     "wolfram",
 })
 OWNER_CAPS = PRIVATE_CAPS | frozenset({"cron", "host_shell", "owner_admin"})
-SANDBOX_CAPS = PRIVATE_CAPS | frozenset({"delegation", "docker_terminal", "isolated_browser"})
+SANDBOX_CAPS = PRIVATE_CAPS
 ROOM_CAPS = frozenset({"attachments", "documents", "public_web", "room_memory", "room_session_search", "vision"})
 
 
@@ -149,6 +152,12 @@ def test_synthetic_access_matrix_is_fail_closed():
         context = registry.resolve(_identity(row["principal_id"]))
         assert context.profile_id == row["profile_id"]
         assert context.role_id == row["role_id"]
+        expected_caps = (
+            OWNER_CAPS
+            if context.role_id == "owner"
+            else PRIVATE_CAPS
+        )
+        assert context.capabilities == expected_caps
 
     room = next(row for row in _fixture()["rooms"] if row["scope_id"] == "room-drafts")
     room_context = registry.resolve(

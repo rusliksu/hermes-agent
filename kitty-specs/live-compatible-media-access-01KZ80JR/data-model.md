@@ -17,7 +17,7 @@ No other field is part of the contract. Raw usernames, message text, credentials
 
 ## Bindings
 
-- `RolePolicy`: read-only role prompt, capability allowlist, sandbox limits and delivery restrictions.
+- `RolePolicy`: read-only role prompt, capability allowlist, sandbox limits and delivery restrictions. `family_standard` and `family_sandbox` are equal-capability private execution classes; the latter label is retained only for rollout compatibility.
 - `PrincipalBinding`: opaque principal, profile, role and confirmed `platform/account/peer_kind/user_id` identities.
 - `SharedScopeBinding`: exact platform/account/chat/topic, room profile and member principal set.
 - `MediaProviderPolicy`: ordered provider IDs per media kind, retry classes and opaque secret references.

@@ -47,7 +47,7 @@ task_type: implement
 ## Objectives & Success Criteria
 
 - Implement `ResolvedAccessContext` with exactly six serialized fields: `principal_id`, `role_id`, `profile_id`, `conversation_scope`, `capabilities`, `delivery_target`.
-- Resolve confirmed DM/room identities to owner, family_standard, family_sandbox or shared_room, or deny before model/session/tools.
+- Resolve confirmed DM/room identities to owner, equal-capability family_standard/family_sandbox private classes or shared_room, or deny before model/session/tools.
 - Do not use username/display name, active profile or owner fallback as identity.
 - Keep all deny/audit data redacted.
 
@@ -78,7 +78,7 @@ task_type: implement
 
 ### T004 -- Tests
 
-- Cover Руслан(owner), Юля(family_sandbox), мама and other family(family_standard), two rooms(shared_room), unknown, malformed, mismatched Telegram IDs and missing profile.
+- Cover Руслан(owner), all private family labels with equal capabilities, two rooms(shared_room), unknown, malformed, mismatched Telegram IDs and missing profile.
 - Assert no model/session/tool callback is invoked after deny.
 
 ## Test Strategy

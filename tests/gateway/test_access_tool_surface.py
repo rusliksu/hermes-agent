@@ -147,6 +147,7 @@ def test_family_standard_uses_capability_and_config_intersection():
                 "session_search",
                 "self_reminder",
                 "delegation",
+                "wolfram",
                 "terminal",
                 "file",
                 "browser",
@@ -155,13 +156,20 @@ def test_family_standard_uses_capability_and_config_intersection():
         ),
     )
 
-    assert toolsets == ["cronjob", "image_gen", "session_search", "tts", "vision", "web"]
+    assert toolsets == [
+        "cronjob",
+        "delegation",
+        "image_gen",
+        "session_search",
+        "tts",
+        "vision",
+        "web",
+        "wolfram",
+    ]
     assert not {
         "terminal",
         "file",
         "browser",
-        "delegation",
-        "wolfram",
         "custom_mcp_server",
         "kanban",
         "homeassistant",
@@ -178,7 +186,10 @@ def test_family_standard_capability_cannot_enable_disabled_platform_toolset():
 def test_family_sandbox_delegation_only_with_capability_and_config():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
-        _context("family_sandbox", {"public_web", "delegation", "terminal", "browser"}),
+        _context(
+            "family_sandbox",
+            {"public_web", "delegation", "wolfram", "terminal", "browser"},
+        ),
     )
     without_capability = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
@@ -189,10 +200,10 @@ def test_family_sandbox_delegation_only_with_capability_and_config():
         _context("family_sandbox", {"public_web", "delegation"}),
     )
 
-    assert allowed == ["delegation", "web"]
+    assert allowed == ["delegation", "web", "wolfram"]
     assert without_capability == ["web"]
     assert without_config == ["web"]
-    assert not {"terminal", "browser", "wolfram"} & set(allowed)
+    assert not {"terminal", "browser"} & set(allowed)
 
 
 def test_shared_room_generic_surface_is_web_and_vision_only():

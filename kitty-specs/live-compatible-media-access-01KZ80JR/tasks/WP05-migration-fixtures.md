@@ -56,7 +56,7 @@ task_type: implement
 ### T016 -- Planner/fixtures
 
 - Add deterministic ownership and room fixtures with opaque principal IDs and redacted hashes.
-- Include Юля as `family_sandbox`, Руслан as `owner`, others as `family_standard`.
+- Preserve existing family role labels for compatibility, but assert that every private family binding receives the same safe capability set; Руслан remains `owner`.
 
 ### T017 -- Migration rules
 

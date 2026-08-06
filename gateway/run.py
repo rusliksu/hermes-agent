@@ -3854,6 +3854,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "voice_generation": "tts",
                 "session_search": "session_search",
                 "self_reminder": "cronjob",
+                "delegation": "delegation",
+                "wolfram": "wolfram",
             },
             "family_sandbox": {
                 "memory_search": "memory",
@@ -3864,6 +3866,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_search": "session_search",
                 "self_reminder": "cronjob",
                 "delegation": "delegation",
+                "wolfram": "wolfram",
             },
             "shared_room": {
                 "public_web": "web",

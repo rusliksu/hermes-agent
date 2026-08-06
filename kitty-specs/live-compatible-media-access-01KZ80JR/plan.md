@@ -101,8 +101,8 @@ The object is immutable, has strict field-count validation on serialization/dese
 ### Role policies
 
 - `owner`: Руслан's current full profile, subject to existing backend safety controls.
-- `family_standard`: private memory/session search, documents, attachments, vision, public web, image/voice generation and self-only reminders; no host shell/filesystem, logged-in browser or arbitrary MCP.
-- `family_sandbox`: `family_standard` plus personal Docker workspace, isolated public browser, Wolfram MCP and same-profile delegation; no host mounts/credentials, terminal network disabled, 2 vCPU/2 GiB/256 PID/5 GiB limits.
+- `family_standard` and `family_sandbox`: the same private user-tool policy — private memory/session search, documents, attachments, vision, public web, image/voice generation, self-only reminders, Wolfram, same-profile delegation, personal Docker workspace and isolated public browser. Both execution classes forbid host mounts/credentials, keep terminal network disabled and enforce 2 vCPU/2 GiB/256 PID/5 GiB limits.
+- `family_sandbox` remains a rollout-compatible execution-class label, not a trust or capability elevation; existing bindings may retain it while all private family principals receive the same safe capability set.
 - `shared_room`: room profile only; shared session/memory, documents/vision/public web; no private memory, cron, private delivery, shell or cross-user search. Wolfram is not inherited and is enabled only by an explicit room policy entry.
 
 Effective capabilities are the intersection of role policy, scope policy and backend policy. Unknown capabilities/tools are denied.

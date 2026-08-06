@@ -13,7 +13,7 @@ description: "Work package task list for live-derived Gurra access and media iso
 ## Work Package WP01: Six-field access contract and fail-closed resolver (Priority: P0)
 
 **Goal**: Add the immutable six-field `ResolvedAccessContext`, typed role/principal/room bindings, capability intersection and exact identity resolver without changing live behavior until the feature gate is enabled.
-**Independent Test**: Unit/contract matrix resolves Руслан(owner), Юля(family_sandbox), мама/other family(family_standard), two rooms(shared_room), unknown and malformed identities to the expected context or a deny result before model/session/tools.
+**Independent Test**: Unit/contract matrix resolves Руслан(owner), all private family role labels with the same capability set, two rooms(shared_room), unknown and malformed identities to the expected context or a deny result before model/session/tools.
 **Prompt**: `/tasks/WP01-access-contract.md`
 **Requirement Refs**: FR-001, FR-002, FR-004, FR-007
 

@@ -44,8 +44,11 @@ OWNER_CAPS = frozenset({
 })
 FAMILY_CAPS = frozenset({
     "attachments",
+    "delegation",
     "documents",
+    "docker_terminal",
     "image_generation",
+    "isolated_browser",
     "memory_search",
     "public_web",
     "self_reminder",
@@ -54,11 +57,10 @@ FAMILY_CAPS = frozenset({
     "voice_generation",
     "wolfram",
 })
-SANDBOX_CAPS = FAMILY_CAPS | frozenset({
-    "delegation",
-    "docker_terminal",
-    "isolated_browser",
-})
+# Keep the legacy role labels for rollout compatibility, but do not make
+# family_sandbox a permission elevation: every private family role gets the
+# same user-tool capability set.
+SANDBOX_CAPS = FAMILY_CAPS
 ROOM_CAPS = frozenset({
     "attachments",
     "documents",
@@ -257,7 +259,7 @@ def test_exact_telegram_dm_success_and_capability_intersection():
     assert context.delivery_target.chat_id == "opaque-family-0"
 
 
-def test_all_family_standard_bindings_get_role_policy_wolfram():
+def test_all_family_standard_bindings_get_common_family_tool_policy():
     registry = _registry()
 
     contexts = [
@@ -266,7 +268,7 @@ def test_all_family_standard_bindings_get_role_policy_wolfram():
     ]
 
     assert all(context.role_id == "family_standard" for context in contexts)
-    assert all("wolfram" in context.capabilities for context in contexts)
+    assert all(context.capabilities == FAMILY_CAPS for context in contexts)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +336,7 @@ def test_shared_room_does_not_inherit_family_wolfram_policy():
     assert "wolfram" not in context.capabilities
 
 
-def test_family_sandbox_uses_literal_wolfram_capability():
+def test_family_roles_use_common_wolfram_and_sandbox_capabilities():
     binding = replace(
         _principal_bindings()[1],
         role_id="family_sandbox",
@@ -347,8 +349,7 @@ def test_family_sandbox_uses_literal_wolfram_capability():
 
     context = registry.resolve(_dm_identity("opaque-family-0"))
 
-    assert "delegation" in context.capabilities
-    assert "wolfram" in context.capabilities
+    assert context.capabilities == FAMILY_CAPS
 
 
 def test_validate_resolved_context_accepts_current_active_context():
