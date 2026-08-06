@@ -4973,14 +4973,14 @@ def _kanban_snapshots(conn):
     }
 
 
-def test_upsert_openspec_definition_retries_tasks_id_collision_once(
+def test_upsert_spec_kitty_definition_retries_tasks_id_collision_once(
     kanban_home,
     monkeypatch,
 ):
     assert kb.kanban_db_path().resolve() != LIVE_KANBAN_DB.resolve()
     generated_ids = iter(("t_collision", "t_unique"))
     monkeypatch.setattr(kb, "_new_task_id", lambda: next(generated_ids))
-    definition = kb.OpenSpecTaskDefinition(
+    definition = kb.SpecKittyTaskDefinition(
         external_key="repo::change::1.1",
         source_path="/tmp/tasks.md",
         title="Первая задача",
@@ -4995,7 +4995,7 @@ def test_upsert_openspec_definition_retries_tasks_id_collision_once(
             ) VALUES ('t_collision', 'existing', 'ready', 0, 1, 'scratch')
             """
         )
-        result = kb.upsert_openspec_task_definitions(
+        result = kb.upsert_spec_kitty_task_definitions(
             conn,
             [definition],
             external_key_prefix="repo::change::",
@@ -5005,7 +5005,7 @@ def test_upsert_openspec_definition_retries_tasks_id_collision_once(
     assert result.items[0].action == "created"
 
 
-def test_upsert_openspec_definition_two_id_collisions_roll_back_batch(
+def test_upsert_spec_kitty_definition_two_id_collisions_roll_back_batch(
     kanban_home,
     monkeypatch,
 ):
@@ -5019,13 +5019,13 @@ def test_upsert_openspec_definition_two_id_collisions_roll_back_batch(
 
     monkeypatch.setattr(kb, "_new_task_id", new_task_id)
     definitions = [
-        kb.OpenSpecTaskDefinition(
+        kb.SpecKittyTaskDefinition(
             external_key="repo::change::1.1",
             source_path="/tmp/tasks.md",
             title="Первая задача",
             body="Тело первой задачи",
         ),
-        kb.OpenSpecTaskDefinition(
+        kb.SpecKittyTaskDefinition(
             external_key="repo::change::1.2",
             source_path="/tmp/tasks.md",
             title="Вторая задача",
@@ -5048,7 +5048,7 @@ def test_upsert_openspec_definition_two_id_collisions_roll_back_batch(
             sqlite3.IntegrityError,
             match=r"UNIQUE constraint failed: tasks\.id",
         ):
-            kb.upsert_openspec_task_definitions(
+            kb.upsert_spec_kitty_task_definitions(
                 conn,
                 definitions,
                 external_key_prefix="repo::change::",
@@ -5059,7 +5059,7 @@ def test_upsert_openspec_definition_two_id_collisions_roll_back_batch(
     assert after == before
 
 
-def test_upsert_openspec_definition_unrelated_integrity_error_does_not_retry(
+def test_upsert_spec_kitty_definition_unrelated_integrity_error_does_not_retry(
     kanban_home,
     monkeypatch,
 ):
@@ -5071,7 +5071,7 @@ def test_upsert_openspec_definition_unrelated_integrity_error_does_not_retry(
         return "t_trigger_rejected"
 
     monkeypatch.setattr(kb, "_new_task_id", new_task_id)
-    definition = kb.OpenSpecTaskDefinition(
+    definition = kb.SpecKittyTaskDefinition(
         external_key="repo::change::1.1",
         source_path="/tmp/tasks.md",
         title="Первая задача",
@@ -5081,19 +5081,19 @@ def test_upsert_openspec_definition_unrelated_integrity_error_does_not_retry(
     with kb.connect_closing() as conn:
         conn.execute(
             """
-            CREATE TRIGGER reject_openspec_definition
+            CREATE TRIGGER reject_spec_kitty_definition
             BEFORE INSERT ON tasks
             BEGIN
-                SELECT RAISE(ABORT, 'reject OpenSpec definition');
+                SELECT RAISE(ABORT, 'reject Spec Kitty definition');
             END
             """
         )
         before = _kanban_snapshots(conn)
         with pytest.raises(
             sqlite3.IntegrityError,
-            match="reject OpenSpec definition",
+            match="reject Spec Kitty definition",
         ):
-            kb.upsert_openspec_task_definitions(
+            kb.upsert_spec_kitty_task_definitions(
                 conn,
                 [definition],
                 external_key_prefix="repo::change::",
@@ -5105,17 +5105,17 @@ def test_upsert_openspec_definition_unrelated_integrity_error_does_not_retry(
 
 
 @pytest.mark.parametrize("status", ["running", "done"])
-def test_upsert_openspec_definition_updates_only_source_owned_fields(
+def test_upsert_spec_kitty_definition_updates_only_source_owned_fields(
     kanban_home,
     status,
 ):
-    original = kb.OpenSpecTaskDefinition(
+    original = kb.SpecKittyTaskDefinition(
         external_key="repo::change::1.1",
         source_path="/old/tasks.md",
         title="Старое название",
         body="Старое тело",
     )
-    changed = kb.OpenSpecTaskDefinition(
+    changed = kb.SpecKittyTaskDefinition(
         external_key=original.external_key,
         source_path="/new/tasks.md",
         title="Новое название",
@@ -5123,7 +5123,7 @@ def test_upsert_openspec_definition_updates_only_source_owned_fields(
     )
 
     with kb.connect_closing() as conn:
-        created = kb.upsert_openspec_task_definitions(
+        created = kb.upsert_spec_kitty_task_definitions(
             conn,
             [original],
             external_key_prefix="repo::change::",
@@ -5164,7 +5164,7 @@ def test_upsert_openspec_definition_updates_only_source_owned_fields(
             conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         )
 
-        updated = kb.upsert_openspec_task_definitions(
+        updated = kb.upsert_spec_kitty_task_definitions(
             conn,
             [changed],
             external_key_prefix="repo::change::",
@@ -5182,7 +5182,7 @@ def test_upsert_openspec_definition_updates_only_source_owned_fields(
                 (task_id,),
             )
         ]
-        unchanged = kb.upsert_openspec_task_definitions(
+        unchanged = kb.upsert_spec_kitty_task_definitions(
             conn,
             [changed],
             external_key_prefix="repo::change::",

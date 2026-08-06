@@ -1,4 +1,4 @@
-"""Import the minimal OpenSpec ``tasks.md`` checklist into Hermes Kanban.
+"""Import the minimal Spec Kitty ``tasks.md`` checklist into Hermes Kanban.
 
 Supported source format is intentionally narrow:
 
@@ -8,7 +8,7 @@ Supported source format is intentionally narrow:
 The task id is the first non-space token after the checkbox and remains a
 string. Remaining text is the title. Normal Markdown indentation is accepted;
 blank and non-task lines are ignored. The importer never writes back to
-OpenSpec and never deletes Kanban rows that disappear from a later import.
+Spec Kitty and never deletes Kanban rows that disappear from a later import.
 """
 
 from __future__ import annotations
@@ -26,15 +26,15 @@ _TASK_LINE_RE = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(\S+)(?:\s+(.*?))?\s*$")
 
 
 @dataclass(frozen=True)
-class OpenSpecTask:
+class SpecKittyTask:
     task_id: str
     title: str
     checked: bool
 
 
-def parse_openspec_tasks_md(text: str) -> list[OpenSpecTask]:
-    """Parse the minimum supported OpenSpec checkbox task format."""
-    tasks: list[OpenSpecTask] = []
+def parse_spec_kitty_tasks_md(text: str) -> list[SpecKittyTask]:
+    """Parse the minimum supported Spec Kitty checkbox task format."""
+    tasks: list[SpecKittyTask] = []
     seen: set[str] = set()
     for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
@@ -45,14 +45,14 @@ def parse_openspec_tasks_md(text: str) -> list[OpenSpecTask]:
         task_id = match.group(2)
         title = (match.group(3) or "").strip()
         if not title:
-            raise ValueError(f"OpenSpec task {task_id!r} on line {line_number} has no title")
+            raise ValueError(f"Spec Kitty task {task_id!r} on line {line_number} has no title")
         if task_id in seen:
-            raise ValueError(f"duplicate OpenSpec task id {task_id!r} on line {line_number}")
+            raise ValueError(f"duplicate Spec Kitty task id {task_id!r} on line {line_number}")
         if "::" in task_id:
-            raise ValueError(f"OpenSpec task id {task_id!r} must not contain '::'")
+            raise ValueError(f"Spec Kitty task id {task_id!r} must not contain '::'")
         seen.add(task_id)
         tasks.append(
-            OpenSpecTask(
+            SpecKittyTask(
                 task_id=task_id,
                 title=title,
                 checked=match.group(1).lower() == "x",
@@ -61,16 +61,16 @@ def parse_openspec_tasks_md(text: str) -> list[OpenSpecTask]:
     return tasks
 
 
-def import_openspec_tasks_md(
+def import_spec_kitty_tasks_md(
     conn: sqlite3.Connection,
     source_path: str | Path,
     *,
     repo: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Atomically upsert OpenSpec tasks into Kanban by external_key.
+    """Atomically upsert Spec Kitty tasks into Kanban by external_key.
 
     Stable identity is ``<repo>::<change-slug>::<task-id>``. If ``repo`` is
-    omitted, it defaults to the directory name that owns ``openspec/``.
+    omitted, it defaults to the directory name that owns ``kitty-specs/``.
     Existing rows update only ``external_key``, ``source_path``, ``title``,
     and ``body``. New imported rows start in fixed status ``todo``.
     """
@@ -87,10 +87,10 @@ def import_openspec_tasks_md(
         raise ValueError("repo and change slug must not contain '::'")
 
     source_path_text = str(path)
-    parsed = parse_openspec_tasks_md(path.read_text(encoding="utf-8"))
+    parsed = parse_spec_kitty_tasks_md(path.read_text(encoding="utf-8"))
     prefix = f"{repo_name}::{change_slug}::"
     definitions = [
-        kb.OpenSpecTaskDefinition(
+        kb.SpecKittyTaskDefinition(
             external_key=f"{prefix}{item.task_id}",
             source_path=source_path_text,
             title=item.title,
@@ -98,7 +98,7 @@ def import_openspec_tasks_md(
         )
         for item in parsed
     ]
-    batch = kb.upsert_openspec_task_definitions(
+    batch = kb.upsert_spec_kitty_task_definitions(
         conn,
         definitions,
         external_key_prefix=prefix,
@@ -130,13 +130,13 @@ def import_openspec_tasks_md(
 
 def _source_identity_parts(path: Path) -> tuple[str, str]:
     parts = path.parts
-    for idx, part in enumerate(parts[:-3]):
-        if part == "openspec" and parts[idx + 1] == "changes" and parts[idx + 3] == "tasks.md":
-            change_slug = parts[idx + 2]
+    for idx, part in enumerate(parts[:-2]):
+        if part == "kitty-specs" and parts[idx + 2] == "tasks.md":
+            change_slug = parts[idx + 1]
             repo_root = Path(*parts[:idx]) if idx else Path(".")
             return change_slug, repo_root.name
-    raise ValueError("source_path must match openspec/changes/<change-slug>/tasks.md")
+    raise ValueError("source_path must match kitty-specs/<change-slug>/tasks.md")
 
 
-def _task_body(task: OpenSpecTask) -> str:
-    return f"OpenSpec задача {task.task_id}\n\n{task.title}"
+def _task_body(task: SpecKittyTask) -> str:
+    return f"Spec Kitty задача {task.task_id}\n\n{task.title}"

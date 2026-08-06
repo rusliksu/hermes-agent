@@ -1,8 +1,13 @@
-# Tasks Directory
+# Каталог рабочих пакетов
 
-This directory contains work package (WP) prompt files.
+Здесь находятся prompt-файлы рабочих пакетов (WP) текущей mission.
 
-## Directory Structure (v0.9.0+)
+Активный workflow: Spec Kitty + Beads. Spec Kitty владеет статусом mission и
+event log, а Beads --- issue identity, приоритетом и зависимостями.
+
+Связанный Beads issue: `HERMES-4t0`.
+
+## Структура каталога (v0.9.0+)
 
 ```
 tasks/
@@ -12,11 +17,12 @@ tasks/
 └── README.md
 ```
 
-All WP files are stored flat in `tasks/`. Status is tracked in `status.events.jsonl`, not in WP frontmatter.
+Все WP-файлы лежат непосредственно в `tasks/`. Статус хранится в
+`status.events.jsonl`, а не во frontmatter WP.
 
-## Work Package File Format
+## Формат файла рабочего пакета
 
-Each WP file **MUST** use YAML frontmatter:
+Каждый WP-файл **обязан** использовать YAML frontmatter:
 
 ```yaml
 ---
@@ -44,21 +50,22 @@ history:
 [Content follows...]
 ```
 
-## Status Tracking
+## Отслеживание статуса
 
-Status is tracked via the canonical event log (`status.events.jsonl`), not in WP frontmatter.
-Use `spec-kitty agent tasks move-task` to change WP status:
+Статус отслеживается через канонический event log (`status.events.jsonl`), а не
+через frontmatter WP. Для изменения lane используйте `spec-kitty agent tasks
+move-task`:
 
 ```bash
 spec-kitty agent tasks move-task <WPID> --to <lane>
 ```
 
-Example:
+Пример:
 ```bash
 spec-kitty agent tasks move-task WP01 --to doing
 ```
 
-## File Naming
+## Имена файлов
 
-- Format: `WP01-kebab-case-slug.md`
-- Examples: `WP01-setup-infrastructure.md`, `WP02-user-auth.md`
+- Формат: `WP01-kebab-case-slug.md`
+- Примеры: `WP01-setup-infrastructure.md`, `WP02-user-auth.md`

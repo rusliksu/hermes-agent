@@ -2510,8 +2510,8 @@ class ExternalTaskSyncSpec:
 
 
 @dataclass(frozen=True)
-class OpenSpecTaskDefinition:
-    """Source-owned fields for one exact-key OpenSpec task definition."""
+class SpecKittyTaskDefinition:
+    """Source-owned fields for one exact-key Spec Kitty task definition."""
 
     external_key: str
     source_path: str
@@ -2520,7 +2520,7 @@ class OpenSpecTaskDefinition:
 
 
 @dataclass(frozen=True)
-class OpenSpecTaskDefinitionUpsert:
+class SpecKittyTaskDefinitionUpsert:
     task_id: str
     external_key: str
     action: Literal["created", "updated", "unchanged"]
@@ -2528,7 +2528,7 @@ class OpenSpecTaskDefinitionUpsert:
 
 
 @dataclass(frozen=True)
-class MissingOpenSpecTaskDefinition:
+class MissingSpecKittyTaskDefinition:
     task_id: str
     external_key: str
     title: str
@@ -2544,9 +2544,9 @@ class MissingOpenSpecTaskDefinition:
 
 
 @dataclass(frozen=True)
-class OpenSpecTaskDefinitionBatchResult:
-    items: tuple[OpenSpecTaskDefinitionUpsert, ...]
-    missing: tuple[MissingOpenSpecTaskDefinition, ...]
+class SpecKittyTaskDefinitionBatchResult:
+    items: tuple[SpecKittyTaskDefinitionUpsert, ...]
+    missing: tuple[MissingSpecKittyTaskDefinition, ...]
 
 
 def _is_tasks_id_collision(exc: sqlite3.IntegrityError) -> bool:
@@ -2558,22 +2558,22 @@ def _is_tasks_id_collision(exc: sqlite3.IntegrityError) -> bool:
     )
 
 
-def upsert_openspec_task_definitions(
+def upsert_spec_kitty_task_definitions(
     conn: sqlite3.Connection,
-    definitions: Iterable[OpenSpecTaskDefinition],
+    definitions: Iterable[SpecKittyTaskDefinition],
     *,
     external_key_prefix: str,
-) -> OpenSpecTaskDefinitionBatchResult:
-    """Atomically persist OpenSpec source definitions by exact external key."""
+) -> SpecKittyTaskDefinitionBatchResult:
+    """Atomically persist Spec Kitty source definitions by exact external key."""
     definitions = tuple(definitions)
     if not isinstance(external_key_prefix, str) or not external_key_prefix:
         raise ValueError("external_key_prefix is required")
 
     seen: set[str] = set()
     for index, definition in enumerate(definitions):
-        if not isinstance(definition, OpenSpecTaskDefinition):
+        if not isinstance(definition, SpecKittyTaskDefinition):
             raise TypeError(
-                f"definition {index} must be an OpenSpecTaskDefinition"
+                f"definition {index} must be a SpecKittyTaskDefinition"
             )
         for field_name in ("external_key", "source_path", "title", "body"):
             if not isinstance(getattr(definition, field_name), str):
@@ -2587,7 +2587,7 @@ def upsert_openspec_task_definitions(
             )
         if definition.external_key in seen:
             raise ValueError(
-                f"duplicate OpenSpec external_key {definition.external_key!r}"
+                f"duplicate Spec Kitty external_key {definition.external_key!r}"
             )
         if not definition.source_path.strip():
             raise ValueError(f"definition {index} source_path is required")
@@ -2595,8 +2595,8 @@ def upsert_openspec_task_definitions(
             raise ValueError(f"definition {index} title is required")
         seen.add(definition.external_key)
 
-    results: list[OpenSpecTaskDefinitionUpsert] = []
-    missing: list[MissingOpenSpecTaskDefinition] = []
+    results: list[SpecKittyTaskDefinitionUpsert] = []
+    missing: list[MissingSpecKittyTaskDefinition] = []
     now = int(time.time())
     with write_txn(conn):
         for definition in definitions:
@@ -2617,7 +2617,7 @@ def upsert_openspec_task_definitions(
                             INSERT INTO tasks (
                                 id, title, body, status, priority, created_by,
                                 created_at, workspace_kind, external_key, source_path
-                            ) VALUES (?, ?, ?, 'todo', 0, 'openspec', ?,
+                            ) VALUES (?, ?, ?, 'todo', 0, 'spec_kitty', ?,
                                       'scratch', ?, ?)
                             """,
                             (
@@ -2646,11 +2646,11 @@ def upsert_openspec_task_definitions(
                         "skills": None,
                         "goal_mode": None,
                         "external_key": definition.external_key,
-                        "source": "openspec",
+                        "source": "spec_kitty",
                     },
                 )
                 results.append(
-                    OpenSpecTaskDefinitionUpsert(
+                    SpecKittyTaskDefinitionUpsert(
                         task_id=task_id,
                         external_key=definition.external_key,
                         action="created",
@@ -2666,7 +2666,7 @@ def upsert_openspec_task_definitions(
             }
             if not updates:
                 results.append(
-                    OpenSpecTaskDefinitionUpsert(
+                    SpecKittyTaskDefinitionUpsert(
                         task_id=str(row["id"]),
                         external_key=definition.external_key,
                         action="unchanged",
@@ -2690,7 +2690,7 @@ def upsert_openspec_task_definitions(
                 },
             )
             results.append(
-                OpenSpecTaskDefinitionUpsert(
+                SpecKittyTaskDefinitionUpsert(
                     task_id=str(row["id"]),
                     external_key=definition.external_key,
                     action="updated",
@@ -2708,7 +2708,7 @@ def upsert_openspec_task_definitions(
             (len(external_key_prefix), external_key_prefix),
         ).fetchall()
         missing.extend(
-            MissingOpenSpecTaskDefinition(
+            MissingSpecKittyTaskDefinition(
                 task_id=str(row["id"]),
                 external_key=str(row["external_key"]),
                 title=str(row["title"]),
@@ -2718,7 +2718,7 @@ def upsert_openspec_task_definitions(
             if row["external_key"] not in seen
         )
 
-    return OpenSpecTaskDefinitionBatchResult(
+    return SpecKittyTaskDefinitionBatchResult(
         items=tuple(results),
         missing=tuple(missing),
     )

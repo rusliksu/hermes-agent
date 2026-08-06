@@ -13,7 +13,7 @@ description: "Список задач рабочих пакетов для из�
 ## Рабочий пакет WP01: контракт доступа с шестью полями и fail-closed resolver (приоритет P0)
 
 **Цель**: добавить неизменяемый шестиполевой `ResolvedAccessContext`, типизированные role/principal/room bindings, пересечение capabilities и точный identity resolver без изменения live-поведения до включения feature gate.
-**Независимая проверка**: unit/contract matrix должна разрешать Руслана(`owner`), все private family role labels с одинаковым набором capabilities, две комнаты(`shared_room`), а unknown и malformed identities — выдавать ожидаемый context либо deny до model/session/tools.
+**Независимая проверка**: unit/contract matrix должна разрешать Руслана(`owner`), все private family role labels с одинаковым набором capabilities, две комнаты(`shared_room`), а unknown и malformed identities --- выдавать ожидаемый context либо deny до model/session/tools.
 **Промпт**: `/tasks/WP01-access-contract.md`
 **Ссылки на требования**: FR-001, FR-002, FR-004, FR-007
 
@@ -145,8 +145,8 @@ description: "Список задач рабочих пакетов для из�
 
 - **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06.
 - **MVP scope**: WP01 + WP02 + WP03 + focused tests; live rollout не входит.
-- **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 — строго последним.
-- **Live gate**: T022 — жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
+- **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 --- строго последним.
+- **Live gate**: T022 --- жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
 
 ## Покрытие требований
 

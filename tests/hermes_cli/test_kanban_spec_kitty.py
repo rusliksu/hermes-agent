@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_openspec import (
-    import_openspec_tasks_md,
-    parse_openspec_tasks_md,
+from hermes_cli.kanban_spec_kitty import (
+    import_spec_kitty_tasks_md,
+    parse_spec_kitty_tasks_md,
 )
 
 LIVE_KANBAN_DB = Path("/home/openclaw/.hermes/kanban.db")
@@ -34,7 +34,7 @@ def temp_board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _source(tmp_path: Path, text: str, change: str = "add-widget") -> Path:
-    path = tmp_path / "repo" / "openspec" / "changes" / change / "tasks.md"
+    path = tmp_path / "repo" / "kitty-specs" / change / "tasks.md"
     path.parent.mkdir(parents=True)
     path.write_text(text, encoding="utf-8")
     return path
@@ -49,7 +49,7 @@ def _task_by_key(conn: sqlite3.Connection, external_key: str) -> sqlite3.Row:
 
 
 def test_parser_accepts_minimum_fixture_and_preserves_string_ids():
-    parsed = parse_openspec_tasks_md(
+    parsed = parse_spec_kitty_tasks_md(
         """
           - [ ] 1.1 Task title
         - [x] 1.2 Completed-in-plan title
@@ -67,8 +67,8 @@ def test_parser_accepts_minimum_fixture_and_preserves_string_ids():
 
 
 def test_parser_rejects_duplicate_task_ids():
-    with pytest.raises(ValueError, match="duplicate OpenSpec task id '1.1'"):
-        parse_openspec_tasks_md("- [ ] 1.1 A\n- [x] 1.1 B\n")
+    with pytest.raises(ValueError, match="duplicate Spec Kitty task id '1.1'"):
+        parse_spec_kitty_tasks_md("- [ ] 1.1 A\n- [x] 1.1 B\n")
 
 
 def test_first_import_round_trips_russian_text_with_technical_terms(
@@ -81,7 +81,7 @@ def test_first_import_round_trips_russian_text_with_technical_terms(
     source = _source(tmp_path, source_text)
 
     with kb.connect_closing() as conn:
-        result = import_openspec_tasks_md(conn, source, repo="repo")
+        result = import_spec_kitty_tasks_md(conn, source, repo="repo")
         rows = conn.execute("SELECT * FROM tasks ORDER BY external_key").fetchall()
         listed = sorted(kb.list_tasks(conn), key=lambda task: task.external_key or "")
         read_back = kb.get_task(conn, listed[0].id)
@@ -96,7 +96,7 @@ def test_first_import_round_trips_russian_text_with_technical_terms(
     ]
     assert [row["source_path"] for row in rows] == [str(source), str(source)]
     assert [row["status"] for row in rows] == ["todo", "todo"]
-    assert [row["created_by"] for row in rows] == ["openspec", "openspec"]
+    assert [row["created_by"] for row in rows] == ["spec_kitty", "spec_kitty"]
     assert [row["workspace_kind"] for row in rows] == ["scratch", "scratch"]
     assert [task.title for task in listed] == [
         "Обновить MCP/API раздел в README",
@@ -104,7 +104,7 @@ def test_first_import_round_trips_russian_text_with_technical_terms(
     ]
     assert read_back is not None
     assert read_back.body == (
-        "OpenSpec задача 1.1\n\nОбновить MCP/API раздел в README"
+        "Spec Kitty задача 1.1\n\nОбновить MCP/API раздел в README"
     )
 
 
@@ -112,8 +112,8 @@ def test_identical_second_import_creates_no_duplicates(temp_board, tmp_path):
     source = _source(tmp_path, "- [ ] 1.1 First task\n")
 
     with kb.connect_closing() as conn:
-        first = import_openspec_tasks_md(conn, source, repo="repo")
-        second = import_openspec_tasks_md(conn, source, repo="repo")
+        first = import_spec_kitty_tasks_md(conn, source, repo="repo")
+        second = import_spec_kitty_tasks_md(conn, source, repo="repo")
         count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         event_count = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
 
@@ -131,7 +131,7 @@ def test_create_update_unchanged_write_canonical_events_only_when_changed(
     source = _source(tmp_path, "- [ ] 1.1 Исходная задача\n")
 
     with kb.connect_closing() as conn:
-        created = import_openspec_tasks_md(conn, source, repo="repo")
+        created = import_spec_kitty_tasks_md(conn, source, repo="repo")
         task_id = created["tasks"][0]["id"]
         assert [
             row["kind"]
@@ -141,14 +141,14 @@ def test_create_update_unchanged_write_canonical_events_only_when_changed(
             )
         ] == ["created"]
 
-        unchanged = import_openspec_tasks_md(conn, source, repo="repo")
+        unchanged = import_spec_kitty_tasks_md(conn, source, repo="repo")
         assert unchanged["tasks"][0]["action"] == "unchanged"
         assert conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)
         ).fetchone()[0] == 1
 
         source.write_text("- [ ] 1.1 Обновлённая задача\n", encoding="utf-8")
-        updated = import_openspec_tasks_md(conn, source, repo="repo")
+        updated = import_spec_kitty_tasks_md(conn, source, repo="repo")
         events = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
             (task_id,),
@@ -167,7 +167,7 @@ def test_changed_source_updates_only_source_owned_fields(temp_board, tmp_path):
     source = _source(tmp_path, "- [ ] 1.1 Old title\n")
 
     with kb.connect_closing() as conn:
-        import_openspec_tasks_md(conn, source, repo="repo")
+        import_spec_kitty_tasks_md(conn, source, repo="repo")
         row = _task_by_key(conn, "repo::add-widget::1.1")
         task_id = row["id"]
         conn.execute(
@@ -177,12 +177,12 @@ def test_changed_source_updates_only_source_owned_fields(temp_board, tmp_path):
             (task_id,),
         )
         source.write_text("- [ ] 1.1 New title\n", encoding="utf-8")
-        result = import_openspec_tasks_md(conn, source, repo="repo")
+        result = import_spec_kitty_tasks_md(conn, source, repo="repo")
         changed = _task_by_key(conn, "repo::add-widget::1.1")
 
     assert result["updated"] == 1
     assert changed["title"] == "New title"
-    assert changed["body"] == "OpenSpec задача 1.1\n\nNew title"
+    assert changed["body"] == "Spec Kitty задача 1.1\n\nNew title"
     assert changed["status"] == "running"
     assert changed["assignee"] == "alice"
     assert changed["priority"] == 50
@@ -198,7 +198,7 @@ def test_reimport_preserves_operational_claim_and_run_state(
     source = _source(tmp_path, "- [ ] 1.1 Claimed task\n")
 
     with kb.connect_closing() as conn:
-        import_openspec_tasks_md(conn, source, repo="repo")
+        import_spec_kitty_tasks_md(conn, source, repo="repo")
         row = _task_by_key(conn, "repo::add-widget::1.1")
         task_id = row["id"]
         run_id = conn.execute(
@@ -233,7 +233,7 @@ def test_reimport_preserves_operational_claim_and_run_state(
             conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         )
         source.write_text("- [ ] 1.1 Claimed task renamed\n", encoding="utf-8")
-        import_openspec_tasks_md(conn, source, repo="repo")
+        import_spec_kitty_tasks_md(conn, source, repo="repo")
         after_task = _task_by_key(conn, "repo::add-widget::1.1")
         after_run = dict(
             conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
@@ -242,7 +242,7 @@ def test_reimport_preserves_operational_claim_and_run_state(
     assert dict(after_task) == {
         **before_task,
         "title": "Claimed task renamed",
-        "body": "OpenSpec задача 1.1\n\nClaimed task renamed",
+        "body": "Spec Kitty задача 1.1\n\nClaimed task renamed",
     }
     assert after_run == before_run
 
@@ -256,7 +256,7 @@ def test_import_batch_rolls_back_tasks_and_events_on_failure(temp_board, tmp_pat
     with kb.connect_closing() as conn:
         conn.execute(
             """
-            CREATE TRIGGER reject_second_openspec_task
+            CREATE TRIGGER reject_second_spec_kitty_task
             BEFORE INSERT ON tasks
             WHEN NEW.external_key = 'repo::add-widget::1.2'
             BEGIN
@@ -271,7 +271,7 @@ def test_import_batch_rolls_back_tasks_and_events_on_failure(temp_board, tmp_pat
             for table in ("tasks", "task_runs", "task_events")
         }
         with pytest.raises(sqlite3.IntegrityError, match="reject second definition"):
-            import_openspec_tasks_md(conn, source, repo="repo")
+            import_spec_kitty_tasks_md(conn, source, repo="repo")
         after = {
             table: [dict(row) for row in conn.execute(
                 f"SELECT * FROM {table} ORDER BY rowid"
@@ -286,10 +286,10 @@ def test_removed_source_line_does_not_mutate_existing_task(temp_board, tmp_path)
     source = _source(tmp_path, "- [ ] 1.1 Keep\n- [ ] 1.2 Missing later\n")
 
     with kb.connect_closing() as conn:
-        import_openspec_tasks_md(conn, source, repo="repo")
+        import_spec_kitty_tasks_md(conn, source, repo="repo")
         missing_before = dict(_task_by_key(conn, "repo::add-widget::1.2"))
         source.write_text("- [ ] 1.1 Keep\n", encoding="utf-8")
-        result = import_openspec_tasks_md(conn, source, repo="repo")
+        result = import_spec_kitty_tasks_md(conn, source, repo="repo")
         missing_after = dict(_task_by_key(conn, "repo::add-widget::1.2"))
 
     assert result["created"] == 0
@@ -303,11 +303,11 @@ def test_checked_checkbox_does_not_force_existing_status_change(
     source = _source(tmp_path, "- [ ] 1.1 Keep status\n")
 
     with kb.connect_closing() as conn:
-        import_openspec_tasks_md(conn, source, repo="repo")
+        import_spec_kitty_tasks_md(conn, source, repo="repo")
         row = _task_by_key(conn, "repo::add-widget::1.1")
         conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (row["id"],))
         source.write_text("- [x] 1.1 Keep status\n", encoding="utf-8")
-        result = import_openspec_tasks_md(conn, source, repo="repo")
+        result = import_spec_kitty_tasks_md(conn, source, repo="repo")
         after = _task_by_key(conn, "repo::add-widget::1.1")
 
     assert result["unchanged"] == 1
