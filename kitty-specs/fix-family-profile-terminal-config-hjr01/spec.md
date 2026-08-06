@@ -3,7 +3,7 @@
 **Mission**: `fix-family-profile-terminal-config-hjr01`
 **Branch**: `codex/fix-family-profile-terminal-config`
 **Bead**: `HERMES-jir`
-**Статус**: implementation проверена; draft PR `#24` открыт, merge/live gate не выполнялись
+**Статус**: implementation проверена; PR `#24` ready, merge/live gate не выполнялись
 
 ## Проблема
 

@@ -10,7 +10,7 @@ Bead: `HERMES-jir`
 - [x] T004 Запустить `python -m pytest -q tests/agent/test_runtime_cwd.py`: `17 passed`; adjacent suite: `65 passed`.
 - [x] T005 Проверить diff: existing malformed/unreadable, legacy/default и cross-profile guards не ослаблены; `candidate-guard-check=ok`.
 - [x] T006 Создать проверенный task-owned local commit.
-- [x] T007 После появления доказанного remote integration base выполнить push и открыть узкий draft PR `#24`.
+- [x] T007 После появления доказанного remote integration base выполнить push, открыть узкий PR `#24` и перевести его в ready.
 - [ ] T008 Получить отдельное разрешение на live deploy/restart и выполнить post-restart canary.
 
 ## Зависимости
@@ -21,4 +21,4 @@ Bead: `HERMES-jir`
 
 На task-owned branch есть минимальный patch и один regression test; targeted suite зелёный; live runtime не изменён.
 
-Публикация: draft PR `#24`, `codex/fix-family-profile-terminal-config` → `codex/live-compatible-media-cutover-refresh`; merge и live mutation не выполнялись этой mission.
+Публикация: ready PR `#24`, `codex/fix-family-profile-terminal-config` → `codex/live-compatible-media-cutover-refresh`; merge и live mutation не выполнялись этой mission.
