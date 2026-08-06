@@ -46,7 +46,7 @@ WRITE_TOOLS: tuple[str, ...] = (
     "kanban_block",
     "kanban_add_dependency",
     "kanban_reclaim",
-    "kanban_import_openspec_tasks",
+    "kanban_import_spec_kitty_tasks",
     KANBAN_EXTERNAL_SYNC_TOOL,
 )
 
@@ -76,7 +76,7 @@ SERVER_INSTRUCTIONS = (
     "read-only статус доски и список метаданных задач; write-инструменты "
     "регистрируются только при запуске с --allow-write. Все human-facing "
     "Kanban title/body/comment/block reason/result/acceptance criteria, "
-    "а также все human-readable OpenSpec artifacts/tasks нужно писать "
+    "а также все human-readable Spec Kitty artifacts/tasks нужно писать "
     "на русском языке. Technical identifiers, API names, code, file paths, "
     "tool names, library names, README и internal status codes могут "
     "оставаться на английском внутри русского текста. Формальная проверка "
@@ -804,15 +804,15 @@ def kanban_reclaim(
         return _err("kanban_error", str(exc))
 
 
-def kanban_import_openspec_tasks(
+def kanban_import_spec_kitty_tasks(
     source_path: str,
     repo: Optional[str] = None,
     board: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Импортирует минимальные checkbox-задачи OpenSpec tasks.md в Kanban.
+    """Импортирует минимальные checkbox-задачи Spec Kitty tasks.md в Kanban.
 
     Поддерживает только строки задач ``- [ ] 1.1 Название`` и
-    ``- [x] 1.2 Название`` в ``openspec/changes/<change-slug>/tasks.md``.
+    ``- [x] 1.2 Название`` в ``kitty-specs/<change-slug>/tasks.md``.
     Исходный файл читается, но не изменяется; существующие Kanban-задачи
     обновляют только поля, принадлежащие источнику.
     """
@@ -830,9 +830,9 @@ def kanban_import_openspec_tasks(
     try:
         kb, conn = _write_conn(board)
         try:
-            from hermes_cli.kanban_openspec import import_openspec_tasks_md
+            from hermes_cli.kanban_spec_kitty import import_spec_kitty_tasks_md
 
-            result = import_openspec_tasks_md(
+            result = import_spec_kitty_tasks_md(
                 conn,
                 source_text or "",
                 repo=(repo_text.strip() if repo_text else None),
@@ -845,7 +845,7 @@ def kanban_import_openspec_tasks(
     except sqlite3.IntegrityError as exc:
         return _err("sqlite_error", str(exc))
     except Exception as exc:
-        logger.exception("kanban_import_openspec_tasks failed")
+        logger.exception("kanban_import_spec_kitty_tasks failed")
         return _err("kanban_error", str(exc))
 
 
@@ -864,7 +864,7 @@ def _tool_handlers(allow_write: bool = False) -> dict[str, Callable[..., Any]]:
                 "kanban_block": kanban_block,
                 "kanban_add_dependency": kanban_add_dependency,
                 "kanban_reclaim": kanban_reclaim,
-                "kanban_import_openspec_tasks": kanban_import_openspec_tasks,
+                "kanban_import_spec_kitty_tasks": kanban_import_spec_kitty_tasks,
                 KANBAN_EXTERNAL_SYNC_TOOL: kanban_sync_external_task,
             }
         )

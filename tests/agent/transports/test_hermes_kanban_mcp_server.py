@@ -27,7 +27,7 @@ PREVIOUS_WRITE_TOOL_NAMES = [
     "kanban_block",
     "kanban_add_dependency",
     "kanban_reclaim",
-    "kanban_import_openspec_tasks",
+    "kanban_import_spec_kitty_tasks",
 ]
 WRITE_TOOL_NAMES = [
     *READ_TOOL_NAMES,

@@ -627,6 +627,8 @@ export const api = {
   // Profiles
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
+  getAccessUsers: () =>
+    fetchJSON<AccessUsersResponse>("/api/access/users"),
   getActiveProfile: () =>
     fetchJSON<ActiveProfileInfo>("/api/profiles/active"),
   setActiveProfile: (name: string) =>
@@ -2093,6 +2095,48 @@ export interface ProfileInfo {
   distribution_version: string | null;
   distribution_source: string | null;
   has_alias: boolean;
+}
+
+export interface AccessProfileHealth {
+  registered: boolean;
+  directory_present: boolean;
+  gateway_running: boolean;
+}
+
+export interface AccessIsolationStatus {
+  status: string;
+  context_contract: string;
+  transport_ids_redacted: boolean;
+  secret_values_exposed: boolean;
+}
+
+export interface AccessBindingView {
+  principal_id: string;
+  role_id: string;
+  profile_id: string;
+  binding_kind: "principal" | "shared_room" | string;
+  active: boolean;
+  effective_capabilities: string[];
+  profile_health: AccessProfileHealth;
+  isolation: AccessIsolationStatus;
+}
+
+export interface AccessValidationReport {
+  verdict: string;
+  conflicts: Array<{ category: string; count: number }>;
+}
+
+export interface AccessUsersResponse {
+  enabled: boolean;
+  validation: AccessValidationReport;
+  redaction: {
+    transport_ids_exposed: boolean;
+    delivery_targets_exposed: boolean;
+    filesystem_paths_exposed: boolean;
+    secret_values_exposed: boolean;
+  };
+  users: AccessBindingView[];
+  rooms: AccessBindingView[];
 }
 
 export interface ModelsAnalyticsModelEntry {

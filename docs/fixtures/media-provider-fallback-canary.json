@@ -1,0 +1,101 @@
+{
+  "schema": "media-provider-fallback-canary/v1",
+  "purpose": "Credential-safe synthetic check for profile-scoped media fallback routing.",
+  "fixture": {
+    "path": "tests/fixtures/media-provider-policy-canary.yaml",
+    "sha256": "5c17b347f4e207fd12c93dcdf7751cd17443709d82c00b05e89e4f39272291c4",
+    "redacted": true
+  },
+  "safety": {
+    "credentials_included": false,
+    "live_configuration_changed": false,
+    "restart_requested": false,
+    "telegram_delivery": false,
+    "profile_fallback": "deny"
+  },
+  "commands": [
+    {
+      "id": "validate-redacted-fixture",
+      "argv": [
+        "hermes",
+        "config",
+        "media-policy",
+        "--dry-run",
+        "--json",
+        "--file",
+        "tests/fixtures/media-provider-policy-canary.yaml"
+      ],
+      "mutates": false,
+      "expected": {
+        "valid": true,
+        "mode": "fallback",
+        "provider_orders": {
+          "image_generation": ["openai-codex", "fal", "openrouter"],
+          "stt": ["local", "mistral", "openai", "elevenlabs"],
+          "tts": ["edge", "openai", "elevenlabs"]
+        }
+      }
+    },
+    {
+      "id": "verify-fixture-integrity",
+      "argv": ["sha256sum", "tests/fixtures/media-provider-policy-canary.yaml"],
+      "mutates": false,
+      "expected": {
+        "sha256": "5c17b347f4e207fd12c93dcdf7751cd17443709d82c00b05e89e4f39272291c4"
+      }
+    }
+  ],
+  "matrix": [
+    {
+      "principal": "owner",
+      "role": "owner",
+      "scope": "private",
+      "expected": "allow"
+    },
+    {
+      "principal": "family_yulia",
+      "role": "family",
+      "scope": "private",
+      "expected": "allow"
+    },
+    {
+      "principal": "family_other",
+      "role": "family",
+      "scope": "private",
+      "expected": "allow"
+    },
+    {
+      "principal": "shared_room",
+      "role": "shared_room",
+      "scope": "registered-room",
+      "expected": "allow"
+    },
+    {
+      "principal": "unknown",
+      "role": null,
+      "scope": null,
+      "expected": "deny"
+    }
+  ],
+  "backup": {
+    "artifact": "media-policy-pre-change.json",
+    "capture": "Store the redacted JSON output of the read-only media-policy dry-run before any live change.",
+    "includes_credentials": false,
+    "preserve_legacy_provider_choice": true
+  },
+  "rollback": {
+    "gate": "explicit-live-configuration-approval",
+    "legacy_provider_order": {
+      "image_generation": ["openai-codex"],
+      "stt": ["local"],
+      "tts": ["edge"]
+    },
+    "steps": [
+      "Restore the pre-change redacted policy snapshot for operator comparison.",
+      "Remove only the image_gen.fallbacks, stt.fallbacks, and tts.fallbacks keys under the approved live change procedure.",
+      "Run the read-only media-policy dry-run again and confirm legacy provider choices before a separately approved restart."
+    ],
+    "does_not_restore_credentials": true,
+    "does_not_change_profile_bindings": true
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "mission_slug": "live-compatible-media-access-01KZ80JR",
+  "mission_id": "01KZ80JR4R04EJYD0AAJ23646M",
+  "mission_branch": "kitty/mission-live-compatible-media-access-01KZ80JR",
+  "target_branch": "codex/live-compatible-media-cutover",
+  "lanes": [
+    {
+      "lane_id": "lane-a",
+      "wp_ids": [
+        "WP01"
+      ],
+      "write_scope": [
+        "gateway/access_registry.py",
+        "gateway/authz_mixin.py",
+        "gateway/profile_routing.py",
+        "tests/gateway/test_access_registry.py",
+        "tests/gateway/test_profile_routing_fail_closed.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "dashboard",
+        "legacy-cleanup"
+      ],
+      "depends_on_lanes": [],
+      "parallel_group": 0
+    },
+    {
+      "lane_id": "lane-b",
+      "wp_ids": [
+        "WP02"
+      ],
+      "write_scope": [
+        "gateway/run.py",
+        "gateway/session_context.py",
+        "tests/test_profile_isolation_runtime.py",
+        "tools/memory_tool.py",
+        "tools/session_search_tool.py"
+      ],
+      "predicted_surfaces": [
+        "api"
+      ],
+      "depends_on_lanes": [
+        "lane-a"
+      ],
+      "parallel_group": 1
+    },
+    {
+      "lane_id": "lane-c",
+      "wp_ids": [
+        "WP03"
+      ],
+      "write_scope": [
+        "tests/test_media_provider_routing.py",
+        "tools/image_generation_tool.py",
+        "tools/media_provider_routing.py",
+        "tools/transcription_tools.py",
+        "tools/tts_tool.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "legacy-cleanup"
+      ],
+      "depends_on_lanes": [
+        "lane-a"
+      ],
+      "parallel_group": 1
+    },
+    {
+      "lane_id": "lane-d",
+      "wp_ids": [
+        "WP04"
+      ],
+      "write_scope": [
+        "hermes_cli/config.py",
+        "hermes_cli/dashboard_auth/audit.py",
+        "hermes_cli/subcommands/config.py",
+        "tests/hermes_cli/test_config_access_policy.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "artifact-rendering",
+        "dashboard",
+        "legacy-cleanup"
+      ],
+      "depends_on_lanes": [
+        "lane-a"
+      ],
+      "parallel_group": 1
+    },
+    {
+      "lane_id": "lane-e",
+      "wp_ids": [
+        "WP05"
+      ],
+      "write_scope": [
+        "tests/fixtures/access_policy_matrix.json",
+        "tests/fixtures/migration_fixture.json",
+        "tests/test_profile_migration.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "legacy-cleanup"
+      ],
+      "depends_on_lanes": [
+        "lane-a"
+      ],
+      "parallel_group": 1
+    },
+    {
+      "lane_id": "lane-planning",
+      "wp_ids": [
+        "WP06"
+      ],
+      "write_scope": [
+        "docs/ops/media-access-canary-rollback.md",
+        "tests/test_media_access_canary.py"
+      ],
+      "predicted_surfaces": [
+        "planning"
+      ],
+      "depends_on_lanes": [
+        "lane-a",
+        "lane-b",
+        "lane-c",
+        "lane-d"
+      ],
+      "parallel_group": 2
+    }
+  ],
+  "computed_at": "2026-08-05T04:05:05.957016+00:00",
+  "computed_from": "dependency_graph+ownership",
+  "planning_artifact_wps": [
+    "WP06"
+  ]
+}

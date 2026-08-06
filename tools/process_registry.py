@@ -76,6 +76,42 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def capture_resolved_access_context_payload() -> Optional[Dict[str, Any]]:
+    """Capture the server-owned six-field context for durable work metadata."""
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    if context is None:
+        return None
+    try:
+        return serialize_resolved_access_context(context)
+    except ValueError as exc:
+        raise ValueError("malformed_resolved_access_context") from exc
+
+
+def _add_access_context_event_payload(event: Dict[str, Any], session: "ProcessSession") -> None:
+    """Attach only the canonical context payload; never copy env/secrets."""
+    if session.resolved_access_context is not None:
+        event["resolved_access_context"] = session.resolved_access_context
+
+
+@dataclass
+class ProcessNotificationSpec:
+    """Notification metadata captured before a background process starts."""
+
+    watcher_platform: str = ""
+    watcher_chat_id: str = ""
+    watcher_user_id: str = ""
+    watcher_user_name: str = ""
+    watcher_thread_id: str = ""
+    watcher_message_id: str = ""
+    watcher_interval: int = 0
+    notify_on_complete: bool = False
+    watch_patterns: tuple = ()
+    resolved_access_context: Optional[dict] = None
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -117,6 +153,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    resolved_access_context: Optional[dict] = None  # Server-owned six-field context
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -212,6 +249,25 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _apply_notification_spec(
+        session: ProcessSession,
+        notification: Optional[ProcessNotificationSpec],
+    ) -> None:
+        if notification is None:
+            return
+        session.watcher_platform = notification.watcher_platform
+        session.watcher_chat_id = notification.watcher_chat_id
+        session.watcher_user_id = notification.watcher_user_id
+        session.watcher_user_name = notification.watcher_user_name
+        session.watcher_thread_id = notification.watcher_thread_id
+        session.watcher_message_id = notification.watcher_message_id
+        session.watcher_interval = notification.watcher_interval
+        session.notify_on_complete = notification.notify_on_complete
+        session.watch_patterns = list(notification.watch_patterns or ())
+        if notification.resolved_access_context is not None:
+            session.resolved_access_context = notification.resolved_access_context
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -313,7 +369,7 @@ class ProcessRegistry:
             if should_disable:
                 # Emit exactly one "watch disabled, falling back to notify_on_complete"
                 # summary event so the agent/user sees why things went quiet.
-                self.completion_queue.put({
+                event = {
                     "session_id": session.id,
                     "session_key": session.session_key,
                     "command": session.command,
@@ -332,7 +388,9 @@ class ProcessRegistry:
                         f"Falling back to notify_on_complete semantics; you'll get "
                         f"exactly one notification when the process exits."
                     ),
-                })
+                }
+                _add_access_context_event_payload(event, session)
+                self.completion_queue.put(event)
             return
 
         # Trim matched output to a reasonable size
@@ -344,7 +402,7 @@ class ProcessRegistry:
         if not self._global_watch_admit(now):
             return
 
-        self.completion_queue.put({
+        event = {
             "session_id": session.id,
             "session_key": session.session_key,
             "command": session.command,
@@ -358,7 +416,9 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
-        })
+        }
+        _add_access_context_event_payload(event, session)
+        self.completion_queue.put(event)
 
     def _global_watch_admit(self, now: float) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
@@ -694,6 +754,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        resolved_access_context: Optional[dict] = None,
+        notification: Optional[ProcessNotificationSpec] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -712,7 +774,9 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            resolved_access_context=resolved_access_context,
         )
+        self._apply_notification_spec(session, notification)
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -833,6 +897,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        resolved_access_context: Optional[dict] = None,
+        notification: Optional[ProcessNotificationSpec] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -854,7 +920,9 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            resolved_access_context=resolved_access_context,
         )
+        self._apply_notification_spec(session, notification)
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -1089,7 +1157,7 @@ class ProcessRegistry:
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            event = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1102,7 +1170,9 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            _add_access_context_event_payload(event, session)
+            self.completion_queue.put(event)
 
     # ----- Query Methods -----
 
@@ -1908,6 +1978,7 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "resolved_access_context": s.resolved_access_context,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1986,6 +2057,7 @@ class ProcessRegistry:
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
+                resolved_access_context=entry.get("resolved_access_context"),
             )
             with self._lock:
                 self._running[session.id] = session
@@ -2005,6 +2077,7 @@ class ProcessRegistry:
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
+                    "resolved_access_context": session.resolved_access_context,
                 })
 
         self._write_checkpoint()

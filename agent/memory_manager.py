@@ -30,8 +30,9 @@ import logging
 import re
 import inspect
 import threading
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_RESOLVED_ACCESS_CONTEXT_UNSET = object()
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -358,7 +360,12 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        resolved_access_context: Any = _RESOLVED_ACCESS_CONTEXT_UNSET,
+    ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
@@ -388,6 +395,84 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        self._resolved_access_context_payload: Optional[str] = None
+        self._memory_scope: Optional[str] = None
+        self._resolved_access_context_captured: bool = False
+        if resolved_access_context is not _RESOLVED_ACCESS_CONTEXT_UNSET:
+            self._resolved_access_context_captured = True
+            if resolved_access_context is not None:
+                self._resolved_access_context_payload = (
+                    self._canonical_resolved_access_context_payload(
+                        resolved_access_context
+                    )
+                )
+                self._memory_scope = self._memory_scope_from_payload(
+                    self._resolved_access_context_payload
+                )
+
+    # -- Access context ------------------------------------------------------
+
+    @staticmethod
+    def _canonical_resolved_access_context_payload(context: Any) -> str:
+        from gateway.access_registry import (
+            deserialize_resolved_access_context,
+            serialize_resolved_access_context,
+        )
+
+        if isinstance(context, dict):
+            resolved = deserialize_resolved_access_context(context)
+        else:
+            resolved = deserialize_resolved_access_context(
+                serialize_resolved_access_context(context)
+            )
+        payload = serialize_resolved_access_context(resolved)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _memory_scope_from_payload(payload: str) -> str:
+        from gateway.access_registry import memory_scope_from_resolved_access_context
+
+        return memory_scope_from_resolved_access_context(json.loads(payload))
+
+    def _capture_resolved_access_context(self, kwargs: Dict[str, Any]) -> None:
+        kwargs.pop("memory_scope", None)
+        explicit = "resolved_access_context" in kwargs
+        context = kwargs.pop("resolved_access_context", None)
+        if not explicit and self._resolved_access_context_captured:
+            return
+        if not explicit:
+            from gateway.session_context import get_resolved_access_context
+
+            context = get_resolved_access_context(None)
+        if context is None:
+            if explicit:
+                raise ValueError("missing_resolved_access_context")
+            self._resolved_access_context_payload = None
+            self._memory_scope = None
+            self._resolved_access_context_captured = True
+            return
+        self._resolved_access_context_payload = (
+            self._canonical_resolved_access_context_payload(context)
+        )
+        self._memory_scope = self._memory_scope_from_payload(
+            self._resolved_access_context_payload
+        )
+        self._resolved_access_context_captured = True
+
+    @contextmanager
+    def _bind_resolved_access_context(self) -> Iterator[None]:
+        if self._resolved_access_context_payload is None:
+            yield
+            return
+
+        from gateway.access_registry import deserialize_resolved_access_context
+        from gateway.session_context import bind_resolved_access_context
+
+        context = deserialize_resolved_access_context(
+            json.loads(self._resolved_access_context_payload)
+        )
+        with bind_resolved_access_context(context):
+            yield
 
     # -- Registration --------------------------------------------------------
 
@@ -428,35 +513,38 @@ class MemoryManager:
 
         _core_tool_names = set(_HERMES_CORE_TOOLS)
 
-        # Index tool names → provider for routing
-        for raw_schema in provider.get_tool_schemas():
-            schema = normalize_tool_schema(raw_schema)
-            if schema is None:
-                continue
-            tool_name = schema["name"]
-            if tool_name in _core_tool_names:
-                logger.warning(
-                    "Memory provider '%s' tool '%s' shadows a reserved core "
-                    "tool name; registration ignored. Core tools always win — "
-                    "rename the provider's tool to something unique.",
-                    provider.name, tool_name,
-                )
-                continue
-            if tool_name and tool_name not in self._tool_to_provider:
-                self._tool_to_provider[tool_name] = provider
-            elif tool_name in self._tool_to_provider:
-                logger.warning(
-                    "Memory tool name conflict: '%s' already registered by %s, "
-                    "ignoring from %s",
-                    tool_name,
-                    self._tool_to_provider[tool_name].name,
-                    provider.name,
-                )
+        with self._bind_resolved_access_context():
+            raw_schemas = list(provider.get_tool_schemas())
+
+            # Index tool names → provider for routing
+            for raw_schema in raw_schemas:
+                schema = normalize_tool_schema(raw_schema)
+                if schema is None:
+                    continue
+                tool_name = schema["name"]
+                if tool_name in _core_tool_names:
+                    logger.warning(
+                        "Memory provider '%s' tool '%s' shadows a reserved core "
+                        "tool name; registration ignored. Core tools always win — "
+                        "rename the provider's tool to something unique.",
+                        provider.name, tool_name,
+                    )
+                    continue
+                if tool_name and tool_name not in self._tool_to_provider:
+                    self._tool_to_provider[tool_name] = provider
+                elif tool_name in self._tool_to_provider:
+                    logger.warning(
+                        "Memory tool name conflict: '%s' already registered by %s, "
+                        "ignoring from %s",
+                        tool_name,
+                        self._tool_to_provider[tool_name].name,
+                        provider.name,
+                    )
 
         logger.info(
             "Memory provider '%s' registered (%d tools)",
             provider.name,
-            len(provider.get_tool_schemas()),
+            len(raw_schemas),
         )
 
     @property
@@ -482,7 +570,8 @@ class MemoryManager:
         blocks = []
         for provider in self._providers:
             try:
-                block = provider.system_prompt_block()
+                with self._bind_resolved_access_context():
+                    block = provider.system_prompt_block()
                 if block and block.strip():
                     blocks.append(block)
             except Exception as e:
@@ -538,14 +627,16 @@ class MemoryManager:
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
     ) -> str:
         if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+            with self._bind_resolved_access_context():
+                return provider.prefetch(query, session_id=session_id)
 
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                with self._bind_resolved_access_context():
+                    result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
@@ -600,14 +691,15 @@ class MemoryManager:
             return
 
         def _run() -> None:
-            for provider in providers:
-                try:
-                    provider.queue_prefetch(clean_query, session_id=session_id)
-                except Exception as e:
-                    logger.debug(
-                        "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
-                        provider.name, e,
-                    )
+            with self._bind_resolved_access_context():
+                for provider in providers:
+                    try:
+                        provider.queue_prefetch(clean_query, session_id=session_id)
+                    except Exception as e:
+                        logger.debug(
+                            "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
+                            provider.name, e,
+                        )
 
         self._submit_background(_run, kind="prefetch")
 
@@ -624,6 +716,19 @@ class MemoryManager:
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return True
         return "messages" in signature.parameters
+
+    @staticmethod
+    def _provider_accepts_keyword(provider: MemoryProvider, method_name: str, keyword: str) -> bool:
+        """Return whether provider.method accepts a specific keyword."""
+        try:
+            method = getattr(provider, method_name)
+            signature = inspect.signature(method)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return keyword in signature.parameters
 
     def sync_all(
         self,
@@ -660,26 +765,27 @@ class MemoryManager:
         user_content = clean_user_content
 
         def _run() -> None:
-            for provider in providers:
-                try:
-                    if messages is not None and self._provider_sync_accepts_messages(provider):
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                            messages=messages,
+            with self._bind_resolved_access_context():
+                for provider in providers:
+                    try:
+                        if messages is not None and self._provider_sync_accepts_messages(provider):
+                            provider.sync_turn(
+                                user_content,
+                                assistant_content,
+                                session_id=session_id,
+                                messages=messages,
+                            )
+                        else:
+                            provider.sync_turn(
+                                user_content,
+                                assistant_content,
+                                session_id=session_id,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Memory provider '%s' sync_turn failed: %s",
+                            provider.name, e,
                         )
-                    else:
-                        provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Memory provider '%s' sync_turn failed: %s",
-                        provider.name, e,
-                    )
 
         self._submit_background(_run)
 
@@ -786,7 +892,9 @@ class MemoryManager:
         seen = set()
         for provider in self._providers:
             try:
-                for raw_schema in provider.get_tool_schemas():
+                with self._bind_resolved_access_context():
+                    raw_schemas = list(provider.get_tool_schemas())
+                for raw_schema in raw_schemas:
                     schema = normalize_tool_schema(raw_schema)
                     if schema is None:
                         logger.warning(
@@ -828,7 +936,8 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
+            with self._bind_resolved_access_context():
+                return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error(
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
@@ -845,7 +954,8 @@ class MemoryManager:
         """
         for provider in self._providers:
             try:
-                provider.on_turn_start(turn_number, message, **kwargs)
+                with self._bind_resolved_access_context():
+                    provider.on_turn_start(turn_number, message, **kwargs)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",
@@ -856,7 +966,8 @@ class MemoryManager:
         """Notify all providers of session end."""
         for provider in self._providers:
             try:
-                provider.on_session_end(messages)
+                with self._bind_resolved_access_context():
+                    provider.on_session_end(messages)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' on_session_end failed: %s",
@@ -949,12 +1060,13 @@ class MemoryManager:
             kwargs["rewound"] = True
         for provider in self._providers:
             try:
-                provider.on_session_switch(
-                    new_session_id,
-                    parent_session_id=parent_session_id,
-                    reset=reset,
-                    **kwargs,
-                )
+                with self._bind_resolved_access_context():
+                    provider.on_session_switch(
+                        new_session_id,
+                        parent_session_id=parent_session_id,
+                        reset=reset,
+                        **kwargs,
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_session_switch failed: %s",
@@ -970,7 +1082,8 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.on_pre_compress(messages)
+                with self._bind_resolved_access_context():
+                    result = provider.on_pre_compress(messages)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -1021,15 +1134,19 @@ class MemoryManager:
             if provider.name == "builtin":
                 continue
             try:
-                metadata_mode = self._provider_memory_write_metadata_mode(provider)
-                if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
-                    )
-                elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
-                else:
-                    provider.on_memory_write(action, target, content)
+                with self._bind_resolved_access_context():
+                    metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                    scoped_metadata = dict(metadata or {})
+                    if self._memory_scope is not None:
+                        scoped_metadata["memory_scope"] = self._memory_scope
+                    if metadata_mode == "keyword":
+                        provider.on_memory_write(
+                            action, target, content, metadata=scoped_metadata
+                        )
+                    elif metadata_mode == "positional":
+                        provider.on_memory_write(action, target, content, scoped_metadata)
+                    else:
+                        provider.on_memory_write(action, target, content)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",
@@ -1122,9 +1239,10 @@ class MemoryManager:
         """Notify all providers that a subagent completed."""
         for provider in self._providers:
             try:
-                provider.on_delegation(
-                    task, result, child_session_id=child_session_id, **kwargs
-                )
+                with self._bind_resolved_access_context():
+                    provider.on_delegation(
+                        task, result, child_session_id=child_session_id, **kwargs
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_delegation failed: %s",
@@ -1143,7 +1261,8 @@ class MemoryManager:
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
-                provider.shutdown()
+                with self._bind_resolved_access_context():
+                    provider.shutdown()
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' shutdown failed: %s",
@@ -1221,9 +1340,18 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        self._capture_resolved_access_context(kwargs)
         for provider in self._providers:
             try:
-                provider.initialize(session_id=session_id, **kwargs)
+                with self._bind_resolved_access_context():
+                    init_kwargs = kwargs
+                    if self._memory_scope is not None and self._provider_accepts_keyword(
+                        provider,
+                        "initialize",
+                        "memory_scope",
+                    ):
+                        init_kwargs = {**kwargs, "memory_scope": self._memory_scope}
+                    provider.initialize(session_id=session_id, **init_kwargs)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",

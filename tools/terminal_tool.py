@@ -2457,7 +2457,11 @@ def terminal_tool(
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
-            from tools.process_registry import process_registry
+            from tools.process_registry import (
+                ProcessNotificationSpec,
+                capture_resolved_access_context_payload,
+                process_registry,
+            )
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
@@ -2465,23 +2469,87 @@ def terminal_tool(
                 session_key=session_key,
             )
             try:
+                # Capture the trusted context before the process starts. The
+                # child can exit immediately, so attaching it after spawn has
+                # a race that would lose the ownership proof on completion.
+                try:
+                    access_context_payload = capture_resolved_access_context_payload()
+                except ValueError as exc:
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": str(exc),
+                        "status": "blocked",
+                    }, ensure_ascii=False)
+
+                # Resolve notification metadata before spawning. Reader/poller
+                # threads can emit output immediately, so post-spawn setup
+                # alone cannot safely own the first completion event.
+                notification = None
+                notify_unsupported = ""
+                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+                    notify_on_complete=bool(notify_on_complete),
+                    watch_patterns=watch_patterns,
+                    background=bool(background),
+                )
+                if notify_on_complete or watch_patterns:
+                    from gateway.session_context import (
+                        async_delivery_supported as _async_ok,
+                        get_session_env as _gse,
+                    )
+                    if not _async_ok():
+                        notify_on_complete = False
+                        watch_patterns = None
+                        notify_unsupported = (
+                            "notify_on_complete / watch_patterns are not available in "
+                            "this session — it cannot receive an async completion after "
+                            "the turn ends (a one-shot runner such as `hermes -z` or a "
+                            "cron job, or a stateless HTTP endpoint). The process is "
+                            "running in the background; retrieve its result with "
+                            "process(action='poll') or process(action='wait')."
+                        )
+                    else:
+                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                        notification = ProcessNotificationSpec(
+                            watcher_platform=_gw_platform,
+                            watcher_chat_id=_gse("HERMES_SESSION_CHAT_ID", "") if _gw_platform else "",
+                            watcher_user_id=_gse("HERMES_SESSION_USER_ID", "") if _gw_platform else "",
+                            watcher_user_name=_gse("HERMES_SESSION_USER_NAME", "") if _gw_platform else "",
+                            watcher_thread_id=_gse("HERMES_SESSION_THREAD_ID", "") if _gw_platform else "",
+                            watcher_message_id=_gse("HERMES_SESSION_MESSAGE_ID", "") if _gw_platform else "",
+                            watcher_interval=5 if notify_on_complete and _gw_platform else 0,
+                            notify_on_complete=bool(notify_on_complete),
+                            watch_patterns=tuple(watch_patterns or ()),
+                            resolved_access_context=access_context_payload,
+                        )
+
                 if env_type == "local":
-                    proc_session = process_registry.spawn_local(
-                        command=command,
-                        cwd=effective_cwd,
-                        task_id=effective_task_id,
-                        session_key=session_key,
-                        env_vars=env.env if hasattr(env, 'env') else None,
-                        use_pty=effective_pty,
-                    )
+                    spawn_kwargs = {
+                        "command": command,
+                        "cwd": effective_cwd,
+                        "task_id": effective_task_id,
+                        "session_key": session_key,
+                        "env_vars": env.env if hasattr(env, 'env') else None,
+                        "use_pty": effective_pty,
+                    }
+                    if access_context_payload is not None:
+                        spawn_kwargs["resolved_access_context"] = access_context_payload
+                    if notification is not None:
+                        spawn_kwargs["notification"] = notification
+                    proc_session = process_registry.spawn_local(**spawn_kwargs)
                 else:
-                    proc_session = process_registry.spawn_via_env(
-                        env=env,
-                        command=command,
-                        cwd=effective_cwd,
-                        task_id=effective_task_id,
-                        session_key=session_key,
-                    )
+                    spawn_kwargs = {
+                        "env": env,
+                        "command": command,
+                        "cwd": effective_cwd,
+                        "task_id": effective_task_id,
+                        "session_key": session_key,
+                    }
+                    if access_context_payload is not None:
+                        spawn_kwargs["resolved_access_context"] = access_context_payload
+                    if notification is not None:
+                        spawn_kwargs["notification"] = notification
+                    proc_session = process_registry.spawn_via_env(**spawn_kwargs)
 
                 result_data = {
                     "output": "Background process started",
@@ -2497,6 +2565,11 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if conflict_note:
+                    result_data["watch_patterns_ignored"] = conflict_note
+                if notify_unsupported:
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = notify_unsupported
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
@@ -2510,7 +2583,7 @@ def terminal_tool(
                 # surface the result. Cheap nudge here costs ~one read for
                 # server cases (false positive) and prevents silent
                 # blindness for bounded-task cases (false negative).
-                if background and not notify_on_complete and not watch_patterns:
+                if background and not notify_on_complete and not watch_patterns and not notify_unsupported:
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
                         "this process runs SILENTLY — you will not be told when "
@@ -2687,12 +2760,26 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "resolved_access_context": getattr(
+                                proc_session,
+                                "resolved_access_context",
+                                access_context_payload,
+                            ),
                         })
 
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
+
+                # Watcher routing metadata is assigned after spawn for legacy
+                # compatibility. Persist it now so a gateway restart cannot
+                # resume the process under an incomplete/foreign route.
+                if background and (notify_on_complete or watch_patterns):
+                    try:
+                        process_registry._write_checkpoint()
+                    except Exception:
+                        logger.debug("Could not checkpoint background routing metadata", exc_info=True)
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:

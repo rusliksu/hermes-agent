@@ -974,7 +974,13 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
 # ===========================================================================
 # Provider: ElevenLabs (premium)
 # ===========================================================================
-def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_elevenlabs(
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+    *,
+    api_key: Optional[str] = None,
+) -> str:
     """
     Generate audio using ElevenLabs.
 
@@ -986,7 +992,9 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     Returns:
         Path to the saved audio file.
     """
-    api_key = (get_env_value("ELEVENLABS_API_KEY") or "")
+    if api_key is None:
+        api_key = get_env_value("ELEVENLABS_API_KEY")
+    api_key = api_key or ""
     if not api_key:
         raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
 
@@ -2278,6 +2286,417 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
     return output_path
 
 
+# ---------------------------------------------------------------------------
+# Scoped TTS provider fallback dispatch
+# ---------------------------------------------------------------------------
+
+
+_TTS_FALLBACK_PROVIDER_IDS = frozenset({"edge", "openai", "elevenlabs"})
+_TTS_FALLBACK_SECRET_ENV = {
+    "openai": "VOICE_TOOLS_OPENAI_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+}
+_TTS_AUDIO_SUFFIXES = frozenset({".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"})
+
+
+def _read_configured_tts_fallbacks(
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> Optional[tuple[tuple[str, ...], Dict[str, str]]]:
+    """Read an explicit server-side TTS fallback policy.
+
+    Missing ``tts.fallbacks`` keeps the legacy single-provider path.  The
+    mapping form mirrors the media policy contract::
+
+        tts:
+          fallbacks:
+            tts: [edge, openai, elevenlabs]
+            secret_references:
+              openai: profile://tts/openai
+
+    Secret reference values are opaque labels; only the bound profile's
+    credential scope is consulted by the resolver below.
+    """
+    if tts_config is None:
+        tts_config = _load_tts_config()
+    if not isinstance(tts_config, dict) or "fallbacks" not in tts_config:
+        return None
+
+    raw = tts_config.get("fallbacks")
+    nested_references: Any = None
+    if isinstance(raw, dict):
+        nested_references = raw.get("secret_references")
+        raw = raw.get("tts")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("tts.fallbacks.tts must be a non-empty list")
+
+    providers: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("TTS fallback provider id must be a non-empty string")
+        provider_id = item.strip().lower()
+        if provider_id not in _TTS_FALLBACK_PROVIDER_IDS:
+            raise ValueError(f"unsupported TTS fallback provider: {provider_id}")
+        if provider_id not in providers:
+            providers.append(provider_id)
+
+    references = (
+        nested_references
+        if nested_references is not None
+        else tts_config.get("secret_references", {})
+    )
+    if references is None:
+        references = {}
+    if not isinstance(references, dict):
+        raise ValueError("tts secret_references must be a mapping")
+
+    normalized_references: Dict[str, str] = {}
+    for raw_provider, raw_reference in references.items():
+        provider_id = str(raw_provider).strip().lower()
+        if provider_id not in providers or provider_id not in _TTS_FALLBACK_SECRET_ENV:
+            raise ValueError(f"secret reference is not allowed for TTS provider: {raw_provider}")
+        if not isinstance(raw_reference, str) or not raw_reference.strip():
+            raise ValueError(f"secret reference for {provider_id} must be non-empty")
+        normalized_references[provider_id] = raw_reference.strip()
+
+    return tuple(providers), normalized_references
+
+
+def _tts_access_context():
+    """Return only the trusted typed context; never infer it from arguments."""
+    from gateway.access_registry import ResolvedAccessContext
+    from gateway.session_context import get_resolved_access_context
+
+    context = get_resolved_access_context(None)
+    return context if isinstance(context, ResolvedAccessContext) else None
+
+
+def _tts_profile_home(context) -> Path:
+    from tools.media_provider_routing import MediaProviderError
+
+    try:
+        from agent.runtime_cwd import bound_profile_home
+
+        profile_home = bound_profile_home()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+    if profile_home is None:
+        raise MediaProviderError("invalid_context")
+    try:
+        return profile_home.resolve()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+
+
+def _tts_profile_default_output_dir(context) -> Path:
+    """Resolve the default audio cache while the typed profile home is bound."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError
+
+    profile_home = _tts_profile_home(context)
+    override_token = set_hermes_home_override(profile_home)
+    try:
+        output_dir = Path(_get_default_output_dir()).resolve()
+    except Exception as exc:
+        raise MediaProviderError("invalid_context") from exc
+    finally:
+        reset_hermes_home_override(override_token)
+    try:
+        output_dir.relative_to(profile_home)
+    except ValueError as exc:
+        raise MediaProviderError("invalid_context") from exc
+    return output_dir
+
+
+def _tts_output_path(context, output_path: str) -> Path:
+    from tools.media_provider_routing import MediaProviderError
+
+    profile_home = _tts_profile_home(context)
+    try:
+        path = Path(output_path).expanduser()
+        if not path.is_absolute():
+            path = profile_home / path
+        resolved = path.resolve()
+        resolved.relative_to(profile_home)
+        if resolved.suffix.lower() not in _TTS_AUDIO_SUFFIXES:
+            raise MediaProviderError("provider_error")
+        return resolved
+    except MediaProviderError:
+        raise
+    except Exception as exc:
+        raise MediaProviderError("provider_error") from exc
+
+
+def _validate_tts_artifact(context, output_path: str) -> Path:
+    """Validate profile ownership, non-empty size, and an audio container."""
+    from tools.media_provider_routing import MediaProviderError
+
+    path = _tts_output_path(context, output_path)
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise MediaProviderError("provider_error")
+    except MediaProviderError:
+        raise
+    except OSError as exc:
+        raise MediaProviderError("provider_error") from exc
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v", "error",
+                    "-show_entries", "format=format_name",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                env=_tts_subprocess_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise MediaProviderError("provider_error") from exc
+        if result.returncode != 0 or not result.stdout.strip():
+            raise MediaProviderError("provider_error")
+    return path
+
+
+def _tts_provider_error(provider_id: str, exc: BaseException):
+    """Classify existing TTS adapter failures for the shared executor."""
+    from tools.media_provider_routing import MediaProviderError
+
+    message = str(exc)
+    lowered = message.lower()
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timed out" in lowered or "timeout" in lowered:
+        error_class = "timeout"
+    elif "rate limit" in lowered or "rate_limited" in lowered or "429" in lowered:
+        error_class = "rate_limited"
+    elif re.search(r"\b5\d{2}\b", lowered) or "upstream 5xx" in lowered:
+        error_class = "upstream_5xx"
+    elif isinstance(exc, (ImportError, ModuleNotFoundError)) or "not installed" in lowered:
+        error_class = "provider_unavailable"
+    elif (
+        "not set" in lowered
+        or "api key" in lowered
+        or "authentication" in lowered
+        or "credentials" in lowered
+    ):
+        error_class = "auth_unavailable"
+    elif isinstance(exc, (ConnectionError, OSError)) or "connection" in lowered:
+        error_class = "provider_unavailable"
+    else:
+        error_class = "provider_error"
+    return MediaProviderError(error_class, provider_id)
+
+
+def _resolve_profile_tts_secret(context, provider_id: str, reference: str):
+    """Resolve a TTS credential through the active profile secret scope."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError
+
+    env_name = _TTS_FALLBACK_SECRET_ENV.get(provider_id)
+    if not env_name or not isinstance(reference, str) or not reference.strip():
+        raise MediaProviderError("auth_unavailable", provider_id)
+    profile_home = _tts_profile_home(context)
+    override_token = set_hermes_home_override(profile_home)
+    try:
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+        except Exception:
+            get_env_value_prefer_dotenv = None
+        if not callable(get_env_value_prefer_dotenv):
+            return None
+        if provider_id == "openai":
+            value = (
+                get_env_value_prefer_dotenv("VOICE_TOOLS_OPENAI_KEY")
+                or get_env_value_prefer_dotenv("OPENAI_API_KEY")
+            )
+        else:
+            value = get_env_value_prefer_dotenv(env_name)
+    finally:
+        reset_hermes_home_override(override_token)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _run_edge_tts_sync(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Run async Edge TTS from the synchronous media executor."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            lambda: asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+        ).result(timeout=60)
+
+
+def _invoke_tts_provider(provider_id: str, context, input_handle: dict, secret_handle: Any):
+    """Invoke one existing TTS adapter under the bound profile home."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.media_provider_routing import MediaProviderError, MediaResult
+
+    profile_home = _tts_profile_home(context)
+    output_path = _tts_output_path(context, input_handle.get("output_path", ""))
+    if provider_id in _TTS_FALLBACK_SECRET_ENV and not isinstance(secret_handle, str):
+        raise MediaProviderError("auth_unavailable", provider_id)
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise MediaProviderError("provider_error", provider_id) from exc
+
+    override_token = set_hermes_home_override(profile_home)
+    generated_path = str(output_path)
+    try:
+        tts_config = _load_tts_config()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        text = input_handle.get("text", "")
+        if provider_id == "edge":
+            generated = _run_edge_tts_sync(text, str(output_path), tts_config)
+        elif provider_id == "openai":
+            openai_config = tts_config.get("openai") or {}
+            generated = _generate_openai_tts(
+                text,
+                str(output_path),
+                tts_config,
+                api_key=secret_handle,
+                base_url=openai_config.get("base_url") or DEFAULT_OPENAI_BASE_URL,
+            )
+        elif provider_id == "elevenlabs":
+            generated = _generate_elevenlabs(
+                text,
+                str(output_path),
+                tts_config,
+                api_key=secret_handle,
+            )
+        else:
+            raise MediaProviderError("invalid_policy", provider_id)
+        if isinstance(generated, str) and generated.strip():
+            generated_path = generated.strip()
+    except MediaProviderError:
+        raise
+    except Exception as exc:
+        raise _tts_provider_error(provider_id, exc) from exc
+    finally:
+        reset_hermes_home_override(override_token)
+
+    artifact = _validate_tts_artifact(context, generated_path)
+    return MediaResult(
+        audio_path=str(artifact),
+        metadata={"provider": provider_id},
+    )
+
+
+def _tts_provider_audit(event) -> None:
+    """Emit only the redacted fields defined by MediaProviderAuditEvent."""
+    logger.info(
+        "media_provider_attempt operation=%s provider=%s error_class=%s "
+        "elapsed_ms=%s profile_ref=%s success=%s",
+        event.operation,
+        event.provider_id,
+        event.error_class or "",
+        event.elapsed_ms,
+        event.profile_ref,
+        event.success,
+    )
+
+
+def _dispatch_to_tts_fallback_chain(
+    text: str,
+    output_path: str,
+    *,
+    configured: Optional[tuple[tuple[str, ...], Dict[str, str]]] = None,
+):
+    """Run the explicit, profile-bound TTS chain, if configured."""
+    try:
+        configured = (
+            _read_configured_tts_fallbacks()
+            if configured is None
+            else configured
+        )
+    except ValueError:
+        return {
+            "success": False,
+            "error": "invalid media provider policy",
+            "error_type": "invalid_policy",
+        }
+    if configured is None:
+        return None
+    provider_order, secret_references = configured
+
+    context = _tts_access_context()
+    if context is None:
+        return {
+            "success": False,
+            "error": "invalid media access context",
+            "error_type": "invalid_context",
+        }
+
+    from tools.media_provider_routing import (
+        MediaProviderError,
+        MediaProviderExecutor,
+        MediaProviderPolicy,
+    )
+
+    try:
+        profile_output = _tts_output_path(context, output_path)
+        profile_output.parent.mkdir(parents=True, exist_ok=True)
+    except MediaProviderError as error:
+        return {
+            "success": False,
+            "error": error.message,
+            "error_type": error.error_class,
+        }
+
+    handlers = {
+        provider_id: (
+            lambda bound_context, input_handle, secret_handle,
+            provider_id=provider_id: _invoke_tts_provider(
+                provider_id, bound_context, input_handle, secret_handle
+            )
+        )
+        for provider_id in provider_order
+    }
+    policy = MediaProviderPolicy(
+        provider_order={"tts": provider_order},
+        required_capabilities={"tts": "voice_generation"},
+        secret_references=secret_references,
+        secret_required=frozenset(
+            provider_id for provider_id in provider_order
+            if provider_id in _TTS_FALLBACK_SECRET_ENV
+        ),
+    )
+    try:
+        result = MediaProviderExecutor(
+            handlers,
+            secret_resolver=_resolve_profile_tts_secret,
+            audit_sink=_tts_provider_audit,
+        ).execute(
+            "tts",
+            context,
+            {"text": text, "output_path": str(profile_output)},
+            policy,
+        )
+    except MediaProviderError as error:
+        return {
+            "success": False,
+            "error": error.message,
+            "error_type": error.error_class,
+        }
+
+    provider_id = result.metadata.get("provider", "") if result.metadata else ""
+    return {
+        "success": True,
+        "file_path": result.audio_path,
+        "provider": provider_id,
+    }
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -2306,6 +2725,14 @@ def text_to_speech_tool(
         return tool_error("Text is required", success=False)
 
     tts_config = _load_tts_config()
+    try:
+        configured_tts_fallbacks = _read_configured_tts_fallbacks(tts_config)
+    except ValueError:
+        return json.dumps({
+            "success": False,
+            "error": "invalid media provider policy",
+            "error_type": "invalid_policy",
+        }, ensure_ascii=False)
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
@@ -2362,8 +2789,18 @@ def text_to_speech_tool(
             )
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if configured_tts_fallbacks is None:
+            out_dir = Path(DEFAULT_OUTPUT_DIR)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            try:
+                out_dir = _tts_profile_default_output_dir(_tts_access_context())
+            except Exception:
+                return json.dumps({
+                    "success": False,
+                    "error": "invalid media access context",
+                    "error_type": "invalid_context",
+                }, ensure_ascii=False)
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
@@ -2374,13 +2811,26 @@ def text_to_speech_tool(
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
 
-    # Ensure parent directory exists
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    # Legacy paths may be created before generation.  An explicit fallback
+    # chain creates its parent only after profile ownership is validated.
+    if configured_tts_fallbacks is None:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
 
     try:
         # Generate audio with the configured provider
-        if command_provider_config is not None:
+        chained_result = _dispatch_to_tts_fallback_chain(
+            text,
+            file_str,
+            configured=configured_tts_fallbacks,
+        )
+        if chained_result is not None:
+            if not chained_result.get("success"):
+                return json.dumps(chained_result, ensure_ascii=False)
+            file_str = str(chained_result["file_path"])
+            provider = str(chained_result["provider"])
+
+        elif command_provider_config is not None:
             logger.info(
                 "Generating speech with command TTS provider '%s'...", provider,
             )

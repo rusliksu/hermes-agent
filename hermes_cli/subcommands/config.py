@@ -56,6 +56,26 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config check
     config_subparsers.add_parser("check", help="Check for missing/outdated config")
 
+    # config media-policy (read-only dry run)
+    media_policy = config_subparsers.add_parser(
+        "media-policy",
+        help="Validate media provider policy without changing live config",
+    )
+    media_policy.add_argument(
+        "--file",
+        help="Optional YAML config file to validate instead of the active config",
+    )
+    media_policy.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the redacted report as JSON",
+    )
+    media_policy.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Explicitly confirm that this command is read-only",
+    )
+
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 

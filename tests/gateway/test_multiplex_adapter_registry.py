@@ -332,6 +332,40 @@ class TestSecondaryProfileConfigHandling:
         assert connected == 0  # nothing connected, but no MultiplexConfigError
 
     @pytest.mark.asyncio
+    async def test_registry_owned_telegram_is_not_started_per_secondary_profile(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.access_registry = SimpleNamespace(
+            principal_bindings=(
+                SimpleNamespace(
+                    transport_identity=SimpleNamespace(platform="telegram")
+                ),
+            ),
+            shared_scope_bindings=(),
+        )
+        runner._profile_adapters = {}
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="t"),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda *_: (_ for _ in ()).throw(AssertionError("shared Telegram must not poll twice")),
+        )
+
+        assert await runner._start_one_profile_adapters("reviewer", "/tmp/x", {}) == 0
+        assert runner._profile_adapters["reviewer"] == {}
+
+    @pytest.mark.asyncio
     async def test_multiplex_secondary_skips_relay_but_starts_direct_adapter(
         self, monkeypatch
     ):

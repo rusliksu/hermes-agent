@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "principals": [
+    {
+      "principal_id": "principal-owner",
+      "role_id": "owner",
+      "profile_id": "profile-owner"
+    },
+    {
+      "principal_id": "principal-yulia",
+      "role_id": "family",
+      "profile_id": "profile-yulia"
+    },
+    {
+      "principal_id": "principal-family-01",
+      "role_id": "family",
+      "profile_id": "profile-family-01"
+    },
+    {
+      "principal_id": "principal-family-02",
+      "role_id": "family",
+      "profile_id": "profile-family-02"
+    },
+    {
+      "principal_id": "principal-family-03",
+      "role_id": "family",
+      "profile_id": "profile-family-03"
+    },
+    {
+      "principal_id": "principal-family-04",
+      "role_id": "family",
+      "profile_id": "profile-family-04"
+    },
+    {
+      "principal_id": "principal-family-05",
+      "role_id": "family",
+      "profile_id": "profile-family-05"
+    },
+    {
+      "principal_id": "principal-family-06",
+      "role_id": "family",
+      "profile_id": "profile-family-06"
+    },
+    {
+      "principal_id": "principal-family-07",
+      "role_id": "family",
+      "profile_id": "profile-family-07"
+    },
+    {
+      "principal_id": "principal-family-08",
+      "role_id": "family",
+      "profile_id": "profile-family-08"
+    }
+  ],
+  "rooms": [
+    {
+      "scope_id": "room-drafts",
+      "role_id": "shared_room",
+      "profile_id": "profile-room-drafts",
+      "members": ["principal-owner", "principal-yulia", "principal-family-01"]
+    },
+    {
+      "scope_id": "room-research",
+      "role_id": "shared_room",
+      "profile_id": "profile-room-research",
+      "members": ["principal-owner", "principal-family-02", "principal-family-03"]
+    }
+  ]
+}

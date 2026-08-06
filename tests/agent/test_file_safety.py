@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
 from agent.file_safety import (
     _BLOCKED_PROJECT_ENV_BASENAMES,
     get_read_block_error,
@@ -113,6 +114,65 @@ class TestCacheFileReadBlocking:
             error = get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error
+
+
+class TestMultiplexProfileReadBlocking:
+    @staticmethod
+    def _context(profile_id: str) -> ResolvedAccessContext:
+        return ResolvedAccessContext(
+            principal_id=f"principal-{profile_id}",
+            role_id="family",
+            profile_id=profile_id,
+            conversation_scope="private",
+            capabilities=frozenset({"memory_search"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="10001",
+                thread_id=None,
+            ),
+        )
+
+    def test_foreign_profile_and_default_state_are_blocked(self, tmp_path):
+        root = tmp_path / "hermes"
+        active = root / "profiles" / "family-alpha"
+        foreign = root / "profiles" / "family-beta"
+        active_file = active / "memories" / "MEMORY.md"
+        foreign_file = foreign / "memories" / "MEMORY.md"
+        default_file = root / "memories" / "MEMORY.md"
+        for path in (active_file, foreign_file, default_file):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("private", encoding="utf-8")
+
+        context = self._context("family-alpha")
+        with (
+            patch("agent.file_safety._hermes_root_path", return_value=root),
+            patch("agent.file_safety._hermes_home_path", return_value=active),
+            patch("agent.secret_scope.is_multiplex_active", return_value=True),
+            patch("gateway.session_context.get_resolved_access_context", return_value=context),
+        ):
+            assert get_read_block_error(str(active_file)) is None
+            assert "another Hermes profile" in (get_read_block_error(str(foreign_file)) or "")
+            assert "another Hermes profile" in (get_read_block_error(str(default_file)) or "")
+
+    def test_missing_context_blocks_hermes_state_but_not_external_project(self, tmp_path):
+        root = tmp_path / "hermes"
+        foreign_file = root / "profiles" / "family-beta" / "memories" / "MEMORY.md"
+        foreign_file.parent.mkdir(parents=True)
+        foreign_file.write_text("private", encoding="utf-8")
+        project_file = tmp_path / "project" / "README.md"
+        project_file.parent.mkdir()
+        project_file.write_text("public", encoding="utf-8")
+
+        with (
+            patch("agent.file_safety._hermes_root_path", return_value=root),
+            patch("agent.file_safety._hermes_home_path", return_value=root),
+            patch("agent.secret_scope.is_multiplex_active", return_value=True),
+            patch("gateway.session_context.get_resolved_access_context", return_value=None),
+        ):
+            assert "context unavailable" in (get_read_block_error(str(foreign_file)) or "")
+            assert get_read_block_error(str(project_file)) is None
 
     def test_hub_directory_blocked(self, tmp_path):
         """Hub directory reads are blocked."""

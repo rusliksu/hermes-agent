@@ -244,6 +244,29 @@ def _is_gateway_approval_context() -> bool:
         return True
     return bool(_get_session_platform())
 
+
+def _has_multiplex_access_context() -> bool:
+    """Return whether an approval callback has a valid server-owned context.
+
+    MCP elicitation callbacks run on a transport-owned task and can otherwise
+    arrive with only legacy session environment values. In a multiplexed
+    gateway those values are not an authority selector: accepting them could
+    route a consent prompt to another principal's session. Validate the
+    typed six-field object and decline when it is missing or malformed.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return True
+        from gateway.access_registry import serialize_resolved_access_context
+        from gateway.session_context import get_resolved_access_context
+
+        serialize_resolved_access_context(get_resolved_access_context(None))
+    except Exception:
+        return False
+    return True
+
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
 # active profile home path such as /home/hermes/.hermes/config.yaml. The
@@ -3862,6 +3885,12 @@ def request_elicitation_consent(
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
+    if not _has_multiplex_access_context():
+        logger.warning(
+            "Elicitation consent blocked: missing or malformed resolved access context"
+        )
+        return "decline"
+
     try:
         session_key = get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive

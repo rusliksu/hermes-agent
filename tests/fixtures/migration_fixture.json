@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "sessions": [
+    {
+      "legacy_session_id": "legacy-dm-owner-001",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-owner",
+      "chat_id": "synthetic-owner",
+      "principal_id": "principal-owner",
+      "profile_id": "profile-owner",
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-yulia-001",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-yulia",
+      "chat_id": "synthetic-yulia",
+      "principal_id": "principal-yulia",
+      "profile_id": "profile-yulia",
+      "created_at": "2026-01-02T00:00:00Z",
+      "updated_at": "2026-01-02T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-family-01-001",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-family-01",
+      "chat_id": "synthetic-family-01",
+      "principal_id": "principal-family-01",
+      "profile_id": "profile-family-01",
+      "created_at": "2026-01-03T00:00:00Z",
+      "updated_at": "2026-01-03T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-family-02-display-hint",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-family-02",
+      "chat_id": "synthetic-family-02",
+      "principal_id": "principal-family-02",
+      "profile_id": "profile-family-02",
+      "display_name_hint": "Synthetic Display Name",
+      "created_at": "2026-01-04T00:00:00Z",
+      "updated_at": "2026-01-04T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-room-drafts-001",
+      "kind": "room",
+      "scope_id": "room-drafts",
+      "profile_id": "profile-room-drafts",
+      "created_at": "2026-01-05T00:00:00Z",
+      "updated_at": "2026-01-05T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-room-research-001",
+      "kind": "room",
+      "scope_id": "room-research",
+      "profile_id": "profile-room-research",
+      "created_at": "2026-01-06T00:00:00Z",
+      "updated_at": "2026-01-06T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-display-only",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": null,
+      "chat_id": null,
+      "principal_id": null,
+      "profile_id": null,
+      "display_name_hint": "Synthetic Display Name",
+      "created_at": "2026-01-07T00:00:00Z",
+      "updated_at": "2026-01-07T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-conflicting-candidates",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-conflict",
+      "chat_id": "synthetic-conflict",
+      "principal_candidates": ["principal-owner", "principal-family-01"],
+      "created_at": "2026-01-08T00:00:00Z",
+      "updated_at": "2026-01-08T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-telegram-mismatch",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-user",
+      "chat_id": "synthetic-chat",
+      "principal_id": "principal-family-03",
+      "profile_id": "profile-family-03",
+      "created_at": "2026-01-09T00:00:00Z",
+      "updated_at": "2026-01-09T00:10:00Z"
+    },
+    {
+      "legacy_session_id": "legacy-dm-unknown-principal",
+      "kind": "dm",
+      "platform": "telegram",
+      "account": "synthetic-bot",
+      "peer_kind": "dm",
+      "user_id": "synthetic-unknown",
+      "chat_id": "synthetic-unknown",
+      "principal_id": "principal-not-registered",
+      "profile_id": "profile-not-registered",
+      "created_at": "2026-01-10T00:00:00Z",
+      "updated_at": "2026-01-10T00:10:00Z"
+    }
+  ],
+  "global_memory": [
+    {"path": "MEMORY.md", "record_hash": "sha256:synthetic-global-memory"},
+    {"path": "USER.md", "record_hash": "sha256:synthetic-global-user"},
+    {"path": "memory/2026-01-01.md", "record_hash": "sha256:synthetic-global-daily"}
+  ]
+}

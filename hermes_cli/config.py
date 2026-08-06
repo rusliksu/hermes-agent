@@ -8699,6 +8699,42 @@ def config_command(args):
             print("    Run 'hermes config migrate' to add them")
         
         print()
+
+    elif subcmd == "media-policy":
+        # This command is intentionally read-only.  It parses either the
+        # active config or an explicitly supplied YAML file and emits only the
+        # credential-safe media-policy report.
+        from tools.media_provider_routing import dry_run_media_policy
+
+        config_file = getattr(args, "file", None)
+        if config_file:
+            policy_path = Path(config_file).expanduser()
+            try:
+                with policy_path.open(encoding="utf-8") as handle:
+                    policy_config = fast_safe_load(handle) or {}
+            except Exception:
+                policy_config = None
+        else:
+            policy_config = load_config()
+
+        report = dry_run_media_policy(policy_config)
+        if getattr(args, "json", False):
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        else:
+            status = "valid" if report.get("valid") else "invalid"
+            print(f"Media policy dry-run: {status} ({report.get('mode', 'unknown')})")
+            for operation, details in report.get("operations", {}).items():
+                order = ", ".join(details.get("provider_order", [])) or "(none)"
+                capability = details.get("capability_status", "unknown")
+                print(f"  {operation}: {order}; capability={capability}")
+            for diagnostic in report.get("diagnostics", []):
+                print(
+                    f"  {diagnostic.get('severity', 'error')}: "
+                    f"{diagnostic.get('path', 'config')}: "
+                    f"{diagnostic.get('message', 'invalid media policy')}"
+                )
+        if not report.get("valid"):
+            sys.exit(1)
     
     else:
         print(f"Unknown config command: {subcmd}")
@@ -8710,6 +8746,7 @@ def config_command(args):
         print("  hermes config set <key> <value>   Set a config value")
         print("  hermes config unset <key>        Remove a config value")
         print("  hermes config check     Check for missing/outdated config")
+        print("  hermes config media-policy --dry-run  Validate media policy (read-only)")
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")

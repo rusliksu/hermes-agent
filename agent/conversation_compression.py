@@ -843,7 +843,16 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    _compacted_rows = agent._session_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        session_scope=getattr(agent, "_session_scope", None),
+                    )
+                    if (
+                        not _compacted_rows
+                        and getattr(agent, "_session_scope_required", False)
+                    ):
+                        raise RuntimeError("session compaction denied by session scope")
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
@@ -963,6 +972,8 @@ def compress_context(
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
                 agent._last_flushed_db_idx = 0
             except Exception as e:
+                if in_place and getattr(agent, "_session_scope_required", False):
+                    raise
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
