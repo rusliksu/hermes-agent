@@ -282,6 +282,31 @@ def test_principal_dm_topic_uses_derived_delivery_and_preserves_session_scope():
     assert registry.validate_resolved_context(context) == context
 
 
+def test_principal_dm_topics_resolve_independently_with_literal_distinct_scopes():
+    registry = _registry()
+    identity_alpha = _dm_identity("opaque-family-0", thread_id="topic-alpha")
+    identity_beta = _dm_identity("opaque-family-0", thread_id="topic-beta")
+
+    context_alpha = registry.resolve(identity_alpha)
+    context_beta = registry.resolve(identity_beta)
+    scope_alpha = session_scope_from_resolved_access_context(context_alpha)
+    scope_beta = session_scope_from_resolved_access_context(context_beta)
+
+    assert (
+        registry.validate_resolved_context_for_identity(context_alpha, identity_alpha)
+        == context_alpha
+    )
+    assert (
+        registry.validate_resolved_context_for_identity(context_beta, identity_beta)
+        == context_beta
+    )
+    assert scope_alpha["thread_id"] == "topic-alpha"
+    assert scope_beta["thread_id"] == "topic-beta"
+    assert scope_alpha != scope_beta
+    assert context_alpha.delivery_target.thread_id == "topic-alpha"
+    assert context_beta.delivery_target.thread_id == "topic-beta"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

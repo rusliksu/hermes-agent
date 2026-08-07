@@ -780,6 +780,28 @@ class AccessRegistry:
             return shared_context
         return matches[0]
 
+    def validate_resolved_context_for_identity(
+        self,
+        context: Any,
+        identity: TransportIdentity,
+    ) -> ResolvedAccessContext:
+        """Validate a resolved context against the original trusted identity."""
+        audit = RedactedAuditMetadata.from_transport(
+            "validate_context_source",
+            identity,
+        )
+        if not isinstance(identity, TransportIdentity) or not _valid_ingress_identity(identity):
+            raise AccessDeniedError("malformed_identity", audit)
+
+        validated = self.validate_resolved_context(context)
+        expected = self.resolve(identity)
+        if (
+            not _delivery_matches_identity(validated.delivery_target, identity)
+            or validated != expected
+        ):
+            raise AccessDeniedError("resolved_access_context_source_mismatch", audit)
+        return expected
+
     def resolve_exact_profile_context(self, profile_id: str) -> ResolvedAccessContext:
         audit = RedactedAuditMetadata(event="resolve_profile_context")
         if not _is_nonempty_str(profile_id):
