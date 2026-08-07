@@ -67,6 +67,19 @@ def _bound_access_context() -> Any:
         raise ValueError("resolved access context unavailable") from exc
 
 
+def _bound_owner_default() -> bool:
+    context = _bound_access_context()
+    try:
+        from gateway.access_registry import ResolvedAccessContext
+    except Exception:
+        return False
+    return (
+        isinstance(context, ResolvedAccessContext)
+        and context.role_id == "owner"
+        and context.profile_id == "default"
+    )
+
+
 def _bound_profile_home() -> Path | None:
     context = _bound_access_context()
     if context is _UNSET or context is None:
@@ -92,9 +105,10 @@ def _bound_profile_home() -> Path | None:
         validate_profile_name(canonical)
     except Exception as exc:
         raise ValueError("malformed resolved access profile") from exc
+    owner_default = canonical == "default" and context.role_id == "owner"
     if (
         canonical != profile_id
-        or canonical == "default"
+        or (canonical == "default" and not owner_default)
         or canonical in _CWD_PLACEHOLDERS
         or not profile_exists(canonical)
     ):
@@ -105,10 +119,9 @@ def _bound_profile_home() -> Path | None:
         profiles_root = _get_profiles_root().resolve()
     except Exception as exc:
         raise ValueError("resolved access profile home unavailable") from exc
-    if (
-        not resolved.is_dir()
-        or resolved == profiles_root
-        or not _relative_to(resolved, profiles_root)
+    if not resolved.is_dir() or (
+        not owner_default
+        and (resolved == profiles_root or not _relative_to(resolved, profiles_root))
     ):
         raise ValueError("resolved access profile home unavailable")
     return resolved
@@ -152,7 +165,13 @@ def bound_profile_terminal_config() -> dict[str, Any] | None:
     return dict(terminal_cfg)
 
 
-def _strict_existing_absolute_dir(raw: Any, *, home: Path, label: str) -> Path | None:
+def _strict_existing_absolute_dir(
+    raw: Any,
+    *,
+    home: Path,
+    label: str,
+    allow_outside_home: bool = False,
+) -> Path | None:
     if not isinstance(raw, str):
         raise ValueError(f"typed {label} cwd malformed")
     value = raw.strip()
@@ -163,7 +182,9 @@ def _strict_existing_absolute_dir(raw: Any, *, home: Path, label: str) -> Path |
         if not p.is_absolute():
             raise ValueError(f"typed {label} cwd malformed")
         resolved = p.resolve()
-        if not resolved.is_dir() or not _relative_to(resolved, home):
+        if not resolved.is_dir() or (
+            not allow_outside_home and not _relative_to(resolved, home)
+        ):
             raise ValueError(f"typed {label} cwd outside profile")
         return resolved
     except ValueError:
@@ -184,27 +205,34 @@ def resolve_bound_profile_cwd(candidate: str | None = None) -> Path | None:
     """Return the typed profile cwd, or None on legacy/no-context paths.
 
     The server-bound profile config may name an absolute existing
-    ``terminal.cwd`` inside the resolved profile home. Missing cwd uses the
-    profile home as the base; malformed configured/candidate cwd values fail
-    closed instead of falling back to process env, owner/default, or local cwd.
+    ``terminal.cwd`` inside the resolved profile home. The exact owner/default
+    context preserves its configured host cwd; every other typed profile stays
+    contained in its profile home. Missing or malformed configured/candidate cwd
+    values fail closed instead of falling back to process env or local cwd.
     """
     home = _bound_profile_home()
     if home is None:
         return None
     terminal_cfg = bound_profile_terminal_config() or {}
     base = home
+    owner_default = _bound_owner_default()
     if "cwd" in terminal_cfg and terminal_cfg.get("cwd") is not None:
-        base = _strict_existing_absolute_dir(
-            terminal_cfg.get("cwd"),
-            home=home,
-            label="configured",
-        ) or home
+        base = (
+            _strict_existing_absolute_dir(
+                terminal_cfg.get("cwd"),
+                home=home,
+                label="configured",
+                allow_outside_home=owner_default,
+            )
+            or home
+        )
 
     if candidate is not None and str(candidate).strip():
         resolved = _strict_existing_absolute_dir(
             candidate,
             home=home,
             label="candidate",
+            allow_outside_home=owner_default,
         )
         if not _relative_to(resolved, base):
             raise ValueError("typed candidate cwd outside configured cwd")

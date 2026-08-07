@@ -1,9 +1,13 @@
 """Tests for agent/runtime_cwd.py — the single source of truth for the agent working directory."""
 
+import json
 import os
 from pathlib import Path
 
 import pytest
+
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
 
 import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
@@ -16,6 +20,77 @@ from agent.runtime_cwd import (
 
 def _raise_oserror(*args, **kwargs):
     raise OSError("cwd gone")
+
+
+def _access_context(*, role_id: str, profile_id: str) -> ResolvedAccessContext:
+    return ResolvedAccessContext(
+        principal_id="principal-a",
+        role_id=role_id,
+        profile_id=profile_id,
+        conversation_scope="private",
+        capabilities=frozenset(),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="primary",
+            peer_kind="dm",
+            chat_id="chat-a",
+        ),
+    )
+
+
+class TestBoundProfileHome:
+    def test_exact_owner_default_profile_uses_root_home(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        project = tmp_path / "owner-workspace"
+        home.mkdir()
+        project.mkdir()
+        (home / "config.yaml").write_text(
+            json.dumps({"terminal": {"cwd": str(project)}})
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with bind_resolved_access_context(
+            _access_context(role_id="owner", profile_id="default")
+        ):
+            assert rt.bound_profile_home() == home.resolve()
+            assert resolve_agent_cwd() == project.resolve()
+
+    def test_non_owner_default_profile_stays_fail_closed(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with (
+            bind_resolved_access_context(
+                _access_context(role_id="family", profile_id="default")
+            ),
+            pytest.raises(ValueError, match="malformed resolved access profile"),
+        ):
+            rt.bound_profile_home()
+
+    def test_named_profile_cwd_outside_profile_stays_fail_closed(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / ".hermes"
+        profile = home / "profiles" / "family-a"
+        outside = tmp_path / "outside"
+        profile.mkdir(parents=True)
+        outside.mkdir()
+        (profile / "config.yaml").write_text(
+            json.dumps({"terminal": {"cwd": str(outside)}})
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with (
+            bind_resolved_access_context(
+                _access_context(role_id="family", profile_id="family-a")
+            ),
+            pytest.raises(ValueError, match="typed configured cwd outside profile"),
+        ):
+            resolve_agent_cwd()
 
 
 class TestResolveAgentCwd:
