@@ -6,12 +6,15 @@ from pathlib import Path
 import pytest
 
 import agent.runtime_cwd as rt
+import hermes_cli.profiles as profiles
 from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
     set_session_cwd,
 )
+from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+from gateway.session_context import bind_resolved_access_context
 
 
 def _raise_oserror(*args, **kwargs):
@@ -91,6 +94,39 @@ class TestResolveContextCwd:
         # than building Path("   ") and resolving garbage under the launch dir.
         monkeypatch.setenv("TERMINAL_CWD", "   ")
         assert resolve_context_cwd() is None
+
+
+class TestTypedProfileCwd:
+    def test_missing_config_uses_validated_profile_home(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "profiles" / "family-test"
+        profile_home.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setattr(
+            profiles,
+            "_get_default_hermes_home",
+            lambda: hermes_home,
+        )
+        monkeypatch.setenv("TERMINAL_CWD", str(outside))
+        context = ResolvedAccessContext(
+            principal_id="principal-family-test",
+            role_id="family_standard",
+            profile_id="family-test",
+            conversation_scope="private",
+            capabilities=frozenset(),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="bot-a",
+                peer_kind="dm",
+                chat_id="10001",
+            ),
+        )
+
+        with bind_resolved_access_context(context):
+            assert rt.bound_profile_terminal_config() == {}
+            assert resolve_agent_cwd() == profile_home.resolve()
+            assert resolve_context_cwd() == profile_home.resolve()
 
 
 class TestSessionCwdOverride:
