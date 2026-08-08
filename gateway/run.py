@@ -3917,6 +3917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expected_tool_names: frozenset[str] | None = None,
     ) -> None:
         from tools.memory_tool import MemoryStore
+        from gateway.session_context import get_resolved_access_context
 
         valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
         if expected_tool_names is not None:
@@ -3929,12 +3930,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             valid = "memory" in valid_tool_names
         if not valid:
             raise RuntimeError("shared capability profile validation failed")
-        memory_dir = get_hermes_home() / "memories" / "shared" / scope.memory_namespace
+        access_context = get_resolved_access_context()
+        if access_context is not None:
+            from gateway.access_registry import (
+                shared_memory_namespace_for_access_context,
+            )
+
+            memory_namespace = shared_memory_namespace_for_access_context(access_context)
+        else:
+            memory_namespace = scope.memory_namespace
+        memory_dir = get_hermes_home() / "memories" / "shared" / memory_namespace
         store = MemoryStore(
             memory_char_limit=memory_config.get("memory_char_limit", 2200),
             user_char_limit=memory_config.get("user_char_limit", 1375),
             memory_dir=memory_dir,
             allow_user_profile=False,
+            access_context=access_context,
+            require_access_context=access_context is not None,
         )
         store.load_from_disk()
         agent._memory_store = store
