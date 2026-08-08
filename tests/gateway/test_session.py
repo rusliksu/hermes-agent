@@ -1,6 +1,7 @@
 """Tests for gateway session management."""
 import json
 import pytest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
@@ -1543,6 +1544,157 @@ class TestSessionEntryAccessContext:
         assert reset is not None
         assert reset.resolved_access_context == context
         assert reset.origin.resolved_access_context == context
+
+
+class TestSessionStoreAccessContextRebind:
+    @staticmethod
+    def _context(*, thread_id=None):
+        from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+
+        return ResolvedAccessContext(
+            principal_id="principal-family",
+            role_id="family",
+            profile_id="profile-family",
+            conversation_scope="private:principal-family",
+            capabilities=frozenset({"memory_read", "public_web"}),
+            delivery_target=DeliveryTarget(
+                platform="telegram",
+                account="family-bot",
+                peer_kind="dm",
+                chat_id="family-chat",
+                thread_id=thread_id,
+            ),
+        )
+
+    @classmethod
+    def _source(cls, context):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="family-chat",
+            chat_type="dm",
+            user_id="family-user",
+            profile="profile-family",
+            route_account="family-bot",
+            resolved_access_context=context,
+        )
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(
+            sessions_dir=tmp_path / "sessions",
+            config=GatewayConfig(multiplex_profiles=True),
+        )
+        yield store
+        if store._db is not None:
+            store._db.close()
+
+    def test_rebinds_persisted_family_dm_context_from_root_to_recovered_topic(
+        self, store
+    ):
+        root_context = self._context()
+        topic_context = self._context(thread_id="recovered-topic")
+        root_source = self._source(root_context)
+        topic_source = self._source(topic_context)
+
+        root_entry = store.get_or_create_session(root_source)
+        assert root_entry.resolved_access_context == root_context
+
+        store._db.close()
+        store._db = None
+        restarted = SessionStore(
+            sessions_dir=store.sessions_dir,
+            config=GatewayConfig(multiplex_profiles=True),
+        )
+        try:
+            topic_entry = restarted.get_or_create_session(topic_source)
+
+            assert topic_entry.session_id == root_entry.session_id
+            assert topic_entry.resolved_access_context == topic_context
+
+            payload = json.loads(
+                (restarted.sessions_dir / "sessions.json").read_text(encoding="utf-8")
+            )
+            assert (
+                payload[root_entry.session_key]["resolved_access_context"]
+                == topic_entry.to_dict()["resolved_access_context"]
+            )
+            persisted = restarted._db.load_gateway_routing_entries(
+                scope=restarted._routing_scope()
+            )
+            assert json.loads(persisted[root_entry.session_key])[
+                "resolved_access_context"
+            ] == topic_entry.to_dict()["resolved_access_context"]
+        finally:
+            restarted._db.close()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("principal_id", "other-principal"),
+            ("role_id", "owner"),
+            ("profile_id", "other-profile"),
+            ("conversation_scope", "private:other-principal"),
+            ("capabilities", frozenset({"memory_read"})),
+        ],
+    )
+    def test_authorization_field_mismatch_remains_fail_closed(
+        self, store, field, value
+    ):
+        root_context = self._context()
+        store.get_or_create_session(self._source(root_context))
+        topic_context = replace(
+            self._context(thread_id="recovered-topic"),
+            **{field: value},
+        )
+
+        with pytest.raises(ValueError, match="resolved_access_context_mismatch"):
+            store.get_or_create_session(self._source(topic_context))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("platform", "signal"),
+            ("account", "other-bot"),
+            ("peer_kind", "group"),
+            ("chat_id", "other-chat"),
+        ],
+    )
+    def test_delivery_identity_mismatch_remains_fail_closed(
+        self, store, field, value
+    ):
+        root_context = self._context()
+        store.get_or_create_session(self._source(root_context))
+        topic_context = self._context(thread_id="recovered-topic")
+        topic_context = replace(
+            topic_context,
+            delivery_target=replace(
+                topic_context.delivery_target,
+                **{field: value},
+            ),
+        )
+
+        with pytest.raises(ValueError, match="resolved_access_context_mismatch"):
+            store.get_or_create_session(self._source(topic_context))
+
+    @pytest.mark.parametrize(
+        "bad_context",
+        [object(), {"unknown": "context"}],
+        ids=["object", "mapping"],
+    )
+    def test_malformed_source_context_is_rejected(self, store, bad_context):
+        with pytest.raises(ValueError, match="malformed_resolved_access_context"):
+            store.get_or_create_session(self._source(bad_context))
+
+    def test_malformed_persisted_context_is_rejected(self, store):
+        root_context = self._context()
+        entry = store.get_or_create_session(self._source(root_context))
+        entry.resolved_access_context = object()
+
+        with pytest.raises(ValueError):
+            store.get_or_create_session(self._source(self._context(thread_id="topic")))
 
 
 class TestLastPromptTokens:
