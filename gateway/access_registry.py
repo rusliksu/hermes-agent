@@ -771,11 +771,36 @@ class AccessRegistry:
         if not self.validate().valid:
             raise AccessDeniedError("registry_validation_failed", audit)
         if not matches:
+            principal_context = self._validate_derived_principal_context(context, audit)
+            if principal_context is not None:
+                return principal_context
             shared_context = self._validate_derived_shared_context(context, audit)
             if shared_context is None:
                 raise AccessDeniedError("resolved_access_context_mismatch", audit)
             return shared_context
         return matches[0]
+
+    def validate_resolved_context_for_identity(
+        self,
+        context: Any,
+        identity: TransportIdentity,
+    ) -> ResolvedAccessContext:
+        """Validate a resolved context against the original trusted identity."""
+        audit = RedactedAuditMetadata.from_transport(
+            "validate_context_source",
+            identity,
+        )
+        if not isinstance(identity, TransportIdentity) or not _valid_ingress_identity(identity):
+            raise AccessDeniedError("malformed_identity", audit)
+
+        validated = self.validate_resolved_context(context)
+        expected = self.resolve(identity)
+        if (
+            not _delivery_matches_identity(validated.delivery_target, identity)
+            or validated != expected
+        ):
+            raise AccessDeniedError("resolved_access_context_source_mismatch", audit)
+        return expected
 
     def resolve_exact_profile_context(self, profile_id: str) -> ResolvedAccessContext:
         audit = RedactedAuditMetadata(event="resolve_profile_context")
@@ -855,7 +880,12 @@ class AccessRegistry:
             raise AccessDeniedError("disabled_principal_binding", audit)
         binding = _single_match(matches, "principal_binding", audit)
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
-        return self._context_from_binding(binding)
+        return self._context_from_binding(
+            binding,
+            delivery_target=_delivery_target_from_principal_identity(identity)
+            if identity.thread_id is not None
+            else None,
+        )
 
     def _resolve_shared_room(
         self,
@@ -963,6 +993,42 @@ class AccessRegistry:
             delivery_target=_delivery_target_from_room_identity(identity)
             if parent_match
             else None,
+        )
+        return expected if expected == context else None
+
+    def _validate_derived_principal_context(
+        self,
+        context: ResolvedAccessContext,
+        audit: RedactedAuditMetadata,
+    ) -> Optional[ResolvedAccessContext]:
+        target = context.delivery_target
+        if not isinstance(target, DeliveryTarget) or target.peer_kind != "dm" or target.thread_id is None:
+            return None
+        identity = TransportIdentity(
+            platform=target.platform,
+            account=target.account,
+            peer_kind=target.peer_kind,
+            user_id=target.chat_id,
+            chat_id=target.chat_id,
+            thread_id=target.thread_id,
+        )
+        if not _valid_principal_binding_identity(identity):
+            return None
+        matches = [
+            binding
+            for binding in self.principal_bindings
+            if (
+                binding.active
+                and _valid_principal_binding_identity(binding.transport_identity)
+            )
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
+        ]
+        if not matches:
+            return None
+        binding = _single_match(matches, "principal_binding", audit)
+        expected = self._context_from_binding(
+            binding,
+            delivery_target=_delivery_target_from_principal_identity(identity),
         )
         return expected if expected == context else None
 
@@ -1094,6 +1160,16 @@ def _room_parent_key(identity: TransportIdentity) -> tuple[str, str, str, str]:
 
 
 def _delivery_target_from_room_identity(identity: TransportIdentity) -> DeliveryTarget:
+    return DeliveryTarget(
+        platform=identity.platform,
+        account=identity.account,
+        peer_kind=identity.peer_kind,
+        chat_id=identity.chat_id,
+        thread_id=identity.thread_id,
+    )
+
+
+def _delivery_target_from_principal_identity(identity: TransportIdentity) -> DeliveryTarget:
     return DeliveryTarget(
         platform=identity.platform,
         account=identity.account,

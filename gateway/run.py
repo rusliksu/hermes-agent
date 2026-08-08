@@ -5831,6 +5831,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    @staticmethod
+    def _transport_identity_for_source(source: SessionSource):
+        from gateway.access_registry import TransportIdentity
+
+        return TransportIdentity.from_session_source(
+            source,
+            account=getattr(source, "route_account", None),
+        )
+
     def _resolve_access_context_for_source(self, source: SessionSource):
         """Resolve and validate the server-owned six-field access context."""
         # Drop inherited session/access state before resolving this event. The
@@ -5848,11 +5857,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.access_registry import (
             AccessDeniedError,
             RedactedAuditMetadata,
-            TransportIdentity,
         )
 
-        account = getattr(source, "route_account", None)
-        identity = TransportIdentity.from_session_source(source, account=account)
+        identity = self._transport_identity_for_source(source)
         context = registry.resolve(identity)
         stamped_profile = (getattr(source, "profile", None) or "").strip()
         if stamped_profile and stamped_profile != context.profile_id:
@@ -5860,7 +5867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile_route_mismatch",
                 RedactedAuditMetadata.from_transport("profile_route_mismatch", identity),
             )
-        return registry.validate_resolved_context(context)
+        return registry.validate_resolved_context_for_identity(context, identity)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # The adapter's busy path runs before ``_handle_message``.  Apply the
@@ -9650,7 +9657,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if context is None:
                 return await self._handle_message_inner(event)
             try:
-                context = registry.validate_resolved_context(context)
+                context = registry.validate_resolved_context_for_identity(
+                    context,
+                    self._transport_identity_for_source(event.source),
+                )
             except Exception:
                 logger.warning("Access-registry internal event context rejected", exc_info=True)
                 return None
@@ -9662,6 +9672,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error(
                 "Access registry configured while multiplex_profiles is disabled; "
                 "rejecting ingress rather than running in the owner profile"
+            )
+            return None
+
+        # Normalize topic routing before resolving the trusted access context.
+        # Telegram may deliver a lobby-shaped reply without its topic thread;
+        # recovery then changes the session key's thread_id.  Resolve/bind
+        # against that final source so SessionDB's scoped append guard sees the
+        # same thread as the session row.  The existing inner recovery remains
+        # idempotent for the already-normalized source.
+        try:
+            event.source = self._normalize_source_for_session_key(event.source)
+        except Exception as exc:
+            logger.warning(
+                "Access-registry ingress normalization failed closed: error=%s",
+                type(exc).__name__,
+                exc_info=True,
             )
             return None
 
@@ -16512,7 +16538,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 context = deserialize_resolved_access_context(payload)
                 if registry is not None:
-                    context = registry.validate_resolved_context(context)
+                    identity = self._transport_identity_for_source(source)
+                    context = registry.validate_resolved_context_for_identity(
+                        context,
+                        identity,
+                    )
                     # The persisted payload must still belong to this exact
                     # source. This prevents a guessed session key or stale
                     # watcher record from routing another profile's result.
@@ -18386,7 +18416,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         RedactedAuditMetadata(event="profile_home"),
                     )
                 context = registry.resolve_exact_profile_context(stamped_profile)
-            context = registry.validate_resolved_context(context)
+            context = registry.validate_resolved_context_for_identity(
+                context,
+                self._transport_identity_for_source(source),
+            )
             name = context.profile_id
             if (getattr(source, "profile", None) or "").strip() not in {"", name}:
                 raise AccessDeniedError(
