@@ -3856,10 +3856,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "self_reminder": "cronjob",
                 "delegation": "delegation",
                 "wolfram": "wolfram",
+                "documents": "file",
+                "docker_terminal": "terminal",
+                "isolated_browser": "browser",
             },
             "shared_room": {
                 "public_web": "web",
                 "vision": "vision",
+                "documents": "file",
             },
         }
         capability_toolsets = role_capability_toolsets.get(role_id)
@@ -3906,6 +3910,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if "vision" in context.capabilities and "vision" in configured:
             toolsets.append("vision")
             expected_tools.add("vision_analyze")
+        if "documents" in context.capabilities and "file" in configured:
+            toolsets.append("file")
+            expected_tools.update({"read_file", "write_file", "patch", "search_files"})
         return sorted(toolsets), frozenset(expected_tools)
 
     @staticmethod
@@ -9334,6 +9341,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value,
                 )
                 continue
+
+            adapter.set_inbound_profile_scope(
+                lambda profile_home=profile_home: _profile_runtime_scope(profile_home)
+            )
 
             # Same-token conflict detection — refuse a duplicate poll.
             fp = self._adapter_credential_fingerprint(adapter)

@@ -183,6 +183,25 @@ def test_family_capability_cannot_enable_disabled_platform_toolset():
     ) == ["web"]
 
 
+def test_family_documents_terminal_and_browser_capabilities_map_to_toolsets():
+    assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        ["file", "terminal", "browser"],
+        _context("family", {"documents", "docker_terminal", "isolated_browser"}),
+    ) == ["browser", "file", "terminal"]
+
+
+def test_shared_room_documents_exposes_file_tool_contract():
+    toolsets, expected_tools = gateway_run.GatewayRunner._shared_tool_profile_for_source(
+        _source(_shared_context({"documents"})),
+        configured_toolsets=["file"],
+    )
+
+    assert toolsets == ["file"]
+    assert expected_tools == frozenset(
+        {"read_file", "write_file", "patch", "search_files"}
+    )
+
+
 def test_family_delegation_only_with_capability_and_config():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,

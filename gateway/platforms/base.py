@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -2504,6 +2505,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
         self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
+        self._inbound_profile_scope_factory: Optional[Callable[[], Any]] = None
         
         # Track active message handlers per session for interrupt support.
         # _active_sessions stores the per-session interrupt Event; _session_tasks
@@ -2834,6 +2836,19 @@ class BasePlatformAdapter(ABC):
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
+
+    def set_inbound_profile_scope(
+        self, factory: Optional[Callable[[], Any]]
+    ) -> None:
+        """Set the context-manager factory for inbound profile-scoped work."""
+        self._inbound_profile_scope_factory = factory
+
+    def _inbound_profile_scope(self):
+        """Return the current inbound profile scope, or a no-op context."""
+        factory = getattr(self, "_inbound_profile_scope_factory", None)
+        if factory is None:
+            return nullcontext()
+        return factory()
 
     def _mark_connected(self) -> None:
         self._running = True

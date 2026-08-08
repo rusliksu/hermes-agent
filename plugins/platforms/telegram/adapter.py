@@ -21,7 +21,9 @@ import secrets
 import threading
 import time
 from contextvars import ContextVar
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Dict, List, Optional, Set, Any
 
 from agent.i18n import t
@@ -298,6 +300,16 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+
+def _with_inbound_profile_scope(handler):
+    @wraps(handler)
+    async def wrapped(self, update, *args, **kwargs):
+        with self._inbound_profile_scope_for_update(update):
+            return await handler(self, update, *args, **kwargs)
+
+    return wrapped
+
 
 def _coerce_duration_seconds(value: Any) -> Optional[int]:
     """Round a raw length to whole positive seconds, or None if unusable."""
@@ -8894,6 +8906,42 @@ class TelegramAdapter(BasePlatformAdapter):
             return MessageType.VOICE
         return MessageType.DOCUMENT
 
+    def _inbound_profile_scope_for_update(self, update: Update):
+        """Return the profile scope for a primary or profile-owned update."""
+        if getattr(self, "_inbound_profile_scope_factory", None) is not None:
+            return self._inbound_profile_scope()
+
+        gateway_runner = getattr(self, "gateway_runner", None)
+        message = getattr(update, "message", None)
+        if (
+            gateway_runner is None
+            or not getattr(
+                getattr(gateway_runner, "config", None),
+                "multiplex_profiles",
+                False,
+            )
+            or message is None
+        ):
+            return nullcontext()
+
+        event = self._build_message_event(
+            message,
+            self._media_message_type(message),
+            update_id=getattr(update, "update_id", None),
+        )
+        try:
+            profile_home = gateway_runner._resolve_profile_home_for_source(
+                event.source
+            )
+        except Exception:
+            if getattr(gateway_runner, "access_registry", None) is not None:
+                raise
+            return nullcontext()
+
+        from gateway.run import _profile_runtime_scope
+
+        return _profile_runtime_scope(profile_home)
+
     async def _cache_observed_media(self, msg: Message, event: MessageEvent) -> None:
         """Cache an unmentioned group attachment and annotate the observed text.
 
@@ -9504,6 +9552,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
+    @_with_inbound_profile_scope
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
