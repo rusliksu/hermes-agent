@@ -3919,8 +3919,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.memory_tool import MemoryStore
 
         valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
-        if expected_tool_names:
-            valid = valid_tool_names == set(expected_tool_names)
+        if expected_tool_names is not None:
+            valid = (
+                isinstance(expected_tool_names, frozenset)
+                and "memory" in valid_tool_names
+                and valid_tool_names.issubset(expected_tool_names)
+            )
         else:
             valid = "memory" in valid_tool_names
         if not valid:
@@ -18565,15 +18569,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         shared_scope = self._shared_scope_for_source(source)
-        shared_expected_tool_names = frozenset()
+        shared_expected_tool_names: frozenset[str] | None = None
         if shared_scope is not None:
-            enabled_toolsets, shared_expected_tool_names = (
+            enabled_toolsets, static_expected_tool_names = (
                 self._shared_tool_profile_for_source(
                     source,
                     configured_toolsets=configured_toolsets,
                 )
             )
             if getattr(source, "resolved_access_context", None) is not None:
+                shared_expected_tool_names = static_expected_tool_names
                 disabled_toolsets = ["kanban"]
 
         display_config = user_config.get("display", {})

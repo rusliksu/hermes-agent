@@ -254,6 +254,117 @@ def test_shared_scope_binds_scoped_memory_with_full_tools_and_denies_admin_comma
         )
 
 
+@pytest.mark.parametrize(
+    "runtime_tool_names",
+    [
+        frozenset({"memory", "web_search", "web_extract"}),
+        frozenset({"memory"}),
+    ],
+    ids=["one-optional-tool-unavailable", "multiple-optional-tools-unavailable"],
+)
+def test_shared_scope_binds_reduced_runtime_capability_profile_without_scope_leakage(
+    runtime_tool_names, tmp_path, monkeypatch
+):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+    import gateway.run as run_module
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    runner = _runner(policy)
+    root_source = _source(OWNER, chat_id="-10001", chat_type="group")
+    topic_source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="31",
+    )
+    topic_source.resolved_access_context = ResolvedAccessContext(
+        principal_id="room",
+        role_id="shared_room",
+        profile_id="room-profile",
+        conversation_scope="room",
+        capabilities=frozenset({"room_memory", "public_web", "vision"}),
+        delivery_target=DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="group",
+            chat_id="-10001",
+        ),
+    )
+    _, expected_tool_names = runner._shared_tool_profile_for_source(
+        topic_source,
+        configured_toolsets=["memory", "web", "vision"],
+    )
+    assert expected_tool_names == frozenset(
+        {"memory", "web_search", "web_extract", "vision_analyze"}
+    )
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    bound_dirs = set()
+    for source in (root_source, topic_source):
+        scope = policy.shared_scope(source)
+        assert scope is not None
+        agent = SimpleNamespace(valid_tool_names=runtime_tool_names)
+        runner._bind_shared_memory(
+            agent,
+            scope,
+            {},
+            expected_tool_names=expected_tool_names,
+        )
+        assert agent._memory_store.memory_dir == (
+            tmp_path / "memories" / "shared" / scope.memory_namespace
+        )
+        bound_dirs.add(agent._memory_store.memory_dir)
+
+    assert len(bound_dirs) == 2
+
+
+@pytest.mark.parametrize(
+    "runtime_tool_names,expected_tool_names",
+    [
+        pytest.param(
+            frozenset({"web_search"}),
+            frozenset({"memory", "web_search"}),
+            id="memory-required",
+        ),
+        pytest.param(
+            frozenset({"memory", "terminal"}),
+            frozenset({"memory", "web_search"}),
+            id="runtime-tool-outside-profile",
+        ),
+        pytest.param(
+            frozenset({"memory"}),
+            frozenset(),
+            id="empty-profile",
+        ),
+        pytest.param(
+            frozenset({"memory"}),
+            {"memory"},
+            id="malformed-profile",
+        ),
+    ],
+)
+def test_shared_scope_strict_profile_rejects_invalid_runtime_or_expected_tools(
+    runtime_tool_names, expected_tool_names, tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    scope = policy.shared_scope(
+        _source(OUTSIDER, chat_id="-10001", chat_type="group", thread_id="31")
+    )
+    assert scope is not None
+    runner = _runner(policy)
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="shared capability profile"):
+        runner._bind_shared_memory(
+            SimpleNamespace(valid_tool_names=runtime_tool_names),
+            scope,
+            {},
+            expected_tool_names=expected_tool_names,
+        )
+
+
 @pytest.mark.parametrize("command", ["settings", "model", "reasoning", "fast"])
 def test_policy_authorized_shared_topic_allows_lane_controls(command):
     policy = _policy(telegram_shared_chat_ids=["-10001"])
