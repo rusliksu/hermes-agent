@@ -561,6 +561,167 @@ async def test_shared_turn_uses_configured_telegram_tool_profile(
     assert shared_signature != private_signature
 
 
+@pytest.mark.parametrize(
+    "runtime_tool_names",
+    [
+        frozenset({"memory", "web_search", "web_extract"}),
+        frozenset({"memory"}),
+    ],
+    ids=["one-optional-tool-unavailable", "multiple-optional-tools-unavailable"],
+)
+@pytest.mark.asyncio
+async def test_shared_turn_binds_reduced_typed_profile_for_root_and_topic(
+    runtime_tool_names, tmp_path, monkeypatch
+):
+    from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
+    import gateway.run as run_module
+    import run_agent
+
+    created_agents = []
+
+    class AvailabilityFilteredAgent:
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.tools = []
+            self.valid_tool_names = set(runtime_tool_names)
+            created_agents.append(self)
+
+        def run_conversation(self, *args, **kwargs):
+            return {
+                "final_response": "ok",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    runner = _runner(policy)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    runner._pending_model_notes = {}
+    runner._session_db = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(streaming=None, single_principal=policy)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        load_transcript=lambda session_id: [],
+    )
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
+
+    monkeypatch.setattr(run_module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(run_module, "_hermes_home", tmp_path)
+    monkeypatch.setattr(run_module, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(run_module, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_module,
+        "_load_gateway_config",
+        lambda: {
+            "platform_toolsets": {
+                "telegram": ["memory", "web", "vision", "terminal"],
+            },
+        },
+    )
+    monkeypatch.setattr(run_module, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(
+        run_module,
+        "_resolve_gateway_model",
+        lambda config=None: "test-model",
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test",
+        },
+    )
+    monkeypatch.setattr(run_agent, "AIAgent", AvailabilityFilteredAgent)
+
+    memory_dirs = set()
+    for label, thread_id in (("root", None), ("topic", "31")):
+        source = _source(
+            OUTSIDER,
+            chat_id="-10001",
+            chat_type="group",
+            thread_id=thread_id,
+        )
+        delivery_target = DeliveryTarget(
+            platform="telegram",
+            account="bot-a",
+            peer_kind="group",
+            chat_id="-10001",
+            thread_id=thread_id,
+        )
+        source.resolved_access_context = ResolvedAccessContext(
+            principal_id="principal-room",
+            role_id="shared_room",
+            profile_id="room-profile",
+            conversation_scope="room",
+            capabilities=frozenset({"room_memory", "public_web", "vision"}),
+            delivery_target=delivery_target,
+        )
+        context = source.resolved_access_context
+
+        assert policy.authorize(source) is True
+        assert isinstance(context, ResolvedAccessContext)
+        assert (
+            context.principal_id,
+            context.role_id,
+            context.profile_id,
+            context.conversation_scope,
+            context.capabilities,
+            context.delivery_target,
+        ) == (
+            "principal-room",
+            "shared_room",
+            "room-profile",
+            "room",
+            frozenset({"room_memory", "public_web", "vision"}),
+            delivery_target,
+        )
+
+        result = await runner._run_agent(
+            message="open the link",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=f"session-{label}",
+            session_key=f"agent:main:telegram:group:shared:{label}",
+        )
+
+        assert result["final_response"] == "ok"
+        agent = created_agents[-1]
+        assert agent.init_kwargs["enabled_toolsets"] == ["memory", "vision", "web"]
+        assert agent.init_kwargs["disabled_toolsets"] == ["kanban"]
+        assert agent.valid_tool_names == set(runtime_tool_names)
+        assert agent._memory_enabled is True
+        assert agent._user_profile_enabled is False
+        assert agent._memory_store.allow_user_profile is False
+
+        scope = policy.shared_scope(source)
+        assert scope is not None
+        expected_memory_dir = (
+            tmp_path / "memories" / "shared" / scope.memory_namespace
+        )
+        assert agent._memory_store.memory_dir == expected_memory_dir
+        memory_dirs.add(agent._memory_store.memory_dir)
+
+    assert len(created_agents) == 2
+    assert len(memory_dirs) == 2
+
+
 def test_shared_memory_canary_matrix_survives_reload_without_cross_scope_leakage(
     tmp_path, monkeypatch
 ):
