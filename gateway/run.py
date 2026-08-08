@@ -9675,6 +9675,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        # Normalize topic routing before resolving the trusted access context.
+        # Telegram may deliver a lobby-shaped reply without its topic thread;
+        # recovery then changes the session key's thread_id.  Resolve/bind
+        # against that final source so SessionDB's scoped append guard sees the
+        # same thread as the session row.  The existing inner recovery remains
+        # idempotent for the already-normalized source.
+        try:
+            event.source = self._normalize_source_for_session_key(event.source)
+        except Exception as exc:
+            logger.warning(
+                "Access-registry ingress normalization failed closed: error=%s",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return None
+
         try:
             context = self._resolve_access_context_for_source(event.source)
             # Keep the trusted result on the in-process source object so
