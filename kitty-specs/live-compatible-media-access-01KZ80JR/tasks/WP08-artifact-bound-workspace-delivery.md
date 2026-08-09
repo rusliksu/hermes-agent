@@ -229,3 +229,57 @@ no heuristic/user-text classifier or P2 production change was added, and the
 temporary impossible RED was removed after preserving this evidence. WP08 and
 Bead `tm-ai-loopx-kimi-86x` remain `in_progress`; this branch is not ready for
 re-review or deployment.
+
+## Cycle-3 provenance remediation — remains in progress
+
+### Strict TDD RED before production edits
+
+Command:
+
+```text
+HERMES_PYTHON=/home/openclaw/staging/hermes-deploy-live-compatible-25d5031b-20260806T202000Z/.venv/bin/python scripts/run_tests.sh tests/gateway/test_artifact_bound_workspace_delivery.py -q
+```
+
+Result: `8 passed, 10 failed`, exit 1. Production code was unchanged from
+`17bb00bee5765df3bd0969f7451c8af927e617d7`. The failures proved that the old
+independent boolean accepted a successful delivery result despite a failed
+document mutation, a different successful mutation output, a later mutation
+that made an earlier delivery stale, missing/malformed/conflicting mutation
+results, an outside-root path, and unrelated delivery paths for parser-valid
+V4A add/update/move cases.
+
+### Minimal production change
+
+`agent/artifact_delivery_stop.py` now scans ordered server-created tool-result
+messages. Successful `write_file`/`patch` results contribute only absolute,
+bound, canonical document paths from `files_modified`; model arguments and
+assistant claims contribute no provenance. A `deliver_artifact` result can
+confirm only when its exact server-resolved `MEDIA:` path follows the latest
+successful mutation of that same path. A later mutation makes an earlier
+delivery stale. Missing, malformed, failed, conflicting, outside-root, or
+multiply qualifying provenance fails closed through the existing single
+correction/failure path. No generic file scan or producer scan was added.
+
+### GREEN evidence
+
+- Focused boundary: `18 passed, 0 failed`.
+- Parser/helper/file-tool focus (`test_patch_parser`,
+  `test_tool_dispatch_helpers`, `test_tool_result_classification`,
+  `test_file_mutation_verifier`, `test_file_tools`): `5 files, 159 passed,
+  0 failed`.
+- Exact prior affected matrix: `33 files, 923 passed, 0 failed` (the prior 913
+  plus ten new cases).
+- Ruff on both changed Python files: `All checks passed!`.
+- `py_compile` on both changed Python files: exit 0.
+- `git diff --check`: exit 0.
+
+Containment coverage now includes parser-valid add, update, and move targets;
+exact delivery coverage includes the canonical successful path, mismatch,
+staleness, malformed/ambiguous results, and outside-root result paths. Existing
+full-boundary assertions still prove one confirmed `send_document` and withheld
+success text on adapter failure. Streaming/global buffering, prompts, image and
+voice paths, inbound media, ordinary final text, roles, configuration, and live
+runtime were not changed.
+
+WP08 and Bead `tm-ai-loopx-kimi-86x` remain `in_progress`. This evidence does
+not claim independent review or deployment readiness.

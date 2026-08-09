@@ -116,6 +116,45 @@ def _visible_texts(adapter: TelegramAdapter) -> list[str]:
     ]
 
 
+def _assistant_tool_call(name: str, call_id: str, args: dict) -> dict:
+    return {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }
+        ],
+    }
+
+
+def _tool_result(name: str, call_id: str, payload: dict) -> dict:
+    return {
+        "role": "tool",
+        "name": name,
+        "tool_name": name,
+        "tool_call_id": call_id,
+        "content": json.dumps(payload),
+    }
+
+
+def _successful_write_result(path: str) -> dict:
+    return {
+        "bytes_written": 16,
+        "resolved_path": path,
+        "files_modified": [path],
+    }
+
+
+def _successful_delivery_result(path: str) -> dict:
+    return {
+        "success": True,
+        "status": "ready_for_delivery",
+        "file_name": Path(path).name,
+        "media_tag": f"MEDIA:{path}",
+    }
+
+
 async def _run_full_boundary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -410,6 +449,197 @@ async def test_success_claim_is_suppressed_when_current_topic_document_send_fail
     assert "DOCUMENT_SENT_OK" not in "\n".join(_visible_texts(case.adapter))
 
 
+def test_failed_mutation_cannot_bind_unrelated_preexisting_delivery(monkeypatch):
+    from agent import artifact_delivery_stop
+
+    new_report = "/trusted/workspace/new-report.xlsx"
+    preexisting = "/trusted/workspace/preexisting.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    messages = [
+        _assistant_tool_call("write_file", "failed-write", {"path": new_report}),
+        _tool_result("write_file", "failed-write", {"error": "synthetic failure"}),
+        _assistant_tool_call(
+            "deliver_artifact", "unrelated-delivery", {"path": preexisting}
+        ),
+        _tool_result(
+            "deliver_artifact",
+            "unrelated-delivery",
+            _successful_delivery_result(preexisting),
+        ),
+    ]
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        messages,
+        attempts=0,
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
+def test_successful_mutation_of_a_cannot_bind_delivery_of_b(monkeypatch):
+    from agent import artifact_delivery_stop
+
+    report_a = "/trusted/workspace/report-a.xlsx"
+    report_b = "/trusted/workspace/report-b.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    messages = [
+        _assistant_tool_call("write_file", "write-a", {"path": report_a}),
+        _tool_result(
+            "write_file", "write-a", _successful_write_result(report_a)
+        ),
+        _assistant_tool_call("deliver_artifact", "deliver-b", {"path": report_b}),
+        _tool_result(
+            "deliver_artifact",
+            "deliver-b",
+            _successful_delivery_result(report_b),
+        ),
+    ]
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        messages,
+        attempts=0,
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
+@pytest.mark.parametrize(
+    "mutation_content",
+    [
+        json.dumps({"success": True}),
+        json.dumps(
+            {
+                "success": True,
+                "files_modified": ["/trusted/workspace/report.xlsx"],
+                "resolved_path": "/trusted/workspace/different.xlsx",
+            }
+        ),
+        "not-json",
+    ],
+)
+def test_missing_malformed_or_ambiguous_mutation_result_fails_closed(
+    monkeypatch,
+    mutation_content,
+):
+    from agent import artifact_delivery_stop
+
+    report = "/trusted/workspace/report.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    mutation_result = _tool_result("patch", "patch-call", {})
+    mutation_result["content"] = mutation_content
+    messages = [
+        _assistant_tool_call(
+            "patch",
+            "patch-call",
+            {
+                "mode": "patch",
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Add File: report.xlsx\n"
+                    "+synthetic report\n"
+                    "*** End Patch"
+                ),
+            },
+        ),
+        mutation_result,
+        _assistant_tool_call("deliver_artifact", "deliver-call", {"path": report}),
+        _tool_result(
+            "deliver_artifact",
+            "deliver-call",
+            _successful_delivery_result(report),
+        ),
+    ]
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        messages,
+        attempts=0,
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
+def test_outside_root_result_paths_fail_closed(monkeypatch):
+    from agent import artifact_delivery_stop
+    from tools import artifact_delivery_tool
+
+    outside = "/outside/report.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    monkeypatch.setattr(
+        artifact_delivery_tool,
+        "validate_bound_artifact_output",
+        lambda path, _task_id: (
+            "path_outside_bound_roots" if path == outside else None
+        ),
+    )
+    messages = [
+        _assistant_tool_call("write_file", "write-call", {"path": outside}),
+        _tool_result(
+            "write_file", "write-call", _successful_write_result(outside)
+        ),
+        _assistant_tool_call(
+            "deliver_artifact", "deliver-call", {"path": outside}
+        ),
+        _tool_result(
+            "deliver_artifact",
+            "deliver-call",
+            _successful_delivery_result(outside),
+        ),
+    ]
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        messages,
+        attempts=0,
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
+def test_delivery_before_later_successful_mutation_of_same_path_is_stale(monkeypatch):
+    from agent import artifact_delivery_stop
+
+    report = "/trusted/workspace/report.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    messages = [
+        _assistant_tool_call("write_file", "write-v1", {"path": report}),
+        _tool_result("write_file", "write-v1", _successful_write_result(report)),
+        _assistant_tool_call("deliver_artifact", "deliver-v1", {"path": report}),
+        _tool_result(
+            "deliver_artifact",
+            "deliver-v1",
+            _successful_delivery_result(report),
+        ),
+        _assistant_tool_call("write_file", "write-v2", {"path": report}),
+        _tool_result("write_file", "write-v2", _successful_write_result(report)),
+    ]
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        messages,
+        attempts=0,
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
 def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
     monkeypatch,
 ):
@@ -469,17 +699,20 @@ def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
             "tool_call_id": "tts-call",
             "content": "MEDIA:/trusted/workspace/earlier.mp3 [[audio_as_voice]]",
         },
-        {
-            "role": "tool",
-            "tool_call_id": "document-call",
-            "content": json.dumps(
-                {
-                    "success": True,
-                    "status": "ready_for_delivery",
-                    "media_tag": f"MEDIA:{document_path}",
-                }
-            ),
-        },
+        _tool_result(
+            "patch",
+            "patch-call",
+            {
+                "success": True,
+                "files_modified": [document_path],
+                "resolved_path": document_path,
+            },
+        ),
+        _tool_result(
+            "deliver_artifact",
+            "document-call",
+            _successful_delivery_result(document_path),
+        ),
     ]
 
     action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
@@ -493,6 +726,105 @@ def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
         "tool_call_id": "document-call",
         "path": document_path,
         "media_tag": f"MEDIA:{document_path}",
+    }
+
+
+@pytest.mark.parametrize(
+    ("patch_body", "mutation_outputs", "delivered_path"),
+    [
+        (
+            "*** Begin Patch\n"
+            "***Add File: added.xlsx\n"
+            "+synthetic report\n"
+            "*** End Patch",
+            ["/trusted/workspace/added.xlsx"],
+            "/trusted/workspace/added.xlsx",
+        ),
+        (
+            "*** Begin Patch\n"
+            "*** Update File: updated.xlsx\n"
+            "@@ synthetic @@\n"
+            "-old\n"
+            "+new\n"
+            "*** End Patch",
+            ["/trusted/workspace/updated.xlsx"],
+            "/trusted/workspace/updated.xlsx",
+        ),
+        (
+            "*** Begin Patch\n"
+            "*** Move File: old.xlsx -> moved.xlsx\n"
+            "*** End Patch",
+            [
+                "/trusted/workspace/old.xlsx",
+                "/trusted/workspace/moved.xlsx",
+            ],
+            "/trusted/workspace/moved.xlsx",
+        ),
+    ],
+)
+def test_parser_valid_patch_outputs_bind_only_exact_delivered_path(
+    monkeypatch,
+    patch_body,
+    mutation_outputs,
+    delivered_path,
+):
+    from agent import artifact_delivery_stop
+
+    unrelated = "/trusted/workspace/unrelated.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    mutation_messages = [
+        _assistant_tool_call(
+            "patch", "patch-call", {"mode": "patch", "patch": patch_body}
+        ),
+        _tool_result(
+            "patch",
+            "patch-call",
+            {"success": True, "files_modified": mutation_outputs},
+        ),
+    ]
+
+    mismatch_action, mismatch_nudge, mismatch_confirmation = (
+        artifact_delivery_stop.bound_artifact_stop_action(
+            [
+                *mutation_messages,
+                _assistant_tool_call(
+                    "deliver_artifact", "wrong-delivery", {"path": unrelated}
+                ),
+                _tool_result(
+                    "deliver_artifact",
+                    "wrong-delivery",
+                    _successful_delivery_result(unrelated),
+                ),
+            ],
+            attempts=0,
+        )
+    )
+    assert mismatch_action == "continue"
+    assert mismatch_nudge is not None
+    assert mismatch_confirmation is None
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        [
+            *mutation_messages,
+            _assistant_tool_call(
+                "deliver_artifact", "exact-delivery", {"path": delivered_path}
+            ),
+            _tool_result(
+                "deliver_artifact",
+                "exact-delivery",
+                _successful_delivery_result(delivered_path),
+            ),
+        ],
+        attempts=0,
+    )
+    assert action == "confirmed"
+    assert nudge is None
+    assert confirmation == {
+        "tool_call_id": "exact-delivery",
+        "path": delivered_path,
+        "media_tag": f"MEDIA:{delivered_path}",
     }
 
 
@@ -578,18 +910,36 @@ def test_bound_patch_denies_outside_add_and_allows_safe_relative_document(
     with bind_resolved_access_context(context):
         tokens = runner._set_session_env(session)
         try:
-            outside_result = json.loads(
-                patch_tool(
-                    mode="patch",
-                    patch=(
+            outside_results = [
+                json.loads(
+                    patch_tool(
+                        mode="patch",
+                        patch=patch_body,
+                        task_id="synthetic-patch-session",
+                    )
+                )
+                for patch_body in (
+                    (
                         "*** Begin Patch\n"
                         f"*** Add File: {outside}\n"
                         "+outside\n"
                         "*** End Patch"
                     ),
-                    task_id="synthetic-patch-session",
+                    (
+                        "*** Begin Patch\n"
+                        f"*** Update File: {outside}\n"
+                        "@@ synthetic @@\n"
+                        "-old\n"
+                        "+new\n"
+                        "*** End Patch"
+                    ),
+                    (
+                        "*** Begin Patch\n"
+                        f"*** Move File: safe-relative.xlsx -> {outside}\n"
+                        "*** End Patch"
+                    ),
                 )
-            )
+            ]
             safe_result = json.loads(
                 patch_tool(
                     mode="patch",
@@ -605,9 +955,11 @@ def test_bound_patch_denies_outside_add_and_allows_safe_relative_document(
         finally:
             runner._clear_session_env(tokens)
 
-    assert outside_result == {
-        "error": "bound_artifact_output_rejected: path_outside_bound_roots"
-    }
+    assert outside_results == [
+        {"error": "bound_artifact_output_rejected: path_outside_bound_roots"},
+        {"error": "bound_artifact_output_rejected: path_outside_bound_roots"},
+        {"error": "bound_artifact_output_rejected: path_outside_bound_roots"},
+    ]
     assert not outside.exists()
     assert safe_result.get("error") is None
     file_ops.patch_v4a.assert_called_once_with(
