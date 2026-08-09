@@ -71,6 +71,23 @@ class _Photo:
         return _DownloadedPhotoFile()
 
 
+VOICE_BYTES = b"synthetic-primary-voice"
+
+
+class _DownloadedVoiceFile:
+    file_path = "voice/synthetic-primary.ogg"
+
+    async def download_as_bytearray(self):
+        return bytearray(VOICE_BYTES)
+
+
+class _Voice:
+    file_size = len(VOICE_BYTES)
+
+    async def get_file(self):
+        return _DownloadedVoiceFile()
+
+
 def _photo_update() -> SimpleNamespace:
     chat = SimpleNamespace(
         id=CHAT_ID,
@@ -180,3 +197,90 @@ async def test_primary_photo_resolves_allowed_dm_before_profile_scoped_cache(
     cached_path = Path(handled[0].media_urls[0])
     assert cached_path.is_file()
     assert cached_path.is_relative_to(profile_home)
+
+
+def _voice_update() -> SimpleNamespace:
+    chat = SimpleNamespace(
+        id=CHAT_ID,
+        type="private",
+        title=None,
+        full_name=None,
+        is_forum=False,
+    )
+    user = SimpleNamespace(
+        id=CHAT_ID,
+        username=None,
+        full_name="synthetic-user",
+        is_bot=False,
+    )
+    message = SimpleNamespace(
+        message_id=2,
+        text="",
+        caption=None,
+        date=None,
+        photo=[],
+        sticker=None,
+        video=None,
+        audio=None,
+        voice=_Voice(),
+        document=None,
+        media_group_id=None,
+        chat=chat,
+        from_user=user,
+        sender_chat=None,
+        message_thread_id=None,
+        is_topic_message=False,
+        reply_to_message=None,
+        quote=None,
+        api_kwargs={},
+        entities=[],
+        caption_entities=[],
+    )
+    return SimpleNamespace(message=message, update_id=2)
+
+
+@pytest.mark.asyncio
+async def test_primary_voice_resolves_allowed_dm_before_profile_scoped_cache(
+    monkeypatch,
+    tmp_path,
+):
+    hermes_root = tmp_path / "hermes-root"
+    profile_home = hermes_root / "profiles" / PROFILE_ID
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+
+    registry = _registry()
+    runner = _runner(registry)
+    adapter = TelegramAdapter(runner.config.platforms[Platform.TELEGRAM])
+    adapter.gateway_runner = runner
+    handled = []
+    handled_contexts = []
+
+    async def downstream(event):
+        handled.append(event)
+        handled_contexts.append(get_resolved_access_context())
+
+    adapter.handle_message = downstream
+
+    reset_session_vars()
+    assert get_resolved_access_context() is None
+    expected_context = registry.resolve(
+        TransportIdentity(
+            platform="telegram",
+            account=ACCOUNT,
+            peer_kind="dm",
+            user_id=CHAT_ID,
+            chat_id=CHAT_ID,
+        )
+    )
+
+    await adapter._handle_media_message(_voice_update(), SimpleNamespace())
+
+    assert len(handled) == 1
+    assert handled[0].message_type == MessageType.VOICE
+    assert handled[0].media_types == ["audio/ogg"]
+    assert handled_contexts == [expected_context]
+    cached_path = Path(handled[0].media_urls[0])
+    assert cached_path.is_file()
+    assert cached_path.is_relative_to(profile_home)
+    assert cached_path.read_bytes() == VOICE_BYTES
