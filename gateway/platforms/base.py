@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -1943,6 +1944,11 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Server-owned current-turn delivery provenance. The gateway sets this
+    # only from the structured agent result after a trusted deliver_artifact
+    # tool result; adapters must never infer it from model-authored text.
+    artifact_delivery_confirmation: Optional[Dict[str, str]] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -5118,6 +5124,7 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                artifact_delivery_confirmation = event.artifact_delivery_confirmation
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
@@ -5129,11 +5136,19 @@ class BasePlatformAdapter(ABC):
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                if artifact_delivery_confirmation:
+                    # Confirmation carries one server-validated artifact.
+                    # Model-authored MEDIA directives are stripped from text
+                    # but never become delivery candidates on this path.
+                    _, response = self.extract_media(response)
+                    media_files = []
+                else:
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
+                extracted_images, text_content = self.extract_images(response)
+                images = [] if artifact_delivery_confirmation else extracted_images
                 # Strip any remaining internal directives from message body (fixes #1561).
                 # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
                 # with an unknown extension is intentionally left in the body for
@@ -5143,7 +5158,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and not artifact_delivery_confirmation:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
@@ -5176,6 +5191,50 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+
+                # A trusted generated-document response is transactional at the
+                # delivery boundary: upload the one validated document first,
+                # and release model success text only after send_document
+                # confirms the current target. This marker is absent from every
+                # unrelated photo, voice, inbound-document, and plain-text path.
+                if artifact_delivery_confirmation:
+                    confirmation_result = None
+                    confirmation_path = artifact_delivery_confirmation.get("path")
+                    confirmation_tag = artifact_delivery_confirmation.get("media_tag")
+                    if (
+                        isinstance(confirmation_path, str)
+                        and confirmation_tag == f"MEDIA:{confirmation_path}"
+                        and Path(confirmation_path).is_absolute()
+                    ):
+                        confirmation_ext = Path(confirmation_path).suffix.lower()
+                        confirmation_mime, _ = mimetypes.guess_type(confirmation_path)
+                        if (
+                            confirmation_ext not in {
+                                ".png", ".jpg", ".jpeg", ".gif", ".webp",
+                                ".bmp", ".tiff", ".svg", ".mp4", ".mov",
+                                ".avi", ".mkv", ".webm", ".mp3", ".wav",
+                                ".ogg", ".opus", ".m4a", ".flac",
+                            }
+                            and not (
+                                confirmation_mime
+                                and confirmation_mime.startswith(("image/", "audio/", "video/"))
+                            )
+                        ):
+                            try:
+                                confirmation_result = await self.send_document(
+                                    chat_id=event.source.chat_id,
+                                    file_path=confirmation_path,
+                                    metadata=_final_thread_metadata,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "[%s] Confirmed artifact send failed",
+                                    self.name,
+                                    exc_info=True,
+                                )
+                    _record_delivery(confirmation_result)
+                    if not getattr(confirmation_result, "success", False):
+                        text_content = "⚠️ Не удалось отправить документ."
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

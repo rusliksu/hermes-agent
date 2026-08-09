@@ -163,6 +163,16 @@ Default candidate order is image `openai-codex → fal → openrouter`, STT `loc
 - **Sequencing/depends-on**: IC-01 и IC-02; реализация строго RED → GREEN от candidate `907dbea2960907d21e38a9b5f55ac7a10a62864c`.
 - **Risks**: модель может попытаться подменить target или передать symlink; неизвестные аргументы, foreign roots, missing/malformed/mismatched context, missing `documents` и account/thread mismatch отклоняются fail-closed без `MEDIA:` tag.
 
+### IC-07 --- Bound создание и подтверждение доставки generated document
+
+- **Purpose**: закрыть exact shared-room/topic sequence, где `write_file` создаёт документ вне bound roots, legacy `MEDIA:` отклоняется validator-ом, но success text всё равно уходит пользователю.
+- **Relevant requirements**: FR-003, FR-005, FR-007, FR-011, FR-012, NFR-001, NFR-009, NFR-010, C-008.
+- **Affected surfaces**: существующие agent continuation/finalization и gateway document delivery boundaries; full-boundary synthetic test с real registry/tool dispatch и captured Telegram adapter.
+- **Design**: переиспользовать `ResolvedAccessContext`, typed bound-root validation, текущую MEDIA extraction и agent continuation machinery. Для family/shared generated document unsafe/out-of-root finalization получает ровно одну synthetic corrective continuation с сохранением role alternation; повторная неудача завершается fail-closed. Success claim удерживается до успешного `send_document` в current event/topic target.
+- **Non-goals**: новый service/parser/dependency, arbitrary outside-path copy, ослабление validator, прямой target от модели, изменения owner/photo/voice/inbound-document/plain-text behavior.
+- **Sequencing/depends-on**: IC-01, IC-02 и IC-06; строго full-boundary RED до production code, затем минимальный ponytail/full root-cause fix.
+- **Risks**: общий MEDIA pipeline обслуживает photo/voice/video; gate должен быть узким по typed family/shared context и generated-document evidence, а continuation иметь жёсткий предел один.
+
 ## Phased Delivery and Gates
 
 ### Phase 0 --- Read-only baseline (current)
@@ -202,6 +212,13 @@ Default candidate order is image `openai-codex → fal → openrouter`, STT `loc
 - Сначала зафиксировать full-boundary RED через real registration/dispatch, family/private context и captured Telegram adapter, включая negative matrix.
 - Затем внести минимальный tool/toolset patch, прогнать focused и затронутые access/document/shared/profile media suites, Ruff, `py_compile` и `git diff --check`.
 - Gate: commit task-owned changes; остановиться до push/merge/deploy/restart/config/symlink/Telegram операций.
+
+### Phase 7 --- Bound workspace artifact correction
+
+- Создать WP08 и связать его с Bead `tm-ai-loopx-kimi-86x` (`spec_id: live-compatible-media-access-01KZ80JR`).
+- Первым зафиксировать full-boundary RED реального shared-room/topic sequence: unsafe outside-root XLS + legacy `MEDIA:`/success, затем одна safe correction через `write_file` + `deliver_artifact`; добавить second-failure/no-loop и foreign/symlink/current-context oracles.
+- Минимально исправить общий root cause без изменения fail-closed validator и без copy произвольного outside artifact.
+- Gate: focused/affected suites, независимый review и task-owned commit; Bead остаётся `in_progress`, live/push/merge/deploy/restart запрещены.
 
 ## Complexity Tracking
 

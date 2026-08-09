@@ -166,9 +166,35 @@ description: "Список задач рабочих пакетов для из�
 - Containment проверяется после `resolve(strict=True)`; outside path и symlink escape отклоняются до adapter.
 - Для family/shared требуется существующая capability `documents`; owner сохраняет полный file toolset, shared-room membership никогда не повышает роль.
 
+## Рабочий пакет WP08: bound создание и подтверждённая доставка generated document (приоритет P0)
+
+**Цель**: исправить exact shared-room/topic flow, в котором `write_file` создаёт XLS вне trusted roots, legacy `MEDIA:` отклоняется, но пользователю уходит ложный success text; допустить ровно одну correction для safe in-root creation + `deliver_artifact` и разрешать success claim только после успешного `send_document` в current target.
+**Независимая проверка**: full-boundary synthetic Telegram group/topic с real registry, agent/model/tool loop и captured adapter сначала воспроизводит unsafe XLS/legacy MEDIA, затем подтверждает одну correction, один safe artifact внутри bound workspace и ровно один `send_document`; second failure не продолжает цикл, foreign/symlink/mismatched context дают ноль delivery/success claim.
+**Промпт**: `/tasks/WP08-artifact-bound-workspace-delivery.md`
+**Ссылки на требования**: FR-003, FR-005, FR-007, FR-011, FR-012, NFR-001, NFR-009, NFR-010, C-008
+**Beads issue**: `tm-ai-loopx-kimi-86x`
+
+### Включённые подзадачи
+
+- [ ] T027 Добавить минимальный full-boundary RED с real shared-room/topic sequence и сохранить точную команду/вывод до production code.
+- [ ] T028 Добавить negative second-failure/no-loop oracle и foreign/symlink/current-context проверки без privacy/log leakage.
+- [ ] T029 Проследить всех callers и реализовать минимальный ponytail/full root-cause fix через существующие context/root/MEDIA/continuation механизмы, не ослабляя validator.
+- [ ] T030 Прогнать focused и affected artifact/shared/family/Telegram document/photo/voice/inbound/plain-text suites, Ruff, `py_compile`, `git diff --check`; перед commit получить независимый review и оставить Bead `in_progress` с verification note.
+
+### Зависимости
+
+- Зависит от WP01, WP02 и WP07.
+
+### Риски и меры
+
+- Correction ограничена одной попыткой на user turn; повторный unsafe/failure результат не инициирует новый цикл.
+- Success text удерживается до результата `send_document`; target берётся только из текущего typed context/event.
+- Gate применяется только к generated non-image document flow в family/shared, поэтому owner capabilities и unrelated photo/voice/inbound/plain-text paths сохраняются.
+- Spec Kitty runtime остаётся ограничен `COORDINATION_BRANCH_DELETED`; `status.events.jsonl` и runtime lanes вручную не материализуются.
+
 ## Сводка зависимостей и порядка выполнения
 
-- **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06; bounded WP07 зависит от уже завершённых WP01/WP02 и не открывает live gate.
+- **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06; bounded WP07 зависит от WP01/WP02, WP08 зависит от WP01/WP02/WP07 и не открывает live gate.
 - **MVP scope**: WP01 + WP02 + WP03 + focused tests; live rollout не входит.
 - **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 --- строго последним.
 - **Live gate**: T022 --- жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
@@ -187,7 +213,8 @@ description: "Список задач рабочих пакетов для из�
 | FR-008 | WP04 |
 | FR-009 | WP05 |
 | FR-010 | WP06 |
-| FR-011 | WP07 |
+| FR-011 | WP07, WP08 |
+| FR-012 | WP08 |
 
 ## Индекс подзадач (справочно)
 
@@ -205,3 +232,7 @@ description: "Список задач рабочих пакетов для из�
 | T024 | Negative RED matrix | WP07 | P0 | Да |
 | T025 | Structured artifact delivery | WP07 | P0 | Нет |
 | T026 | Полные проверки и review | WP07 | P0 | Нет |
+| T027 | Full-boundary generated-document RED | WP08 | P0 | Нет |
+| T028 | Negative no-loop/privacy matrix | WP08 | P0 | Да |
+| T029 | Минимальный root-cause fix | WP08 | P0 | Нет |
+| T030 | Affected suites и независимый review | WP08 | P0 | Нет |

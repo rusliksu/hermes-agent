@@ -1569,6 +1569,28 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _bound_artifact_output_error(path: str, task_id: str) -> str | None:
+    """Run the shared fail-closed bound-output validator for one target."""
+    try:
+        from tools.artifact_delivery_tool import validate_bound_artifact_output
+
+        return validate_bound_artifact_output(path, task_id)
+    except Exception:
+        logger.debug("bound artifact output validation failed closed", exc_info=True)
+        try:
+            from gateway.session_context import get_resolved_access_context
+
+            _bound_context = get_resolved_access_context(None)
+            _bound_role = getattr(_bound_context, "role_id", None)
+        except Exception:
+            _bound_role = None
+        return (
+            "bound_roots_unavailable"
+            if _bound_role in {"family", "shared_room"}
+            else None
+        )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1580,6 +1602,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    bound_artifact_error = _bound_artifact_output_error(path, task_id)
+    if bound_artifact_error:
+        return tool_error(
+            "bound_artifact_output_rejected: " + bound_artifact_error
+        )
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1708,6 +1735,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        bound_artifact_error = _bound_artifact_output_error(_p, task_id)
+        if bound_artifact_error:
+            return tool_error(
+                "bound_artifact_output_rejected: " + bound_artifact_error
+            )
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

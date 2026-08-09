@@ -28,6 +28,22 @@ _ALLOWED_ROLES = _DOCUMENT_ROLES | {"owner"}
 _MEDIA_MIME_PREFIXES = ("image/", "audio/", "video/")
 
 
+def is_outbound_document_path(raw_path: str) -> bool:
+    """Return whether ``raw_path`` names a gateway-deliverable non-media file."""
+    if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+        return False
+    try:
+        from gateway.platforms.base import MEDIA_DELIVERY_EXTS
+
+        suffix = Path(raw_path.strip()).suffix.lower()
+        if suffix not in MEDIA_DELIVERY_EXTS:
+            return False
+    except Exception:
+        return False
+    mime_type, _ = mimetypes.guess_type(raw_path)
+    return not (mime_type and mime_type.startswith(_MEDIA_MIME_PREFIXES))
+
+
 def _result(
     *,
     success: bool,
@@ -125,6 +141,57 @@ def _resolve_artifact(raw_path: str, task_id: str) -> tuple[Path | None, str | N
     if mime_type and mime_type.startswith(_MEDIA_MIME_PREFIXES):
         return None, "media_type_not_supported"
     return resolved, None
+
+
+def validate_bound_artifact_output(
+    raw_path: str,
+    task_id: str,
+) -> str | None:
+    """Validate an intended generated document path for a bound shared context.
+
+    Existing owner and non-document writes are deliberately outside this guard.
+    For family/shared turns, an output path may not escape the same trusted roots
+    later enforced by :func:`_resolve_artifact`, including through a symlinked
+    parent. The candidate need not exist yet.
+    """
+    raw_context = get_resolved_access_context(None)
+    if (
+        not isinstance(raw_context, ResolvedAccessContext)
+        or raw_context.role_id not in _DOCUMENT_ROLES
+        or not is_outbound_document_path(raw_path)
+    ):
+        return None
+    context, context_error = _strict_context()
+    if context_error is not None or context is None:
+        return context_error or "malformed_context"
+    if "documents" not in context.capabilities:
+        return "missing_documents_capability"
+    try:
+        roots = _bound_roots(task_id)
+    except (OSError, RuntimeError, ValueError):
+        return "bound_roots_unavailable"
+
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = roots[1] / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return "invalid_path"
+    if not any(_is_within(resolved, root) for root in roots):
+        return "path_outside_bound_roots"
+    return None
+
+
+def bound_document_context_active() -> bool:
+    """Return whether the current trusted turn is family/shared document-bound."""
+    context, context_error = _strict_context()
+    return bool(
+        context_error is None
+        and context is not None
+        and context.role_id in _DOCUMENT_ROLES
+        and "documents" in context.capabilities
+    )
 
 
 def _deliver_artifact(args: dict[str, Any], **kwargs: Any) -> str:

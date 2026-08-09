@@ -234,6 +234,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # bound generated-artifact correction: premature success plus the one
+    # internal corrective instruction must never enter durable chat history.
+    "_artifact_delivery_stop_synthetic",
 )
 
 

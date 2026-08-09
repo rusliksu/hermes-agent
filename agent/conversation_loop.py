@@ -5436,6 +5436,74 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                # A family/shared generated document is not complete merely
+                # because write_file ran or the model emitted a legacy MEDIA
+                # path. Require one trusted deliver_artifact result, with at
+                # most one corrective continuation, before accepting a final
+                # success response.
+                try:
+                    from agent.artifact_delivery_stop import bound_artifact_stop_action
+
+                    (
+                        _artifact_action,
+                        _artifact_nudge,
+                        _artifact_confirmation,
+                    ) = bound_artifact_stop_action(
+                        messages[current_turn_user_idx:],
+                        attempts=getattr(agent, "_artifact_delivery_stop_nudges", 0),
+                    )
+                except Exception:
+                    logger.debug("artifact delivery stop-loop check failed", exc_info=True)
+                    _artifact_action, _artifact_nudge, _artifact_confirmation = (
+                        "none",
+                        None,
+                        None,
+                    )
+
+                if _artifact_action != "none":
+                    # This expected policy rejection is handled by the bounded
+                    # correction/failure response below. Do not let the generic
+                    # mutation footer expose the rejected host path in chat;
+                    # preserve every unrelated mutation failure.
+                    _failed_mutations = getattr(
+                        agent, "_turn_failed_file_mutations", None
+                    )
+                    if isinstance(_failed_mutations, dict):
+                        for _failed_path, _failed_detail in list(
+                            _failed_mutations.items()
+                        ):
+                            _preview = (
+                                _failed_detail.get("error_preview", "")
+                                if isinstance(_failed_detail, dict)
+                                else ""
+                            )
+                            if "bound_artifact_output_rejected:" in str(_preview):
+                                _failed_mutations.pop(_failed_path, None)
+
+                if _artifact_action == "continue" and _artifact_nudge:
+                    agent._artifact_delivery_stop_nudges = 1
+                    final_msg["finish_reason"] = "artifact_delivery_correction_required"
+                    final_msg["_artifact_delivery_stop_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _artifact_nudge,
+                        "_artifact_delivery_stop_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info("bound artifact corrective continuation issued")
+                    final_response = None
+                    continue
+
+                if _artifact_action == "failed":
+                    final_response = (
+                        "⚠️ Не удалось безопасно подготовить и отправить документ."
+                    )
+                    final_msg["content"] = final_response
+                    final_msg["finish_reason"] = "artifact_delivery_failed"
+                elif _artifact_action == "confirmed":
+                    agent._artifact_delivery_confirmation = _artifact_confirmation
+
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
