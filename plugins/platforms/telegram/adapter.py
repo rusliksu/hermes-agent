@@ -21,7 +21,7 @@ import secrets
 import threading
 import time
 from contextvars import ContextVar
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Dict, List, Optional, Set, Any
@@ -8929,12 +8929,37 @@ class TelegramAdapter(BasePlatformAdapter):
             self._media_message_type(message),
             update_id=getattr(update, "update_id", None),
         )
+
+        registry = getattr(gateway_runner, "access_registry", None)
+        resolve_access_context = getattr(
+            gateway_runner, "_resolve_access_context_for_source", None
+        )
+        if registry is not None and callable(resolve_access_context):
+            from gateway.session_context import bind_resolved_access_context
+
+            scope = ExitStack()
+            try:
+                resolved_context = resolve_access_context(event.source)
+                event.source.resolved_access_context = resolved_context
+                event.source.profile = resolved_context.profile_id
+                scope.enter_context(bind_resolved_access_context(resolved_context))
+                profile_home = gateway_runner._resolve_profile_home_for_source(
+                    event.source
+                )
+                from gateway.run import _profile_runtime_scope
+
+                scope.enter_context(_profile_runtime_scope(profile_home))
+                return scope
+            except Exception:
+                scope.close()
+                raise
+
         try:
             profile_home = gateway_runner._resolve_profile_home_for_source(
                 event.source
             )
         except Exception:
-            if getattr(gateway_runner, "access_registry", None) is not None:
+            if registry is not None:
                 raise
             return nullcontext()
 
