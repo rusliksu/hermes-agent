@@ -283,3 +283,61 @@ runtime were not changed.
 
 WP08 and Bead `tm-ai-loopx-kimi-86x` remain `in_progress`. This evidence does
 not claim independent review or deployment readiness.
+
+## Cycle-4 compression-boundary remediation — remains in progress
+
+### Strict TDD RED before production edits
+
+Starting state was the requested clean branch at exact HEAD
+`5495e2d45feeb8a9ce2c857617cd1551bff7d423`. Four deterministic full-boundary
+cases added a 48-message prior transcript and then shortened/replaced it during
+the current turn through post-tool compression or the real alternation repair.
+
+Command:
+
+```text
+HERMES_PYTHON=/home/openclaw/staging/hermes-deploy-live-compatible-25d5031b-20260806T202000Z/.venv/bin/python scripts/run_tests.sh tests/gateway/test_artifact_bound_workspace_delivery.py -q -k 'compression_keeps_failed_mutation or compression_keeps_exact_mutation or non_document_final_text_is_unchanged_after_current_turn_compression or repaired_stale_numeric_boundary'
+```
+
+Result: `1 passed, 3 failed`, exit 1. The failed-mutation/unrelated-delivery and
+repair cases exposed `UNSAFE_SUCCESS`; the exact mutation/delivery case made
+zero `send_document` calls. The ordinary non-document final text case passed
+unchanged. Production code was still exact HEAD `5495e2d45` for this RED run.
+
+### Minimal stable-boundary change
+
+`agent/conversation_loop.py` now owns one ordered, turn-local ledger of copied
+server-created `tool`/`function` results. The real tool-execution chokepoint is
+captured in a `finally` block before post-tool compression, and all four
+synthetic tool-result append sites add to the same ledger. The artifact guard
+consumes only that ledger; it no longer slices the mutable transcript with the
+prologue-time numeric user index. The ledger does not inspect user text,
+identities, model claims, or tool arguments, is not persisted or logged, and
+does not alter compression, provider, prompt, role, streaming, or delivery
+semantics.
+
+Site audit covers the prologue compression in `agent/turn_context.py`, all five
+in-loop `_compress_context` assignments (pre-API, long-context tier,
+payload-too-large, context-overflow, and post-tool), the in-place
+`repair_message_sequence_with_cursor`, and partial-stream rollback/rebuild
+recovery. The prologue runs before any current-turn tool event exists; every
+later real or synthetic tool result is ledgered before any shortening,
+replacement, or retry can remove it.
+
+### GREEN evidence
+
+- Four new boundary cases: `4 passed, 0 failed`.
+- Full focused artifact boundary: `22 passed, 0 failed`.
+- Direct compression/repair focus: `6 files, 232 passed, 0 failed`.
+- Parser/helper/file-tool focus: `5 files, 159 passed, 0 failed`.
+- Synthetic/segmented tool-result recovery focus: `4 files, 142 passed,
+  0 failed`.
+- Exact prior affected matrix plus four cases: `33 files, 927 passed,
+  0 failed`.
+
+The failed mutation cannot bind delivery of an unrelated pre-existing file;
+successful mutation A followed by exact delivery A confirms and delivers once;
+ordinary non-document final text is byte-for-byte unchanged; and a numeric
+boundary invalidated by real message repair fails closed on relevant artifact
+activity. WP08 and Bead `tm-ai-loopx-kimi-86x` remain `in_progress`; no runtime
+status files, live state, or deployment surface were changed.

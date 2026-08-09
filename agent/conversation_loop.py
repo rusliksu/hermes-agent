@@ -665,6 +665,24 @@ def run_conversation(
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
 
+    # Ordered server-created tool results for this user turn. Transcript
+    # repair and context compression may shorten or replace ``messages`` and
+    # invalidate ``current_turn_user_idx``; artifact provenance must survive
+    # those representation changes without matching user/model content.
+    _current_turn_tool_events: list[dict[str, Any]] = []
+
+    def _append_current_turn_tool_event(message: dict[str, Any]) -> None:
+        messages.append(message)
+        _current_turn_tool_events.append(message.copy())
+
+    def _capture_executed_tool_events(start_idx: int) -> None:
+        for message in messages[start_idx:]:
+            if (
+                isinstance(message, dict)
+                and message.get("role") in {"tool", "function"}
+            ):
+                _current_turn_tool_events.append(message.copy())
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -4720,7 +4738,7 @@ def run_conversation(
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
-                        messages.append({
+                        _append_current_turn_tool_event({
                             "role": "tool",
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
@@ -4820,7 +4838,7 @@ def run_conversation(
                                 )
                             else:
                                 tool_result = "Skipped: other tool call in this response had invalid JSON."
-                            messages.append({
+                            _append_current_turn_tool_event({
                                 "role": "tool",
                                 "name": tc.function.name,
                                 "tool_call_id": tc.id,
@@ -4950,7 +4968,7 @@ def run_conversation(
                 # provider-side tool_call/result pairing stays intact.
                 if _invalid_batch_calls:
                     for tc in _invalid_batch_calls:
-                        messages.append({
+                        _append_current_turn_tool_event({
                             "role": "tool",
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
@@ -4989,7 +5007,16 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _tool_event_start = len(messages)
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    _capture_executed_tool_events(_tool_event_start)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -5449,7 +5476,7 @@ def run_conversation(
                         _artifact_nudge,
                         _artifact_confirmation,
                     ) = bound_artifact_stop_action(
-                        messages[current_turn_user_idx:],
+                        _current_turn_tool_events,
                         attempts=getattr(agent, "_artifact_delivery_stop_nudges", 0),
                     )
                 except Exception:
@@ -5703,7 +5730,7 @@ def run_conversation(
                                 "tool_call_id": tc["id"],
                                 "content": f"Error executing tool: {error_msg}",
                             }
-                            messages.append(err_msg)
+                            _append_current_turn_tool_event(err_msg)
                 break
             
             # Non-tool errors don't need a synthetic message injected.

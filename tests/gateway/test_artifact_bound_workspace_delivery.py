@@ -162,6 +162,8 @@ async def _run_full_boundary(
     correction_succeeds: bool,
     document_succeeds: bool = True,
     no_space_v4a: bool = False,
+    boundary_scenario: str | None = None,
+    transcript_rewrite: str | None = None,
 ):
     from agent.secret_scope import is_multiplex_active, set_multiplex_active
 
@@ -177,6 +179,8 @@ async def _run_full_boundary(
     )
     outside = tmp_path / "outside-report.xls"
     safe = workspace / "safe-report.xls"
+    preexisting = workspace / "preexisting-report.xls"
+    ordinary = workspace / "ordinary-note.txt"
 
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
@@ -214,10 +218,68 @@ async def _run_full_boundary(
         lambda *_args, **_kwargs: 100_000,
     )
 
-    unsafe_final = _model_response(
-        text=f"UNSAFE_SUCCESS\nMEDIA:{outside}",
-    )
-    if correction_succeeds:
+    unsafe_final = _model_response(text=f"UNSAFE_SUCCESS\nMEDIA:{outside}")
+    if boundary_scenario == "failed_then_unrelated":
+        preexisting.write_text("preexisting", encoding="utf-8")
+        responses = [
+            _model_response(
+                tool="write_file",
+                args={"path": str(outside), "content": "rejected"},
+                call_id="failed-write",
+            ),
+            _model_response(
+                tool="deliver_artifact",
+                args={"path": str(preexisting)},
+                call_id="unrelated-delivery",
+            ),
+            unsafe_final,
+            _model_response(
+                tool="write_file",
+                args={"path": str(outside), "content": "rejected-again"},
+                call_id="failed-correction",
+            ),
+            unsafe_final,
+        ]
+    elif boundary_scenario == "successful_exact":
+        responses = [
+            _model_response(
+                tool="write_file",
+                args={"path": str(safe), "content": "synthetic-safe-xls"},
+                call_id="exact-write",
+            ),
+            _model_response(
+                tool="deliver_artifact",
+                args={"path": str(safe)},
+                call_id="exact-delivery",
+            ),
+            _model_response(text="DOCUMENT_SENT_AFTER_COMPRESSION"),
+        ]
+    elif boundary_scenario == "ordinary":
+        ordinary.write_text("ordinary", encoding="utf-8")
+        responses = [
+            _model_response(
+                tool="read_file",
+                args={"path": str(ordinary)},
+                call_id="ordinary-read",
+            ),
+            _model_response(text="PLAIN_AFTER_COMPRESSION"),
+        ]
+    elif boundary_scenario == "failed_after_repair":
+        responses = [
+            _model_response(
+                tool="write_file",
+                args={"path": str(outside), "content": "rejected"},
+                call_id="repair-failed-write",
+            ),
+            unsafe_final,
+            _model_response(
+                tool="write_file",
+                args={"path": str(outside), "content": "rejected-again"},
+                call_id="repair-failed-correction",
+            ),
+            unsafe_final,
+        ]
+    elif correction_succeeds:
         followup = [
             _model_response(
                 tool="write_file",
@@ -261,11 +323,8 @@ async def _run_full_boundary(
             call_id="first-unsafe-write",
         )
     )
-    responses = [
-        unsafe_mutation,
-        unsafe_final,
-        *followup,
-    ]
+    if boundary_scenario is None:
+        responses = [unsafe_mutation, unsafe_final, *followup]
     provider_client = MagicMock()
     provider_client.chat.completions.create.side_effect = responses
     monkeypatch.setattr(run_agent, "OpenAI", lambda *args, **kwargs: provider_client)
@@ -279,6 +338,71 @@ async def _run_full_boundary(
         "_close_request_openai_client",
         lambda self, client, **kwargs: None,
     )
+
+    compression_calls: list[int] = []
+    if transcript_rewrite:
+        from agent import conversation_loop
+
+        original_build_turn_context = conversation_loop.build_turn_context
+
+        def _build_turn_context_with_long_prior_transcript(*args, **kwargs):
+            context = original_build_turn_context(*args, **kwargs)
+            if transcript_rewrite == "repair":
+                prior = [
+                    {"role": "assistant", "content": f"prior-{index}"}
+                    for index in range(48)
+                ]
+            else:
+                prior = [
+                    {
+                        "role": "user" if index % 2 == 0 else "assistant",
+                        "content": f"prior-{index}",
+                    }
+                    for index in range(48)
+                ]
+            context.messages[:0] = prior
+            context.current_turn_user_idx += len(prior)
+            return context
+
+        monkeypatch.setattr(
+            conversation_loop,
+            "build_turn_context",
+            _build_turn_context_with_long_prior_transcript,
+        )
+
+        if transcript_rewrite == "compression":
+            from agent.context_compressor import ContextCompressor
+
+            should_compress_calls: dict[int, int] = {}
+
+            def _compress_once_after_first_tool(self, _prompt_tokens=None):
+                key = id(self)
+                call = should_compress_calls.get(key, 0) + 1
+                should_compress_calls[key] = call
+                return call == 2
+
+            def _compact_current_turn(
+                agent,
+                messages,
+                _system_message,
+                **_kwargs,
+            ):
+                compression_calls.append(len(messages))
+                compacted = [dict(message) for message in messages[-3:]]
+                agent._session_messages = compacted
+                agent.context_compressor.last_prompt_tokens = -1
+                return compacted, agent._cached_system_prompt
+
+            monkeypatch.setattr(
+                ContextCompressor,
+                "should_compress",
+                _compress_once_after_first_tool,
+            )
+            monkeypatch.setattr(
+                run_agent.AIAgent,
+                "_compress_context",
+                _compact_current_turn,
+            )
 
     policy = SinglePrincipalPolicy.from_dict(
         {
@@ -355,6 +479,9 @@ async def _run_full_boundary(
         delivery_order=delivery_order,
         outside=outside,
         safe=safe,
+        preexisting=preexisting,
+        ordinary=ordinary,
+        compression_calls=compression_calls,
         event=event,
         runner=runner,
     )
@@ -447,6 +574,88 @@ async def test_success_claim_is_suppressed_when_current_topic_document_send_fail
 
     case.adapter.send_document.assert_awaited_once()
     assert "DOCUMENT_SENT_OK" not in "\n".join(_visible_texts(case.adapter))
+
+
+@pytest.mark.asyncio
+async def test_compression_keeps_failed_mutation_from_binding_unrelated_preexisting_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=False,
+        boundary_scenario="failed_then_unrelated",
+        transcript_rewrite="compression",
+    )
+
+    assert case.compression_calls
+    assert case.provider.chat.completions.create.call_count == 5
+    case.adapter.send_document.assert_not_awaited()
+    assert "UNSAFE_SUCCESS" not in "\n".join(_visible_texts(case.adapter))
+    assert case.preexisting.read_text(encoding="utf-8") == "preexisting"
+
+
+@pytest.mark.asyncio
+async def test_compression_keeps_exact_mutation_delivery_confirmation_exactly_once(
+    monkeypatch,
+    tmp_path,
+):
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=True,
+        boundary_scenario="successful_exact",
+        transcript_rewrite="compression",
+    )
+
+    assert case.compression_calls
+    assert case.provider.chat.completions.create.call_count == 3
+    case.adapter.send_document.assert_awaited_once_with(
+        chat_id=CHAT_ID,
+        file_path=str(case.safe.resolve()),
+        metadata={"thread_id": THREAD_ID, "notify": True},
+    )
+    assert "DOCUMENT_SENT_AFTER_COMPRESSION" in "\n".join(
+        _visible_texts(case.adapter)
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_document_final_text_is_unchanged_after_current_turn_compression(
+    monkeypatch,
+    tmp_path,
+):
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=True,
+        boundary_scenario="ordinary",
+        transcript_rewrite="compression",
+    )
+
+    assert case.compression_calls
+    assert case.provider.chat.completions.create.call_count == 2
+    case.adapter.send_document.assert_not_awaited()
+    assert _visible_texts(case.adapter) == ["PLAIN_AFTER_COMPRESSION"]
+
+
+@pytest.mark.asyncio
+async def test_repaired_stale_numeric_boundary_fails_closed_for_artifact_activity(
+    monkeypatch,
+    tmp_path,
+):
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=False,
+        boundary_scenario="failed_after_repair",
+        transcript_rewrite="repair",
+    )
+
+    assert case.provider.chat.completions.create.call_count == 4
+    case.adapter.send_document.assert_not_awaited()
+    assert "UNSAFE_SUCCESS" not in "\n".join(_visible_texts(case.adapter))
 
 
 def test_failed_mutation_cannot_bind_unrelated_preexisting_delivery(monkeypatch):
