@@ -141,9 +141,34 @@ description: "Список задач рабочих пакетов для из�
 
 - В live branch могут быть deployment-specific assumptions; сравнить service state до/после и сохранить точные code/config references для rollback.
 
+## Рабочий пакет WP07: явная доставка outbound-артефакта (приоритет P0)
+
+**Цель**: добавить минимальный структурированный инструмент, который публикует обычный non-image файл только из bound profile/workspace как trusted `MEDIA:` candidate; существующий gateway доставляет его в текущий immutable `delivery_target` через adapter `send_document`.
+**Независимая проверка**: реальная регистрация/dispatch с family/private context, а также настоящий `AccessRegistry` shared scope с `role_id=shared_room`, group chat и forum thread, возвращают structured success/tag; затем auto-append и gateway delivery вызывают Telegram `send_document` ровно один раз с текущим chat/topic metadata. Foreign chat/thread target, missing/mismatch context, missing `documents`, outside path и symlink escape дают structured failure без tag и adapter call.
+**Промпт**: `/tasks/WP07-outbound-artifact-delivery.md`
+**Ссылки на требования**: FR-001, FR-003, FR-004, FR-007, FR-011, NFR-001, NFR-009, C-007
+**Beads issue**: `hermes-outbound-artifact-delivery-gry`
+
+### Включённые подзадачи
+
+- [x] T023 Проследить все registration/dispatch/toolset-filtering call sites и первым зафиксировать full-boundary RED с точным выводом.
+- [x] T024 Добавить negative RED matrix для model-supplied target, missing/malformed/mismatched context, outside path, symlink escape и missing `documents` capability; structured failure не содержит tag, adapter не вызывается.
+- [x] T025 Реализовать минимальный structured artifact-publication contract через existing access context, current MessageEvent target, profile/workspace guards и gateway auto-append; tool сам не отправляет и не добавляет dependency, path scraping, retry или fallback.
+- [x] T026 Прогнать focused и затронутые send_message/document/access/shared/profile media suites, primary photo/voice regressions, Ruff, `py_compile`, `git diff --check`; выполнить privacy/fail-closed review и commit без live-операций.
+
+### Зависимости
+
+- Зависит от WP01 и WP02.
+
+### Риски и меры
+
+- Подмена target блокируется отсутствием target-полей в schema и отказом на неизвестные аргументы; адресат берётся только из валидированного `delivery_target`.
+- Containment проверяется после `resolve(strict=True)`; outside path и symlink escape отклоняются до adapter.
+- Для family/shared требуется существующая capability `documents`; owner сохраняет полный file toolset, shared-room membership никогда не повышает роль.
+
 ## Сводка зависимостей и порядка выполнения
 
-- **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06.
+- **Последовательность**: WP01 → WP02 и WP03 (параллельно после contract) → WP04 и WP05 → WP06; bounded WP07 зависит от уже завершённых WP01/WP02 и не открывает live gate.
 - **MVP scope**: WP01 + WP02 + WP03 + focused tests; live rollout не входит.
 - **Параллельность**: WP02 и WP03 после WP01 затрагивают непересекающиеся основные модули. WP04 и WP05 можно выполнять после их зависимостей; WP06 --- строго последним.
 - **Live gate**: T022 --- жёсткая остановка до отдельного approval; approval реализации не означает разрешение на restart/deploy.
@@ -162,6 +187,7 @@ description: "Список задач рабочих пакетов для из�
 | FR-008 | WP04 |
 | FR-009 | WP05 |
 | FR-010 | WP06 |
+| FR-011 | WP07 |
 
 ## Индекс подзадач (справочно)
 
@@ -175,3 +201,7 @@ description: "Список задач рабочих пакетов для из�
 | T016 | Migration planner | WP05 | P1 | Нет |
 | T019 | Staging artifact | WP06 | P1 | Нет |
 | T022 | Остановка на live gate | WP06 | P1 | Нет |
+| T023 | Full-boundary RED | WP07 | P0 | Нет |
+| T024 | Negative RED matrix | WP07 | P0 | Да |
+| T025 | Structured artifact delivery | WP07 | P0 | Нет |
+| T026 | Полные проверки и review | WP07 | P0 | Нет |

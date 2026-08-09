@@ -61,6 +61,20 @@
 1. **Given** staging candidate на live-derived base, **When** policy and privacy suites pass, **Then** публикуется redacted evidence с hashes и явно перечисленными изменёнными файлами.
 2. **Given** live canary или preflight failure, **When** оператор запускает rollback, **Then** восстанавливаются предыдущие code/config surfaces без удаления legacy данных.
 
+### User Story 5 - Явная доставка созданного артефакта (Priority: P1)
+
+Авторизованный участник текущего family/private разговора или разрешённого shared-room group/topic может получить только что созданный документ явным структурированным вызовом. Получатель всегда выводится из неизменяемого `ResolvedAccessContext.delivery_target` и обязан точно совпасть с target текущего event; модель не выбирает пользователя, профиль, чат или topic.
+
+**Why this priority**: Сообщение «файл готов» без фактического вложения вводит пользователя в заблуждение, а поиск путей в произвольном terminal stdout создаёт риск утечки между профилями.
+
+**Independent Test**: Через реальную регистрацию и dispatch инструмента передать synthetic XLSX из bound workspace при family/private context и настоящем `AccessRegistry` shared scope, проверить structured success с trusted `MEDIA:` tag и единственный gateway `send_document` в текущий DM либо Telegram group/topic. Для missing/mismatch context, missing `documents`, foreign chat/thread target, outside path и symlink escape проверить structured failure без tag и adapter call.
+
+**Acceptance Scenarios**:
+
+1. **Given** bound six-field context с capability `documents` и обычный XLSX внутри текущего profile/workspace, **When** модель явно вызывает `deliver_artifact(path=...)`, **Then** tool возвращает structured success с trusted `MEDIA:<absolute-path>`, а существующие auto-append и gateway delivery ровно один раз отправляют документ в текущий `delivery_target` с его thread metadata.
+2. **Given** модель передаёт target либо файл отсутствует, находится вне разрешённых roots или выходит через symlink, **When** вызывается доставка, **Then** система fail-closed возвращает structured failure без `MEDIA:` tag, и adapter не вызывается.
+3. **Given** family/shared context без capability `documents`, **When** вызывается доставка, **Then** membership не повышает роль, а публикация артефакта запрещается без owner/home/env fallback; owner сохраняет полный file toolset.
+
 ## Edge Cases
 
 - Telegram DM с `user_id != chat_id`, username-only identity, edited message или missing account metadata: reject before model/session/tools.
@@ -86,6 +100,7 @@
 | FR-008 | Dashboard audit and break-glass boundary | As the owner, I want redacted access health and a reason-bound, read-only 15-minute break-glass lease without model delivery, bulk search or export. | Medium | Open |
 | FR-009 | Migration safety | As the operator, I want dry-run counts/hashes, per-principal unambiguous DM migration and a closed read-only legacy archive for ambiguous records so that migration is reversible and data ownership is not guessed. | High | Open |
 | FR-010 | Staged rollout and rollback | As the operator, I want live-derived staging, synthetic canaries, backups and an explicit live restart gate so that this compatibility slice can be rolled back to the current live base. | High | Open |
+| FR-011 | Explicit outbound artifact delivery | Как авторизованный участник, я хочу явным структурированным вызовом доставить существующий non-image артефакт из bound profile/workspace в текущий `delivery_target`, чтобы документ пришёл ровно один раз без path scraping, foreign target или fallback. | High | Open |
 
 ### Non-Functional Requirements
 
@@ -99,6 +114,7 @@
 | NFR-006 | Resource limits | Every `family` profile enforces 2 vCPU, 2 GiB RAM, 256 PIDs, 5 GiB workspace, no host mounts and terminal network disabled. | Security | High | Open |
 | NFR-007 | Observability | Every deny, fallback and break-glass event has a redacted audit record with no session contents or credentials. | Auditability | Medium | Open |
 | NFR-008 | Rollback | A failed canary can restore previous code/config surfaces without destructive data cleanup. | Reliability | High | Open |
+| NFR-009 | Artifact delivery boundary | Доставка проверяет regular-file и containment после `resolve`, отклоняет symlink escape и missing context/capabilities, не меняет MEDIA/TTS/image/voice paths и всегда возвращает структурированный результат. | Security | High | Open |
 
 ### Constraints
 
@@ -110,6 +126,7 @@
 | C-004 | OAuth and provider scope | Prefer Codex OAuth/scoped model client references; fallbacks are server-configured and opaque to model/tool processes. | Security | High | Open |
 | C-005 | Separate live gate | Backup, live config application, service restart and Telegram canary require a separate explicit approval after implementation and staging evidence. | Operations | High | Open |
 | C-006 | No global memory copy | Do not migrate global `MEMORY.md`, `USER.md` or personal context into family profiles. | Privacy | High | Open |
+| C-007 | Bounded artifact candidate | Пакет доставки реализуется от exact candidate `907dbea2960907d21e38a9b5f55ac7a10a62864c`; push, merge, deploy, restart, config/symlink mutation и Telegram messages не входят в пакет. | Operations | High | Open |
 
 ### Key Entities
 
@@ -131,3 +148,4 @@
 - **SC-004**: Staging gateway and dashboard canary completes with services healthy, loopback-only dashboard, no restart loop and reproducible evidence hashes.
 - **SC-005**: Migration dry-run reports stable counts/hashes and leaves ambiguous/global memory records outside family profiles.
 - **SC-006**: Rollback rehearsal restores the live-derived code/config baseline without destructive cleanup.
+- **SC-007**: Boundary regression подтверждает один `send_document` в bound `delivery_target` для synthetic XLSX и ноль adapter calls во всех negative cases; focused и затронутые access/document/media suites проходят.

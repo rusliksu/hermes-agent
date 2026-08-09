@@ -1148,6 +1148,20 @@ def _profile_media_delivery_roots(profile_home: Path) -> List[Path]:
     return roots
 
 
+def _bound_multiplex_delivery_roots(profile_home: Path) -> List[Path]:
+    """Return typed profile/workspace roots without process/env fallback."""
+    roots = [profile_home]
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        workspace = resolve_bound_profile_cwd()
+        if workspace is not None:
+            roots.append(workspace)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return list(dict.fromkeys(root.resolve(strict=False) for root in roots))
+
+
 def _kanban_attachment_roots() -> List[Path]:
     """Return durable Kanban attachment roots without importing kanban_db."""
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
@@ -1180,7 +1194,9 @@ def _media_delivery_allowed_roots() -> List[Path]:
         # In multiplex mode never expose the all-profile enumeration or a
         # process-wide operator root. Explicit roots are accepted only when
         # they are physically inside the currently bound profile home.
+        bound_roots = _bound_multiplex_delivery_roots(profile_home)
         roots = _profile_media_delivery_roots(profile_home)
+        roots.extend(bound_roots)
         candidate_roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
         candidate_roots.extend(_kanban_attachment_roots())
         extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
@@ -1194,7 +1210,7 @@ def _media_delivery_allowed_roots() -> List[Path]:
                 resolved_root = root.expanduser().resolve(strict=False)
             except (OSError, RuntimeError, ValueError):
                 continue
-            if _path_is_within(resolved_root, profile_home):
+            if any(_path_is_within(resolved_root, root) for root in bound_roots):
                 roots.append(resolved_root)
         return roots
 
@@ -1414,10 +1430,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # non-strict fallback so a guessed path in another profile can never be
     # delivered through the default path.
     multiplex_active, profile_home = _multiplex_media_delivery_scope()
-    if multiplex_active and (
-        profile_home is None or not _path_is_within(resolved, profile_home)
-    ):
-        return None
+    if multiplex_active:
+        if profile_home is None or not any(
+            _path_is_within(resolved, root)
+            for root in _bound_multiplex_delivery_roots(profile_home)
+        ):
+            return None
 
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.

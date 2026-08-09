@@ -198,7 +198,7 @@ def test_shared_room_documents_exposes_file_tool_contract():
 
     assert toolsets == ["file"]
     assert expected_tools == frozenset(
-        {"read_file", "write_file", "patch", "search_files"}
+        {"read_file", "write_file", "patch", "search_files", "deliver_artifact"}
     )
 
 

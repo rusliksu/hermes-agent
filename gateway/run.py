@@ -1155,6 +1155,7 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech",
     "text_to_speech_tool",
     "image_generate",
+    "deliver_artifact",
 }
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
@@ -3912,7 +3913,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             expected_tools.add("vision_analyze")
         if "documents" in context.capabilities and "file" in configured:
             toolsets.append("file")
-            expected_tools.update({"read_file", "write_file", "patch", "search_files"})
+            expected_tools.update(
+                {"read_file", "write_file", "patch", "search_files", "deliver_artifact"}
+            )
         return sorted(toolsets), frozenset(expected_tools)
 
     @staticmethod
@@ -16185,6 +16188,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        current_delivery_target = None
+        try:
+            from gateway.access_registry import DeliveryTarget
+
+            current_delivery_target = DeliveryTarget(
+                platform=context.source.platform.value,
+                account=context.source.route_account,
+                peer_kind=context.source.chat_type,
+                chat_id=context.source.chat_id,
+                thread_id=context.source.thread_id,
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Legacy/untyped events can omit route-account data. Keep a bound
+            # None so artifact delivery fails closed instead of consulting env.
+            current_delivery_target = None
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -16196,6 +16215,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            current_delivery_target=current_delivery_target,
         )
 
     def _clear_session_env(self, tokens: list) -> None:

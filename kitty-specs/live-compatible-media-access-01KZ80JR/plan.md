@@ -153,6 +153,16 @@ Default candidate order is image `openai-codex → fal → openrouter`, STT `loc
 - **Sequencing/depends-on**: IC-01 through IC-04.
 - **Risks**: live branch may have hidden local deployment assumptions; keep candidate isolated and compare service state before/after.
 
+### IC-06 --- Явная доставка outbound-артефакта
+
+- **Purpose**: добавить минимальный структурированный contract для доставки существующего non-image файла в текущий разговор через уже выбранный adapter.
+- **Relevant requirements**: FR-001, FR-003, FR-004, FR-007, FR-011, NFR-001, NFR-009, C-007.
+- **Affected surfaces**: реестр инструментов `tools/`, существующий `file` toolset, boundary regression и access/document/media tests.
+- **Design**: schema принимает только путь; handler повторно валидирует bound six-field context, current MessageEvent target и `documents` capability для family/shared, разрешает regular file после `resolve` только внутри typed profile/workspace roots и возвращает structured success с trusted `MEDIA:<absolute-path>`. Существующие gateway auto-append и `_deliver_media_from_response` выполняют единственный `send_document` с current event/thread metadata; tool сам не отправляет.
+- **Non-goals**: generic path scraping, terminal stdout scanning, новый target API, dependency, retry/fallback, изменение MEDIA/TTS/image/voice paths, live mutation.
+- **Sequencing/depends-on**: IC-01 и IC-02; реализация строго RED → GREEN от candidate `907dbea2960907d21e38a9b5f55ac7a10a62864c`.
+- **Risks**: модель может попытаться подменить target или передать symlink; неизвестные аргументы, foreign roots, missing/malformed/mismatched context, missing `documents` и account/thread mismatch отклоняются fail-closed без `MEDIA:` tag.
+
 ## Phased Delivery and Gates
 
 ### Phase 0 --- Read-only baseline (current)
@@ -185,6 +195,13 @@ Default candidate order is image `openai-codex → fal → openrouter`, STT `loc
 
 - Only after an explicit new approval: backup metadata/config, apply live code/config, restart `hermes-gateway`/`hermes-dashboard`, run owner/Юля/мама/other-family/room/unknown canaries, verify service health.
 - Failure action: restore exact prior code/config surfaces; do not delete legacy/archive data.
+
+### Phase 6 --- Bounded outbound artifact delivery
+
+- Создать WP07 и связать его с Bead `hermes-outbound-artifact-delivery-gry` (`spec_id: live-compatible-media-access-01KZ80JR`).
+- Сначала зафиксировать full-boundary RED через real registration/dispatch, family/private context и captured Telegram adapter, включая negative matrix.
+- Затем внести минимальный tool/toolset patch, прогнать focused и затронутые access/document/shared/profile media suites, Ruff, `py_compile` и `git diff --check`.
+- Gate: commit task-owned changes; остановиться до push/merge/deploy/restart/config/symlink/Telegram операций.
 
 ## Complexity Tracking
 

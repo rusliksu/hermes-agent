@@ -160,6 +160,31 @@ caption
         assert tags == ["MEDIA:/tmp/voice.ogg"]
         assert voice is True
 
+    def test_gateway_auto_append_keeps_explicit_artifact_delivery_tag(self):
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_artifact", "function": {"name": "deliver_artifact"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_artifact",
+                "content": (
+                    '{"success": true, "status": "ready_for_delivery", '
+                    '"media_tag": "MEDIA:/workspace/report.xlsx"}'
+                ),
+            },
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/workspace/report.xlsx"]
+        assert voice is False
+
     def test_gateway_auto_append_image_generate_json_path(self):
         """image_generate returns a local path in JSON (no MEDIA: tag); it is
         auto-appended so delivery doesn't depend on the model restating it."""

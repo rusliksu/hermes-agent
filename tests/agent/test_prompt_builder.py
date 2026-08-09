@@ -1158,6 +1158,17 @@ class TestPromptBuilderConstants:
         # Local media delivery guidance must remain intact in the base hint.
         assert "include MEDIA:" in hint
 
+    def test_telegram_hint_requires_structured_delivery_for_created_documents(self):
+        hint = PLATFORM_HINTS["telegram"]
+        lowered = hint.lower()
+
+        assert "deliver_artifact(path=" in hint
+        assert "downloadable" in lowered
+        assert "structured success" in lowered
+        assert "do not claim" in lowered
+        # Existing MEDIA syntax remains documented for legacy media producers.
+        assert "MEDIA:" in hint
+
     def test_platform_hints_mattermost(self):
         hint = PLATFORM_HINTS["mattermost"]
         assert "Mattermost" in hint
@@ -1705,4 +1716,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
