@@ -122,6 +122,7 @@ async def _run_full_boundary(
     *,
     correction_succeeds: bool,
     document_succeeds: bool = True,
+    no_space_v4a: bool = False,
 ):
     from agent.secret_scope import is_multiplex_active, set_multiplex_active
 
@@ -200,12 +201,29 @@ async def _run_full_boundary(
             ),
             unsafe_final,
         ]
-    responses = [
+    unsafe_mutation = (
         _model_response(
+            tool="patch",
+            args={
+                "mode": "patch",
+                "patch": (
+                    "*** Begin Patch\n"
+                    f"***Add File: {outside}\n"
+                    "+first-unsafe-xls\n"
+                    "*** End Patch"
+                ),
+            },
+            call_id="first-unsafe-write",
+        )
+        if no_space_v4a
+        else _model_response(
             tool="write_file",
             args={"path": str(outside), "content": "first-unsafe-xls"},
             call_id="first-unsafe-write",
-        ),
+        )
+    )
+    responses = [
+        unsafe_mutation,
         unsafe_final,
         *followup,
     ]
@@ -332,6 +350,30 @@ async def test_outside_generated_xls_gets_one_safe_correction_and_confirmed_topi
         if delivery.startswith("text:DOCUMENT_SENT_OK")
     )
     assert document_index < success_index
+
+
+@pytest.mark.asyncio
+async def test_no_space_v4a_outside_add_gets_one_safe_correction(
+    monkeypatch,
+    tmp_path,
+):
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=True,
+        no_space_v4a=True,
+    )
+
+    assert case.provider.chat.completions.create.call_count == 5
+    assert not case.outside.exists()
+    assert case.safe.read_text(encoding="utf-8") == "synthetic-safe-xls"
+    texts = _visible_texts(case.adapter)
+    assert "UNSAFE_SUCCESS" not in "\n".join(texts)
+    case.adapter.send_document.assert_awaited_once_with(
+        chat_id=CHAT_ID,
+        file_path=str(case.safe.resolve()),
+        metadata={"thread_id": THREAD_ID, "notify": True},
+    )
 
 
 @pytest.mark.asyncio
@@ -553,7 +595,7 @@ def test_bound_patch_denies_outside_add_and_allows_safe_relative_document(
                     mode="patch",
                     patch=(
                         "*** Begin Patch\n"
-                        "*** Add File: safe-relative.xlsx\n"
+                        "***Add File: safe-relative.xlsx\n"
                         "+inside\n"
                         "*** End Patch"
                     ),
@@ -570,7 +612,7 @@ def test_bound_patch_denies_outside_add_and_allows_safe_relative_document(
     assert safe_result.get("error") is None
     file_ops.patch_v4a.assert_called_once_with(
         "*** Begin Patch\n"
-        "*** Add File: safe-relative.xlsx\n"
+        "***Add File: safe-relative.xlsx\n"
         "+inside\n"
         "*** End Patch"
     )

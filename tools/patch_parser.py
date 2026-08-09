@@ -224,6 +224,19 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
     return operations, None
 
 
+def extract_v4a_file_paths(patch_content: str) -> List[str]:
+    """Return every source and destination path from a valid V4A patch."""
+    operations, error = parse_v4a_patch(patch_content)
+    if error:
+        return []
+    paths: List[str] = []
+    for operation in operations:
+        paths.append(operation.file_path)
+        if operation.new_path:
+            paths.append(operation.new_path)
+    return paths
+
+
 def _count_occurrences(text: str, pattern: str) -> int:
     """Count non-overlapping occurrences of *pattern* in *text*."""
     count = 0

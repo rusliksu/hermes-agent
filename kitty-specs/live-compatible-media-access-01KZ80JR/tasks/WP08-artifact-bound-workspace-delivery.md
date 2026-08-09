@@ -182,3 +182,50 @@ This is the same explicit affected-file matrix as the earlier 865-pass run; the 
 - Every `patch` mutation target, including absolute V4A Add File targets, passes the shared bound-output validator before file operations. Ordinary source patches and owner behavior remain unchanged.
 - Streaming hold state and delivery confirmation reset per turn and remain local to the current run; unrelated bound plain-text output is replayed unchanged. No binder or gateway target reconstruction remains.
 - New policy logging contains no raw artifact path, user/chat identity, or owner fallback.
+
+## Cycle-2 review remediation — partial, remains in progress
+
+### P1 strict TDD evidence
+
+RED command:
+
+```text
+HERMES_PYTHON=/home/openclaw/staging/hermes-deploy-live-compatible-25d5031b-20260806T202000Z/.venv/bin/python scripts/run_tests.sh tests/gateway/test_artifact_bound_workspace_delivery.py -q
+```
+
+RED result: `7 passed, 2 failed`. The no-space `***Add File:` outside-document
+case stopped after 2 model calls instead of issuing the one correction; the
+outside mutation was rejected, but `UNSAFE_SUCCESS` still reached text delivery.
+The second temporary RED showed ordinary bound plain text remained buffered
+before turn completion.
+
+P1 now derives all V4A mutation targets from `tools.patch_parser` rather than
+maintaining separate safety/stop regex grammars. Focused boundary GREEN:
+`8 passed, 0 failed`. Parser/helper/file-tool focused GREEN: `4 files, 155
+passed, 0 failed`. The no-space outside target does not mutate, triggers one
+correction, and exposes no premature success; a safe relative no-space target
+remains accepted.
+
+Affected matrix GREEN: `33 files, 913 passed, 0 failed` (the prior 912 cases
+plus the new no-space boundary case). Ruff on changed Python, `py_compile` on
+changed Python, and `git diff --check` all exit 0.
+
+### P2 material protocol trade-off — not implemented
+
+The temporary timing RED used an identical `SUCCESS_PREFIX` for an ordinary
+no-tool response and for an adversarial response whose document mutation was
+announced later. Before that later event, both runs expose the same gateway
+input: `stream_delta_callback(text)`. The first mutation-classifying signal is
+`tool_start_callback(name, args)`, fired only when the parsed tool call begins
+execution. Therefore immediate ordinary-prefix delivery also immediately
+delivers the adversarial prefix; waiting for the tool-start signal preserves
+the no-premature-success guarantee but delays ordinary plain text.
+
+Existing transports do not close the gap: Telegram family/shared rooms cannot
+use native draft streaming (private chats only), progressive edits are already
+user-visible, and native drafts are also visible previews. Retraction after
+tool start cannot establish “never exposed”. Per the cycle-2 stopping condition,
+no heuristic/user-text classifier or P2 production change was added, and the
+temporary impossible RED was removed after preserving this evidence. WP08 and
+Bead `tm-ai-loopx-kimi-86x` remain `in_progress`; this branch is not ready for
+re-review or deployment.
