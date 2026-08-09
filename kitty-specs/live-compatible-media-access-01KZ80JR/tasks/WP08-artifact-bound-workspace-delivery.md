@@ -341,3 +341,67 @@ ordinary non-document final text is byte-for-byte unchanged; and a numeric
 boundary invalidated by real message repair fails closed on relevant artifact
 activity. WP08 and Bead `tm-ai-loopx-kimi-86x` remain `in_progress`; no runtime
 status files, live state, or deployment surface were changed.
+
+## Cycle-5 restart-provenance review — material blocker, remains in progress
+
+### Strict TDD RED before any production edit
+
+A temporary six-case restart contract used real `SessionDB`/`SessionStore`
+close-and-reopen boundaries for: failed mutation plus unrelated delivery;
+exact mutation/delivery and outbound acknowledgement; finalized-turn exclusion;
+profile/session isolation; reset abandonment; and malformed/ambiguous state.
+
+Command:
+
+```text
+HERMES_PYTHON=/home/openclaw/staging/hermes-deploy-live-compatible-25d5031b-20260806T202000Z/.venv/bin/python scripts/run_tests.sh tests/gateway/test_artifact_pending_turn_restart_red.py -q
+```
+
+Result: `0 passed, 6 failed`, exit 1. Every case stopped at the same missing
+contract: `SessionStore` has no durable, session/profile/turn/generation-bound
+pending artifact transaction API. The exact captured failure text was:
+
+```text
+AssertionError: SessionStore lacks a durable, session/profile/turn/generation-bound pending artifact transaction API
+```
+
+The temporary impossible RED file was removed after this evidence was
+preserved. No production source was changed.
+
+### Why the existing persisted suffix is not a trusted complete substitute
+
+- `messages` persists role/content/tool-call fields, but no server-origin
+  marker, `turn_id`, run generation, pending/finalized transaction identity,
+  or outbound delivery receipt. The generated `turn_id` remains process-local.
+- `SessionEntry.resume_pending` persists only a session-level boolean/reason/time;
+  crash recovery marks every recently active session and cannot identify the
+  exact pending turn or its tool-result suffix.
+- Session import intentionally accepts message `role`, `tool_call_id`,
+  `tool_name`, and tool-call payloads. Therefore an arbitrary imported/history
+  suffix can be structurally indistinguishable from rows appended by the live
+  tool executor. Scanning the transcript cannot prove server-owned provenance.
+- Finalization appends and persists the closing assistant row before the
+  platform adapter calls `send_document`. The only persisted
+  `platform_message_id` dedupe lookup is documented and implemented for inbound
+  messages. There is no durable outbound document acknowledgement/idempotency
+  record that can distinguish “not sent” from “Telegram accepted it before the
+  process died.”
+- Reset correctly rotates to a fresh session and profile/session columns already
+  exist, but there is no typed pending transaction for reset to atomically
+  abandon or for compression/repair to carry without trusting transcript text.
+
+### Stopping condition
+
+A complete fix now requires a material `state.db` schema and cross-layer
+protocol migration: a server-written pending artifact transaction keyed by the
+exact profile/session/session-key/turn/generation; ordered mutation/delivery
+events with canonical-path invariants; explicit ambiguous/finalized/abandoned
+states; reset and compression lifecycle handling; and a durable outbound
+delivery acknowledgement/idempotency policy spanning `AIAgent`, gateway, and
+Telegram delivery. A suffix-only rehydration would be a partial fail-open fix,
+while retrying without an outbound receipt can duplicate a Telegram document.
+
+Per the explicit WP08 stopping condition, no partial implementation or schema
+migration was started. WP08 and Bead `tm-ai-loopx-kimi-86x` remain
+`in_progress`; no GREEN count is claimed and no runtime status/live data was
+changed.
