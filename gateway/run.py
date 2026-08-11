@@ -42,6 +42,7 @@ import time
 import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
+from functools import partial
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Union
@@ -768,6 +769,19 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
+    if reason in {"artifact_delivery_abandoned", "artifact_delivery_uncertain"}:
+        delivery_state = (
+            "may have been delivered, but no durable receipt was stored"
+            if reason == "artifact_delivery_uncertain"
+            else "was not sent"
+        )
+        return (
+            "[System note: A document delivery was interrupted and "
+            f"{delivery_state}. Do not re-execute or auto-resume old tool calls. "
+            "Tell the user to explicitly retry the document request if they still "
+            "want it delivered, then address only their new message.]"
+        )
+
     reason_phrase = (
         "a gateway restart"
         if reason == "restart_timeout"
@@ -12779,7 +12793,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-            if not self._is_session_run_current(_quick_key, run_generation):
+            confirmation = agent_result.get("artifact_delivery_confirmation")
+            _confirmation_marker = confirmation is not None
+            _run_is_current = self._is_session_run_current(
+                _quick_key, run_generation
+            )
+            _confirmation_publishable = True
+            if _confirmation_marker:
+                _confirmation_publishable = (
+                    await self._prepare_artifact_delivery_confirmation(
+                        event,
+                        confirmation,
+                        publish=_run_is_current,
+                    )
+                )
+
+            if not _run_is_current:
                 logger.info(
                     "Discarding stale agent result for %s — generation %d is no longer current",
                     _quick_key or "?",
@@ -12795,12 +12824,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            confirmation = agent_result.get("artifact_delivery_confirmation")
-            event.artifact_delivery_confirmation = (
-                dict(confirmation) if isinstance(confirmation, dict) else None
+            _confirmation_quarantined = (
+                _confirmation_marker and not _confirmation_publishable
             )
-
-            response = agent_result.get("final_response") or ""
+            response = (
+                ""
+                if _confirmation_quarantined
+                else agent_result.get("final_response") or ""
+            )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -12811,11 +12842,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
+                _intentional_silence = (
+                    _confirmation_quarantined
+                    or is_intentional_silence_agent_result(agent_result, response)
                 )
             except Exception:
-                _intentional_silence = False
+                _intentional_silence = _confirmation_quarantined
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -17583,6 +17615,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
 
+    async def _prepare_artifact_delivery_confirmation(
+        self,
+        event: MessageEvent,
+        confirmation: Any,
+        *,
+        publish: bool,
+    ) -> bool:
+        """Bind valid provenance or quarantine and abandon a ready transaction."""
+        event.artifact_delivery_confirmation = None
+        if hasattr(event, "_artifact_delivery_transition"):
+            delattr(event, "_artifact_delivery_transition")
+
+        transaction_session_id = (
+            confirmation.get("transaction_session_id")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        transaction_id = (
+            confirmation.get("transaction_id")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        usable_transaction = (
+            isinstance(transaction_session_id, str)
+            and bool(transaction_session_id)
+            and isinstance(transaction_id, str)
+            and bool(transaction_id)
+            and self._session_db is not None
+        )
+
+        path = confirmation.get("path") if isinstance(confirmation, dict) else None
+        media_tag = (
+            confirmation.get("media_tag")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        valid = (
+            publish
+            and usable_transaction
+            and isinstance(path, str)
+            and bool(path)
+            and Path(path).is_absolute()
+            and media_tag == f"MEDIA:{path}"
+        )
+        if valid:
+            event.artifact_delivery_confirmation = dict(confirmation)
+            event._artifact_delivery_transition = partial(
+                self._session_db.transition_artifact_delivery,
+                transaction_session_id,
+                transaction_id,
+            )
+            return True
+
+        if usable_transaction:
+            try:
+                await self._session_db.transition_artifact_delivery(
+                    transaction_session_id,
+                    transaction_id,
+                    "ready",
+                    "abandoned",
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to abandon quarantined artifact delivery transaction",
+                    exc_info=True,
+                )
+        return False
+
     def _bind_adapter_run_generation(
         self,
         adapter: Any,
@@ -20693,11 +20793,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
-            _artifact_confirmation = result.get("artifact_delivery_confirmation")
+            _raw_artifact_confirmation = result.get(
+                "artifact_delivery_confirmation"
+            )
+            _artifact_confirmation_present = _raw_artifact_confirmation is not None
+            _artifact_confirmation = _raw_artifact_confirmation
             if not isinstance(_artifact_confirmation, dict):
                 _artifact_confirmation = None
             _artifact_stream_buffer.resolve(
-                _artifact_confirmation,
+                _artifact_confirmation_present,
                 (
                     _stream_consumer.on_delta
                     if _stream_consumer is not None
@@ -20878,7 +20982,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if _artifact_confirmation:
+            if _artifact_confirmation_present:
                 # Discard every model-authored legacy MEDIA directive. Only a
                 # current-turn deliver_artifact result may select the file, and
                 # its exact path is propagated separately below.
@@ -20980,11 +21084,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": (
                     False
-                    if _artifact_confirmation
+                    if _artifact_confirmation_present
                     else result.get("response_previewed", False)
                 ),
                 "response_transformed": result.get("response_transformed", False),
-                "artifact_delivery_confirmation": _artifact_confirmation,
+                "artifact_delivery_confirmation": _raw_artifact_confirmation,
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

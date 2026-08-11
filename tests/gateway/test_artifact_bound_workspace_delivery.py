@@ -116,18 +116,6 @@ def _visible_texts(adapter: TelegramAdapter) -> list[str]:
     ]
 
 
-def _assistant_tool_call(name: str, call_id: str, args: dict) -> dict:
-    return {
-        "role": "assistant",
-        "tool_calls": [
-            {
-                "id": call_id,
-                "function": {"name": name, "arguments": json.dumps(args)},
-            }
-        ],
-    }
-
-
 def _tool_result(name: str, call_id: str, payload: dict) -> dict:
     return {
         "role": "tool",
@@ -185,6 +173,7 @@ async def _run_full_boundary(
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
     monkeypatch.setattr(gateway_run, "_env_path", home / ".env")
+    monkeypatch.setattr(run_agent, "_hermes_home", profile_home)
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -217,6 +206,10 @@ async def _run_full_boundary(
         "agent.model_metadata.get_model_context_length",
         lambda *_args, **_kwargs: 100_000,
     )
+    monkeypatch.setattr(
+        "agent.title_generator.maybe_auto_title", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr("agent.lsp.get_service", lambda: None)
 
     unsafe_final = _model_response(text=f"UNSAFE_SUCCESS\nMEDIA:{outside}")
     if boundary_scenario == "failed_then_unrelated":
@@ -422,69 +415,90 @@ async def _run_full_boundary(
             Platform.TELEGRAM: PlatformConfig(enabled=True, token="synthetic-token")
         },
     )
-    runner = gateway_run.GatewayRunner(config)
-    adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
-    delivery_order: list[str] = []
-
-    async def _send(*args, **kwargs):
-        delivery_order.append(f"text:{kwargs.get('content', args[1] if len(args) > 1 else '')}")
-        return SendResult(success=True, message_id="synthetic-text")
-
-    async def _send_document(*args, **kwargs):
-        delivery_order.append(f"document:{kwargs.get('file_path', '')}")
-        return SendResult(
-            success=document_succeeds,
-            message_id="synthetic-document" if document_succeeds else None,
-            error=None if document_succeeds else "synthetic document failure",
-        )
-
-    adapter.send = AsyncMock(side_effect=_send)
-    adapter.send_document = AsyncMock(side_effect=_send_document)
-    if correction_succeeds:
-        monkeypatch.setattr(
-            adapter,
-            "filter_local_delivery_paths",
-            lambda paths: list(paths),
-        )
-    adapter.send_typing = AsyncMock()
-    adapter.stop_typing = AsyncMock()
-    adapter.set_message_handler(runner._handle_message)
-    runner.adapters[Platform.TELEGRAM] = adapter
-    event = MessageEvent(
-        text="Создай и отправь общую таблицу",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id=CHAT_ID,
-            chat_type="group",
-            user_id=USER_ID,
-            thread_id=THREAD_ID,
-            route_account=ACCOUNT,
-        ),
-        message_id="synthetic-inbound",
-    )
-
     try:
-        await adapter.handle_message(event)
-        await _wait_for_turn(adapter)
+        runner = gateway_run.GatewayRunner(config)
+        adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
+        delivery_order: list[str] = []
+
+        async def _send(*args, **kwargs):
+            delivery_order.append(
+                f"text:{kwargs.get('content', args[1] if len(args) > 1 else '')}"
+            )
+            return SendResult(success=True, message_id="synthetic-text")
+
+        async def _send_document(*args, **kwargs):
+            delivery_order.append(f"document:{kwargs.get('file_path', '')}")
+            return SendResult(
+                success=document_succeeds,
+                message_id="synthetic-document" if document_succeeds else None,
+                error=None if document_succeeds else "synthetic document failure",
+            )
+
+        adapter.send = AsyncMock(side_effect=_send)
+        adapter.send_document = AsyncMock(side_effect=_send_document)
+        if correction_succeeds:
+            monkeypatch.setattr(
+                adapter,
+                "filter_local_delivery_paths",
+                lambda paths: list(paths),
+            )
+        adapter.send_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock()
+        adapter.set_message_handler(runner._handle_message)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = MessageEvent(
+            text="Создай и отправь общую таблицу",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=CHAT_ID,
+                chat_type="group",
+                user_id=USER_ID,
+                thread_id=THREAD_ID,
+                route_account=ACCOUNT,
+            ),
+            message_id="synthetic-inbound",
+        )
+
+        try:
+            await adapter.handle_message(event)
+            await _wait_for_turn(adapter)
+        finally:
+            try:
+                await adapter.cancel_background_tasks()
+            finally:
+                try:
+                    with runner._agent_cache_lock:
+                        agents = [
+                            entry[0] if isinstance(entry, tuple) else entry
+                            for entry in runner._agent_cache.values()
+                        ]
+                        runner._agent_cache.clear()
+                    for agent in agents:
+                        if isinstance(agent, run_agent.AIAgent):
+                            await runner._cleanup_agent_resources_off_loop(agent)
+                finally:
+                    try:
+                        runner._shutdown_executor()
+                    finally:
+                        if runner._session_db is not None:
+                            runner._session_db._db.close()
+                        if runner.session_store._db is not None:
+                            runner.session_store._db.close()
+
+        return SimpleNamespace(
+            adapter=adapter,
+            provider=provider_client,
+            delivery_order=delivery_order,
+            outside=outside,
+            safe=safe,
+            preexisting=preexisting,
+            ordinary=ordinary,
+            compression_calls=compression_calls,
+            event=event,
+            runner=runner,
+        )
     finally:
         set_multiplex_active(previous_multiplex_state)
-
-    if runner._session_db is not None:
-        runner._session_db._db.close()
-    if runner.session_store._db is not None:
-        runner.session_store._db.close()
-    return SimpleNamespace(
-        adapter=adapter,
-        provider=provider_client,
-        delivery_order=delivery_order,
-        outside=outside,
-        safe=safe,
-        preexisting=preexisting,
-        ordinary=ordinary,
-        compression_calls=compression_calls,
-        event=event,
-        runner=runner,
-    )
 
 
 @pytest.mark.asyncio
@@ -505,6 +519,7 @@ async def test_outside_generated_xls_gets_one_safe_correction_and_confirmed_topi
         chat_id=CHAT_ID,
         file_path=str(case.safe.resolve()),
         metadata={"thread_id": THREAD_ID, "notify": True},
+        _require_native=True,
     )
     texts = _visible_texts(case.adapter)
     assert "UNSAFE_SUCCESS" not in "\n".join(texts)
@@ -539,6 +554,7 @@ async def test_no_space_v4a_outside_add_gets_one_safe_correction(
         chat_id=CHAT_ID,
         file_path=str(case.safe.resolve()),
         metadata={"thread_id": THREAD_ID, "notify": True},
+        _require_native=True,
     )
 
 
@@ -615,6 +631,7 @@ async def test_compression_keeps_exact_mutation_delivery_confirmation_exactly_on
         chat_id=CHAT_ID,
         file_path=str(case.safe.resolve()),
         metadata={"thread_id": THREAD_ID, "notify": True},
+        _require_native=True,
     )
     assert "DOCUMENT_SENT_AFTER_COMPRESSION" in "\n".join(
         _visible_texts(case.adapter)
@@ -658,6 +675,53 @@ async def test_repaired_stale_numeric_boundary_fails_closed_for_artifact_activit
     assert "UNSAFE_SUCCESS" not in "\n".join(_visible_texts(case.adapter))
 
 
+@pytest.mark.asyncio
+async def test_durable_begin_failure_prevents_document_tool_execution(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        hermes_state.SessionDB,
+        "begin_artifact_delivery",
+        lambda *_args, **_kwargs: False,
+    )
+
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=True,
+    )
+
+    assert case.provider.chat.completions.create.call_count == 1
+    case.adapter.send_document.assert_not_awaited()
+    assert not case.outside.exists()
+    assert not case.safe.exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_scanner_exception_fails_closed_in_active_artifact_turn(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import artifact_delivery_stop
+
+    monkeypatch.setattr(
+        artifact_delivery_stop,
+        "bound_artifact_stop_action",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scanner crash")),
+    )
+
+    case = await _run_full_boundary(
+        monkeypatch,
+        tmp_path,
+        correction_succeeds=True,
+    )
+
+    assert case.provider.chat.completions.create.call_count == 2
+    case.adapter.send_document.assert_not_awaited()
+    assert "UNSAFE_SUCCESS" not in "\n".join(_visible_texts(case.adapter))
+
+
 def test_failed_mutation_cannot_bind_unrelated_preexisting_delivery(monkeypatch):
     from agent import artifact_delivery_stop
 
@@ -667,11 +731,7 @@ def test_failed_mutation_cannot_bind_unrelated_preexisting_delivery(monkeypatch)
         artifact_delivery_stop, "bound_document_context_active", lambda: True
     )
     messages = [
-        _assistant_tool_call("write_file", "failed-write", {"path": new_report}),
         _tool_result("write_file", "failed-write", {"error": "synthetic failure"}),
-        _assistant_tool_call(
-            "deliver_artifact", "unrelated-delivery", {"path": preexisting}
-        ),
         _tool_result(
             "deliver_artifact",
             "unrelated-delivery",
@@ -698,11 +758,9 @@ def test_successful_mutation_of_a_cannot_bind_delivery_of_b(monkeypatch):
         artifact_delivery_stop, "bound_document_context_active", lambda: True
     )
     messages = [
-        _assistant_tool_call("write_file", "write-a", {"path": report_a}),
         _tool_result(
             "write_file", "write-a", _successful_write_result(report_a)
         ),
-        _assistant_tool_call("deliver_artifact", "deliver-b", {"path": report_b}),
         _tool_result(
             "deliver_artifact",
             "deliver-b",
@@ -747,21 +805,7 @@ def test_missing_malformed_or_ambiguous_mutation_result_fails_closed(
     mutation_result = _tool_result("patch", "patch-call", {})
     mutation_result["content"] = mutation_content
     messages = [
-        _assistant_tool_call(
-            "patch",
-            "patch-call",
-            {
-                "mode": "patch",
-                "patch": (
-                    "*** Begin Patch\n"
-                    "*** Add File: report.xlsx\n"
-                    "+synthetic report\n"
-                    "*** End Patch"
-                ),
-            },
-        ),
         mutation_result,
-        _assistant_tool_call("deliver_artifact", "deliver-call", {"path": report}),
         _tool_result(
             "deliver_artifact",
             "deliver-call",
@@ -795,12 +839,8 @@ def test_outside_root_result_paths_fail_closed(monkeypatch):
         ),
     )
     messages = [
-        _assistant_tool_call("write_file", "write-call", {"path": outside}),
         _tool_result(
             "write_file", "write-call", _successful_write_result(outside)
-        ),
-        _assistant_tool_call(
-            "deliver_artifact", "deliver-call", {"path": outside}
         ),
         _tool_result(
             "deliver_artifact",
@@ -827,15 +867,12 @@ def test_delivery_before_later_successful_mutation_of_same_path_is_stale(monkeyp
         artifact_delivery_stop, "bound_document_context_active", lambda: True
     )
     messages = [
-        _assistant_tool_call("write_file", "write-v1", {"path": report}),
         _tool_result("write_file", "write-v1", _successful_write_result(report)),
-        _assistant_tool_call("deliver_artifact", "deliver-v1", {"path": report}),
         _tool_result(
             "deliver_artifact",
             "deliver-v1",
             _successful_delivery_result(report),
         ),
-        _assistant_tool_call("write_file", "write-v2", {"path": report}),
         _tool_result("write_file", "write-v2", _successful_write_result(report)),
     ]
 
@@ -859,43 +896,6 @@ def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
         artifact_delivery_stop, "bound_document_context_active", lambda: True
     )
     messages = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "image-call",
-                    "function": {"name": "image_generate", "arguments": "{}"},
-                },
-                {
-                    "id": "tts-call",
-                    "function": {"name": "text_to_speech", "arguments": "{}"},
-                },
-                {
-                    "id": "patch-call",
-                    "function": {
-                        "name": "patch",
-                        "arguments": json.dumps(
-                            {
-                                "mode": "patch",
-                                "patch": (
-                                    "*** Begin Patch\n"
-                                    "*** Add File: report.xlsx\n"
-                                    "+synthetic report\n"
-                                    "*** End Patch"
-                                ),
-                            }
-                        ),
-                    },
-                },
-                {
-                    "id": "document-call",
-                    "function": {
-                        "name": "deliver_artifact",
-                        "arguments": json.dumps({"path": document_path}),
-                    },
-                },
-            ],
-        },
         {
             "role": "tool",
             "tool_call_id": "image-call",
@@ -939,30 +939,17 @@ def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
 
 
 @pytest.mark.parametrize(
-    ("patch_body", "mutation_outputs", "delivered_path"),
+    ("mutation_outputs", "delivered_path"),
     [
         (
-            "*** Begin Patch\n"
-            "***Add File: added.xlsx\n"
-            "+synthetic report\n"
-            "*** End Patch",
             ["/trusted/workspace/added.xlsx"],
             "/trusted/workspace/added.xlsx",
         ),
         (
-            "*** Begin Patch\n"
-            "*** Update File: updated.xlsx\n"
-            "@@ synthetic @@\n"
-            "-old\n"
-            "+new\n"
-            "*** End Patch",
             ["/trusted/workspace/updated.xlsx"],
             "/trusted/workspace/updated.xlsx",
         ),
         (
-            "*** Begin Patch\n"
-            "*** Move File: old.xlsx -> moved.xlsx\n"
-            "*** End Patch",
             [
                 "/trusted/workspace/old.xlsx",
                 "/trusted/workspace/moved.xlsx",
@@ -971,9 +958,8 @@ def test_exact_deliver_artifact_result_wins_over_earlier_image_and_tts_tags(
         ),
     ],
 )
-def test_parser_valid_patch_outputs_bind_only_exact_delivered_path(
+def test_patch_result_outputs_bind_only_exact_delivered_path(
     monkeypatch,
-    patch_body,
     mutation_outputs,
     delivered_path,
 ):
@@ -984,9 +970,6 @@ def test_parser_valid_patch_outputs_bind_only_exact_delivered_path(
         artifact_delivery_stop, "bound_document_context_active", lambda: True
     )
     mutation_messages = [
-        _assistant_tool_call(
-            "patch", "patch-call", {"mode": "patch", "patch": patch_body}
-        ),
         _tool_result(
             "patch",
             "patch-call",
@@ -998,9 +981,6 @@ def test_parser_valid_patch_outputs_bind_only_exact_delivered_path(
         artifact_delivery_stop.bound_artifact_stop_action(
             [
                 *mutation_messages,
-                _assistant_tool_call(
-                    "deliver_artifact", "wrong-delivery", {"path": unrelated}
-                ),
                 _tool_result(
                     "deliver_artifact",
                     "wrong-delivery",
@@ -1017,9 +997,6 @@ def test_parser_valid_patch_outputs_bind_only_exact_delivered_path(
     action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
         [
             *mutation_messages,
-            _assistant_tool_call(
-                "deliver_artifact", "exact-delivery", {"path": delivered_path}
-            ),
             _tool_result(
                 "deliver_artifact",
                 "exact-delivery",

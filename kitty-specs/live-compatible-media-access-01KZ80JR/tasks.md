@@ -176,10 +176,10 @@ description: "Список задач рабочих пакетов для из�
 
 ### Включённые подзадачи
 
-- [ ] T027 Добавить минимальный full-boundary RED с real shared-room/topic sequence и сохранить точную команду/вывод до production code.
-- [ ] T028 Добавить negative second-failure/no-loop oracle и foreign/symlink/current-context проверки без privacy/log leakage.
-- [ ] T029 Проследить всех callers и реализовать минимальный ponytail/full root-cause fix через существующие context/root/MEDIA/continuation механизмы, не ослабляя validator.
-- [ ] T030 Прогнать focused и affected artifact/shared/family/Telegram document/photo/voice/inbound/plain-text suites, Ruff, `py_compile`, `git diff --check`; перед commit получить независимый review и оставить Bead `in_progress` с verification note.
+- [x] T027 Добавить минимальный full-boundary RED с real shared-room/topic sequence и сохранить точную команду/вывод до production code.
+- [x] T028 Добавить negative second-failure/no-loop oracle и foreign/symlink/current-context проверки без privacy/log leakage.
+- [x] T029 Проследить всех callers и реализовать минимальный ponytail/full root-cause fix через существующие context/root/MEDIA/continuation механизмы, не ослабляя validator.
+- [x] T030 Прогнать focused и affected artifact/shared/family/Telegram document/photo/voice/inbound/plain-text suites, Ruff, `py_compile`, `git diff --check`; перед commit получить независимый review и оставить Bead `in_progress` с verification note.
 
 ### Зависимости
 

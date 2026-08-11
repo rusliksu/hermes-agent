@@ -6265,6 +6265,19 @@ class AIAgent:
                     moa_config=moa_config,
                 )
             finally:
+                artifact_cleanup = getattr(
+                    self, "_artifact_delivery_turn_cleanup", None
+                )
+                if callable(artifact_cleanup):
+                    try:
+                        artifact_cleanup()
+                    except Exception:
+                        logger.warning(
+                            "Artifact delivery turn cleanup failed",
+                            exc_info=True,
+                        )
+                    finally:
+                        self._artifact_delivery_turn_cleanup = None
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

@@ -3667,7 +3667,97 @@ class BasePlatformAdapter(ABC):
             text = "⚠️ Couldn't deliver the file attachment."
         if caption:
             text = f"{caption}\n{text}"
+        if kwargs.get("_require_native"):
+            return SendResult(
+                success=False,
+                error="Native document delivery unavailable",
+            )
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+    async def _deliver_confirmed_artifact(
+        self,
+        event: MessageEvent,
+        file_path: str,
+        *,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Claim, natively send, and durably receipt one confirmed document."""
+        transition = getattr(event, "_artifact_delivery_transition", None)
+        if not callable(transition):
+            return SendResult(success=False, error="Missing durable delivery transaction")
+        claimed = False
+        delivered = False
+        try:
+            if not await transition("ready", "delivery_started"):
+                return SendResult(success=False, error="Artifact delivery claim rejected")
+            claimed = True
+            result = await self.send_document(
+                chat_id=event.source.chat_id,
+                file_path=file_path,
+                metadata=metadata,
+                _require_native=True,
+            )
+            receipt_id = getattr(result, "message_id", None)
+            if not getattr(result, "success", False) or not receipt_id:
+                return SendResult(
+                    success=False,
+                    error=getattr(result, "error", None) or "Native document receipt missing",
+                )
+            if not await transition(
+                "delivery_started", "delivered", receipt_id=str(receipt_id)
+            ):
+                return SendResult(success=False, error="Artifact receipt persistence failed")
+            delivered = True
+            return result
+        except Exception:
+            logger.warning(
+                "[%s] Confirmed artifact transaction failed",
+                self.name,
+                exc_info=True,
+            )
+            return SendResult(success=False, error="Artifact delivery transaction failed")
+        finally:
+            if claimed and not delivered:
+                try:
+                    marked_uncertain = await transition(
+                        "delivery_started", "uncertain"
+                    )
+                    if not marked_uncertain:
+                        logger.warning(
+                            "[%s] Failed to mark confirmed artifact delivery uncertain",
+                            self.name,
+                        )
+                except Exception:
+                    logger.warning(
+                        "[%s] Failed to mark confirmed artifact delivery uncertain",
+                        self.name,
+                        exc_info=True,
+                    )
+
+    async def _abandon_confirmed_artifact(self, event: MessageEvent) -> None:
+        """Best-effort abandon a ready confirmation that will not be delivered."""
+        confirmation = event.artifact_delivery_confirmation
+        transition = getattr(event, "_artifact_delivery_transition", None)
+        try:
+            if (
+                isinstance(confirmation, dict)
+                and isinstance(confirmation.get("transaction_session_id"), str)
+                and confirmation.get("transaction_session_id")
+                and isinstance(confirmation.get("transaction_id"), str)
+                and confirmation.get("transaction_id")
+                and callable(transition)
+            ):
+                await transition("ready", "abandoned")
+        except Exception:
+            logger.warning(
+                "[%s] Failed to abandon suppressed artifact delivery",
+                self.name,
+                exc_info=True,
+            )
+        finally:
+            event.artifact_delivery_confirmation = None
+            if hasattr(event, "_artifact_delivery_transition"):
+                delattr(event, "_artifact_delivery_transition")
 
     async def send_image_file(
         self,
@@ -5120,6 +5210,7 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
+                await self._abandon_confirmed_artifact(event)
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
@@ -5220,21 +5311,16 @@ class BasePlatformAdapter(ABC):
                                 and confirmation_mime.startswith(("image/", "audio/", "video/"))
                             )
                         ):
-                            try:
-                                confirmation_result = await self.send_document(
-                                    chat_id=event.source.chat_id,
-                                    file_path=confirmation_path,
-                                    metadata=_final_thread_metadata,
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "[%s] Confirmed artifact send failed",
-                                    self.name,
-                                    exc_info=True,
-                                )
+                            confirmation_result = await self._deliver_confirmed_artifact(
+                                event,
+                                confirmation_path,
+                                metadata=_final_thread_metadata,
+                            )
+                    if confirmation_result is None:
+                        await self._abandon_confirmed_artifact(event)
                     _record_delivery(confirmation_result)
                     if not getattr(confirmation_result, "success", False):
-                        text_content = "⚠️ Не удалось отправить документ."
+                        text_content = ""
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

@@ -405,3 +405,15 @@ Per the explicit WP08 stopping condition, no partial implementation or schema
 migration was started. WP08 and Bead `tm-ai-loopx-kimi-86x` remain
 `in_progress`; no GREEN count is claimed and no runtime status/live data was
 changed.
+
+## Cycle-6 durable delivery completion
+
+- Минимальная Ponytail-архитектура использует ровно один nullable-столбец `sessions.artifact_delivery_json`: без новых table, outbox, repository, workflow и dependency; path, target, timestamps, attempts, idempotency и tool ledger не сохраняются.
+- Durable transaction привязана к profile/session/turn/generation; reset, switch, stale, interrupt и failure terminalize её fail-closed. Malformed confirmation quarantined; compression lineage пропускает terminal child и может восстановить live parent. Успешная Signal attachment delivery теперь предоставляет receipt, а text behavior не изменён.
+- Реальное privacy-safe evidence: бот заявил, что Excel/CSV создан, и спросил, дошёл ли он, хотя attachment отсутствовал. Acceptance запрещает success wording без подтверждённого adapter receipt.
+- Финальный test evidence: boundary — 24 passed (15 preserved + 9 targeted rerun), restart provenance — 55 passed, Signal — 140 passed, lifecycle — 12 passed; всего в final focused packet — 231 passed. Более ранняя affected matrix — 1153 passed. Ruff, `py_compile` и `git diff --check` passed.
+- `tests/agent/test_compression_rotation_state.py` даёт одинаковые 5 passed/4 failed с идентичными signatures на clean `f7b547ff` и dirty tree; это pre-existing и вне WP08.
+- Discord fake-CDN rerun environment-blocked из-за sandbox DNS/SSRF, а не assertion regression.
+- Independent correctness review: APPROVE; Ponytail: `Lean already. Ship.`; net 0.
+- Spec Kitty runtime по-прежнему возвращает `COORDINATION_BRANCH_DELETED`; repair runtime topology — отдельный governance debt.
+- WP08 завершён по acceptance evidence, но Bead `tm-ai-loopx-kimi-86x` остаётся `in_progress`; push, merge, live и restart не выполнялись.

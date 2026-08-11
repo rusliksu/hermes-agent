@@ -1454,7 +1454,11 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            timestamp = result.get("timestamp") if isinstance(result, dict) else None
+            return SendResult(
+                success=True,
+                message_id=str(timestamp) if timestamp is not None else None,
+            )
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 
     async def send_document(

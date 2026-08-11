@@ -17,6 +17,33 @@ from tools.artifact_delivery_tool import (
 _MUTATION_TOOLS = frozenset({"write_file", "patch"})
 
 
+def bound_artifact_tool_batch_relevant(tool_calls: Iterable[Any]) -> bool:
+    """Return whether a bound tool batch can create or publish a document."""
+    if not bound_document_context_active():
+        return False
+    from agent.tool_dispatch_helpers import _extract_file_mutation_targets
+
+    for tool_call in tool_calls:
+        function = getattr(tool_call, "function", None)
+        tool_name = getattr(function, "name", None)
+        if tool_name == "deliver_artifact":
+            return True
+        if tool_name not in _MUTATION_TOOLS:
+            continue
+        try:
+            arguments = json.loads(getattr(function, "arguments", "") or "{}")
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(arguments, dict):
+            return True
+        targets = _extract_file_mutation_targets(tool_name, arguments)
+        if not targets:
+            return True
+        if any(is_outbound_document_path(path) for path in targets):
+            return True
+    return False
+
+
 def _tool_result_name(message: dict[str, Any]) -> str | None:
     names = {
         value
@@ -184,4 +211,4 @@ def bound_artifact_stop_action(
     return "failed", None, None
 
 
-__all__ = ["bound_artifact_stop_action"]
+__all__ = ["bound_artifact_stop_action", "bound_artifact_tool_batch_relevant"]

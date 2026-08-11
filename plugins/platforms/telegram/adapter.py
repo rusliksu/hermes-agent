@@ -7874,6 +7874,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Failed to send document: %s",
                 self.name, _redact_telegram_error_text(e),
             )
+            if kwargs.get("_require_native"):
+                return SendResult(
+                    success=False,
+                    error=_redact_telegram_error_text(e),
+                )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
     async def send_video(

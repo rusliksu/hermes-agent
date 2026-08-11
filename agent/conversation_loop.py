@@ -670,6 +670,55 @@ def run_conversation(
     # invalidate ``current_turn_user_idx``; artifact provenance must survive
     # those representation changes without matching user/model content.
     _current_turn_tool_events: list[dict[str, Any]] = []
+    _artifact_transaction_session_id: str | None = None
+    _artifact_transaction_id: str | None = None
+    _artifact_reconfirmation_required = False
+
+    def _abandon_artifact_delivery(*, invalidate_provenance: bool = False) -> None:
+        """Best-effort terminalize this turn's live artifact transaction."""
+        nonlocal _artifact_transaction_session_id
+        nonlocal _artifact_transaction_id
+        nonlocal _artifact_reconfirmation_required
+
+        session_id = _artifact_transaction_session_id
+        transaction_id = _artifact_transaction_id
+        if (
+            (session_id and transaction_id)
+            or invalidate_provenance
+            or _artifact_reconfirmation_required
+        ):
+            agent._artifact_delivery_confirmation = None
+        if session_id and transaction_id:
+            artifact_db = getattr(agent, "_session_db", None)
+            try:
+                abandoned = bool(
+                    artifact_db
+                    and artifact_db.transition_artifact_delivery(
+                        session_id,
+                        transaction_id,
+                        "pending",
+                        "abandoned",
+                    )
+                )
+                if artifact_db and not abandoned:
+                    artifact_db.transition_artifact_delivery(
+                        session_id,
+                        transaction_id,
+                        "ready",
+                        "abandoned",
+                    )
+            except Exception:
+                logger.warning(
+                    "Durable artifact abandonment failed",
+                    exc_info=True,
+                )
+        _artifact_transaction_session_id = None
+        _artifact_transaction_id = None
+        if invalidate_provenance:
+            _current_turn_tool_events.clear()
+            _artifact_reconfirmation_required = True
+
+    agent._artifact_delivery_turn_cleanup = _abandon_artifact_delivery
 
     def _append_current_turn_tool_event(message: dict[str, Any]) -> None:
         messages.append(message)
@@ -4995,6 +5044,82 @@ def run_conversation(
                         exc,
                     )
 
+                try:
+                    from agent.artifact_delivery_stop import (
+                        bound_artifact_tool_batch_relevant,
+                    )
+
+                    _artifact_batch_relevant = bound_artifact_tool_batch_relevant(
+                        assistant_message.tool_calls
+                    )
+                except Exception:
+                    logger.warning(
+                        "artifact delivery tool-batch classification failed",
+                        exc_info=True,
+                    )
+                    for tc in assistant_message.tool_calls:
+                        _append_current_turn_tool_event(
+                            {
+                                "role": "tool",
+                                "name": tc.function.name,
+                                "tool_name": tc.function.name,
+                                "tool_call_id": tc.id,
+                                "content": (
+                                    "Tool execution refused because artifact-bound "
+                                    "batch classification was uncertain."
+                                ),
+                            }
+                        )
+                    final_response = (
+                        "⚠️ Не удалось безопасно классифицировать подготовку "
+                        "документа. Повторите запрос явно."
+                    )
+                    failed = True
+                    _turn_exit_reason = "artifact_delivery_classification_failed"
+                    break
+
+                if (
+                    _artifact_batch_relevant
+                    and _artifact_transaction_session_id is None
+                ):
+                    _artifact_db = getattr(agent, "_session_db", None)
+                    _artifact_session_id = agent.session_id
+                    try:
+                        _artifact_transaction_id = (
+                            _artifact_db
+                            and _artifact_session_id
+                            and _artifact_db.begin_artifact_delivery(_artifact_session_id)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Durable artifact delivery begin failed",
+                            exc_info=True,
+                        )
+                        _artifact_transaction_id = None
+                    if not _artifact_transaction_id:
+                        for tc in assistant_message.tool_calls:
+                            _append_current_turn_tool_event(
+                                {
+                                    "role": "tool",
+                                    "name": tc.function.name,
+                                    "tool_name": tc.function.name,
+                                    "tool_call_id": tc.id,
+                                    "content": (
+                                        "Artifact tool execution refused because "
+                                        "durable delivery provenance could not be started."
+                                    ),
+                                }
+                            )
+                        final_response = (
+                            "⚠️ Не удалось безопасно начать подготовку документа. "
+                            "Повторите запрос явно."
+                        )
+                        failed = True
+                        _turn_exit_reason = "artifact_delivery_begin_failed"
+                        break
+                    _artifact_transaction_session_id = _artifact_session_id
+                    _artifact_reconfirmation_required = False
+
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
                 # have streamed early content that opened the response box;
@@ -5416,6 +5541,8 @@ def run_conversation(
                         require_workspace=(_ack_mode == "codex_only"),
                     )
                 ):
+                    if _artifact_transaction_id:
+                        _abandon_artifact_delivery(invalidate_provenance=True)
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)
@@ -5482,10 +5609,22 @@ def run_conversation(
                 except Exception:
                     logger.debug("artifact delivery stop-loop check failed", exc_info=True)
                     _artifact_action, _artifact_nudge, _artifact_confirmation = (
-                        "none",
+                        "failed" if _artifact_transaction_session_id else "none",
                         None,
                         None,
                     )
+
+                _artifact_db = getattr(agent, "_session_db", None)
+                if _artifact_transaction_session_id and _artifact_action == "none":
+                    _artifact_action = "failed"
+                if _artifact_reconfirmation_required and not _artifact_transaction_id:
+                    _artifact_action = "failed"
+                    _artifact_confirmation = None
+                if _artifact_action == "confirmed" and not (
+                    _artifact_transaction_session_id and _artifact_transaction_id
+                ):
+                    _artifact_action = "failed"
+                    _artifact_confirmation = None
 
                 if _artifact_action != "none":
                     # This expected policy rejection is handled by the bounded
@@ -5508,6 +5647,7 @@ def run_conversation(
                                 _failed_mutations.pop(_failed_path, None)
 
                 if _artifact_action == "continue" and _artifact_nudge:
+                    _abandon_artifact_delivery(invalidate_provenance=True)
                     agent._artifact_delivery_stop_nudges = 1
                     final_msg["finish_reason"] = "artifact_delivery_correction_required"
                     final_msg["_artifact_delivery_stop_synthetic"] = True
@@ -5523,13 +5663,12 @@ def run_conversation(
                     continue
 
                 if _artifact_action == "failed":
+                    _abandon_artifact_delivery()
                     final_response = (
                         "⚠️ Не удалось безопасно подготовить и отправить документ."
                     )
                     final_msg["content"] = final_response
                     final_msg["finish_reason"] = "artifact_delivery_failed"
-                elif _artifact_action == "confirmed":
-                    agent._artifact_delivery_confirmation = _artifact_confirmation
 
                 try:
                     from agent.verification_stop import (
@@ -5550,6 +5689,8 @@ def run_conversation(
                     _verify_nudge = None
 
                 if _verify_nudge:
+                    if _artifact_action == "confirmed":
+                        _abandon_artifact_delivery(invalidate_provenance=True)
                     agent._verification_stop_nudges = (
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
@@ -5617,6 +5758,8 @@ def run_conversation(
                     _verify_nudge2 = None
 
                 if _verify_nudge2:
+                    if _artifact_action == "confirmed":
+                        _abandon_artifact_delivery(invalidate_provenance=True)
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
                     final_msg["_pre_verify_synthetic"] = True
@@ -5655,6 +5798,8 @@ def run_conversation(
                     _kanban_nudge = None
 
                 if _kanban_nudge:
+                    if _artifact_action == "confirmed":
+                        _abandon_artifact_delivery(invalidate_provenance=True)
                     agent._kanban_stop_nudges = (
                         getattr(agent, "_kanban_stop_nudges", 0) + 1
                     )
@@ -5683,6 +5828,43 @@ def run_conversation(
                     _pending_verification_response = final_response
                     final_response = None
                     continue
+
+                if _artifact_action == "confirmed":
+                    _confirmed_session_id = _artifact_transaction_session_id
+                    _confirmed_transaction_id = _artifact_transaction_id
+                    try:
+                        _artifact_ready = bool(
+                            _artifact_db
+                            and _confirmed_session_id
+                            and _confirmed_transaction_id
+                            and _artifact_db.transition_artifact_delivery(
+                                _confirmed_session_id,
+                                _confirmed_transaction_id,
+                                "pending",
+                                "ready",
+                            )
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Durable artifact ready transition failed",
+                            exc_info=True,
+                        )
+                        _artifact_ready = False
+                    if _artifact_ready:
+                        agent._artifact_delivery_confirmation = {
+                            **_artifact_confirmation,
+                            "transaction_session_id": _confirmed_session_id,
+                            "transaction_id": _confirmed_transaction_id,
+                        }
+                        _artifact_transaction_session_id = None
+                        _artifact_transaction_id = None
+                    else:
+                        _abandon_artifact_delivery()
+                        final_response = (
+                            "⚠️ Не удалось безопасно подготовить и отправить документ."
+                        )
+                        final_msg["content"] = final_response
+                        final_msg["finish_reason"] = "artifact_delivery_failed"
 
                 messages.append(final_msg)
                 
@@ -5748,6 +5930,8 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    _abandon_artifact_delivery()
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
