@@ -1,11 +1,13 @@
 """Focused ingress tests for the staged access-registry boundary."""
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.access_registry import (
+    AccessDeniedError,
     AccessRegistry,
     DeliveryTarget,
     PrincipalBinding,
@@ -220,6 +222,45 @@ def test_route_account_round_trips_as_server_owned_source_field():
     )
     restored = SessionSource.from_dict(source.to_dict())
     assert restored.route_account == "main-bot"
+
+
+def test_ingress_rejects_post_resolution_dm_topic_tamper_against_original_source():
+    registry = _registry()
+    identity_alpha = TransportIdentity(
+        platform="telegram",
+        account="main-bot",
+        peer_kind="dm",
+        user_id="42",
+        chat_id="42",
+        thread_id="topic-alpha",
+    )
+    resolved_alpha = registry.resolve(identity_alpha)
+    tampered = replace(
+        resolved_alpha,
+        delivery_target=replace(
+            resolved_alpha.delivery_target,
+            thread_id="topic-beta",
+        ),
+    )
+    runner = _runner()
+    runner.access_registry = SimpleNamespace(
+        resolve=lambda identity: tampered,
+        validate_resolved_context=registry.validate_resolved_context,
+        validate_resolved_context_for_identity=registry.validate_resolved_context_for_identity,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="42",
+        user_id="42",
+        chat_type="dm",
+        thread_id="topic-alpha",
+        route_account="main-bot",
+    )
+
+    with pytest.raises(AccessDeniedError) as exc:
+        runner._resolve_access_context_for_source(source)
+
+    assert exc.value.reason == "resolved_access_context_source_mismatch"
 
 
 def test_session_search_cannot_select_foreign_profile(monkeypatch):

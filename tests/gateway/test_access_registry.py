@@ -73,13 +73,20 @@ BACKEND_CAPS = (
 )
 
 
-def _dm_identity(user_id: str, *, chat_id: str | None = None, account: str = ACCOUNT):
+def _dm_identity(
+    user_id: str,
+    *,
+    chat_id: str | None = None,
+    account: str = ACCOUNT,
+    thread_id: str | None = None,
+):
     return TransportIdentity(
         platform="telegram",
         account=account,
         peer_kind="dm",
         user_id=user_id,
         chat_id=user_id if chat_id is None else chat_id,
+        thread_id=thread_id,
     )
 
 
@@ -252,6 +259,72 @@ def test_exact_telegram_dm_success_and_capability_intersection():
     assert "not_backend" not in context.capabilities
     assert "backend_only" not in context.capabilities
     assert context.delivery_target.chat_id == "opaque-family-0"
+
+
+def test_principal_dm_topic_uses_derived_delivery_and_preserves_session_scope():
+    registry = _registry()
+    identity = _dm_identity("opaque-family-0", thread_id="42")
+    root_context = registry.resolve(_dm_identity("opaque-family-0"))
+
+    context = registry.resolve(identity)
+
+    assert context == replace(root_context, delivery_target=_target(identity))
+    assert session_scope_from_resolved_access_context(context) == {
+        "profile_name": "family-profile-0",
+        "source": "telegram",
+        "account": ACCOUNT,
+        "chat_type": "dm",
+        "chat_id": "opaque-family-0",
+        "thread_id": "42",
+        "user_id": "opaque-family-0",
+        "is_dm": True,
+    }
+    assert registry.validate_resolved_context(context) == context
+
+
+def test_principal_dm_topics_resolve_independently_with_literal_distinct_scopes():
+    registry = _registry()
+    identity_alpha = _dm_identity("opaque-family-0", thread_id="topic-alpha")
+    identity_beta = _dm_identity("opaque-family-0", thread_id="topic-beta")
+
+    context_alpha = registry.resolve(identity_alpha)
+    context_beta = registry.resolve(identity_beta)
+    scope_alpha = session_scope_from_resolved_access_context(context_alpha)
+    scope_beta = session_scope_from_resolved_access_context(context_beta)
+
+    assert (
+        registry.validate_resolved_context_for_identity(context_alpha, identity_alpha)
+        == context_alpha
+    )
+    assert (
+        registry.validate_resolved_context_for_identity(context_beta, identity_beta)
+        == context_beta
+    )
+    assert scope_alpha["thread_id"] == "topic-alpha"
+    assert scope_beta["thread_id"] == "topic-beta"
+    assert scope_alpha != scope_beta
+    assert context_alpha.delivery_target.thread_id == "topic-alpha"
+    assert context_beta.delivery_target.thread_id == "topic-beta"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda context: replace(context, principal_id="principal-family-1"),
+        lambda context: replace(context, role_id="owner"),
+        lambda context: replace(context, profile_id="family-profile-1"),
+        lambda context: replace(context, conversation_scope="private-alt"),
+        lambda context: replace(context, capabilities=OWNER_CAPS),
+    ],
+)
+def test_validate_resolved_context_rejects_tampered_principal_dm_topic_context(mutate):
+    registry = _registry()
+    context = registry.resolve(_dm_identity("opaque-family-0", thread_id="42"))
+
+    with pytest.raises(AccessDeniedError) as exc:
+        registry.validate_resolved_context(mutate(context))
+
+    assert exc.value.reason == "resolved_access_context_mismatch"
 
 
 def test_legacy_family_role_aliases_normalize_to_canonical_family():

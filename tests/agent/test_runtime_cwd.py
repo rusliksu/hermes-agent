@@ -39,6 +39,25 @@ def _access_context(*, role_id: str, profile_id: str) -> ResolvedAccessContext:
 
 
 class TestBoundProfileHome:
+    def test_missing_named_profile_config_uses_profile_home(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / ".hermes"
+        profile = home / "profiles" / "family-a"
+        outside = tmp_path / "outside"
+        profile.mkdir(parents=True)
+        outside.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TERMINAL_CWD", str(outside))
+
+        with bind_resolved_access_context(
+            _access_context(role_id="family", profile_id="family-a")
+        ):
+            assert rt.bound_profile_terminal_config() == {}
+            assert resolve_agent_cwd() == profile.resolve()
+            assert resolve_context_cwd() == profile.resolve()
+
     def test_exact_owner_default_profile_uses_root_home(self, monkeypatch, tmp_path):
         home = tmp_path / ".hermes"
         project = tmp_path / "owner-workspace"

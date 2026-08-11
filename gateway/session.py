@@ -137,6 +137,55 @@ def _canonical_resolved_access_context(
     return deserialize_resolved_access_context(serialize_resolved_access_context(context))
 
 
+def _can_rebind_trusted_telegram_dm_context(
+    persisted_context: Any,
+    source_context: Any,
+) -> bool:
+    """Return whether a persisted context may follow a trusted DM topic.
+
+    Topic recovery can change only the server-owned delivery thread.  Keep
+    every authorization and delivery-identity field fail-closed while
+    allowing the root/topic transition for the same Telegram DM.
+    """
+    persisted = _canonical_resolved_access_context(persisted_context)
+    source = _canonical_resolved_access_context(source_context)
+    if persisted is None or source is None:
+        return False
+
+    if (
+        (
+            persisted.principal_id,
+            persisted.role_id,
+            persisted.profile_id,
+            persisted.conversation_scope,
+            persisted.capabilities,
+        )
+        != (
+            source.principal_id,
+            source.role_id,
+            source.profile_id,
+            source.conversation_scope,
+            source.capabilities,
+        )
+    ):
+        return False
+
+    persisted_target = persisted.delivery_target
+    source_target = source.delivery_target
+    return (
+        persisted_target.platform == source_target.platform == "telegram"
+        and persisted_target.peer_kind == source_target.peer_kind == "dm"
+        and (
+            persisted_target.account,
+            persisted_target.chat_id,
+        )
+        == (
+            source_target.account,
+            source_target.chat_id,
+        )
+    )
+
+
 def _is_session_key_unsafe(value: object) -> bool:
     """Return True if ``value`` could be a real traversal vector in a session_key.
 
@@ -2241,7 +2290,13 @@ class SessionStore:
                         entry.resolved_access_context is not None
                         and entry.resolved_access_context != _source_access_context
                     ):
-                        raise ValueError("resolved_access_context_mismatch")
+                        if not _can_rebind_trusted_telegram_dm_context(
+                            entry.resolved_access_context,
+                            _source_access_context,
+                        ):
+                            raise ValueError("resolved_access_context_mismatch")
+                        entry.resolved_access_context = _source_access_context
+                        _needs_save = True
                     if entry.resolved_access_context is None:
                         entry.resolved_access_context = _source_access_context
                         _needs_save = True
