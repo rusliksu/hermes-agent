@@ -84,6 +84,48 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
+    def _trusted_control_delivery_adapter(self, source: Optional[SessionSource]):
+        """Resolve a control-delivery adapter without weakening authorization.
+
+        The source profile's adapter remains primary.  The default adapter is
+        available only for an already-resolved, registry-owned shared room,
+        where the registry can prove the exact source identity again.
+        """
+        adapter = self._adapter_for_source(source)
+        if adapter is not None or source is None:
+            return adapter
+
+        registry = getattr(self, "access_registry", None)
+        context = getattr(source, "resolved_access_context", None)
+        if registry is None:
+            return None
+
+        from gateway.access_registry import ResolvedAccessContext
+
+        if (
+            not isinstance(context, ResolvedAccessContext)
+            or context.role_id != "shared_room"
+            or (getattr(source, "profile", None) or "").strip() != context.profile_id
+        ):
+            return None
+
+        platform = getattr(source, "platform", None)
+        try:
+            # Import lazily: this mixin is imported by gateway.run.
+            from gateway.run import _access_registry_routes_platform
+
+            identity = self._transport_identity_for_source(source)
+            if (
+                not _access_registry_routes_platform(registry, platform)
+                or registry.validate_resolved_context_for_identity(context, identity)
+                != context
+            ):
+                return None
+        except Exception:
+            return None
+
+        return (getattr(self, "adapters", None) or {}).get(platform)
+
     def _adapter_authorization_is_upstream(
         self,
         platform: Optional[Platform],
