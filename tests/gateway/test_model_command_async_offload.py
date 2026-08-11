@@ -19,8 +19,6 @@ directly. Reverting either ``to_thread`` wrap (calling the sync fn inline again)
 makes the corresponding test fail — i.e. the tests are mutation-survivable.
 """
 
-import asyncio
-
 import pytest
 
 import gateway.slash_commands as slash_commands
@@ -39,6 +37,7 @@ def _make_runner():
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
+    runner.session_store = _SessionStore()
     return runner
 
 
@@ -51,16 +50,23 @@ def _make_event():
     )
 
 
+class _SessionStore:
+    def peek_session_id(self, _session_key: str) -> str:
+        return "session-one"
+
+    def _cached_topic_preferences(self, _source: SessionSource) -> tuple[bool, dict]:
+        return True, {}
+
+
 class _ToThreadSpy:
-    """Wraps the real ``asyncio.to_thread`` and records what it was asked to run."""
+    """Records ``to_thread`` routes without relying on executor teardown."""
 
     def __init__(self):
         self.calls = []  # list of (func, args, kwargs)
-        self._real = asyncio.to_thread
 
     async def __call__(self, func, /, *args, **kwargs):
         self.calls.append((func, args, kwargs))
-        return await self._real(func, *args, **kwargs)
+        return func(*args, **kwargs)
 
     def funcs_offloaded(self):
         return [c[0] for c in self.calls]
@@ -171,6 +177,7 @@ async def test_picker_path_offloads_list_picker_providers(_isolated_config, monk
 @pytest.mark.asyncio
 async def test_picker_path_requests_moa_presets(_isolated_config, monkeypatch):
     """Gateway /model pickers must opt into the virtual MoA preset provider."""
+    monkeypatch.setattr(slash_commands.asyncio, "to_thread", _ToThreadSpy())
     captured = {}
 
     def _fake_list_picker_providers(**kwargs):

@@ -1748,7 +1748,7 @@ class GatewaySlashCommandsMixin:
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
-            adapter = getattr(self, "_adapter_for_source")(source)
+            adapter = self._trusted_control_delivery_adapter(source)
             has_picker = (
                 adapter is not None
                 and getattr(type(adapter), "send_model_picker", None) is not None
@@ -2036,8 +2036,11 @@ class GatewaySlashCommandsMixin:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
                     if p["models"]:
-                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
-                        extra = t("gateway.model.more_models_suffix", count=p["total_models"] - len(p["models"])) if p["total_models"] > len(p["models"]) else ""
+                        models = p["models"]
+                        shown_models = models[:5]
+                        total_models = max(int(p["total_models"]), len(models))
+                        model_strs = ", ".join(f"`{m}`" for m in shown_models)
+                        extra = t("gateway.model.more_models_suffix", count=total_models - len(shown_models)) if total_models > len(shown_models) else ""
                         lines.append(f"  {model_strs}{extra}")
                     elif p.get("api_url"):
                         lines.append(f"  `{p['api_url']}`")
