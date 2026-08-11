@@ -5,7 +5,10 @@
 Активный workflow: Spec Kitty + Beads. Spec Kitty владеет статусом mission и
 event log, а Beads --- issue identity, приоритетом и зависимостями.
 
-Связанный Beads issue: `HERMES-4t0`.
+Исторический Beads issue mission: `HERMES-4t0`.
+Текущий bounded WP08: `tm-ai-loopx-kimi-86x` с
+`spec_id: live-compatible-media-access-01KZ80JR`. Runtime lane не
+материализуется вручную из-за существующего `COORDINATION_BRANCH_DELETED`.
 
 ## Структура каталога (v0.9.0+)
 

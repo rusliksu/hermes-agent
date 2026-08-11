@@ -1045,6 +1045,40 @@ class TestSignalSendDocumentViaHelper:
     """Verify send_document gained size check and path-in-error via _send_attachment."""
 
     @pytest.mark.asyncio
+    async def test_send_document_success_returns_rpc_timestamp_string(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, _ = _stub_rpc({"timestamp": 1712345678000})
+        adapter._stop_typing_indicator = AsyncMock()
+        doc_path = tmp_path / "report.pdf"
+        doc_path.write_bytes(b"synthetic pdf")
+
+        result = await adapter.send_document(
+            chat_id="+155****4567", file_path=str(doc_path)
+        )
+
+        assert result.success is True
+        assert result.message_id == "1712345678000"
+
+    @pytest.mark.asyncio
+    async def test_send_document_success_without_timestamp_returns_none_message_id(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, _ = _stub_rpc({})
+        adapter._stop_typing_indicator = AsyncMock()
+        doc_path = tmp_path / "report.pdf"
+        doc_path.write_bytes(b"synthetic pdf")
+
+        result = await adapter.send_document(
+            chat_id="+155****4567", file_path=str(doc_path)
+        )
+
+        assert result.success is True
+        assert result.message_id is None
+
+    @pytest.mark.asyncio
     async def test_send_document_too_large(self, monkeypatch, tmp_path):
         """send_document should now reject files over 100MB (was previously missing)."""
         adapter = _make_signal_adapter(monkeypatch)

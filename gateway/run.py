@@ -42,6 +42,7 @@ import time
 import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
+from functools import partial
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Union
@@ -768,6 +769,19 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
+    if reason in {"artifact_delivery_abandoned", "artifact_delivery_uncertain"}:
+        delivery_state = (
+            "may have been delivered, but no durable receipt was stored"
+            if reason == "artifact_delivery_uncertain"
+            else "was not sent"
+        )
+        return (
+            "[System note: A document delivery was interrupted and "
+            f"{delivery_state}. Do not re-execute or auto-resume old tool calls. "
+            "Tell the user to explicitly retry the document request if they still "
+            "want it delivered, then address only their new message.]"
+        )
+
     reason_phrase = (
         "a gateway restart"
         if reason == "restart_timeout"
@@ -1155,6 +1169,7 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech",
     "text_to_speech_tool",
     "image_generate",
+    "deliver_artifact",
 }
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
@@ -1211,6 +1226,66 @@ def _strip_auto_continue_noise(content: Any) -> Any:
 # extracts the path from these fields so delivery is deterministic and does not
 # depend on the model restating the path in its final reply.
 _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
+
+
+class _BoundArtifactStreamBuffer:
+    """Hold shared-document output until its tool outcome is classified."""
+
+    def __init__(self, *, enabled: bool):
+        self._state = "pending" if enabled else "released"
+        self._events: list[tuple[str, Any, bool]] = []
+
+    def on_delta(self, text: Any, emit: Callable[[Any], None]) -> None:
+        if self._state == "pending":
+            self._events.append(("delta", text, False))
+        elif self._state == "released":
+            emit(text)
+
+    def on_interim(
+        self,
+        text: str,
+        *,
+        already_streamed: bool,
+        emit: Callable[..., None],
+    ) -> None:
+        if self._state == "pending":
+            self._events.append(("interim", text, already_streamed))
+        elif self._state == "released":
+            emit(text, already_streamed=already_streamed)
+
+    def on_tool_start(self, tool_name: str, args: Any) -> None:
+        if self._state != "pending" or not isinstance(args, dict):
+            return
+        try:
+            from agent.tool_dispatch_helpers import _extract_file_mutation_targets
+            from tools.artifact_delivery_tool import is_outbound_document_path
+
+            targets = _extract_file_mutation_targets(tool_name, args)
+            if any(is_outbound_document_path(path) for path in targets):
+                self._state = "held"
+                self._events.clear()
+        except Exception:
+            logger.debug("bound artifact stream classification failed", exc_info=True)
+
+    def resolve(
+        self,
+        confirmation: Any,
+        emit_delta: Callable[[Any], None],
+        emit_interim: Optional[Callable[..., None]] = None,
+    ) -> None:
+        if confirmation or self._state == "held":
+            self._state = "held"
+            self._events.clear()
+            return
+        if self._state != "pending":
+            return
+        self._state = "released"
+        for kind, text, already_streamed in self._events:
+            if kind == "delta":
+                emit_delta(text)
+            elif emit_interim is not None:
+                emit_interim(text, already_streamed=already_streamed)
+        self._events.clear()
 
 
 # Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
@@ -3856,10 +3931,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "self_reminder": "cronjob",
                 "delegation": "delegation",
                 "wolfram": "wolfram",
+                "documents": "file",
+                "docker_terminal": "terminal",
+                "isolated_browser": "browser",
             },
             "shared_room": {
                 "public_web": "web",
                 "vision": "vision",
+                "documents": "file",
             },
         }
         capability_toolsets = role_capability_toolsets.get(role_id)
@@ -3906,6 +3985,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if "vision" in context.capabilities and "vision" in configured:
             toolsets.append("vision")
             expected_tools.add("vision_analyze")
+        if "documents" in context.capabilities and "file" in configured:
+            toolsets.append("file")
+            expected_tools.update(
+                {"read_file", "write_file", "patch", "search_files", "deliver_artifact"}
+            )
         return sorted(toolsets), frozenset(expected_tools)
 
     @staticmethod
@@ -9335,6 +9419,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            adapter.set_inbound_profile_scope(
+                lambda profile_home=profile_home: _profile_runtime_scope(profile_home)
+            )
+
             # Same-token conflict detection — refuse a duplicate poll.
             fp = self._adapter_credential_fingerprint(adapter)
             if fp is not None:
@@ -12705,7 +12793,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-            if not self._is_session_run_current(_quick_key, run_generation):
+            confirmation = agent_result.get("artifact_delivery_confirmation")
+            _confirmation_marker = confirmation is not None
+            _run_is_current = self._is_session_run_current(
+                _quick_key, run_generation
+            )
+            _confirmation_publishable = True
+            if _confirmation_marker:
+                _confirmation_publishable = (
+                    await self._prepare_artifact_delivery_confirmation(
+                        event,
+                        confirmation,
+                        publish=_run_is_current,
+                    )
+                )
+
+            if not _run_is_current:
                 logger.info(
                     "Discarding stale agent result for %s — generation %d is no longer current",
                     _quick_key or "?",
@@ -12721,7 +12824,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            response = agent_result.get("final_response") or ""
+            _confirmation_quarantined = (
+                _confirmation_marker and not _confirmation_publishable
+            )
+            response = (
+                ""
+                if _confirmation_quarantined
+                else agent_result.get("final_response") or ""
+            )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -12732,11 +12842,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
+                _intentional_silence = (
+                    _confirmation_quarantined
+                    or is_intentional_silence_agent_result(agent_result, response)
                 )
             except Exception:
-                _intentional_silence = False
+                _intentional_silence = _confirmation_quarantined
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -16174,6 +16285,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        current_delivery_target = None
+        try:
+            from gateway.access_registry import DeliveryTarget
+
+            current_delivery_target = DeliveryTarget(
+                platform=context.source.platform.value,
+                account=context.source.route_account,
+                peer_kind=context.source.chat_type,
+                chat_id=context.source.chat_id,
+                thread_id=context.source.thread_id,
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Legacy/untyped events can omit route-account data. Keep a bound
+            # None so artifact delivery fails closed instead of consulting env.
+            current_delivery_target = None
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -16185,6 +16312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            current_delivery_target=current_delivery_target,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -17486,6 +17614,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
+
+    async def _prepare_artifact_delivery_confirmation(
+        self,
+        event: MessageEvent,
+        confirmation: Any,
+        *,
+        publish: bool,
+    ) -> bool:
+        """Bind valid provenance or quarantine and abandon a ready transaction."""
+        event.artifact_delivery_confirmation = None
+        if hasattr(event, "_artifact_delivery_transition"):
+            delattr(event, "_artifact_delivery_transition")
+
+        transaction_session_id = (
+            confirmation.get("transaction_session_id")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        transaction_id = (
+            confirmation.get("transaction_id")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        usable_transaction = (
+            isinstance(transaction_session_id, str)
+            and bool(transaction_session_id)
+            and isinstance(transaction_id, str)
+            and bool(transaction_id)
+            and self._session_db is not None
+        )
+
+        path = confirmation.get("path") if isinstance(confirmation, dict) else None
+        media_tag = (
+            confirmation.get("media_tag")
+            if isinstance(confirmation, dict)
+            else None
+        )
+        valid = (
+            publish
+            and usable_transaction
+            and isinstance(path, str)
+            and bool(path)
+            and Path(path).is_absolute()
+            and media_tag == f"MEDIA:{path}"
+        )
+        if valid:
+            event.artifact_delivery_confirmation = dict(confirmation)
+            event._artifact_delivery_transition = partial(
+                self._session_db.transition_artifact_delivery,
+                transaction_session_id,
+                transaction_id,
+            )
+            return True
+
+        if usable_transaction:
+            try:
+                await self._session_db.transition_artifact_delivery(
+                    transaction_session_id,
+                    transaction_id,
+                    "ready",
+                    "abandoned",
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to abandon quarantined artifact delivery transaction",
+                    exc_info=True,
+                )
+        return False
 
     def _bind_adapter_run_generation(
         self,
@@ -19614,6 +19810,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
+            try:
+                from tools.artifact_delivery_tool import bound_document_context_active
+
+                _bound_artifact_stream = bound_document_context_active()
+            except Exception:
+                _bound_artifact_stream = False
+            _artifact_stream_buffer = _BoundArtifactStreamBuffer(
+                enabled=_bound_artifact_stream
+            )
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
             if _scfg is None:
                 from gateway.config import StreamingConfig
@@ -19697,12 +19902,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
                                 if _run_still_current():
-                                    _stream_consumer.on_delta(text)
+                                    _artifact_stream_buffer.on_delta(
+                                        text, _stream_consumer.on_delta
+                                    )
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
-            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            def _deliver_interim_assistant(
+                text: str, *, already_streamed: bool = False
+            ) -> None:
                 if not _run_still_current():
                     return
                 display_text = text
@@ -19723,6 +19932,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _loop_for_step,
                     logger=logger,
                     log_message="interim_assistant_callback scheduling error",
+                )
+
+            def _interim_assistant_cb(
+                text: str, *, already_streamed: bool = False
+            ) -> None:
+                if not _run_still_current():
+                    return
+                _artifact_stream_buffer.on_interim(
+                    text,
+                    already_streamed=already_streamed,
+                    emit=_deliver_interim_assistant,
                 )
 
             turn_route = self._resolve_turn_agent_config(
@@ -20022,9 +20242,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
-            agent.tool_start_callback = (
-                voice_ack_callback if _voice_ack_guild[0] is not None else None
-            )
+            def _gateway_tool_start_callback(call_id, tool_name, args):
+                if _voice_ack_guild[0] is not None:
+                    voice_ack_callback(call_id, tool_name, args)
+                _artifact_stream_buffer.on_tool_start(tool_name, args)
+
+            agent.tool_start_callback = _gateway_tool_start_callback
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -20570,6 +20793,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
+            _raw_artifact_confirmation = result.get(
+                "artifact_delivery_confirmation"
+            )
+            _artifact_confirmation_present = _raw_artifact_confirmation is not None
+            _artifact_confirmation = _raw_artifact_confirmation
+            if not isinstance(_artifact_confirmation, dict):
+                _artifact_confirmation = None
+            _artifact_stream_buffer.resolve(
+                _artifact_confirmation_present,
+                (
+                    _stream_consumer.on_delta
+                    if _stream_consumer is not None
+                    else lambda _text: None
+                ),
+                _deliver_interim_assistant,
+            )
+
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
@@ -20742,7 +20982,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
+            if _artifact_confirmation_present:
+                # Discard every model-authored legacy MEDIA directive. Only a
+                # current-turn deliver_artifact result may select the file, and
+                # its exact path is propagated separately below.
+                _, final_response = BasePlatformAdapter.extract_media(final_response)
+            elif "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),
@@ -20837,8 +21082,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
-                "response_previewed": result.get("response_previewed", False),
+                "response_previewed": (
+                    False
+                    if _artifact_confirmation_present
+                    else result.get("response_previewed", False)
+                ),
                 "response_transformed": result.get("response_transformed", False),
+                "artifact_delivery_confirmation": _raw_artifact_confirmation,
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -21754,7 +22004,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if (
+            isinstance(response, dict)
+            and not response.get("failed")
+            and not response.get("artifact_delivery_confirmation")
+        ):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already

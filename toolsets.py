@@ -38,7 +38,7 @@ _HERMES_CORE_TOOLS = [
     # hidden outside the GUI).
     "read_terminal", "close_terminal",
     # File manipulation
-    "read_file", "write_file", "patch", "search_files",
+    "read_file", "write_file", "patch", "search_files", "deliver_artifact",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -191,7 +191,7 @@ TOOLSETS = {
 
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "tools": ["read_file", "write_file", "patch", "search_files", "deliver_artifact"],
         "includes": []
     },
     

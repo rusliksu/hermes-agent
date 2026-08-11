@@ -103,6 +103,14 @@ _RESOLVED_ACCESS_CONTEXT: ContextVar = ContextVar(
     default=_UNSET,
 )
 
+# Immutable destination snapshot derived from the current MessageEvent's
+# SessionSource. Unlike the legacy HERMES_SESSION_* compatibility strings,
+# this never falls back to process environment and is not model-controlled.
+_CURRENT_DELIVERY_TARGET: ContextVar = ContextVar(
+    "HERMES_CURRENT_DELIVERY_TARGET",
+    default=_UNSET,
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -180,6 +188,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     resolved_access_context: Any = _UNSET,
+    current_delivery_target: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -222,6 +231,8 @@ def set_session_vars(
     # wrapper context rather than clearing it.
     if resolved_access_context is not _UNSET:
         tokens.append(_RESOLVED_ACCESS_CONTEXT.set(resolved_access_context))
+    if current_delivery_target is not _UNSET:
+        tokens.append(_CURRENT_DELIVERY_TARGET.set(current_delivery_target))
     try:
         from agent.runtime_cwd import set_session_cwd
 
@@ -263,6 +274,7 @@ def clear_session_vars(tokens: list) -> None:
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
+    _CURRENT_DELIVERY_TARGET.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -312,6 +324,7 @@ def reset_session_vars() -> None:
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _RESOLVED_ACCESS_CONTEXT.set(_UNSET)
+    _CURRENT_DELIVERY_TARGET.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -353,6 +366,14 @@ def get_resolved_access_context(default: Any = None) -> Any:
     design. A missing or cleared context returns *default*.
     """
     value = _RESOLVED_ACCESS_CONTEXT.get()
+    if value is _UNSET:
+        return default
+    return value
+
+
+def get_current_delivery_target(default: Any = None) -> Any:
+    """Return the current MessageEvent destination without env fallback."""
+    value = _CURRENT_DELIVERY_TARGET.get()
     if value is _UNSET:
         return default
     return value

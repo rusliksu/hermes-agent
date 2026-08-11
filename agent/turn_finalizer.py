@@ -443,6 +443,9 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "artifact_delivery_confirmation": getattr(
+            agent, "_artifact_delivery_confirmation", None
+        ),
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,

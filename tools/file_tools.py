@@ -1569,6 +1569,28 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _bound_artifact_output_error(path: str, task_id: str) -> str | None:
+    """Run the shared fail-closed bound-output validator for one target."""
+    try:
+        from tools.artifact_delivery_tool import validate_bound_artifact_output
+
+        return validate_bound_artifact_output(path, task_id)
+    except Exception:
+        logger.debug("bound artifact output validation failed closed", exc_info=True)
+        try:
+            from gateway.session_context import get_resolved_access_context
+
+            _bound_context = get_resolved_access_context(None)
+            _bound_role = getattr(_bound_context, "role_id", None)
+        except Exception:
+            _bound_role = None
+        return (
+            "bound_roots_unavailable"
+            if _bound_role in {"family", "shared_room"}
+            else None
+        )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1580,6 +1602,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    bound_artifact_error = _bound_artifact_output_error(path, task_id)
+    if bound_artifact_error:
+        return tool_error(
+            "bound_artifact_output_rejected: " + bound_artifact_error
+        )
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1667,8 +1694,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
-        import re as _re
         from tools.path_security import has_traversal_component
+        from tools.patch_parser import extract_v4a_file_paths
+
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
@@ -1687,27 +1715,20 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        # Use the production parser as the single grammar authority.  This
+        # keeps safety/stop classification aligned with every parser-valid
+        # spelling, including no-space ``***Add File:`` headers and moves.
+        for v4a_path in extract_v4a_file_paths(patch):
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-                _err = _reject_v4a_traversal(v4a_path)
-                if _err:
-                    return _err
-                _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        bound_artifact_error = _bound_artifact_output_error(_p, task_id)
+        if bound_artifact_error:
+            return tool_error(
+                "bound_artifact_output_rejected: " + bound_artifact_error
+            )
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

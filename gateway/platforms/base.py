@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -18,6 +19,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -1147,6 +1149,20 @@ def _profile_media_delivery_roots(profile_home: Path) -> List[Path]:
     return roots
 
 
+def _bound_multiplex_delivery_roots(profile_home: Path) -> List[Path]:
+    """Return typed profile/workspace roots without process/env fallback."""
+    roots = [profile_home]
+    try:
+        from agent.runtime_cwd import resolve_bound_profile_cwd
+
+        workspace = resolve_bound_profile_cwd()
+        if workspace is not None:
+            roots.append(workspace)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return list(dict.fromkeys(root.resolve(strict=False) for root in roots))
+
+
 def _kanban_attachment_roots() -> List[Path]:
     """Return durable Kanban attachment roots without importing kanban_db."""
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
@@ -1179,7 +1195,9 @@ def _media_delivery_allowed_roots() -> List[Path]:
         # In multiplex mode never expose the all-profile enumeration or a
         # process-wide operator root. Explicit roots are accepted only when
         # they are physically inside the currently bound profile home.
+        bound_roots = _bound_multiplex_delivery_roots(profile_home)
         roots = _profile_media_delivery_roots(profile_home)
+        roots.extend(bound_roots)
         candidate_roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
         candidate_roots.extend(_kanban_attachment_roots())
         extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
@@ -1193,7 +1211,7 @@ def _media_delivery_allowed_roots() -> List[Path]:
                 resolved_root = root.expanduser().resolve(strict=False)
             except (OSError, RuntimeError, ValueError):
                 continue
-            if _path_is_within(resolved_root, profile_home):
+            if any(_path_is_within(resolved_root, root) for root in bound_roots):
                 roots.append(resolved_root)
         return roots
 
@@ -1413,10 +1431,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # non-strict fallback so a guessed path in another profile can never be
     # delivered through the default path.
     multiplex_active, profile_home = _multiplex_media_delivery_scope()
-    if multiplex_active and (
-        profile_home is None or not _path_is_within(resolved, profile_home)
-    ):
-        return None
+    if multiplex_active:
+        if profile_home is None or not any(
+            _path_is_within(resolved, root)
+            for root in _bound_multiplex_delivery_roots(profile_home)
+        ):
+            return None
 
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.
@@ -1924,6 +1944,11 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Server-owned current-turn delivery provenance. The gateway sets this
+    # only from the structured agent result after a trusted deliver_artifact
+    # tool result; adapters must never infer it from model-authored text.
+    artifact_delivery_confirmation: Optional[Dict[str, str]] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2504,6 +2529,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
         self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
+        self._inbound_profile_scope_factory: Optional[Callable[[], Any]] = None
         
         # Track active message handlers per session for interrupt support.
         # _active_sessions stores the per-session interrupt Event; _session_tasks
@@ -2834,6 +2860,19 @@ class BasePlatformAdapter(ABC):
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
+
+    def set_inbound_profile_scope(
+        self, factory: Optional[Callable[[], Any]]
+    ) -> None:
+        """Set the context-manager factory for inbound profile-scoped work."""
+        self._inbound_profile_scope_factory = factory
+
+    def _inbound_profile_scope(self):
+        """Return the current inbound profile scope, or a no-op context."""
+        factory = getattr(self, "_inbound_profile_scope_factory", None)
+        if factory is None:
+            return nullcontext()
+        return factory()
 
     def _mark_connected(self) -> None:
         self._running = True
@@ -3628,7 +3667,97 @@ class BasePlatformAdapter(ABC):
             text = "⚠️ Couldn't deliver the file attachment."
         if caption:
             text = f"{caption}\n{text}"
+        if kwargs.get("_require_native"):
+            return SendResult(
+                success=False,
+                error="Native document delivery unavailable",
+            )
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+    async def _deliver_confirmed_artifact(
+        self,
+        event: MessageEvent,
+        file_path: str,
+        *,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Claim, natively send, and durably receipt one confirmed document."""
+        transition = getattr(event, "_artifact_delivery_transition", None)
+        if not callable(transition):
+            return SendResult(success=False, error="Missing durable delivery transaction")
+        claimed = False
+        delivered = False
+        try:
+            if not await transition("ready", "delivery_started"):
+                return SendResult(success=False, error="Artifact delivery claim rejected")
+            claimed = True
+            result = await self.send_document(
+                chat_id=event.source.chat_id,
+                file_path=file_path,
+                metadata=metadata,
+                _require_native=True,
+            )
+            receipt_id = getattr(result, "message_id", None)
+            if not getattr(result, "success", False) or not receipt_id:
+                return SendResult(
+                    success=False,
+                    error=getattr(result, "error", None) or "Native document receipt missing",
+                )
+            if not await transition(
+                "delivery_started", "delivered", receipt_id=str(receipt_id)
+            ):
+                return SendResult(success=False, error="Artifact receipt persistence failed")
+            delivered = True
+            return result
+        except Exception:
+            logger.warning(
+                "[%s] Confirmed artifact transaction failed",
+                self.name,
+                exc_info=True,
+            )
+            return SendResult(success=False, error="Artifact delivery transaction failed")
+        finally:
+            if claimed and not delivered:
+                try:
+                    marked_uncertain = await transition(
+                        "delivery_started", "uncertain"
+                    )
+                    if not marked_uncertain:
+                        logger.warning(
+                            "[%s] Failed to mark confirmed artifact delivery uncertain",
+                            self.name,
+                        )
+                except Exception:
+                    logger.warning(
+                        "[%s] Failed to mark confirmed artifact delivery uncertain",
+                        self.name,
+                        exc_info=True,
+                    )
+
+    async def _abandon_confirmed_artifact(self, event: MessageEvent) -> None:
+        """Best-effort abandon a ready confirmation that will not be delivered."""
+        confirmation = event.artifact_delivery_confirmation
+        transition = getattr(event, "_artifact_delivery_transition", None)
+        try:
+            if (
+                isinstance(confirmation, dict)
+                and isinstance(confirmation.get("transaction_session_id"), str)
+                and confirmation.get("transaction_session_id")
+                and isinstance(confirmation.get("transaction_id"), str)
+                and confirmation.get("transaction_id")
+                and callable(transition)
+            ):
+                await transition("ready", "abandoned")
+        except Exception:
+            logger.warning(
+                "[%s] Failed to abandon suppressed artifact delivery",
+                self.name,
+                exc_info=True,
+            )
+        finally:
+            event.artifact_delivery_confirmation = None
+            if hasattr(event, "_artifact_delivery_transition"):
+                delattr(event, "_artifact_delivery_transition")
 
     async def send_image_file(
         self,
@@ -5081,10 +5210,12 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
+                await self._abandon_confirmed_artifact(event)
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                artifact_delivery_confirmation = event.artifact_delivery_confirmation
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
@@ -5096,11 +5227,19 @@ class BasePlatformAdapter(ABC):
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                if artifact_delivery_confirmation:
+                    # Confirmation carries one server-validated artifact.
+                    # Model-authored MEDIA directives are stripped from text
+                    # but never become delivery candidates on this path.
+                    _, response = self.extract_media(response)
+                    media_files = []
+                else:
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
+                extracted_images, text_content = self.extract_images(response)
+                images = [] if artifact_delivery_confirmation else extracted_images
                 # Strip any remaining internal directives from message body (fixes #1561).
                 # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
                 # with an unknown extension is intentionally left in the body for
@@ -5110,7 +5249,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and not artifact_delivery_confirmation:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
@@ -5143,6 +5282,45 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+
+                # A trusted generated-document response is transactional at the
+                # delivery boundary: upload the one validated document first,
+                # and release model success text only after send_document
+                # confirms the current target. This marker is absent from every
+                # unrelated photo, voice, inbound-document, and plain-text path.
+                if artifact_delivery_confirmation:
+                    confirmation_result = None
+                    confirmation_path = artifact_delivery_confirmation.get("path")
+                    confirmation_tag = artifact_delivery_confirmation.get("media_tag")
+                    if (
+                        isinstance(confirmation_path, str)
+                        and confirmation_tag == f"MEDIA:{confirmation_path}"
+                        and Path(confirmation_path).is_absolute()
+                    ):
+                        confirmation_ext = Path(confirmation_path).suffix.lower()
+                        confirmation_mime, _ = mimetypes.guess_type(confirmation_path)
+                        if (
+                            confirmation_ext not in {
+                                ".png", ".jpg", ".jpeg", ".gif", ".webp",
+                                ".bmp", ".tiff", ".svg", ".mp4", ".mov",
+                                ".avi", ".mkv", ".webm", ".mp3", ".wav",
+                                ".ogg", ".opus", ".m4a", ".flac",
+                            }
+                            and not (
+                                confirmation_mime
+                                and confirmation_mime.startswith(("image/", "audio/", "video/"))
+                            )
+                        ):
+                            confirmation_result = await self._deliver_confirmed_artifact(
+                                event,
+                                confirmation_path,
+                                metadata=_final_thread_metadata,
+                            )
+                    if confirmation_result is None:
+                        await self._abandon_confirmed_artifact(event)
+                    _record_delivery(confirmation_result)
+                    if not getattr(confirmation_result, "success", False):
+                        text_content = ""
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

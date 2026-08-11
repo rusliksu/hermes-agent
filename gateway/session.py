@@ -1375,6 +1375,31 @@ class SessionStore:
         # entries before the first message arrives. Pruning here (lock already
         # held) is cheap: one lookup per routing key, once at startup.
         self._prune_stale_sessions_locked()
+        self._recover_artifact_deliveries_locked()
+
+    def _recover_artifact_deliveries_locked(self) -> None:
+        """Terminalize restart-interrupted artifact sends without replaying tools."""
+        db = getattr(self, "_db", None)
+        if not db:
+            return
+        changed = False
+        for entry in self._entries.values():
+            try:
+                recovered = db.recover_artifact_delivery(entry.session_id)
+            except Exception:
+                logger.warning(
+                    "gateway.session: artifact delivery recovery failed",
+                    exc_info=True,
+                )
+                recovered = {"state": "uncertain"}
+            if not recovered:
+                continue
+            entry.resume_pending = True
+            entry.resume_reason = f"artifact_delivery_{recovered['state']}"
+            entry.last_resume_marked_at = _now()
+            changed = True
+        if changed:
+            self._save()
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
@@ -2676,6 +2701,16 @@ class SessionStore:
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
 
+            if self._db and db_end_session_id:
+                try:
+                    self._db.recover_artifact_delivery(db_end_session_id)
+                except Exception as e:
+                    logger.warning(
+                        "Session reset artifact terminalization failed: %s",
+                        e,
+                    )
+                    return None
+
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
@@ -2758,6 +2793,16 @@ class SessionStore:
                 return old_entry
 
             db_end_session_id = old_entry.session_id
+
+            if self._db and db_end_session_id:
+                try:
+                    self._db.recover_artifact_delivery(db_end_session_id)
+                except Exception as e:
+                    logger.warning(
+                        "Session switch artifact terminalization failed: %s",
+                        e,
+                    )
+                    return None
 
             now = _now()
             new_entry = SessionEntry(
