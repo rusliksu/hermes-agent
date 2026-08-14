@@ -81,3 +81,4 @@ schema, config/env или live service. Нельзя ослаблять identity
 - 2026-08-14T10:09:13Z – codex – Implementation already completed at bab2b18d; restoring canonical lifecycle before PR merge.
 - 2026-08-14T10:09:18Z – codex – RED 2 failures; GREEN focused 14, access/profile/session 376, model-picker 41 and 45; Ruff, py_compile and diff-check passed.
 - 2026-08-14T10:09:22Z – codex – shell_pid=658234 – Started review via action command
+- 2026-08-14T10:09:45Z – codex – shell_pid=658234 – Self-review fallback: exact one-condition production diff, negative fail-closed cases and affected suites verified; no live mutation.
