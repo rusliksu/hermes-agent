@@ -78,3 +78,4 @@ schema, config/env или live service. Нельзя ослаблять identity
 ## Activity Log
 
 - 2026-08-14T10:09:13Z – codex – Implementation already completed at bab2b18d; restoring canonical lifecycle before PR merge.
+- 2026-08-14T10:09:18Z – codex – RED 2 failures; GREEN focused 14, access/profile/session 376, model-picker 41 and 45; Ruff, py_compile and diff-check passed.
