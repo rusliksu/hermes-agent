@@ -258,7 +258,7 @@ def test_single_principal_shared_group_requires_exact_trigger_and_exact_chat():
     assert adapter._is_user_authorized_from_message(anonymous) is False
 
 
-def test_single_principal_free_response_shared_group_dispatches_all_topics_with_thread_isolation():
+def test_single_principal_free_response_shared_group_gates_ambient_text_with_thread_isolation():
     from gateway.session import build_session_key
 
     adapter = _make_adapter(
@@ -271,8 +271,10 @@ def test_single_principal_free_response_shared_group_dispatches_all_topics_with_
     first = _group_message("ambient one", chat_id=-100, thread_id=7, is_forum=True)
     second = _group_message("ambient two", chat_id=-100, thread_id=8, is_forum=True)
 
-    assert adapter._should_process_message(first) is True
-    assert adapter._should_process_message(second) is True
+    assert adapter._should_process_message(first) is False
+    assert adapter._should_process_message(second) is False
+    assert adapter._should_observe_unmentioned_group_message(first) is True
+    assert adapter._should_observe_unmentioned_group_message(second) is True
 
     first_source = adapter._build_message_event(first, MessageType.TEXT).source
     second_source = adapter._build_message_event(second, MessageType.TEXT).source
@@ -285,7 +287,29 @@ def test_single_principal_free_response_shared_group_dispatches_all_topics_with_
     )
 
 
-def test_single_principal_free_response_shared_group_text_dispatch_is_not_passive_observation():
+def test_single_principal_free_response_shared_group_triggers_only_on_mention_or_reply():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    _attach_single_principal(adapter, ["-100"])
+
+    ambient = _group_message("ambient in shared room", chat_id=-100)
+    mention_text = "hi @hermes_bot"
+    mentioned = _group_message(
+        mention_text,
+        chat_id=-100,
+        entities=[_mention_entity(mention_text)],
+    )
+    reply = _group_message("reply", chat_id=-100, reply_to_bot=True)
+
+    assert adapter._should_process_message(ambient) is False
+    assert adapter._should_process_message(mentioned) is True
+    assert adapter._should_process_message(reply) is True
+
+
+def test_single_principal_free_response_shared_group_text_is_passively_observed_not_dispatched():
     async def _run():
         adapter = _make_adapter(
             require_mention=True,
@@ -310,11 +334,13 @@ def test_single_principal_free_response_shared_group_text_dispatch_is_not_passiv
         try:
             await adapter._handle_text_message(update, SimpleNamespace())
             batch_tasks = list(adapter._pending_text_batch_tasks.values())
-            assert len(batch_tasks) == 1
-            await asyncio.gather(*batch_tasks)
+            assert batch_tasks == []
 
-            assert runner.handle_calls == 1
-            assert store.messages == []
+            assert runner.handle_calls == 0
+            assert len(store.messages) == 1
+            _, observed, _ = store.messages[0]
+            assert observed["content"] == "[Alice Example]\nambient in shared room"
+            assert observed["observed"] is True
             assert adapter._pending_text_batch_tasks == {}
         finally:
             pending_tasks = [
@@ -390,8 +416,8 @@ def test_single_principal_free_response_dispatch_bypasses_observation_only_for_e
     _attach_single_principal(adapter, ["-100", "-200"])
 
     free_response = _group_message("ambient", chat_id=-100)
-    assert adapter._should_process_message(free_response) is True
-    assert adapter._should_observe_unmentioned_group_message(free_response) is False
+    assert adapter._should_process_message(free_response) is False
+    assert adapter._should_observe_unmentioned_group_message(free_response) is True
 
     mention_only = _group_message("ambient", chat_id=-200)
     assert adapter._should_process_message(mention_only) is False
