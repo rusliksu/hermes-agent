@@ -13677,8 +13677,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except ValueError:
                 command_tokens = normalized_args.split()
             if (
-                shared_scope.is_topic
-                and canonical_cmd in {"settings", "model", "reasoning", "fast"}
+                (
+                    canonical_cmd == "model"
+                    or (
+                        shared_scope.is_topic
+                        and canonical_cmd in {"settings", "reasoning", "fast"}
+                    )
+                )
                 and "--global" not in command_tokens
                 and self._is_user_authorized(source)
             ):

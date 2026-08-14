@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -67,22 +68,27 @@ class _SessionStore:
         return {}
 
 
-def _registry() -> AccessRegistry:
+def _registry(
+    *,
+    chat_id: str = CHAT,
+    user_id: str = MEMBER,
+    thread_id: str | None = TOPIC,
+) -> AccessRegistry:
     capabilities = frozenset({"documents"})
     room_identity = TransportIdentity(
         platform="telegram",
         account=ACCOUNT,
         peer_kind="group",
-        user_id=MEMBER,
-        chat_id=CHAT,
-        thread_id=TOPIC,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
     )
     target = DeliveryTarget(
         platform="telegram",
         account=ACCOUNT,
         peer_kind="group",
-        chat_id=CHAT,
-        thread_id=TOPIC,
+        chat_id=chat_id,
+        thread_id=thread_id,
     )
     return AccessRegistry(
         roles={"shared_room": RolePolicy("shared_room", capabilities)},
@@ -96,7 +102,7 @@ def _registry() -> AccessRegistry:
                 conversation_scope="shared-room-scope",
                 delivery_target=target,
                 participant_identities=(
-                    ParticipantIdentity("telegram", ACCOUNT, MEMBER),
+                    ParticipantIdentity("telegram", ACCOUNT, user_id),
                 ),
             ),
         ),
@@ -116,22 +122,54 @@ def _runner(
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._profile_adapters = profile_adapters or {}
     runner.access_registry = access_registry
-    runner.config = SimpleNamespace(multiplex_profiles=multiplex)
+    runner.config = SimpleNamespace(
+        multiplex_profiles=multiplex,
+        group_sessions_per_user=False,
+        thread_sessions_per_user=False,
+        single_principal=None,
+    )
     runner._resolve_profile_home_for_source = lambda _source: Path("/tmp/test-room-profile")
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._session_run_generation = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_sources = {}
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._reasoning_config = None
+    runner._show_reasoning = False
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._capture_gateway_honcho_if_configured = lambda *_args, **_kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner.hooks = SimpleNamespace(
+        emit=AsyncMock(),
+        emit_collect=AsyncMock(return_value=[]),
+        loaded_hooks=False,
+    )
     runner.session_store = _SessionStore()
     return runner
 
 
-def _shared_source(*, profile: str | None = None) -> SessionSource:
+def _shared_source(
+    *,
+    chat_id: str = CHAT,
+    user_id: str = MEMBER,
+    profile: str | None = None,
+    thread_id: str | None = TOPIC,
+) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id=CHAT,
+        chat_id=chat_id,
         chat_type="group",
-        user_id=MEMBER,
-        thread_id=TOPIC,
+        user_id=user_id,
+        thread_id=thread_id,
         profile=profile,
         route_account=ACCOUNT,
     )
@@ -212,6 +250,98 @@ async def test_registry_owned_shared_room_uses_default_telegram_picker(
     assert await validator() is True
     runner.session_store.session_id = "session-two"
     assert await validator() is False
+
+
+def _root_shared_case(*, source_user: str = "10001"):
+    from gateway.single_principal import SinglePrincipalPolicy
+
+    root_chat = "-10001"
+    registered_member = "10001"
+    adapter = _PickerAdapter()
+    runner = _runner(
+        adapter,
+        access_registry=_registry(
+            chat_id=root_chat,
+            user_id=registered_member,
+            thread_id=None,
+        ),
+        profile_adapters={ROOM_PROFILE: {}},
+    )
+    policy = SinglePrincipalPolicy.from_dict(
+        {
+            "enabled": True,
+            "telegram_owner_id": registered_member,
+            "telegram_shared_chat_ids": [root_chat],
+        }
+    )
+    runner._single_principal_policy = policy
+    runner.config.single_principal = policy
+    runner._normalize_source_for_session_key = lambda source: source
+    source = _shared_source(
+        chat_id=root_chat,
+        user_id=source_user,
+        thread_id=None,
+    )
+    return runner, adapter, source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/model@pickerbot"])
+async def test_authorized_root_shared_room_dispatches_lane_local_model_picker(
+    monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """The real ingress gate must not reject a registry-owned root room."""
+    runner, adapter, source = _root_shared_case()
+    _stub_provider_lists(monkeypatch)
+    event = _event(command, source)
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    assert len(adapter.calls) == 1
+    kwargs = adapter.calls[0]
+    assert kwargs["allow_shared_lane_control"] is True
+    assert kwargs["metadata"] is None
+    assert source.profile == ROOM_PROFILE
+    assert isinstance(source.resolved_access_context, ResolvedAccessContext)
+    assert source.resolved_access_context.delivery_target.thread_id is None
+    validator = kwargs["is_state_current"]
+    assert await validator() is True
+    runner.session_store.session_id = "root-session-two"
+    assert await validator() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["/model --global", "/settings", "/reasoning", "/fast"],
+)
+async def test_root_shared_room_keeps_global_and_topic_only_controls_denied(
+    monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    runner, adapter, source = _root_shared_case()
+    _stub_provider_lists(monkeypatch)
+
+    result = await runner._handle_message(_event(command, source))
+
+    assert isinstance(result, str)
+    assert "unavailable in shared chats" in result
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_root_shared_room_unknown_participant_is_rejected_before_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, adapter, source = _root_shared_case(source_user="10002")
+    _stub_provider_lists(monkeypatch)
+
+    result = await runner._handle_message(_event("/model", source))
+
+    assert result is None
+    assert source.profile is None
+    assert source.resolved_access_context is None
+    assert adapter.calls == []
 
 
 @pytest.mark.asyncio

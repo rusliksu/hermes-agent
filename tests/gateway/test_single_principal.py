@@ -381,7 +381,7 @@ def test_policy_authorized_shared_topic_allows_lane_controls(command):
     assert runner._check_slash_access(source, command) is None
 
 
-@pytest.mark.parametrize("command", ["settings", "model", "reasoning", "fast"])
+@pytest.mark.parametrize("command", ["settings", "reasoning", "fast"])
 def test_shared_lane_controls_remain_topic_only_and_never_global(command):
     policy = _policy(telegram_shared_chat_ids=["-10001"])
     root_source = _source(
@@ -404,6 +404,24 @@ def test_shared_lane_controls_remain_topic_only_and_never_global(command):
     assert "unavailable in shared chats" in runner._check_slash_access(
         topic_source,
         command,
+        command_args="--global",
+    )
+
+
+def test_shared_root_model_is_lane_local_and_never_global():
+    policy = _policy(telegram_shared_chat_ids=["-10001"])
+    root_source = _source(
+        OUTSIDER,
+        chat_id="-10001",
+        chat_type="group",
+    )
+    runner = _runner(policy)
+    runner.config = GatewayConfig(single_principal=policy)
+
+    assert runner._check_slash_access(root_source, "model") is None
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        root_source,
+        "model",
         command_args="--global",
     )
 
