@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "mission_slug": "fix-shared-root-model-picker-01KZZDNM",
+  "mission_id": "01KZZDNMX6RGNB7BZ75T5H2A36",
+  "mission_branch": "kitty/mission-fix-shared-root-model-picker-01KZZDNM",
+  "target_branch": "codex/owner-default-profile-integration",
+  "lanes": [
+    {
+      "lane_id": "lane-a",
+      "wp_ids": [
+        "WP01"
+      ],
+      "write_scope": [
+        "gateway/run.py",
+        "tests/gateway/test_shared_room_model_picker.py",
+        "tests/gateway/test_slash_access_dispatch.py"
+      ],
+      "predicted_surfaces": [
+        "api"
+      ],
+      "depends_on_lanes": [],
+      "parallel_group": 0
+    }
+  ],
+  "computed_at": "2026-08-14T10:07:29.575754+00:00",
+  "computed_from": "dependency_graph+ownership",
+  "planning_artifact_wps": []
+}

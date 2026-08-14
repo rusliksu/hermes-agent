@@ -1,0 +1,49 @@
+{
+  "mission_slug": "fix-shared-root-model-picker-01KZZDNM",
+  "mission_number": "",
+  "mission_type": "software-dev",
+  "overall_verdict": "pass",
+  "criteria": [
+    {
+      "criterion_id": "FR-001",
+      "description": "Решение о доступе проверяется на полном dispatch boundary через реальный `GatewayRunner._handle_message`, а не прямой вызов handler.",
+      "proof_type": "automated_test",
+      "evidence": "tests/gateway/test_shared_room_model_picker.py::test_authorized_root_shared_room_dispatches_lane_local_model_picker",
+      "pass_fail": "pass",
+      "verified_by": "codex",
+      "verified_at": "2026-08-14T10:12:00Z",
+      "notes": "Covers authorized root shared-room ingress through the real dispatch boundary."
+    },
+    {
+      "criterion_id": "FR-002",
+      "description": "Для `/model` в shared chat допустим только lane-local scope; `--global` запрещён.",
+      "proof_type": "automated_test",
+      "evidence": "tests/gateway/test_shared_room_model_picker.py::test_root_shared_room_keeps_global_and_topic_only_controls_denied",
+      "pass_fail": "pass",
+      "verified_by": "codex",
+      "verified_at": "2026-08-14T10:12:00Z",
+      "notes": "Confirms shared root chat denies global model controls."
+    },
+    {
+      "criterion_id": "FR-003",
+      "description": "Авторизация использует server-owned registry binding и текущую transport identity; имя пользователя и аргументы модели права не дают.",
+      "proof_type": "automated_test",
+      "evidence": "tests/gateway/test_shared_room_model_picker.py::test_root_shared_room_unknown_participant_is_rejected_before_picker; tests/gateway/test_shared_room_model_picker.py::test_control_delivery_never_uses_default_adapter_without_trusted_registry_room",
+      "pass_fail": "pass",
+      "verified_by": "codex",
+      "verified_at": "2026-08-14T10:12:00Z",
+      "notes": "Covers fail-closed participant checks and trusted registry room delivery."
+    },
+    {
+      "criterion_id": "FR-004",
+      "description": "Topic behavior остаётся прежним; root-group получает только model picker, остальные topic-only команды не расширяются.",
+      "proof_type": "automated_test",
+      "evidence": "tests/gateway/test_shared_room_model_picker.py::test_root_shared_room_keeps_global_and_topic_only_controls_denied; tests/gateway/test_slash_access_dispatch.py::test_shared_topic_typed_global_lane_control_is_denied",
+      "pass_fail": "pass",
+      "verified_by": "codex",
+      "verified_at": "2026-08-14T10:12:00Z",
+      "notes": "Verifies topic-only and global lane controls remain denied."
+    }
+  ],
+  "negative_invariants": []
+}
