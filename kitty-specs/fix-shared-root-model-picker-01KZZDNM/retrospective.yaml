@@ -82,7 +82,7 @@ gaps:
   summary: research.md absent
   evidence_refs:
   - e-002
-  details: spec.md is present but research.md is missing. Research artifacts help future maintainers understand design 
+  details: spec.md is present but research.md is missing. Research artifacts help future maintainers understand design
     decisions.
 proposals: []
 evidence_refs:
