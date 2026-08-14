@@ -2,27 +2,42 @@
 work_package_id: WP01
 title: Full-boundary regression и минимальный ingress fix
 dependencies: []
-requirement_refs: [FR-001, FR-002, FR-003, FR-004, NFR-001, NFR-002, NFR-003]
-tracker_refs: [hermes-cf7]
+requirement_refs:
+- FR-001
+- FR-002
+- FR-003
+- FR-004
+- NFR-001
+- NFR-002
+- NFR-003
+tracker_refs:
+- hermes-cf7
 planning_base_branch: codex/owner-default-profile-integration
 merge_target_branch: codex/owner-default-profile-integration
-branch_strategy: Реализация в task-owned ветке от exact merged head 57e7d869; live отдельно.
-subtasks: [T001, T002, T003, T004]
+branch_strategy: Planning artifacts for this mission were generated on codex/owner-default-profile-integration. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into codex/owner-default-profile-integration unless the human explicitly redirects the landing branch.
+subtasks:
+- T001
+- T002
+- T003
+- T004
 phase: Bounded bugfix
 agent: codex
-task_type: implement
 history:
-  - at: '2026-08-14T06:04:03Z'
-    actor: codex
-    action: Пакет одобрен; создан Bead hermes-cf7.
-  - at: '2026-08-14T06:14:00Z'
-    actor: codex
-    action: RED воспроизвёл реальный ingress denial; минимальный patch и затронутые suites зелёные.
+- at: '2026-08-14T06:04:03Z'
+  actor: codex
+  action: Пакет одобрен; создан Bead hermes-cf7.
+- at: '2026-08-14T06:14:00Z'
+  actor: codex
+  action: RED воспроизвёл реальный ingress denial; минимальный patch и затронутые suites зелёные.
+authoritative_surface: tests/gateway/
+create_intent: []
+execution_mode: code_change
 owned_files:
-  - gateway/run.py
-  - tests/gateway/test_shared_room_model_picker.py
-  - tests/gateway/test_slash_access_dispatch.py
-  - kitty-specs/fix-shared-root-model-picker-01KZZDNM/
+- gateway/run.py
+- tests/gateway/test_shared_room_model_picker.py
+- tests/gateway/test_slash_access_dispatch.py
+tags: []
+task_type: implement
 ---
 
 # WP01 — `/model` в корневой shared-room
