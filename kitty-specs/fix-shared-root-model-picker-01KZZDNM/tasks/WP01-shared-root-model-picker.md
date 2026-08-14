@@ -21,7 +21,8 @@ subtasks:
 - T003
 - T004
 phase: Bounded bugfix
-agent: codex
+agent: "codex"
+assignee: "codex"
 history:
 - at: '2026-08-14T06:04:03Z'
   actor: codex
@@ -73,3 +74,7 @@ schema, config/env или live service. Нельзя ослаблять identity
   дополнительные model-picker пакеты `41 passed` и `45 passed`.
 - Production diff: одно условие в `_check_slash_access`; роли, профили, memory,
   sessions, toolsets и live runtime не менялись.
+
+## Activity Log
+
+- 2026-08-14T10:09:13Z – codex – Implementation already completed at bab2b18d; restoring canonical lifecycle before PR merge.
