@@ -9,6 +9,6 @@
   "purpose_context": "Исправить ingress-проверку /model для авторизованной корневой shared-room, сохранив lane scope и fail-closed изоляцию.",
   "purpose_tldr": "Разрешить локальный /model в авторизованной корневой shared-room",
   "slug": "fix-shared-root-model-picker-01KZZDNM",
-  "target_branch": "codex/fix-shared-root-model-picker-20260814",
+  "target_branch": "codex/owner-default-profile-integration",
   "topology": "single_branch"
 }
