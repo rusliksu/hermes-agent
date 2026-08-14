@@ -1,0 +1,119 @@
+schema_version: 1
+mission_id: 01KZZDNMX6RGNB7BZ75T5H2A36
+mission_slug: fix-shared-root-model-picker-01KZZDNM
+mission_number:
+friendly_name: Model picker в корневой shared-room
+mission_type: software-dev
+target_branch: codex/owner-default-profile-integration
+created_at: '2026-08-14T12:31:07.765478+00:00'
+created_by:
+  kind: human
+  id: cli
+  display: spec-kitty retrospect
+provenance:
+  kind: explicit_create
+  invoked_at: '2026-08-14T12:31:07.765478+00:00'
+  policy_resolved_from:
+    enabled: <default>
+    timing: <default>
+    failure_policy: <default>
+    write_record: <default>
+    generate_proposals: <default>
+    apply_proposals: <default>
+    permissions.write_record: <default>
+    permissions.inspect_mission_artifacts: <default>
+    permissions.propose_glossary_changes: <default>
+    permissions.propose_drg_changes: <default>
+    permissions.propose_doctrine_changes: <default>
+    permissions.apply_low_risk_changes: <default>
+    permissions.apply_structural_changes: <default>
+    precedence: <default>
+    generator: <default>
+  command: spec-kitty retrospect create
+policy_source:
+  enabled: <default>
+  timing: <default>
+  failure_policy: <default>
+  write_record: <default>
+  generate_proposals: <default>
+  apply_proposals: <default>
+  permissions.write_record: <default>
+  permissions.inspect_mission_artifacts: <default>
+  permissions.propose_glossary_changes: <default>
+  permissions.propose_drg_changes: <default>
+  permissions.propose_doctrine_changes: <default>
+  permissions.apply_low_risk_changes: <default>
+  permissions.apply_structural_changes: <default>
+  precedence: <default>
+  generator: <default>
+findings_status: has_findings
+helped:
+- id: h-001
+  category: implementation
+  summary: WP01 completed without rejection cycles
+  evidence_refs:
+  - e-006
+not_helpful:
+- id: n-001
+  category: process
+  summary: WP01 required 2 --force override(s) during workflow
+  evidence_refs:
+  - e-007
+  details: WP WP01 required 2 operator-driven --force lane transition(s). Force overrides typically indicate the runtime
+    guard failed or the operator routed around it; investigate the underlying cause.
+- id: n-002
+  category: process
+  summary: WP01 used self-review fallback instead of independent review
+  evidence_refs:
+  - e-008
+  details: 'WP WP01 recorded 1 ReviewerSelfApproval event(s): codex self-reviewed after intended reviewer Reviewer Renata
+    failed (Native subagent delegation was not authorized for this merge turn; parent performed deterministic focused and
+    affected-suite verification.). Treat this as a review-independence gap.'
+- id: n-003
+  category: review_loop
+  summary: mission-review-report.md present with findings
+  evidence_refs:
+  - e-009
+  details: A mission-review-report.md artifact is present for this mission. Review its findings to understand documented
+    review outcomes.
+gaps:
+- id: g-001
+  category: doc
+  summary: research.md absent
+  evidence_refs:
+  - e-002
+  details: spec.md is present but research.md is missing. Research artifacts help future maintainers understand design 
+    decisions.
+proposals: []
+evidence_refs:
+- id: e-001
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/meta.json
+- id: e-002
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/spec.md
+- id: e-003
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/plan.md
+- id: e-004
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/tasks.md
+- id: e-005
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/tasks/WP01-shared-root-model-picker.md
+- id: e-006
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/status.events.jsonl
+- id: e-007
+  kind: event_range
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/status.events.jsonl
+  range: 01KZZVZGNN0GBVD50CSKA1739N..01M003D6SC5X49ARJA42E4XA2P
+- id: e-008
+  kind: event_range
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/status.events.jsonl
+  range: 01KZZVZH1S5T5V8DT3J9PH1VKA
+- id: e-009
+  kind: file
+  path: kitty-specs/fix-shared-root-model-picker-01KZZDNM/mission-review-report.md
+generator_version: '1.0'
+provenance_history: []
