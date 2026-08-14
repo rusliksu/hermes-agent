@@ -82,3 +82,4 @@ schema, config/env или live service. Нельзя ослаблять identity
 - 2026-08-14T10:09:18Z – codex – RED 2 failures; GREEN focused 14, access/profile/session 376, model-picker 41 and 45; Ruff, py_compile and diff-check passed.
 - 2026-08-14T10:09:22Z – codex – shell_pid=658234 – Started review via action command
 - 2026-08-14T10:09:45Z – codex – shell_pid=658234 – Self-review fallback: exact one-condition production diff, negative fail-closed cases and affected suites verified; no live mutation.
+- 2026-08-14T12:19:34Z – codex – shell_pid=658234 – Closeout evidence: PR #30 merge f978007c; exact live runtime f978007c; gateway active/running, stable PID, NRestarts=0; 39 post-restart tests; sanitized error count 0; real Telegram /model picker canary passed.
