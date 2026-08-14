@@ -1,7 +1,7 @@
 {
-  "event_count": 2,
-  "last_event_id": "01KZZVYHJBJM56Y7AKD5A3PQ35",
-  "materialized_at": "2026-08-14T10:09:13.291143+00:00",
+  "event_count": 3,
+  "last_event_id": "01KZZVYJ0KR8G62SK1AFA63FTD",
+  "materialized_at": "2026-08-14T10:09:13.747152+00:00",
   "mission_number": "",
   "mission_slug": "fix-shared-root-model-picker-01KZZDNM",
   "mission_type": "software-dev",
@@ -9,10 +9,10 @@
     "approved": 0,
     "blocked": 0,
     "canceled": 0,
-    "claimed": 1,
+    "claimed": 0,
     "done": 0,
     "for_review": 0,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
     "planned": 0
   },
@@ -20,9 +20,9 @@
     "WP01": {
       "actor": "codex",
       "force_count": 0,
-      "lane": "claimed",
-      "last_event_id": "01KZZVYHJBJM56Y7AKD5A3PQ35",
-      "last_transition_at": "2026-08-14T10:09:13.291143+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KZZVYJ0KR8G62SK1AFA63FTD",
+      "last_transition_at": "2026-08-14T10:09:13.747152+00:00"
     }
   }
 }
