@@ -3904,11 +3904,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return policy.shared_scope(source)
 
     @staticmethod
+    def _is_admin_toolset(toolset_name: Any) -> bool:
+        """Return whether a configured toolset is reserved for owner/admin use."""
+        name = str(toolset_name or "").strip().lower()
+        return name.endswith("_admin") or name in {
+            "global_cron",
+            "host_shell",
+            "owner_admin",
+        }
+
+    @staticmethod
+    def _is_role_user_toolset(toolset_name: Any) -> bool:
+        """Return whether a toolset belongs in a normal user conversation."""
+        name = str(toolset_name or "").strip().lower()
+        return not GatewayRunner._is_admin_toolset(name) and name not in {"kanban"}
+
+    @staticmethod
     def _toolsets_for_resolved_access_context(
         configured_toolsets: list[str],
         context: Any,
     ) -> list[str]:
-        """Intersect configured toolsets with the trusted role capabilities."""
+        """Apply the role boundary without shrinking the user tool surface.
+
+        Configuration, platform relevance and per-tool ``check_fn`` gates are
+        applied later by ``AIAgent``. This boundary only keeps explicitly
+        administrative toolsets owner-only; every other configured toolset is
+        available to an authenticated family member or room context.
+        """
         if context is None:
             return list(configured_toolsets)
         if not isinstance(context, ResolvedAccessContext):
@@ -3919,39 +3941,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         if role_id == "owner":
             return list(configured_toolsets)
-
-        role_capability_toolsets = {
-            "family": {
-                "memory_search": "memory",
-                "public_web": "web",
-                "vision": "vision",
-                "image_generation": "image_gen",
-                "voice_generation": "tts",
-                "session_search": "session_search",
-                "self_reminder": "cronjob",
-                "delegation": "delegation",
-                "wolfram": "wolfram",
-                "documents": "file",
-                "docker_terminal": "terminal",
-                "isolated_browser": "browser",
-            },
-            "shared_room": {
-                "public_web": "web",
-                "vision": "vision",
-                "documents": "file",
-            },
-        }
-        capability_toolsets = role_capability_toolsets.get(role_id)
-        if capability_toolsets is None:
+        if role_id not in {"family", "shared_room"}:
             return []
-
-        configured = {str(toolset) for toolset in configured_toolsets}
-        allowed = {
-            toolset
-            for capability, toolset in capability_toolsets.items()
-            if capability in capabilities and toolset in configured
-        }
-        return sorted(allowed)
+        return sorted(
+            str(toolset)
+            for toolset in configured_toolsets
+            if GatewayRunner._is_role_user_toolset(toolset)
+        )
 
     @staticmethod
     def _shared_tool_profile_for_source(
@@ -3973,23 +3969,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return [], frozenset()
 
-        configured = {str(toolset) for toolset in (configured_toolsets or [])}
-        toolsets: list[str] = []
-        expected_tools: set[str] = set()
-        if "room_memory" in context.capabilities and "memory" in configured:
-            toolsets.append("memory")
-            expected_tools.add("memory")
-        if "public_web" in context.capabilities and "web" in configured:
-            toolsets.append("web")
-            expected_tools.update({"web_search", "web_extract"})
-        if "vision" in context.capabilities and "vision" in configured:
-            toolsets.append("vision")
-            expected_tools.add("vision_analyze")
-        if "documents" in context.capabilities and "file" in configured:
-            toolsets.append("file")
-            expected_tools.update(
-                {"read_file", "write_file", "patch", "search_files", "deliver_artifact"}
-            )
+        configured = [str(toolset) for toolset in (configured_toolsets or [])]
+        toolsets = GatewayRunner._toolsets_for_resolved_access_context(
+            configured,
+            context,
+        )
+        from toolsets import resolve_toolset
+
+        expected_tools = {
+            tool
+            for toolset in toolsets
+            for tool in resolve_toolset(toolset)
+        }
         return sorted(toolsets), frozenset(expected_tools)
 
     @staticmethod

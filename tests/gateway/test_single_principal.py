@@ -588,7 +588,7 @@ async def test_shared_turn_uses_configured_telegram_tool_profile(
     ids=["one-optional-tool-unavailable", "multiple-optional-tools-unavailable"],
 )
 @pytest.mark.asyncio
-async def test_shared_turn_binds_reduced_typed_profile_for_root_and_topic(
+async def test_shared_turn_binds_full_typed_profile_for_root_and_topic(
     runtime_tool_names, tmp_path, monkeypatch
 ):
     from gateway.access_registry import DeliveryTarget, ResolvedAccessContext
@@ -721,7 +721,12 @@ async def test_shared_turn_binds_reduced_typed_profile_for_root_and_topic(
 
         assert result["final_response"] == "ok"
         agent = created_agents[-1]
-        assert agent.init_kwargs["enabled_toolsets"] == ["memory", "vision", "web"]
+        assert agent.init_kwargs["enabled_toolsets"] == [
+            "memory",
+            "terminal",
+            "vision",
+            "web",
+        ]
         assert agent.init_kwargs["disabled_toolsets"] == ["kanban"]
         assert agent.valid_tool_names == set(runtime_tool_names)
         assert agent._memory_enabled is True

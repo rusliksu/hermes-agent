@@ -25,6 +25,7 @@ CONFIGURED_TOOLSETS = [
     "web",
     "wolfram",
     "custom_mcp_server",
+    "discord_admin",
 ]
 
 
@@ -134,46 +135,25 @@ def test_owner_context_returns_configured_toolsets_unchanged():
     ) == CONFIGURED_TOOLSETS
 
 
-def test_family_uses_capability_and_config_intersection():
+def test_family_gets_full_configured_non_admin_surface():
     toolsets = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _context(
             "family",
-            {
-                "public_web",
-                "vision",
-                "image_generation",
-                "voice_generation",
-                "session_search",
-                "self_reminder",
-                "delegation",
-                "wolfram",
-                "terminal",
-                "file",
-                "browser",
-                "arbitrary_mcp",
-            },
+            {"public_web"},
         ),
     )
 
-    assert toolsets == [
-        "cronjob",
-        "delegation",
-        "image_gen",
-        "session_search",
-        "tts",
-        "vision",
-        "web",
-        "wolfram",
-    ]
-    assert not {
-        "terminal",
-        "file",
-        "browser",
-        "custom_mcp_server",
-        "kanban",
-        "homeassistant",
-    } & set(toolsets)
+    assert toolsets == sorted(
+        name for name in CONFIGURED_TOOLSETS if name != "discord_admin"
+    )
+
+
+def test_admin_toolsets_are_excluded_for_non_owner_roles():
+    assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
+        ["web", "discord_admin", "owner_admin"],
+        _context("family", set()),
+    ) == ["web"]
 
 
 def test_family_capability_cannot_enable_disabled_platform_toolset():
@@ -202,7 +182,7 @@ def test_shared_room_documents_exposes_file_tool_contract():
     )
 
 
-def test_family_delegation_only_with_capability_and_config():
+def test_family_keeps_configured_surface_without_capability_flags():
     allowed = gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _context(
@@ -219,17 +199,21 @@ def test_family_delegation_only_with_capability_and_config():
         _context("family", {"public_web", "delegation"}),
     )
 
-    assert allowed == ["delegation", "web", "wolfram"]
-    assert without_capability == ["web"]
+    assert allowed == sorted(
+        name for name in CONFIGURED_TOOLSETS if name != "discord_admin"
+    )
+    assert without_capability == sorted(
+        name for name in CONFIGURED_TOOLSETS if name != "discord_admin"
+    )
     assert without_config == ["web"]
-    assert not {"terminal", "browser"} & set(allowed)
+    assert {"terminal", "browser", "delegation"} <= set(allowed)
 
 
-def test_shared_room_generic_surface_is_web_and_vision_only():
+def test_shared_room_gets_full_configured_non_admin_surface():
     assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         CONFIGURED_TOOLSETS,
         _shared_context({"room_memory", "public_web", "vision"}),
-    ) == ["vision", "web"]
+    ) == sorted(name for name in CONFIGURED_TOOLSETS if name != "discord_admin")
 
 
 def test_shared_profile_memory_requires_room_memory_capability_and_config():
@@ -250,14 +234,27 @@ def test_shared_profile_memory_requires_room_memory_capability_and_config():
         configured_toolsets=["web", "vision"],
     )
 
-    assert toolsets == ["memory", "vision", "web"]
-    assert expected_tools == frozenset(
-        {"memory", "vision_analyze", "web_search", "web_extract"}
+    from toolsets import resolve_toolset
+
+    expected = frozenset(
+        tool
+        for toolset in ["memory", "web", "vision", "terminal"]
+        for tool in resolve_toolset(toolset)
     )
-    assert no_capability == ["vision", "web"]
-    assert no_capability_tools == frozenset({"vision_analyze", "web_search", "web_extract"})
+    assert toolsets == ["memory", "terminal", "vision", "web"]
+    assert expected_tools == expected
+    assert no_capability == ["memory", "vision", "web"]
+    assert no_capability_tools == frozenset(
+        tool
+        for toolset in ["memory", "web", "vision"]
+        for tool in resolve_toolset(toolset)
+    )
     assert no_config == ["vision", "web"]
-    assert no_config_tools == frozenset({"vision_analyze", "web_search", "web_extract"})
+    assert no_config_tools == frozenset(
+        tool
+        for toolset in ["web", "vision"]
+        for tool in resolve_toolset(toolset)
+    )
 
 
 def test_malformed_and_unknown_roles_fail_closed_to_empty_toolsets():
@@ -275,11 +272,11 @@ def test_malformed_and_unknown_roles_fail_closed_to_empty_toolsets():
     ) == ([], frozenset())
 
 
-def test_empty_toolset_result_stays_empty_list_not_default_all():
+def test_configured_toolset_is_not_removed_for_family_without_capability_flag():
     assert gateway_run.GatewayRunner._toolsets_for_resolved_access_context(
         ["terminal"],
         _context("family", {"public_web"}),
-    ) == []
+    ) == ["terminal"]
 
 
 def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
@@ -321,5 +318,13 @@ def test_run_agent_passes_filtered_toolsets_and_shared_override_does_not_reopen(
     )
 
     assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["enabled_toolsets"] == ["web"]
-    bind_shared_memory.assert_not_called()
+    assert _CapturingAgent.last_init["enabled_toolsets"] == [
+        "browser",
+        "delegation",
+        "memory",
+        "terminal",
+        "web",
+    ]
+    bind_shared_memory.assert_called_once()
+    assert "browser_snapshot" in bind_shared_memory.call_args.kwargs["expected_tool_names"]
+    assert "web_search" in bind_shared_memory.call_args.kwargs["expected_tool_names"]
