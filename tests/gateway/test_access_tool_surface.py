@@ -216,7 +216,7 @@ def test_shared_room_gets_full_configured_non_admin_surface():
     ) == sorted(name for name in CONFIGURED_TOOLSETS if name != "discord_admin")
 
 
-def test_shared_profile_memory_requires_room_memory_capability_and_config():
+def test_shared_profile_uses_configured_surface_and_scope_context():
     source = _source(_shared_context({"room_memory", "public_web", "vision"}))
 
     toolsets, expected_tools = gateway_run.GatewayRunner._shared_tool_profile_for_source(
