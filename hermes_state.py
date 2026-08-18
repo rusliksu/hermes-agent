@@ -959,6 +959,14 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
+CREATE TABLE IF NOT EXISTS gateway_topic_preferences (
+    scope TEXT NOT NULL DEFAULT '',
+    lane_key TEXT NOT NULL,
+    preferences_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, lane_key)
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -2539,6 +2547,58 @@ class SessionDB:
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
                 [(scope, k) for k in session_keys],
+            )
+
+        self._execute_write(_do)
+
+    # ── Durable gateway topic preferences ──────────────────────────────
+
+    def save_gateway_topic_preferences(
+        self, lane_key: str, preferences_json: str, *, scope: str = ""
+    ) -> None:
+        """Upsert sanitized model/reasoning preferences for one gateway lane."""
+        if not lane_key or not preferences_json:
+            return
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO gateway_topic_preferences
+                       (scope, lane_key, preferences_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(scope, lane_key) DO UPDATE SET
+                       preferences_json = excluded.preferences_json,
+                       updated_at = excluded.updated_at""",
+                (scope, lane_key, preferences_json, time.time()),
+            )
+
+        self._execute_write(_do)
+
+    def load_gateway_topic_preferences(
+        self, lane_key: str, *, scope: str = ""
+    ) -> Optional[str]:
+        """Return the preference JSON for one lane, or ``None`` when absent."""
+        if not lane_key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT preferences_json FROM gateway_topic_preferences
+                   WHERE scope = ? AND lane_key = ?""",
+                (scope, lane_key),
+            ).fetchone()
+        return row["preferences_json"] if row else None
+
+    def delete_gateway_topic_preferences(
+        self, lane_key: str, *, scope: str = ""
+    ) -> None:
+        """Delete the preference row for one lane."""
+        if not lane_key:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM gateway_topic_preferences "
+                "WHERE scope = ? AND lane_key = ?",
+                (scope, lane_key),
             )
 
         self._execute_write(_do)
