@@ -13683,6 +13683,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._is_elevated_user_authorized(source)
             ):
                 return None
+            # Tool-progress verbosity changes the Telegram display surface and
+            # is persisted as a platform setting, so keep it owner-only in a
+            # shared scope instead of letting any participant toggle it.
+            if canonical_cmd == "verbose" and self._is_elevated_user_authorized(source):
+                return None
             logger.info("Shared-scope slash command denied")
             return (
                 f"⛔ /{canonical_cmd} is unavailable in shared chats. "

@@ -222,6 +222,10 @@ def test_shared_scope_binds_scoped_memory_with_full_tools_and_denies_admin_comma
     assert "unavailable in shared chats" in runner._check_slash_access(
         source, "approve"
     )
+    assert runner._check_slash_access(owner_source, "verbose") is None
+    assert "unavailable in shared chats" in runner._check_slash_access(
+        source, "verbose"
+    )
 
     import gateway.run as run_module
 
