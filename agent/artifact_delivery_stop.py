@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +16,34 @@ from tools.artifact_delivery_tool import (
 
 
 _MUTATION_TOOLS = frozenset({"write_file", "patch"})
+_TERMINAL_DOCUMENT_SUFFIX = re.compile(
+    r"\.(?:xlsx?|csv|docx?|pdf|od[st]|pptx?|zip)\b",
+    re.IGNORECASE,
+)
+
+
+def _terminal_document_activity(
+    message: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> bool:
+    """Return whether a terminal result shows a generated document path.
+
+    Terminal is intentionally not treated as a generic file mutation: most
+    terminal calls in a shared chat are unrelated reads or code tasks. A
+    document suffix in the command output is the narrow signal emitted by
+    common generators (for example ``Saved: ...xlsx``), and is enough to
+    route the turn through the existing one-shot publication correction.
+    """
+    candidates: list[Any] = []
+    if payload is not None:
+        candidates.extend(payload.get(key) for key in ("output", "error"))
+    raw_content = message.get("content")
+    if isinstance(raw_content, str):
+        candidates.append(raw_content)
+    return any(
+        isinstance(value, str) and _TERMINAL_DOCUMENT_SUFFIX.search(value)
+        for value in candidates
+    )
 
 
 def bound_artifact_tool_batch_relevant(tool_calls: Iterable[Any]) -> bool:
@@ -187,6 +216,10 @@ def bound_artifact_stop_action(
             confirmation = _delivery_confirmation(message, payload)
             if confirmation is not None:
                 deliveries.append((sequence, confirmation))
+        elif tool_name == "terminal":
+            relevant_activity = relevant_activity or _terminal_document_activity(
+                message, payload
+            )
 
     qualifying = [
         confirmation

@@ -771,3 +771,54 @@ def test_only_bound_document_batches_enter_transaction(monkeypatch):
         assert not artifact_delivery_stop.bound_artifact_tool_batch_relevant(
             [call(name, args)]
         )
+
+
+def test_terminal_document_output_requires_structured_publication(monkeypatch):
+    from agent import artifact_delivery_stop
+
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    terminal_result = {
+        "role": "tool",
+        "name": "terminal",
+        "tool_name": "terminal",
+        "tool_call_id": "terminal-call",
+        "content": json.dumps(
+            {
+                "output": "Saved: /trusted/workspace/report.xlsx",
+                "exit_code": 0,
+            }
+        ),
+    }
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        [terminal_result], attempts=0
+    )
+
+    assert action == "continue"
+    assert nudge is not None
+    assert confirmation is None
+
+
+def test_unrelated_terminal_output_does_not_enter_document_correction(monkeypatch):
+    from agent import artifact_delivery_stop
+
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    terminal_result = {
+        "role": "tool",
+        "name": "terminal",
+        "tool_name": "terminal",
+        "tool_call_id": "terminal-call",
+        "content": json.dumps({"output": "tests passed", "exit_code": 0}),
+    }
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        [terminal_result], attempts=0
+    )
+
+    assert action == "none"
+    assert nudge is None
+    assert confirmation is None
