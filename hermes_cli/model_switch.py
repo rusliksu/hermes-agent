@@ -2527,4 +2527,40 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
-    return filtered
+    # Provider identity is case-insensitive.  Keep the picker deterministic if
+    # one discovery path emits a raw provider row (e.g. ``openrouter``) and
+    # another emits its canonical row (e.g. ``OpenRouter``).  Prefer the
+    # currently selected row first, then the canonical display label, then a
+    # built-in row over a user-defined shadow.
+    def _row_preference(row: dict) -> tuple[bool, bool, int, bool]:
+        row_slug = str(row.get("slug", "")).strip()
+        canonical_label = get_label(row_slug)
+        source_priority = {
+            "canonical": 3,
+            "hermes": 2,
+            "built-in": 1,
+        }.get(str(row.get("source", "")), 0)
+        return (
+            bool(row.get("is_current")),
+            str(row.get("name", "")).strip().casefold()
+            == str(canonical_label).strip().casefold(),
+            source_priority,
+            not bool(row.get("is_user_defined")),
+        )
+
+    deduped: list[dict] = []
+    row_index_by_slug: dict[str, int] = {}
+    for row in filtered:
+        normalized_slug = str(row.get("slug", "")).strip().casefold()
+        if not normalized_slug:
+            deduped.append(row)
+            continue
+        existing_index = row_index_by_slug.get(normalized_slug)
+        if existing_index is None:
+            row_index_by_slug[normalized_slug] = len(deduped)
+            deduped.append(row)
+            continue
+        if _row_preference(row) > _row_preference(deduped[existing_index]):
+            deduped[existing_index] = row
+
+    return deduped

@@ -109,6 +109,35 @@ def test_non_openrouter_rows_passed_through_unchanged(monkeypatch):
     assert result[1]["models"] == ["gemini-3-flash-preview"]
 
 
+def test_provider_slug_duplicates_are_collapsed_case_insensitively(monkeypatch):
+    """Raw and canonical casing variants must not become two picker rows."""
+    base = [
+        _make_provider(
+            "openrouter",
+            name="openrouter",
+            models=["raw/model"],
+            source="built-in",
+        ),
+        _make_provider(
+            "OpenRouter",
+            name="OpenRouter",
+            models=["curated/model"],
+            source="canonical",
+        ),
+    ]
+
+    monkeypatch.setattr(model_switch, "list_authenticated_providers",
+                        lambda **kw: list(base))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [("curated/model", "")])
+
+    result = model_switch.list_picker_providers(max_models=50)
+
+    assert len(result) == 1
+    assert result[0]["slug"] == "OpenRouter"
+    assert result[0]["name"] == "OpenRouter"
+
+
 def test_include_moa_adds_virtual_provider_with_named_presets(monkeypatch):
     """Gateway pickers opt into a virtual MoA provider so presets are tappable."""
     base = [_make_provider("minimax", models=["MiniMax-M3"])]
