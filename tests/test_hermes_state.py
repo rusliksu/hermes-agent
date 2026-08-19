@@ -117,6 +117,23 @@ class TestSessionScopedReads:
             "is_dm": True,
         }
 
+    def _group_scope(
+        self,
+        *,
+        profile_name="room-alpha",
+        chat_id="group-a",
+        thread_id="31",
+    ):
+        return {
+            "profile_name": profile_name,
+            "source": "telegram",
+            "chat_type": "group",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": "",
+            "is_dm": False,
+        }
+
     def _seed(self, db, session_id, *, profile_name="family-alpha"):
         db.create_session(
             session_id,
@@ -157,6 +174,127 @@ class TestSessionScopedReads:
         )
         db.append_message(session_id, role="user", content=f"{session_id} transcript")
         db._conn.commit()
+
+    def test_scoped_create_binds_exact_legacy_group_topic(self, db):
+        db.create_session(
+            "legacy-group-create",
+            source="telegram",
+            chat_type="group",
+            chat_id="group-a",
+            thread_id="31",
+        )
+        scope = self._group_scope()
+
+        assert db.create_session(
+            "legacy-group-create",
+            source="telegram",
+            session_scope=scope,
+            model="test-model",
+        ) is True
+        session = db.get_session("legacy-group-create")
+        assert session["profile_name"] == "room-alpha"
+        assert db.get_session("legacy-group-create", session_scope=scope)["id"] == (
+            "legacy-group-create"
+        )
+
+    def test_scoped_append_binds_legacy_group_topic_with_transcript(self, db):
+        db.create_session(
+            "legacy-group-append",
+            source="telegram",
+            chat_type="group",
+            chat_id="group-a",
+            thread_id="31",
+        )
+        db.append_message("legacy-group-append", role="user", content="existing")
+        scope = self._group_scope()
+
+        message_id = db.append_message(
+            "legacy-group-append",
+            role="assistant",
+            content="continued",
+            session_scope=scope,
+        )
+        assert message_id > 0
+        assert db.get_session("legacy-group-append")["profile_name"] == "room-alpha"
+        assert [m["content"] for m in db.get_messages("legacy-group-append")] == [
+            "existing",
+            "continued",
+        ]
+
+    def test_scoped_append_binds_exact_legacy_dm(self, db):
+        db.create_session(
+            "legacy-dm",
+            source="telegram",
+            chat_type="dm",
+            chat_id="chat-a",
+            thread_id="thread-a",
+            user_id="chat-a",
+        )
+        scope = self._scope()
+
+        assert db.append_message(
+            "legacy-dm",
+            role="user",
+            content="hello",
+            session_scope=scope,
+        ) > 0
+        assert db.get_session("legacy-dm")["profile_name"] == "family-alpha"
+
+    def test_legacy_scope_recovery_keeps_mismatched_topic_denied(self, db):
+        db.create_session(
+            "legacy-wrong-topic",
+            source="telegram",
+            chat_type="group",
+            chat_id="group-a",
+            thread_id="31",
+        )
+        scope = self._group_scope(thread_id="32")
+
+        assert db.append_message(
+            "legacy-wrong-topic",
+            role="user",
+            content="must stay denied",
+            session_scope=scope,
+        ) == 0
+        assert db.get_session("legacy-wrong-topic")["profile_name"] is None
+
+    def test_legacy_scope_recovery_keeps_foreign_profile_denied(self, db):
+        db.create_session(
+            "foreign-profile",
+            source="telegram",
+            profile_name="room-beta",
+            chat_type="group",
+            chat_id="group-a",
+            thread_id="31",
+        )
+        scope = self._group_scope()
+
+        assert db.append_message(
+            "foreign-profile",
+            role="user",
+            content="must stay denied",
+            session_scope=scope,
+        ) == 0
+        assert db.get_session("foreign-profile")["profile_name"] == "room-beta"
+
+    def test_scoped_create_binds_exact_legacy_parent_before_check(self, db):
+        db.create_session(
+            "legacy-parent",
+            source="telegram",
+            chat_type="group",
+            chat_id="group-a",
+            thread_id="31",
+        )
+        scope = self._group_scope()
+
+        assert db.create_session(
+            "child-session",
+            source="telegram",
+            session_scope=scope,
+            parent_session_id="legacy-parent",
+        ) is True
+        assert db.get_session("legacy-parent")["profile_name"] == "room-alpha"
+        assert db.get_session("child-session")["profile_name"] == "room-alpha"
 
     def test_scoped_sessiondb_reads_allow_own_and_hide_foreign(self, db):
         own_anchor = self._seed(db, "own")

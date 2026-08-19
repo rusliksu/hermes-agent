@@ -122,6 +122,34 @@ def _session_scope_metadata(
     }
 
 
+def _legacy_session_scope_clause(
+    session_scope: Optional[Dict[str, Any]],
+    alias: str = "s",
+) -> Tuple[str, List[Any]]:
+    """Match an unprofiled legacy row to the non-profile scope dimensions."""
+    metadata = _session_scope_metadata(session_scope)
+    if metadata is None:
+        return "1 = 0", []
+
+    clauses = [
+        f"{alias}.profile_name IS NULL",
+        f"{alias}.source = ?",
+        f"{alias}.chat_type = ?",
+        f"{alias}.chat_id = ?",
+        f"COALESCE({alias}.thread_id, '') = ?",
+    ]
+    params: List[Any] = [
+        metadata["source"],
+        metadata["chat_type"],
+        metadata["chat_id"],
+        metadata["thread_id"],
+    ]
+    if session_scope.get("is_dm") is True:
+        clauses.append(f"{alias}.user_id = ?")
+        params.append(metadata["user_id"])
+    return " AND ".join(clauses), params
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -2141,6 +2169,25 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def _bind_legacy_session_scope_txn(
+        self,
+        conn,
+        session_id: str,
+        session_scope: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Bind a legacy NULL-profile row only after exact peer matching."""
+        scope_metadata = _session_scope_metadata(session_scope)
+        legacy_clause, legacy_params = _legacy_session_scope_clause(session_scope)
+        if scope_metadata is None or legacy_clause == "1 = 0":
+            return False
+        cursor = conn.execute(
+            f"""UPDATE sessions AS s
+                   SET profile_name = ?
+                 WHERE s.id = ? AND {legacy_clause}""",
+            [scope_metadata["profile_name"], session_id, *legacy_params],
+        )
+        return cursor.rowcount > 0
+
     def create_session(
         self,
         session_id: str,
@@ -2168,7 +2215,10 @@ class SessionDB:
                     (session_id,),
                 ).fetchone()
                 if any_existing is not None and existing_in_scope is None:
-                    return False
+                    if not self._bind_legacy_session_scope_txn(
+                        conn, session_id, session_scope
+                    ):
+                        return False
 
                 parent_id = exact_kwargs.get("parent_session_id")
                 if parent_id:
@@ -2176,7 +2226,9 @@ class SessionDB:
                         f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
                         [parent_id, *scope_params],
                     ).fetchone()
-                    if parent_in_scope is None:
+                    if parent_in_scope is None and not self._bind_legacy_session_scope_txn(
+                        conn, parent_id, session_scope
+                    ):
                         return False
 
                 insert_kwargs = dict(exact_kwargs)
@@ -4817,7 +4869,9 @@ class SessionDB:
                     f"SELECT 1 FROM sessions s WHERE s.id = ? AND {scope_clause} LIMIT 1",
                     [session_id, *scope_params],
                 ).fetchone()
-                if row is None:
+                if row is None and not self._bind_legacy_session_scope_txn(
+                    conn, session_id, session_scope
+                ):
                     return 0
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
