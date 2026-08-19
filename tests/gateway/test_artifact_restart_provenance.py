@@ -801,6 +801,53 @@ def test_terminal_document_output_requires_structured_publication(monkeypatch):
     assert confirmation is None
 
 
+def test_terminal_document_output_binds_later_delivery(monkeypatch):
+    from agent import artifact_delivery_stop
+    from tools import artifact_delivery_tool
+
+    path = "/trusted/workspace/report.xlsx"
+    monkeypatch.setattr(
+        artifact_delivery_stop, "bound_document_context_active", lambda: True
+    )
+    monkeypatch.setattr(
+        artifact_delivery_tool, "validate_bound_artifact_output", lambda *_args: None
+    )
+    terminal_result = {
+        "role": "tool",
+        "name": "terminal",
+        "tool_name": "terminal",
+        "tool_call_id": "terminal-call",
+        "content": json.dumps(
+            {"output": f"Saved: {path}", "exit_code": 0}
+        ),
+    }
+    delivery_result = {
+        "role": "tool",
+        "name": "deliver_artifact",
+        "tool_name": "deliver_artifact",
+        "tool_call_id": "delivery-call",
+        "content": json.dumps(
+            {
+                "success": True,
+                "status": "ready_for_delivery",
+                "media_tag": f"MEDIA:{path}",
+            }
+        ),
+    }
+
+    action, nudge, confirmation = artifact_delivery_stop.bound_artifact_stop_action(
+        [terminal_result, delivery_result], attempts=0
+    )
+
+    assert action == "confirmed"
+    assert nudge is None
+    assert confirmation == {
+        "tool_call_id": "delivery-call",
+        "path": path,
+        "media_tag": f"MEDIA:{path}",
+    }
+
+
 def test_unrelated_terminal_output_does_not_enter_document_correction(monkeypatch):
     from agent import artifact_delivery_stop
 

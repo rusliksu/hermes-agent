@@ -20,6 +20,33 @@ _TERMINAL_DOCUMENT_SUFFIX = re.compile(
     r"\.(?:xlsx?|csv|docx?|pdf|od[st]|pptx?|zip)\b",
     re.IGNORECASE,
 )
+_TERMINAL_DOCUMENT_PATH = re.compile(
+    r"(?P<path>(?:/|[A-Za-z]:[\\/])[^\s\"'`<>]+"
+    r"\.(?:xlsx?|csv|docx?|pdf|od[st]|pptx?|zip))",
+    re.IGNORECASE,
+)
+
+
+def _terminal_document_paths(
+    message: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    """Extract successful absolute document paths printed by ``terminal``."""
+    if payload is None or payload.get("exit_code") != 0 or payload.get("error"):
+        return ()
+    candidates = [payload.get("output")]
+    raw_content = message.get("content")
+    if isinstance(raw_content, str):
+        candidates.append(raw_content)
+    paths: list[str] = []
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        for match in _TERMINAL_DOCUMENT_PATH.finditer(value):
+            path = match.group("path").rstrip(".,;:)]}")
+            if path not in paths:
+                paths.append(path)
+    return tuple(paths)
 
 
 def _terminal_document_activity(
@@ -217,9 +244,12 @@ def bound_artifact_stop_action(
             if confirmation is not None:
                 deliveries.append((sequence, confirmation))
         elif tool_name == "terminal":
-            relevant_activity = relevant_activity or _terminal_document_activity(
-                message, payload
-            )
+            relevant_activity = relevant_activity or _terminal_document_activity(message, payload)
+            for raw_path in _terminal_document_paths(message, payload):
+                validated = _validated_document_path(raw_path)
+                if validated is not None:
+                    relevant_activity = True
+                    latest_mutation[validated] = sequence
 
     qualifying = [
         confirmation
