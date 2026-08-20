@@ -19358,7 +19358,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     kwargs["finalize"] = True
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
-                return await adapter.edit_message(**kwargs)
+                result = await adapter.edit_message(**kwargs)
+                logger.info(
+                    "Tool-progress delivery: platform=%s action=edit success=%s message_id=%s",
+                    platform_key,
+                    bool(getattr(result, "success", False)),
+                    getattr(result, "message_id", None),
+                )
+                return result
 
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
@@ -19392,6 +19399,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     content=text,
                     reply_to=_progress_reply_to,
                     metadata=_progress_metadata,
+                )
+                logger.info(
+                    "Tool-progress delivery: platform=%s action=send success=%s message_id=%s",
+                    platform_key,
+                    bool(getattr(result, "success", False)),
+                    getattr(result, "message_id", None),
                 )
                 _track_progress_result(result)
                 return result
@@ -19534,40 +19547,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _last_edit_ts = time.monotonic()
                             else:
                                 can_edit = False
-                            _flood_result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=msg,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
-                            )
-                            if (
-                                _cleanup_progress
-                                and getattr(_flood_result, "success", False)
-                                and getattr(_flood_result, "message_id", None)
-                            ):
-                                _cleanup_msg_ids.append(str(_flood_result.message_id))
+                            await _send_progress_text(msg)
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=full_text,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
-                            )
+                            result = await _send_progress_text(full_text)
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=msg,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
-                            )
+                            result = await _send_progress_text(msg)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(str(result.message_id))
 
                     _last_edit_ts = time.monotonic()
 

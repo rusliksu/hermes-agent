@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import logging
 import sys
 import time
 import types
@@ -271,8 +272,9 @@ def _make_runner(adapter):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_path):
+async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -315,6 +317,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+    assert "Tool-progress delivery: platform=telegram action=send success=True" in caplog.text
 
 
 @pytest.mark.asyncio
