@@ -217,7 +217,6 @@ def bound_artifact_stop_action(
 
     latest_mutation: dict[str, int] = {}
     deliveries: list[tuple[int, dict[str, str]]] = []
-    successful_terminal_sequences: list[int] = []
     relevant_activity = False
     for sequence, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") not in {"tool", "function"}:
@@ -246,12 +245,6 @@ def bound_artifact_stop_action(
                 deliveries.append((sequence, confirmation))
         elif tool_name == "terminal":
             relevant_activity = relevant_activity or _terminal_document_activity(message, payload)
-            if (
-                payload is not None
-                and payload.get("exit_code") == 0
-                and not payload.get("error")
-            ):
-                successful_terminal_sequences.append(sequence)
             for raw_path in _terminal_document_paths(message, payload):
                 validated = _validated_document_path(raw_path)
                 if validated is not None:
@@ -262,13 +255,16 @@ def bound_artifact_stop_action(
         confirmation
         for sequence, confirmation in deliveries
         if latest_mutation.get(confirmation["path"], sequence) < sequence
-        or (
-            attempts >= 1
-            and any(terminal_sequence < sequence for terminal_sequence in successful_terminal_sequences)
-        )
     ]
     if len(qualifying) == 1:
         return "confirmed", None, qualifying[0]
+
+    # The corrective continuation clears all earlier provenance before it
+    # starts. A sole successful delivery here is therefore the exact bounded
+    # artifact re-confirmation requested by the guard; deliver_artifact itself
+    # has already revalidated the current profile root, file and destination.
+    if attempts >= 1 and len(deliveries) == 1:
+        return "confirmed", None, deliveries[0][1]
 
     if not relevant_activity:
         return "none", None, None

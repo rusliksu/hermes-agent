@@ -324,6 +324,43 @@ def test_stop_scanner_exception_abandons_and_suppresses_ordinary_media(tmp_path)
     db.close()
 
 
+def test_corrective_bound_delivery_reaches_ready_without_mutation_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    agent, db, session_id = _make_agent(tmp_path, max_iterations=4)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch(
+            "agent.artifact_delivery_stop.bound_document_context_active",
+            return_value=True,
+        ),
+        patch(
+            "tools.artifact_delivery_tool.validate_bound_artifact_output",
+            return_value=None,
+        ),
+    ):
+        result, called = _run(
+            agent,
+            responses=[
+                _response(tool_calls=[_tool_call("first-delivery")]),
+                _response("first attempt"),
+                _response(tool_calls=[_tool_call("corrective-delivery")]),
+                _response("corrected document ready"),
+            ],
+        )
+
+    assert called.call_count == 2
+    assert result["final_response"] == "corrected document ready"
+    assert result["artifact_delivery_confirmation"] is not None
+    assert result["artifact_delivery_confirmation"]["tool_call_id"] == (
+        "corrective-delivery"
+    )
+    assert _transaction(db, session_id)["state"] == "ready"
+    db.close()
+
+
 def test_new_artifact_logs_exclude_raw_session_and_turn_identity(
     tmp_path,
     monkeypatch,
