@@ -35,7 +35,7 @@ artifacts; live не изменён.
   trusted adapter.
 - [x] T006 Реализовать единый apply path для typed/picker выбора.
 - [x] T007 Установить профильный baseline `verbose` во всех активных configs.
-- [ ] T008 Выполнить focused tests, review, isolated deploy и runtime smoke.
+- [x] T008 Выполнить focused tests, review, isolated deploy и runtime smoke.
 
 ### Критерий завершения
 
