@@ -24,3 +24,18 @@ shared lane, но тест PR #28 вызывал handler напрямую и и�
 - **Расширение прав:** правило ограничено exact model command и server-side
   authorization; остальные команды остаются topic-only/denied.
 - **Cross-room callback:** тест проверяет bound shared source и отказ mismatch.
+
+## Follow-up plan: `/verbose` UX и global baseline
+
+1. Расширить существующий handler без нового command surface: распознавать
+   точный режим и `next`, а вызов без аргументов направлять в существующий
+   `send_choice_picker`.
+2. Для registry-owned shared rooms использовать существующий
+   `_trusted_control_delivery_adapter`; callback привязать к текущей session/lane
+   тем же validator, который применяют другие Telegram picker-команды.
+3. Сохранить единый application path для typed args и picker callback, чтобы
+   режим и профильная запись не расходились.
+4. Установить `display.tool_progress: verbose` во всех активных profile configs
+   и default config, не затрагивая другие display/tool/access настройки.
+5. Проверить direct args, no-arg picker, shared-room trusted delivery,
+   profile-scoped persistence, focused progress/authz suites и isolated deploy.

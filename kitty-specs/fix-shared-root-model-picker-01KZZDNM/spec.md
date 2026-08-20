@@ -54,3 +54,33 @@
 Сначала RED на полном dispatch boundary, затем минимальный production patch,
 focused и затронутые privacy/access suites, Ruff, `py_compile` и
 `git diff --check`. Live rollout остаётся отдельным явным gate.
+
+## Одобренный material delta: `/verbose` и базовый прогресс (2026-08-20)
+
+Пользователь явно поручил заменить неудобное циклическое переключение
+`/verbose` на прямой выбор и включить подробный прогресс как базовую настройку
+во всех профилях Gurra.
+
+### Дополнительные приёмочные сценарии
+
+1. **Given** `/verbose` доступен в текущей lane, **when** команда вызвана без
+   аргументов на Telegram, **then** открывается picker с режимами `OFF`, `NEW`,
+   `ALL`, `VERBOSE`, `LOG`, текущий режим отмечен и команда сама режим не меняет.
+2. **Given** допустимый аргумент, **when** вызвано `/verbose verbose|all|new|off|log`,
+   **then** выбранный режим сохраняется сразу в профиль, обслуживающий lane.
+3. **Given** `/verbose next`, **when** команда вызвана, **then** сохраняется
+   совместимое циклическое переключение.
+4. **Given** registry-owned shared room, **when** открывается picker или
+   сохраняется выбор, **then** используется проверенный общий Telegram adapter
+   без owner/default fallback для неизвестной identity.
+5. **Given** любой активный профиль Gurra, **when** начинается следующий
+   Telegram turn без локального выбора пользователя, **then** эффективный
+   `tool_progress` равен `verbose`.
+
+### Ограничения delta
+
+- Не меняются роли, toolsets, capabilities, модели, fallback chain и
+  административные права.
+- Секреты, auth-файлы и platform tokens не читаются и не изменяются.
+- Развёртывание выполняется только на HOSTKEY staging с isolated candidate и
+  проверяемым rollback на предыдущий candidate.

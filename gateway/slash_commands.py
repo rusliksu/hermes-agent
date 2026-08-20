@@ -3047,7 +3047,7 @@ class GatewaySlashCommandsMixin:
         adapter *type* (``send_choice_picker``), and a failed send falls back
         to the text path (returns False) instead of erroring the command.
         """
-        adapter = getattr(self, "_adapter_for_source")(event.source)
+        adapter = getattr(self, "_trusted_control_delivery_adapter")(event.source)
         has_picker = (
             adapter is not None
             and getattr(type(adapter), "send_choice_picker", None) is not None
@@ -3644,15 +3644,8 @@ class GatewaySlashCommandsMixin:
             enable_session_yolo(session_key)
             return EphemeralReply(t("gateway.yolo.enabled"))
 
-    async def _handle_verbose_command(self, event: MessageEvent) -> str:
-        """Handle /verbose command — cycle tool progress display mode.
-
-        Gated by ``display.tool_progress_command`` in config.yaml (default off).
-        When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
-        ``display.platforms.<platform>.tool_progress`` so each channel can
-        have its own verbosity level independently.
-        """
+    async def _handle_verbose_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /verbose — pick or directly set tool progress for this platform."""
         from gateway.run import (
             _hermes_home,
             _load_gateway_config,
@@ -3694,7 +3687,6 @@ class GatewaySlashCommandsMixin:
         except Exception:
             user_config = {}
 
-        # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose", "log"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
@@ -3704,32 +3696,70 @@ class GatewaySlashCommandsMixin:
             "log": t("gateway.verbose.mode_log"),
         }
 
-        # Read current effective mode for this platform via the resolver
         from gateway.display_config import resolve_display_setting
         current = resolve_display_setting(user_config, platform_key, "tool_progress", "all")
         if current not in cycle:
             current = "all"
-        idx = (cycle.index(current) + 1) % len(cycle)
-        new_mode = cycle[idx]
 
-        # Save to display.platforms.<platform>.tool_progress
-        try:
-            if "display" not in user_config or not isinstance(user_config.get("display"), dict):
-                user_config["display"] = {}
-            display = user_config["display"]
-            if "platforms" not in display or not isinstance(display.get("platforms"), dict):
-                display["platforms"] = {}
-            if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
-                display["platforms"][platform_key] = {}
-            display["platforms"][platform_key]["tool_progress"] = new_mode
-            atomic_config_write(config_path, user_config)
-            return (
-                f"{descriptions[new_mode]}\n"
-                + t("gateway.verbose.saved_suffix", platform=platform_key)
-            )
-        except Exception as e:
-            logger.warning("Failed to save tool_progress mode: %s", e)
-            return f"{descriptions[new_mode]}\n" + t("gateway.verbose.save_failed", error=e)
+        def _apply_selection(new_mode: str) -> str:
+            if new_mode not in cycle:
+                return "Usage: `/verbose off|new|all|verbose|log|next`"
+            try:
+                if profile_home is None:
+                    target_config = _load_gateway_config()
+                else:
+                    with _profile_runtime_scope(profile_home):
+                        target_config = _load_gateway_config()
+                if not isinstance(target_config, dict):
+                    target_config = {}
+                if "display" not in target_config or not isinstance(target_config.get("display"), dict):
+                    target_config["display"] = {}
+                display = target_config["display"]
+                if "platforms" not in display or not isinstance(display.get("platforms"), dict):
+                    display["platforms"] = {}
+                if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
+                    display["platforms"][platform_key] = {}
+                display["platforms"][platform_key]["tool_progress"] = new_mode
+                atomic_config_write(config_path, target_config)
+                return (
+                    f"{descriptions[new_mode]}\n"
+                    + t("gateway.verbose.saved_suffix", platform=platform_key)
+                )
+            except Exception as e:
+                logger.warning("Failed to save tool_progress mode: %s", e)
+                return f"{descriptions[new_mode]}\n" + t(
+                    "gateway.verbose.save_failed", error=e
+                )
+
+        mode_arg = event.get_command_args().strip().lower()
+        if mode_arg:
+            if mode_arg == "next":
+                mode_arg = cycle[(cycle.index(current) + 1) % len(cycle)]
+            return _apply_selection(mode_arg)
+
+        async def _on_verbose_choice(_chat_id: str, value: str) -> str:
+            return _apply_selection(value)
+
+        picker_sent = await self._try_send_choice_picker(
+            event,
+            self._session_key_for_source(event.source),
+            title=descriptions[current],
+            choices=[
+                {
+                    "value": mode,
+                    "label": mode.upper(),
+                    "is_current": mode == current,
+                }
+                for mode in cycle
+            ],
+            on_choice_selected=_on_verbose_choice,
+            initiator_user_id=event.source.user_id,
+            allow_shared_lane_control=True,
+        )
+        if picker_sent:
+            return None
+
+        return f"{descriptions[current]}\nUsage: `/verbose off|new|all|verbose|log|next`"
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer.

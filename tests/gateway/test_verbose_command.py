@@ -61,8 +61,8 @@ class TestVerboseCommand:
         assert "tool_progress_command" in result
 
     @pytest.mark.asyncio
-    async def test_enabled_cycles_mode(self, tmp_path, monkeypatch):
-        """When enabled, /verbose cycles tool_progress mode per-platform."""
+    async def test_next_cycles_mode(self, tmp_path, monkeypatch):
+        """Explicit /verbose next cycles tool_progress mode per-platform."""
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
@@ -74,7 +74,7 @@ class TestVerboseCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        result = await runner._handle_verbose_command(_make_event())
+        result = await runner._handle_verbose_command(_make_event("/verbose next"))
 
         # all -> verbose
         assert "VERBOSE" in result
@@ -120,7 +120,7 @@ class TestVerboseCommand:
         # off -> new -> all -> verbose -> log -> off
         expected = ["new", "all", "verbose", "log", "off"]
         for mode in expected:
-            result = await runner._handle_verbose_command(_make_event())
+            result = await runner._handle_verbose_command(_make_event("/verbose next"))
             saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             actual = saved["display"]["platforms"]["telegram"]["tool_progress"]
             assert actual == mode, \
@@ -145,7 +145,7 @@ class TestVerboseCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        result = await runner._handle_verbose_command(_make_event())
+        result = await runner._handle_verbose_command(_make_event("/verbose next"))
 
         # Telegram platform default is "off" → cycles to "new"
         assert "NEW" in result
@@ -174,11 +174,11 @@ class TestVerboseCommand:
 
         # Cycle on Telegram
         await runner._handle_verbose_command(
-            _make_event(platform=Platform.TELEGRAM)
+            _make_event("/verbose next", platform=Platform.TELEGRAM)
         )
         # Cycle on Slack
         await runner._handle_verbose_command(
-            _make_event(platform=Platform.SLACK)
+            _make_event("/verbose next", platform=Platform.SLACK)
         )
 
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -213,13 +213,86 @@ class TestVerboseCommand:
             return_value=profile_home
         )
 
-        result = await runner._handle_verbose_command(_make_event())
+        result = await runner._handle_verbose_command(_make_event("/verbose next"))
 
         assert "NEW" in result
         saved_profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
         assert saved_profile["display"]["platforms"]["telegram"]["tool_progress"] == "new"
         saved_control = yaml.safe_load(control_path.read_text(encoding="utf-8"))
         assert "platforms" not in saved_control["display"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_mode_applies_without_cycling(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "display:\n  tool_progress_command: true\n  tool_progress: 'off'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        result = await _make_runner()._handle_verbose_command(
+            _make_event("/verbose verbose")
+        )
+
+        assert "VERBOSE" in result
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
+
+    @pytest.mark.asyncio
+    async def test_bare_command_opens_picker_without_mutating_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "display:\n  tool_progress_command: true\n  tool_progress: all\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        captured = {}
+
+        async def _capture_picker(*args, **kwargs):
+            captured.update(kwargs)
+            return True
+
+        runner._try_send_choice_picker = _capture_picker
+
+        result = await runner._handle_verbose_command(_make_event())
+
+        assert result is None
+        assert [choice["value"] for choice in captured["choices"]] == [
+            "off", "new", "all", "verbose", "log"
+        ]
+        assert next(
+            choice for choice in captured["choices"] if choice["value"] == "all"
+        )["is_current"] is True
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert "platforms" not in saved["display"]
+
+        callback_result = await captured["on_choice_selected"]("67890", "verbose")
+        assert "VERBOSE" in callback_result
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
+
+    @pytest.mark.asyncio
+    async def test_invalid_mode_does_not_mutate_config(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        original = "display:\n  tool_progress_command: true\n  tool_progress: all\n"
+        config_path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        result = await _make_runner()._handle_verbose_command(
+            _make_event("/verbose maximum")
+        )
+
+        assert "off|new|all|verbose|log" in result.lower()
+        assert config_path.read_text(encoding="utf-8") == original
 
     @pytest.mark.asyncio
     async def test_no_config_file_returns_disabled(self, tmp_path, monkeypatch):

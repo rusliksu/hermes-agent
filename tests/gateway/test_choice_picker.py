@@ -110,6 +110,20 @@ def _make_runner(adapter=None):
 
 class TestReasoningChoicePicker:
     @pytest.mark.asyncio
+    async def test_picker_uses_trusted_shared_room_delivery_adapter(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        adapter = _PickerAdapter()
+        runner = _make_runner(None)
+        runner._trusted_control_delivery_adapter = lambda _source: adapter
+
+        result = await runner._handle_reasoning_command(_make_event("/reasoning"))
+
+        assert result is None
+        assert len(adapter.calls) == 1
+
+    @pytest.mark.asyncio
     async def test_bare_reasoning_sends_picker_when_adapter_supports_it(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
