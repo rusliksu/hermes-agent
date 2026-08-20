@@ -5859,6 +5859,9 @@ def run_conversation(
                         _artifact_transaction_session_id = None
                         _artifact_transaction_id = None
                     else:
+                        logger.warning(
+                            "Durable artifact ready transition rejected"
+                        )
                         _abandon_artifact_delivery()
                         final_response = (
                             "⚠️ Не удалось безопасно подготовить и отправить документ."

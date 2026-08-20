@@ -189,6 +189,39 @@ class TestVerboseCommand:
         assert platforms["slack"]["tool_progress"] == "new"
 
     @pytest.mark.asyncio
+    async def test_multiplexed_topic_updates_serving_profile(self, tmp_path, monkeypatch):
+        """Shared-topic /verbose persists where the following turn reads it."""
+        hermes_home = tmp_path / "hermes"
+        profile_home = tmp_path / "room-drafts"
+        hermes_home.mkdir()
+        profile_home.mkdir()
+        control_path = hermes_home / "config.yaml"
+        profile_path = profile_home / "config.yaml"
+        control_path.write_text(
+            "display:\n  tool_progress_command: true\n  tool_progress: all\n",
+            encoding="utf-8",
+        )
+        profile_path.write_text(
+            "display:\n  tool_progress: 'off'\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        runner.config = MagicMock(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = MagicMock(
+            return_value=profile_home
+        )
+
+        result = await runner._handle_verbose_command(_make_event())
+
+        assert "NEW" in result
+        saved_profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        assert saved_profile["display"]["platforms"]["telegram"]["tool_progress"] == "new"
+        saved_control = yaml.safe_load(control_path.read_text(encoding="utf-8"))
+        assert "platforms" not in saved_control["display"]
+
+    @pytest.mark.asyncio
     async def test_no_config_file_returns_disabled(self, tmp_path, monkeypatch):
         """When config.yaml doesn't exist, command reports disabled."""
         hermes_home = tmp_path / "hermes"

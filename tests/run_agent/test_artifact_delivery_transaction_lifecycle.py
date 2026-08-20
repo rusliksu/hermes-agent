@@ -391,6 +391,50 @@ def test_new_artifact_logs_exclude_raw_session_and_turn_identity(
     db.close()
 
 
+def test_artifact_stop_scan_diagnostics_exclude_paths_and_call_ids(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    agent, db, raw_session = _make_agent(tmp_path, max_iterations=4)
+    raw_path = "/trusted/sensitive-report-name.xlsx"
+    raw_call_id = "sensitive-artifact-call-id"
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    caplog.set_level("INFO", logger="agent.artifact_delivery_stop")
+
+    with (
+        patch(
+            "agent.artifact_delivery_stop.bound_document_context_active",
+            return_value=True,
+        ),
+        patch(
+            "tools.artifact_delivery_tool.validate_bound_artifact_output",
+            return_value=None,
+        ),
+    ):
+        result, _ = _run(
+            agent,
+            responses=[
+                _response(tool_calls=[_tool_call(raw_call_id)]),
+                _response("first document attempt"),
+                _response(tool_calls=[_tool_call(f"{raw_call_id}-corrective")]),
+                _response("document ready"),
+            ],
+        )
+
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if "bound artifact stop scan" in record.getMessage()
+    ]
+    assert diagnostics
+    assert all(raw_session not in message for message in diagnostics)
+    assert all(raw_path not in message for message in diagnostics)
+    assert all(raw_call_id not in message for message in diagnostics)
+    assert result["artifact_delivery_confirmation"] is not None
+    db.close()
+
+
 def test_transaction_id_is_opaque_random_and_reused_while_live(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     raw_session = "session-task-user-chat-raw-identity"

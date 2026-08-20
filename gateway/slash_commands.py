@@ -3653,23 +3653,46 @@ class GatewaySlashCommandsMixin:
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
-        from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key
+        from gateway.run import (
+            _hermes_home,
+            _load_gateway_config,
+            _platform_config_key,
+            _profile_runtime_scope,
+        )
 
-        config_path = _hermes_home / "config.yaml"
         platform_key = _platform_config_key(event.source.platform)
 
         # --- check config gate ------------------------------------------------
         try:
-            user_config = _load_gateway_config()
+            control_config = _load_gateway_config()
             gate_enabled = is_truthy_value(
-                cfg_get(user_config, "display", "tool_progress_command"),
+                cfg_get(control_config, "display", "tool_progress_command"),
                 default=False,
             )
         except Exception:
+            control_config = {}
             gate_enabled = False
 
         if not gate_enabled:
             return t("gateway.verbose.not_enabled")
+
+        # The operator-level gate lives in the gateway's control profile, but
+        # the selected mode belongs to the profile serving this source.  A
+        # shared Telegram topic may be multiplexed into a different profile;
+        # writing the control config in that case makes /verbose appear to
+        # succeed while subsequent turns continue using "off".
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(event.source)
+        config_path = (profile_home or _hermes_home) / "config.yaml"
+        try:
+            if profile_home is None:
+                user_config = control_config
+            else:
+                with _profile_runtime_scope(profile_home):
+                    user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
 
         # --- cycle mode (per-platform) ----------------------------------------
         cycle = ["off", "new", "all", "verbose", "log"]

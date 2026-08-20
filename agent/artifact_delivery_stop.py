@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,6 +14,9 @@ from tools.artifact_delivery_tool import (
     bound_document_context_active,
     is_outbound_document_path,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 _MUTATION_TOOLS = frozenset({"write_file", "patch"})
@@ -217,10 +221,14 @@ def bound_artifact_stop_action(
 
     latest_mutation: dict[str, int] = {}
     deliveries: list[tuple[int, dict[str, str]]] = []
+    delivery_results = 0
+    successful_delivery_results = 0
+    tool_events = 0
     relevant_activity = False
     for sequence, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") not in {"tool", "function"}:
             continue
+        tool_events += 1
         tool_name = _tool_result_name(message)
         payload = _tool_result_payload(message)
         if tool_name in _MUTATION_TOOLS:
@@ -240,6 +248,13 @@ def bound_artifact_stop_action(
                     latest_mutation[path] = sequence
         elif tool_name == "deliver_artifact":
             relevant_activity = True
+            delivery_results += 1
+            if (
+                payload is not None
+                and payload.get("success") is True
+                and payload.get("status") == "ready_for_delivery"
+            ):
+                successful_delivery_results += 1
             confirmation = _delivery_confirmation(message, payload)
             if confirmation is not None:
                 deliveries.append((sequence, confirmation))
@@ -256,6 +271,17 @@ def bound_artifact_stop_action(
         for sequence, confirmation in deliveries
         if latest_mutation.get(confirmation["path"], sequence) < sequence
     ]
+    logger.info(
+        "bound artifact stop scan attempts=%d events=%d delivery_results=%d "
+        "successful_results=%d validated_results=%d mutations=%d relevant=%s",
+        attempts,
+        tool_events,
+        delivery_results,
+        successful_delivery_results,
+        len(deliveries),
+        len(latest_mutation),
+        relevant_activity,
+    )
     if len(qualifying) == 1:
         return "confirmed", None, qualifying[0]
 
