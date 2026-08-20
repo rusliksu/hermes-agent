@@ -18974,7 +18974,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
-        _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
+        _cleanup_adapter = (
+            self._trusted_control_delivery_adapter(source)
+            if _cleanup_progress
+            else None
+        )
         if _cleanup_adapter is not None and (
             type(_cleanup_adapter).delete_message is BasePlatformAdapter.delete_message
         ):
@@ -19095,7 +19099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _code_block_full = None
             _code_block_short = None
             try:
-                _progress_adapter = self._adapter_for_source(source)
+                _progress_adapter = self._trusted_control_delivery_adapter(source)
             except Exception:
                 _progress_adapter = None
             if (
@@ -19285,7 +19289,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not progress_queue:
                 return
 
-            adapter = self._adapter_for_source(source)
+            # Registry-routed shared rooms intentionally reuse the default
+            # profile's single Telegram listener.  They therefore have no
+            # profile-local adapter entry even though the source is stamped
+            # with the room profile.  Use the authorization-preserving shared
+            # delivery rail here, just like slash-command controls do, or the
+            # progress sender sees ``None`` and silently drops every tool line.
+            adapter = self._trusted_control_delivery_adapter(source)
             if not adapter:
                 return
 
@@ -19660,7 +19670,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("event_callback hook error: %s", _e)
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        # Status/interim/streaming updates share the same outbound transport as
+        # tool progress.  In a registry-owned shared room the trusted resolver
+        # re-validates the exact transport identity before falling back to the
+        # default profile's process-level adapter.
+        _status_adapter = self._trusted_control_delivery_adapter(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are

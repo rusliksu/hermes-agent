@@ -318,6 +318,61 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_run_agent_progress_uses_trusted_shared_room_delivery_adapter(
+    monkeypatch, tmp_path
+):
+    """Registry-owned rooms reuse the process-level Telegram listener.
+
+    Their profile-local adapter lookup is deliberately fail-closed, so tool
+    progress must use the trusted delivery resolver that re-validates the room
+    identity before returning the shared listener.
+    """
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+        profile="room-drafts",
+    )
+
+    # This is the production shape: the stamped room profile has no dedicated
+    # listener, while the trusted registry rail resolves the shared one.
+    runner._adapter_for_source = lambda _source: None
+    runner._trusted_control_delivery_adapter = lambda _source: adapter
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-shared-room-progress",
+        session_key="agent:room-drafts:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["content"] == "💻 Running pwd"
+    assert adapter.sent[0]["metadata"] == {"thread_id": "17585"}
+
+
+@pytest.mark.asyncio
 async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
