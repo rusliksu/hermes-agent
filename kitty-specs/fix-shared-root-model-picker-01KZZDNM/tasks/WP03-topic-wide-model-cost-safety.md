@@ -49,3 +49,10 @@ owned_files:
 - GREEN: `tests/gateway/test_topic_preferences.py` — 13/13.
 - Affected suites: topic preferences + shared picker + single-principal — 86/86.
 - Ruff, `py_compile`, `git diff --check` — pass.
+- Isolated candidate:
+  `/home/openclaw/staging/hermes-topic-model-costsafe-037e84bf1-r7-20260822T083457Z`.
+- HOSTKEY service: active/running, new PID `1070579`, `NRestarts=0`, Telegram
+  connected and 60 commands registered.
+- Candidate runtime resolver confirms both room profiles use
+  Codex/Luna → direct DeepSeek → free Kimi; post-start log contains no
+  OpenRouter/GLM/402 route.

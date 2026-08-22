@@ -55,7 +55,7 @@ artifacts; live не изменён.
 - [x] T009 Добавить RED для shared lane key без sender identity и legacy migration.
 - [x] T010 Исправить canonical key/read-migrate path без ослабления room/topic isolation.
 - [x] T011 Установить Codex/Luna defaults для room profiles и cost-safe fallback order.
-- [ ] T012 Выполнить focused/affected suites, review, isolated deploy и runtime canary.
+- [x] T012 Выполнить focused/affected suites, review, isolated deploy и runtime canary.
 
 ### Критерий завершения
 
