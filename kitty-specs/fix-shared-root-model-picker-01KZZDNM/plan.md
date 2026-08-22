@@ -39,3 +39,12 @@ shared lane, но тест PR #28 вызывал handler напрямую и и�
    и default config, не затрагивая другие display/tool/access настройки.
 5. Проверить direct args, no-arg picker, shared-room trusted delivery,
    profile-scoped persistence, focused progress/authz suites и isolated deploy.
+
+## Follow-up plan: topic-wide model routing и cost safety
+
+1. Добавить RED: shared lane key не зависит от sender identity, сохраняя
+   границы profile/platform/chat/topic.
+2. Канонизировать key builder и добавить совместимое чтение legacy preference.
+3. Зафиксировать Codex default в room profiles и cost-safe fallback order.
+4. Проверить same-topic, cross-topic/room, migration и provider resolution.
+5. Собрать isolated HOSTKEY candidate и подтвердить отсутствие implicit GLM.

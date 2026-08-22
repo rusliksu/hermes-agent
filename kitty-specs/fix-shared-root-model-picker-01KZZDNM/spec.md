@@ -84,3 +84,28 @@ focused и затронутые privacy/access suites, Ruff, `py_compile` и
 - Секреты, auth-файлы и platform tokens не читаются и не изменяются.
 - Развёртывание выполняется только на HOSTKEY staging с isolated candidate и
   проверяемым rollback на предыдущий candidate.
+
+## Одобренный material delta: topic-wide model routing и cost safety (2026-08-22)
+
+Пользователь подтвердил `делай` после runtime-диагностики: shared-room profiles
+без `model/provider` неявно выбирают платный `openrouter/z-ai/glm-5.2`, а
+сохранённый `/model` включает sender identity и поэтому не применяется к
+другому участнику того же Telegram topic.
+
+### Дополнительные приёмочные сценарии
+
+1. `room-drafts` и `room-research` без lane override используют
+   `openai-codex/gpt-5.6-luna`, а не неявный OpenRouter GLM.
+2. `/model`, выбранная авторизованным участником shared-room, применяется к
+   другому авторизованному участнику той же комнаты/topic, но не другой lane.
+3. Старый sender-bound override безопасно мигрируется без секретов.
+4. Fallback идёт через direct DeepSeek и free Kimi; paid OpenRouter не является
+   неявным fallback, но остаётся доступен при явном выборе.
+5. Payment/credit error OpenRouter не вызывает повторный первичный GLM-запрос
+   на следующем shared turn без явного OpenRouter override.
+
+### Ограничения delta
+
+- Административные права, capabilities, toolsets и memory isolation не меняются.
+- Auth/token files не читаются и не изменяются.
+- Live rollout ограничен HOSTKEY staging и проверяемым runtime canary.

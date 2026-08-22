@@ -17,7 +17,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Any
 from urllib.parse import urlsplit
 
@@ -1652,9 +1652,48 @@ class SessionStore:
 
     def _generate_topic_preference_key(self, source: SessionSource) -> str:
         """Generate the durable preference key for a normalized source."""
+        policy = getattr(self.config, "single_principal", None)
+        if policy is not None and policy.shared_scope(source) is not None:
+            source = replace(
+                source,
+                user_id=None,
+                user_id_alt=None,
+                user_name=None,
+            )
         return build_topic_preference_key(
             source, profile=self._resolve_profile_for_key(source)
         )
+
+    def _legacy_topic_preference_keys(self, source: SessionSource) -> List[str]:
+        """Return sender-bound keys eligible for one-time shared-room migration."""
+        policy = getattr(self.config, "single_principal", None)
+        if policy is None or policy.shared_scope(source) is None:
+            return []
+
+        profile = self._resolve_profile_for_key(source)
+        legacy_sources = [source]
+        configured_user_ids = (
+            getattr(policy, "telegram_owner_id", None),
+            *getattr(policy, "telegram_allowed_user_ids", ()),
+        )
+        for user_id in configured_user_ids:
+            if user_id:
+                legacy_sources.append(
+                    replace(
+                        source,
+                        user_id=str(user_id),
+                        user_id_alt=None,
+                        user_name=None,
+                    )
+                )
+
+        canonical_key = self._generate_topic_preference_key(source)
+        keys: List[str] = []
+        for legacy_source in legacy_sources:
+            key = build_topic_preference_key(legacy_source, profile=profile)
+            if key != canonical_key and key not in keys:
+                keys.append(key)
+        return keys
 
     def _cached_topic_preferences(
         self, source: SessionSource
@@ -1682,6 +1721,70 @@ class SessionStore:
             if callable(loader):
                 try:
                     raw = loader(lane_key, scope=self._routing_scope())
+                    legacy_keys = self._legacy_topic_preference_keys(source)
+                    if not raw and legacy_keys:
+                        latest_loader = getattr(
+                            db, "load_latest_gateway_topic_preferences", None
+                        )
+                        if callable(latest_loader):
+                            migrated = latest_loader(
+                                legacy_keys, scope=self._routing_scope()
+                            )
+                        else:
+                            migrated = next(
+                                (
+                                    (key, legacy_raw)
+                                    for key in legacy_keys
+                                    if (legacy_raw := loader(
+                                        key, scope=self._routing_scope()
+                                    ))
+                                ),
+                                None,
+                            )
+                        if migrated:
+                            _legacy_key, legacy_raw = migrated
+                            migrated_preferences = sanitize_topic_preferences(
+                                json.loads(legacy_raw)
+                            )
+                            migrated_json = (
+                                json.dumps(
+                                    migrated_preferences,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                                if migrated_preferences
+                                else ""
+                            )
+                            promoter = getattr(
+                                db, "promote_gateway_topic_preferences", None
+                            )
+                            if callable(promoter):
+                                raw = promoter(
+                                    lane_key,
+                                    migrated_json,
+                                    legacy_keys,
+                                    scope=self._routing_scope(),
+                                )
+                            else:
+                                saver = getattr(
+                                    db, "save_gateway_topic_preferences", None
+                                )
+                                deleter = getattr(
+                                    db, "delete_gateway_topic_preferences", None
+                                )
+                                if migrated_json and callable(saver):
+                                    saver(
+                                        lane_key,
+                                        migrated_json,
+                                        scope=self._routing_scope(),
+                                    )
+                                if callable(deleter):
+                                    for legacy_key in legacy_keys:
+                                        deleter(
+                                            legacy_key,
+                                            scope=self._routing_scope(),
+                                        )
+                                raw = migrated_json or None
                     if raw:
                         preferences = sanitize_topic_preferences(json.loads(raw))
                 except Exception as exc:

@@ -42,3 +42,22 @@ artifacts; live не изменён.
 `/verbose` без аргументов показывает выбор, точный аргумент применяет режим
 сразу, `next` сохраняет совместимость, а следующий Telegram turn в каждом
 активном профиле по умолчанию показывает полные tool calls.
+
+## WP03: Topic-wide model routing и cost-safe fallback (P0)
+
+**Bead:** `tm-ai-loopx-kimi-n1p`
+
+**Цель:** исключить неявный платный GLM и сделать `/model` действительно общим
+для всех авторизованных участников одной shared room/topic.
+
+### Подзадачи
+
+- [x] T009 Добавить RED для shared lane key без sender identity и legacy migration.
+- [x] T010 Исправить canonical key/read-migrate path без ослабления room/topic isolation.
+- [x] T011 Установить Codex/Luna defaults для room profiles и cost-safe fallback order.
+- [ ] T012 Выполнить focused/affected suites, review, isolated deploy и runtime canary.
+
+### Критерий завершения
+
+Участники одного shared topic используют общий override; другие lanes
+изолированы; без override используется Codex/Luna; implicit paid GLM отсутствует.

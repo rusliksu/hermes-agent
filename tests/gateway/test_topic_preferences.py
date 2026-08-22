@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.single_principal import SinglePrincipalPolicy
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
@@ -30,7 +31,7 @@ def _source(**overrides):
     return SessionSource(**values)
 
 
-def _store_factory(tmp_path, monkeypatch):
+def _store_factory(tmp_path, monkeypatch, config=None):
     from hermes_state import SessionDB as RealSessionDB
     import hermes_state
 
@@ -45,9 +46,23 @@ def _store_factory(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_state, "SessionDB", _open)
 
     def _make(scope="sessions"):
-        return SessionStore(tmp_path / scope, GatewayConfig())
+        return SessionStore(tmp_path / scope, config or GatewayConfig())
 
     return _make, opened
+
+
+def _shared_room_config():
+    return GatewayConfig(
+        multiplex_profiles=True,
+        single_principal=SinglePrincipalPolicy.from_dict(
+            {
+                "enabled": True,
+                "telegram_owner_id": "10001",
+                "telegram_allowed_user_ids": ["20002"],
+                "telegram_shared_chat_ids": ["-10001"],
+            }
+        ),
+    )
 
 
 def test_lane_key_is_versioned_and_isolates_every_identity_component():
@@ -157,6 +172,152 @@ def test_preferences_are_isolated_by_topic_and_store_scope(tmp_path, monkeypatch
 
     assert first.get_topic_preferences(other_topic) == {}
     assert second_scope.get_topic_preferences(source) == {}
+
+    for db in opened:
+        db.close()
+
+
+def test_shared_room_preferences_are_topic_wide_across_participants(
+    tmp_path, monkeypatch
+):
+    make_store, opened = _store_factory(
+        tmp_path, monkeypatch, config=_shared_room_config()
+    )
+    store = make_store()
+    owner = _source(
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="4",
+        user_id="10001",
+        profile="room-drafts",
+    )
+    family = _source(
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="4",
+        user_id="20002",
+        profile="room-drafts",
+    )
+
+    assert store._generate_topic_preference_key(owner) == (
+        store._generate_topic_preference_key(family)
+    )
+    store.update_topic_preferences(
+        owner,
+        model_override={"model": "gpt-5.6-luna", "provider": "openai-codex"},
+    )
+    assert store.get_topic_preferences(family)["model_override"] == {
+        "model": "gpt-5.6-luna",
+        "provider": "openai-codex",
+    }
+
+    other_topic = _source(
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="5",
+        user_id="20002",
+        profile="room-drafts",
+    )
+    other_room = _source(
+        chat_id="-20002",
+        chat_type="group",
+        thread_id="4",
+        user_id="20002",
+        profile="room-drafts",
+    )
+    assert store.get_topic_preferences(other_topic) == {}
+    assert store._generate_topic_preference_key(other_room) != (
+        store._generate_topic_preference_key(owner)
+    )
+
+    for db in opened:
+        db.close()
+
+
+def test_shared_room_migrates_latest_authorized_sender_preference(
+    tmp_path, monkeypatch
+):
+    make_store, opened = _store_factory(
+        tmp_path, monkeypatch, config=_shared_room_config()
+    )
+    store = make_store()
+    owner = _source(
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="4",
+        user_id="10001",
+        profile="room-drafts",
+    )
+    family = _source(
+        chat_id="-10001",
+        chat_type="group",
+        thread_id="4",
+        user_id="20002",
+        profile="room-drafts",
+    )
+    owner_legacy_key = build_topic_preference_key(owner, profile="room-drafts")
+    family_legacy_key = build_topic_preference_key(family, profile="room-drafts")
+    store._db.save_gateway_topic_preferences(
+        owner_legacy_key,
+        json.dumps(
+            {
+                "model_override": {
+                    "model": "gpt-5.6-sol",
+                    "provider": "openai-codex",
+                }
+            }
+        ),
+        scope=store._routing_scope(),
+    )
+    time.sleep(0.01)
+    store._db.save_gateway_topic_preferences(
+        family_legacy_key,
+        json.dumps(
+            {
+                "model_override": {
+                    "model": "gpt-5.6-luna",
+                    "provider": "openai-codex",
+                    "api_key": "must-not-migrate",
+                }
+            }
+        ),
+        scope=store._routing_scope(),
+    )
+
+    assert store.get_topic_preferences(owner) == {
+        "model_override": {
+            "model": "gpt-5.6-luna",
+            "provider": "openai-codex",
+        }
+    }
+    canonical_key = store._generate_topic_preference_key(owner)
+    canonical_raw = store._db.load_gateway_topic_preferences(
+        canonical_key, scope=store._routing_scope()
+    )
+    assert canonical_raw is not None
+    assert "must-not-migrate" not in canonical_raw
+    assert store._db.load_gateway_topic_preferences(
+        owner_legacy_key, scope=store._routing_scope()
+    ) is None
+    assert store._db.load_gateway_topic_preferences(
+        family_legacy_key, scope=store._routing_scope()
+    ) is None
+
+    for db in opened:
+        db.close()
+
+
+def test_non_shared_preferences_remain_sender_scoped(tmp_path, monkeypatch):
+    make_store, opened = _store_factory(
+        tmp_path, monkeypatch, config=_shared_room_config()
+    )
+    store = make_store()
+    first = _source(user_id="10001", profile="room-drafts")
+    second = _source(user_id="20002", profile="room-drafts")
+
+    assert store._generate_topic_preference_key(first) != (
+        store._generate_topic_preference_key(second)
+    )
 
     for db in opened:
         db.close()

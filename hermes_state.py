@@ -2639,6 +2639,66 @@ class SessionDB:
             ).fetchone()
         return row["preferences_json"] if row else None
 
+    def load_latest_gateway_topic_preferences(
+        self, lane_keys: List[str], *, scope: str = ""
+    ) -> Optional[tuple[str, str]]:
+        """Return the most recently updated preference among legacy lanes."""
+        keys = list(dict.fromkeys(key for key in lane_keys if key))
+        if not keys:
+            return None
+        placeholders = ",".join("?" for _ in keys)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT lane_key, preferences_json
+                    FROM gateway_topic_preferences
+                    WHERE scope = ? AND lane_key IN ({placeholders})
+                    ORDER BY updated_at DESC
+                    LIMIT 1""",
+                (scope, *keys),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["lane_key"], row["preferences_json"]
+
+    def promote_gateway_topic_preferences(
+        self,
+        lane_key: str,
+        preferences_json: str,
+        legacy_lane_keys: List[str],
+        *,
+        scope: str = "",
+    ) -> Optional[str]:
+        """Atomically migrate sanitized legacy preferences unless already set."""
+        legacy_keys = list(
+            dict.fromkeys(
+                key for key in legacy_lane_keys if key and key != lane_key
+            )
+        )
+
+        def _do(conn):
+            if lane_key and preferences_json:
+                conn.execute(
+                    """INSERT OR IGNORE INTO gateway_topic_preferences
+                           (scope, lane_key, preferences_json, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (scope, lane_key, preferences_json, time.time()),
+                )
+            if legacy_keys:
+                placeholders = ",".join("?" for _ in legacy_keys)
+                conn.execute(
+                    f"""DELETE FROM gateway_topic_preferences
+                        WHERE scope = ? AND lane_key IN ({placeholders})""",
+                    (scope, *legacy_keys),
+                )
+            row = conn.execute(
+                """SELECT preferences_json FROM gateway_topic_preferences
+                   WHERE scope = ? AND lane_key = ?""",
+                (scope, lane_key),
+            ).fetchone()
+            return row["preferences_json"] if row else None
+
+        return self._execute_write(_do)
+
     def delete_gateway_topic_preferences(
         self, lane_key: str, *, scope: str = ""
     ) -> None:
