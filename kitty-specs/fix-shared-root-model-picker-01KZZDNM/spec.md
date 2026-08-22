@@ -99,8 +99,9 @@ focused и затронутые privacy/access suites, Ruff, `py_compile` и
 2. `/model`, выбранная авторизованным участником shared-room, применяется к
    другому авторизованному участнику той же комнаты/topic, но не другой lane.
 3. Старый sender-bound override безопасно мигрируется без секретов.
-4. Fallback идёт через direct DeepSeek и free Kimi; paid OpenRouter не является
-   неявным fallback, но остаётся доступен при явном выборе.
+4. Fallback идёт только через direct DeepSeek; недоступный Kimi и paid
+   OpenRouter не являются неявными fallback, но OpenRouter остаётся доступен
+   при явном выборе.
 5. Payment/credit error OpenRouter не вызывает повторный первичный GLM-запрос
    на следующем shared turn без явного OpenRouter override.
 

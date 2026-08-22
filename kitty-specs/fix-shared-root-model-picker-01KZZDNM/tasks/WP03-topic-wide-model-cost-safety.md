@@ -40,7 +40,7 @@ owned_files:
 - Legacy sender-bound rows всех настроенных участников выбираются по `updated_at`,
   повторно sanitизируются и атомарно переносятся в canonical lane.
 - `room-drafts` и `room-research` получили явный Codex/Luna default и цепочку
-  Codex → direct DeepSeek → free Kimi; автоматические auxiliary overrides
+  Codex → direct DeepSeek; автоматические auxiliary overrides
   OpenRouter заменены на `auto`.
 
 ## Evidence
@@ -54,5 +54,11 @@ owned_files:
 - HOSTKEY service: active/running, new PID `1070579`, `NRestarts=0`, Telegram
   connected and 60 commands registered.
 - Candidate runtime resolver confirms both room profiles use
-  Codex/Luna → direct DeepSeek → free Kimi; post-start log contains no
+  Codex/Luna → direct DeepSeek; post-start log contains no
   OpenRouter/GLM/402 route.
+
+## Approved delta 2026-08-22
+
+Пользователь сообщил, что бесплатный Kimi K3 больше недоступен, и явно одобрил
+его полное удаление командой `делай`. Provider registration и все fallback
+references удалены; итоговая автоматическая цепочка — Codex → direct DeepSeek.
