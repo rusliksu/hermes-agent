@@ -51,7 +51,7 @@ owned_files:
 - Ruff, `py_compile`, `git diff --check` — pass.
 - Isolated candidate:
   `/home/openclaw/staging/hermes-topic-model-costsafe-037e84bf1-r7-20260822T083457Z`.
-- HOSTKEY service: active/running, new PID `1070579`, `NRestarts=0`, Telegram
+- HOSTKEY service: active/running, new PID `1112628`, `NRestarts=0`, Telegram
   connected and 60 commands registered.
 - Candidate runtime resolver confirms both room profiles use
   Codex/Luna → direct DeepSeek; post-start log contains no
@@ -62,3 +62,5 @@ owned_files:
 Пользователь сообщил, что бесплатный Kimi K3 больше недоступен, и явно одобрил
 его полное удаление командой `делай`. Provider registration и все fallback
 references удалены; итоговая автоматическая цепочка — Codex → direct DeepSeek.
+После config restart оба room-профиля прошли runtime resolution smoke, а
+post-start log не содержит Kimi/OpenRouter/GLM/402 route.
