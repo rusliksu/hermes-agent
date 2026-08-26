@@ -32,3 +32,6 @@ Active policy содержала два shared bindings: `principal-room-drafts`
 - `check-hermes-single-principal`: verdict `pass`.
 - `hermes-gateway.service`: active, PID `1783968`, `NRestarts=0`, result success.
 - Product spec: Gurra workspace commit `63ce134`.
+- Независимый read-only review: первоначально отклонён из-за отсутствия
+  parent-inheritance full-boundary oracle; после добавления теста повторный
+  verdict `APPROVE`, blocking findings отсутствуют.

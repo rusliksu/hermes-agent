@@ -13,7 +13,7 @@
 - [x] Реализовать минимальный config/migration или code fix без sibling-derived authority.
 - [x] Добавить positive/negative regression matrix и обновить product spec.
 - [x] Прогнать focused/affected suites, Ruff, `py_compile` и `git diff --check`.
-- [ ] Получить независимый review; исправить замечания.
+- [x] Получить независимый review; исправить замечания.
 - [ ] Собрать isolated candidate, проверить rollback, перезапустить только `hermes-gateway.service` и выполнить topic canary на HOSTKEY staging. Runtime и synthetic canary пройдены; ожидается реальное сообщение в Telegram.
 
 ### Проверка завершения
