@@ -37,6 +37,14 @@ thread inheritance было корректным, но применялось к
 - Post-correction resolver на фактических chat/topic keys: `allowed`, profile
   `room-drafts`, topic delivery preserved, registry `pass`.
 
+## Real Telegram canary
+
+После correction и restart в ранее отклонявшемся топике получено новое
+сообщение. Runtime подтвердил один ingress batch, один completed model response
+и одну Telegram delivery в тот же target. После restart отсутствуют
+`missing_shared_scope_binding`, `resolved_access_context_mismatch` и agent
+errors. Screenshot пользователя показывает ответ Gurra в топике.
+
 ## Проверка
 
 - In-memory RED/GREEN на active policy: `missing_shared_scope_binding` →

@@ -14,8 +14,8 @@
 - [x] Добавить positive/negative regression matrix и обновить product spec.
 - [x] Прогнать focused/affected suites, Ruff, `py_compile` и `git diff --check`.
 - [x] Получить независимый review; исправить замечания.
-- [ ] Собрать isolated candidate, проверить rollback, перезапустить только `hermes-gateway.service` и выполнить topic canary на HOSTKEY staging. Runtime и synthetic canary пройдены; ожидается реальное сообщение в Telegram.
+- [x] Собрать isolated candidate, проверить rollback, перезапустить только `hermes-gateway.service` и выполнить topic canary на HOSTKEY staging.
 
 ### Проверка завершения
 
-Новый топик зарегистрированной группы отвечает в том же Telegram topic; неизвестные группы и неучастники остаются fail-closed; соседние topic sessions не видят историю друг друга.
+Новый топик зарегистрированной группы отвечает в том же Telegram topic; неизвестные группы и неучастники остаются fail-closed; соседние topic sessions не видят историю друг друга. Проверено реальным Telegram turn 2026-08-26.
