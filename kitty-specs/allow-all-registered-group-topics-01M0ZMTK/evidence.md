@@ -18,6 +18,25 @@ Active policy содержала два shared bindings: `principal-room-drafts`
 - Credential-free rollback metadata:
   `/home/openclaw/.hermes/backups/allow-all-registered-group-topics-20260826/rollback.json`.
 
+### Runtime correction after real canary
+
+Первый post-fix message снова показал `missing_shared_scope_binding`. Redacted
+transport comparison доказал, что `principal-room-drafts` содержал stale
+`chat_id`: он не совпадал ни с одним observed batch нужного чата. Group-level
+thread inheritance было корректным, но применялось к другому transport key.
+
+- `room_identity.chat_id` и `delivery_target.chat_id` заменены на transport key
+  фактического чата: ещё две строки active runtime config.
+- Owner и Юля уже входили в server-owned membership; роли, capabilities,
+  profile/scope и participant list не менялись.
+- SHA256 config:
+  `2a17aa68ee06183690612046ed352df77b7638341314b758c563db88a9efaa9e` →
+  `1edf175a8f1edccfaf8e3e8932f850c52fe71ebf46174a8e1dba7746f2b305a0`.
+- Rollback metadata:
+  `/home/openclaw/.hermes/backups/allow-all-registered-group-topics-20260826/chat-rollback.json`.
+- Post-correction resolver на фактических chat/topic keys: `allowed`, profile
+  `room-drafts`, topic delivery preserved, registry `pass`.
+
 ## Проверка
 
 - In-memory RED/GREEN на active policy: `missing_shared_scope_binding` →
