@@ -22,16 +22,13 @@ Active policy содержала два shared bindings: `principal-room-drafts`
 
 - In-memory RED/GREEN на active policy: `missing_shared_scope_binding` →
   `allowed`, registry `pass`, `room-drafts`, исходящий topic сохранён.
-- `tests/gateway/test_access_registry.py`: `87 passed`.
+- Full-boundary regression uses a group-level binding without `thread_id`, an
+  ingress event with a novel `thread_id`, and asserts same-topic delivery,
+  topic-scoped session key and memory namespace.
+- `tests/gateway/test_shared_topic_full_boundary.py` plus
+  `tests/gateway/test_access_registry.py`: `88 passed`.
 - Два synthetic новых топика разрешены и имеют разные memory namespaces;
   synthetic unknown group остаётся `missing_shared_scope_binding`.
 - `check-hermes-single-principal`: verdict `pass`.
 - `hermes-gateway.service`: active, PID `1783968`, `NRestarts=0`, result success.
 - Product spec: Gurra workspace commit `63ce134`.
-
-## Известный несвязанный drift
-
-`tests/gateway/test_shared_topic_full_boundary.py` доходит до успешного ответа
-`GROUP_SMOKE_OK`, но падает на старом ожидании только `memory`: текущий runtime
-также выдаёт `web_search` и `web_extract`. Access resolution, модель и Telegram
-delivery в этом тесте успешны; данный toolset drift не изменялся этой миссией.

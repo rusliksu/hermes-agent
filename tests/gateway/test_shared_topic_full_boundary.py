@@ -45,14 +45,14 @@ def _registry() -> AccessRegistry:
         peer_kind="group",
         user_id="ignored-member",
         chat_id=CHAT_ID,
-        thread_id=THREAD_ID,
+        thread_id=None,
     )
     delivery_target = DeliveryTarget(
         platform="telegram",
         account=ACCOUNT,
         peer_kind="group",
         chat_id=CHAT_ID,
-        thread_id=THREAD_ID,
+        thread_id=None,
     )
     capabilities = frozenset({"room_memory", "public_web", "vision"})
     return AccessRegistry(
@@ -99,7 +99,7 @@ async def _wait_for_delivery(adapter: TelegramAdapter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_allowed_shared_topic_survives_optional_tool_reduction_at_full_boundary(
+async def test_new_shared_topic_inherits_group_binding_at_full_boundary(
     monkeypatch,
     tmp_path,
     caplog,
@@ -251,7 +251,8 @@ async def test_allowed_shared_topic_survives_optional_tool_reduction_at_full_bou
     expected_memory_dir = (
         profile_home / "memories" / "shared" / memory_namespace
     )
-    assert agent.valid_tool_names == {"memory"}
+    assert event.source.resolved_access_context.delivery_target.thread_id == THREAD_ID
+    assert agent.valid_tool_names == {"memory", "web_extract", "web_search"}
     assert agent._memory_enabled is True
     assert agent._user_profile_enabled is False
     assert agent._memory_store.allow_user_profile is False
@@ -259,6 +260,10 @@ async def test_allowed_shared_topic_survives_optional_tool_reduction_at_full_bou
     assert agent._memory_store.memory_dir == expected_memory_dir
     assert not (profile_home / "memories" / "MEMORY.md").exists()
     assert not (profile_home / "memories" / "USER.md").exists()
+
+    assert set(runner.session_store._entries) == {
+        f"agent:{PROFILE_ID}:telegram:group:{CHAT_ID}:{THREAD_ID}"
+    }
 
     assert runner._session_db is not None
     assert runner.session_store._db is not None
