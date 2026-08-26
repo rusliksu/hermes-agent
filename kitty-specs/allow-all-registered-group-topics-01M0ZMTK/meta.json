@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-08-26T18:20:26.058599+00:00",
+  "flattened": false,
+  "friendly_name": "allow all registered group topics",
+  "mission_id": "01M0ZMTKJ72JW8QG6K7PDDXQKB",
+  "mission_number": null,
+  "mission_slug": "allow-all-registered-group-topics-01M0ZMTK",
+  "mission_type": "software-dev",
+  "purpose_context": "Исправить Telegram shared-room ingress: зарегистрированная группа разрешает любой свой forum topic, включая созданный после регистрации, без ослабления границы между группами и профилями.",
+  "purpose_tldr": "Разрешить все топики зарегистрированных Telegram-групп",
+  "slug": "allow-all-registered-group-topics-01M0ZMTK",
+  "target_branch": "codex/allow-all-registered-group-topics",
+  "topology": "single_branch"
+}
