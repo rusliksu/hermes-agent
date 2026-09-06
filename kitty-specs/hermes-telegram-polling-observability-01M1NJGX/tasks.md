@@ -50,10 +50,10 @@
 
 ### Included Subtasks
 
-- [ ] T005 Update `plugins/platforms/telegram/adapter.py` to write the timestamp after current-generation progress is accepted.
-- [ ] T006 Add success-path tests for empty and non-empty `getUpdates` results.
-- [ ] T007 Add no-advance tests for HTTP/API errors, parse failures, timeouts, retry failures, `getMe`, `start_polling`, and non-`getUpdates` activity.
-- [ ] T008 Add or extend stale-generation and network reconnect tests so old completions cannot advance the timestamp.
+- [x] T005 Update `plugins/platforms/telegram/adapter.py` to write the timestamp after current-generation progress is accepted.
+- [x] T006 Add success-path tests for empty and non-empty `getUpdates` results.
+- [x] T007 Add no-advance tests for HTTP/API errors, parse failures, timeouts, retry failures, `getMe`, `start_polling`, and non-`getUpdates` activity.
+- [x] T008 Add or extend stale-generation and network reconnect tests so old completions cannot advance the timestamp.
 
 ### Implementation Notes
 
