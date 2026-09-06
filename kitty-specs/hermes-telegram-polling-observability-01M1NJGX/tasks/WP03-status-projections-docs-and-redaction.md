@@ -18,9 +18,9 @@ subtasks:
 - T011
 - T012
 phase: Phase 3 - Projection And Documentation
-assignee: ''
+assignee: "codex-runtime-binding-review"
 agent: "codex-runtime-binding-review"
-shell_pid: "3290214"
+shell_pid: "6141"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -149,3 +149,8 @@ pytest tests/gateway/test_telegram_error_redaction.py
 - 2026-09-04T19:49:03Z - system - Prompt created.
 - 2026-09-04T20:49:52Z – user – Verification complete on task branch d2649a434: focused per-file pytest with pytest-asyncio passed status 97, polling 24, PTB 8, reconnect 42, API 204, redaction 8, web status projection 2; diff-scoped ruff passed. No prior WP03 reviewer verdict artifact found, leaving review-ready.
 - 2026-09-05T09:22:11Z – codex-runtime-binding-review – shell_pid=3290214 – Started review via action command
+- 2026-09-06T10:43:26Z – codex-runtime-binding-review – shell_pid=3290214 – Moved to planned
+- 2026-09-06T10:43:43Z – codex-runtime-binding-review – shell_pid=3290214 – Moved to in_progress
+- 2026-09-06T10:46:41Z – codex-runtime-binding-review – shell_pid=3290214 – Moved to for_review
+- 2026-09-06T12:02:33Z – codex-runtime-binding-review – shell_pid=6141 – Started review via action command
+- 2026-09-06T12:08:06Z – codex-runtime-binding-review – shell_pid=6141 – Moved to planned
