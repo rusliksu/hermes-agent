@@ -16,10 +16,10 @@
 
 ### Included Subtasks
 
-- [ ] T001 Extend `gateway/status.py` to accept and persist an optional Telegram polling timestamp field.
-- [ ] T002 Preserve backward compatibility and unrelated per-platform status fields during timestamp writes.
-- [ ] T003 Add focused `tests/gateway/test_status.py` coverage for timestamp persistence, absence, and UTC formatting.
-- [ ] T004 Verify the runtime status contract still treats older files without the field as valid.
+- [x] T001 Extend `gateway/status.py` to accept and persist an optional Telegram polling timestamp field.
+- [x] T002 Preserve backward compatibility and unrelated per-platform status fields during timestamp writes.
+- [x] T003 Add focused `tests/gateway/test_status.py` coverage for timestamp persistence, absence, and UTC formatting.
+- [x] T004 Verify the runtime status contract still treats older files without the field as valid.
 
 ### Implementation Notes
 

@@ -17,7 +17,8 @@ subtasks:
 - T004
 phase: Phase 1 - Foundation
 assignee: ''
-agent: codex
+agent: "codex:gpt-5:python-pedro:implementer"
+shell_pid: "29571"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -139,3 +140,4 @@ pytest tests/gateway/test_status.py
 ## Activity Log
 
 - 2026-09-04T19:49:03Z - system - Prompt created.
+- 2026-09-06T12:35:21Z – codex:gpt-5:python-pedro:implementer – shell_pid=29571 – Assigned agent via action command

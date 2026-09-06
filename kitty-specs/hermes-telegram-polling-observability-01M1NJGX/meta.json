@@ -11,5 +11,7 @@
   "purpose_tldr": "Persist the last successful Telegram polling timestamp for observability without changing polling behavior.",
   "slug": "hermes-telegram-polling-observability-01M1NJGX",
   "target_branch": "main",
-  "topology": "coord"
+  "topology": "coord",
+  "vcs": "git",
+  "vcs_locked_at": "2026-09-06T12:35:12.177967+00:00"
 }
