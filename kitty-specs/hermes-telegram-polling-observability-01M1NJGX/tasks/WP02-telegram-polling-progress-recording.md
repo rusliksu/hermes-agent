@@ -20,7 +20,7 @@ subtasks:
 - T008
 phase: Phase 2 - Adapter Behavior
 assignee: ''
-agent: codex
+agent: "codex"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -146,3 +146,7 @@ pytest tests/gateway/test_telegram_network_reconnect.py
 ## Activity Log
 
 - 2026-09-04T19:49:03Z - system - Prompt created.
+- 2026-09-06T14:38:00Z – codex – WP02 recovery ready: transferred approved WP01 prerequisite, original WP02 implementation, and reviewed non-list/test-isolation fixes; focused gate targets passed with no new failures.
+- 2026-09-06T14:50:56Z – codex – Rerun pre-review gate after WP02 test isolation and baseline placement repair
+- 2026-09-06T14:51:27Z – codex – Pre-review gate rerun after test isolation and baseline placement repair
+- 2026-09-06T15:07:03Z – user – Moved to approved
