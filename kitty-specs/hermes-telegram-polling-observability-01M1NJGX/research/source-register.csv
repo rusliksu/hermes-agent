@@ -1,0 +1,6 @@
+source_id,path,type,notes
+S1,plugins/platforms/telegram/adapter.py,source,"Telegram polling generation, getUpdates instrumentation, and progress recording."
+S2,gateway/status.py,source,"Runtime status persistence and per-platform status update contract."
+S3,hermes_cli/web_server.py,source,"Dashboard /api/status runtime status projection."
+S4,gateway/platforms/api_server.py,source,"Gateway /health/detailed runtime status projection."
+S5,tests/gateway/test_telegram_polling_progress.py; tests/test_telegram_polling_progress_ptb.py; tests/gateway/test_telegram_network_reconnect.py,test,"Existing polling progress, PTB wrapper, and reconnect coverage to extend."

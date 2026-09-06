@@ -1,0 +1,15 @@
+{
+  "coordination_branch": "kitty/mission-hermes-telegram-polling-observability-01M1NJGX",
+  "created_at": "2026-09-04T06:43:28.501829+00:00",
+  "flattened": false,
+  "friendly_name": "Persist Telegram Polling Success Timestamp",
+  "mission_id": "01M1NJGX3JWAYHHRJT4FRMFXDE",
+  "mission_number": null,
+  "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
+  "mission_type": "software-dev",
+  "purpose_context": "Create a planning mission for Hermes Telegram polling observability on the verified origin/main baseline d9fb7fb49051815158791b2e7b50789fa51398fa. Bootstrap only: record lifecycle identity and Beads coordination; do not implement, test, deploy, or change runtime behavior in this package.",
+  "purpose_tldr": "Persist the last successful Telegram polling timestamp for observability without changing polling behavior.",
+  "slug": "hermes-telegram-polling-observability-01M1NJGX",
+  "target_branch": "main",
+  "topology": "coord"
+}

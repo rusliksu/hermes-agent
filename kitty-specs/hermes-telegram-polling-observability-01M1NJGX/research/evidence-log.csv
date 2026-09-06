@@ -1,0 +1,7 @@
+id,source_id,claim,artifact_or_lineage,planning_use
+E1,S1,"_record_polling_progress gates teardown, accepting state, and current generation before treating getUpdates as progress.","plugins/platforms/telegram/adapter.py","Place timestamp persistence after existing generation guards."
+E2,S1,"_observe_polling_request_result records progress only for 2xx parseable Telegram envelopes with ok true and a result key.","plugins/platforms/telegram/adapter.py","Define success semantics; empty result counts, errors do not."
+E3,S2,"write_runtime_status owns persisted per-platform status fields in gateway_state.json.","gateway/status.py","Extend existing persistence boundary rather than adding endpoint/config."
+E4,S3,"/api/status projects gateway_platforms from runtime status and filters to configured platforms when possible.","hermes_cli/web_server.py","Expose the timestamp through existing dashboard status projection."
+E5,S4,"/health/detailed returns runtime platforms from read_runtime_status and shares active-agent derivation with /api/status.","gateway/platforms/api_server.py","Pin the detailed health projection to the same status value."
+E6,S5,"Existing Telegram polling progress tests cover HTTP/API success and failure, non-getUpdates paths, stale generation completions, and verifier behavior.","tests/gateway/test_telegram_polling_progress.py; tests/test_telegram_polling_progress_ptb.py; tests/gateway/test_telegram_network_reconnect.py","Plan focused regression tests instead of inventing broad fixtures."
