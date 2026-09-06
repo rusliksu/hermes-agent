@@ -1,11 +1,11 @@
 {
   "wp_id": "WP03",
-  "captured_at": "2026-09-06T15:20:19Z",
-  "base_branch": "12899625c611b6ba68e572a07d1309c3d7de2ea1",
-  "base_commit": "12899625c611b6ba68e572a07d1309c3d7de2ea1",
+  "captured_at": "2026-09-06T12:07:15Z",
+  "base_branch": "kitty/mission-hermes-telegram-polling-observability-01M1NJGX",
+  "base_commit": "81b8acdac737ab69a346a38aeeb229f023abe735",
   "test_runner": "pytest",
-  "total": 488,
-  "passed": 488,
+  "total": 0,
+  "passed": 0,
   "failed": 0,
   "skipped": 0,
   "failures": []

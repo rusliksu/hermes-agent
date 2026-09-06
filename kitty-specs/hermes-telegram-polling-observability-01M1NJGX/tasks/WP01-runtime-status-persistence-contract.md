@@ -17,8 +17,8 @@ subtasks:
 - T004
 phase: Phase 1 - Foundation
 assignee: ''
-agent: "codex:gpt-5:python-pedro:implementer"
-shell_pid: "29571"
+agent: "codex-wp01-gate-review"
+shell_pid: "116568"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -141,3 +141,7 @@ pytest tests/gateway/test_status.py
 
 - 2026-09-04T19:49:03Z - system - Prompt created.
 - 2026-09-06T12:35:21Z – codex:gpt-5:python-pedro:implementer – shell_pid=29571 – Assigned agent via action command
+- 2026-09-06T12:51:15Z – codex:gpt-5:python-pedro:implementer – shell_pid=29571 – Moved to for_review
+- 2026-09-06T14:20:26Z – codex-wp01-gate-review – shell_pid=112799 – Started review via action command
+- 2026-09-06T14:23:52Z – codex-wp01-gate-review – shell_pid=112799 – Rerun pre-review gate after verified WP01 baseline placement
+- 2026-09-06T14:24:06Z – codex-wp01-gate-review – shell_pid=116568 – Started review via action command
