@@ -3,6 +3,8 @@ project:
   slug: hermes-agent
   node_id: f1da69b66ab4
   build_id: d1032300-c4bb-5715-944f-89fa915fbe1b
+  path_conventions:
+    workspace: gateway/
 vcs:
   type: git
 agents:
