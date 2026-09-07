@@ -26,6 +26,6 @@
   "purpose_tldr": "Persist the last successful Telegram polling timestamp for observability without changing polling behavior.",
   "slug": "hermes-telegram-polling-observability-01M1NJGX",
   "status_phase": "1",
-  "target_branch": "main",
+  "target_branch": "codex/hermes-telegram-polling-planning-root",
   "topology": "coord"
 }

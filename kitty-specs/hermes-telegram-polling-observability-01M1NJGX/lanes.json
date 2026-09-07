@@ -3,7 +3,7 @@
   "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
   "mission_id": "01M1NJGX3JWAYHHRJT4FRMFXDE",
   "mission_branch": "kitty/mission-hermes-telegram-polling-observability-01M1NJGX",
-  "target_branch": "main",
+  "target_branch": "codex/hermes-telegram-polling-planning-root",
   "lanes": [
     {
       "lane_id": "lane-a",
@@ -55,7 +55,9 @@
       ],
       "predicted_surfaces": [
         "api",
-        "dashboard"
+        "artifact-rendering",
+        "dashboard",
+        "tracker-integration"
       ],
       "depends_on_lanes": [
         "lane-a",
@@ -64,7 +66,8 @@
       "parallel_group": 2
     }
   ],
-  "computed_at": "2026-09-04T19:58:46.244804+00:00",
+  "computed_at": "2026-09-07T21:26:43.583036+00:00",
   "computed_from": "dependency_graph+ownership",
-  "planning_artifact_wps": []
+  "planning_artifact_wps": [],
+  "planning_commit_sha": null
 }
