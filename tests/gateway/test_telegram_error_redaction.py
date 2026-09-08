@@ -23,6 +23,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
+from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 _SECRET_TOKEN = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
@@ -41,6 +42,35 @@ def _make_connected_adapter() -> TelegramAdapter:
     bot.send_chat_action = AsyncMock()
     adapter._bot = bot
     return adapter
+
+
+def test_polling_progress_status_write_contains_only_timestamp(monkeypatch):
+    adapter = _make_bare_adapter()
+    writes = []
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:00:00+00:00"
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_write_runtime_status_safe",
+        lambda context, **kwargs: writes.append((context, kwargs)),
+    )
+
+    generation, _ = adapter._begin_polling_generation()
+    adapter._record_polling_progress(generation)
+
+    assert writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:00:00+00:00"},
+        )
+    ]
+    serialized = repr(writes)
+    assert _SECRET_TOKEN not in serialized
+    assert "api.telegram.org" not in serialized
+    assert "getUpdates" not in serialized
+    assert "update_id" not in serialized
+    assert "chat" not in serialized
 
 
 @pytest.mark.asyncio

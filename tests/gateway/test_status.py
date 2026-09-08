@@ -460,6 +460,48 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
 
+    def test_write_runtime_status_preserves_poll_timestamp_on_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """Restart metadata refresh must not erase prior platform poll progress."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        timestamp = "2026-09-04T19:00:00+00:00"
+
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "gateway_state": "running",
+            "pid": 99999,
+            "start_time": 1000.0,
+            "kind": "hermes-gateway",
+            "argv": ["/old/path/hermes", "gateway", "run"],
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "last_successful_poll_at": timestamp,
+                    "updated_at": "2026-09-04T19:01:00+00:00",
+                }
+            },
+            "updated_at": "2026-09-04T19:01:00+00:00",
+        }))
+
+        monkeypatch.setattr(status.sys, "argv", ["/new/path/hermes", "gateway", "run"])
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 2000)
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = status.read_runtime_status()
+        telegram = payload["platforms"]["telegram"]
+        assert payload["argv"] == ["/new/path/hermes", "gateway", "run"]
+        assert payload["pid"] == os.getpid()
+        assert payload["start_time"] == 2000
+        assert telegram["last_successful_poll_at"] == timestamp
+
+        status.write_runtime_status(platform="telegram", platform_state="connected")
+
+        telegram = status.read_runtime_status()["platforms"]["telegram"]
+        assert telegram["state"] == "connected"
+        assert telegram["last_successful_poll_at"] == timestamp
+
     def test_runtime_status_running_pid_rejects_stale_record_for_supervisor_pid(self, monkeypatch):
         """Regression: stale profile runtime state must not mark s6 supervisors live.
 
@@ -640,6 +682,75 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["state"] == "fatal"
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
+
+    def test_write_runtime_status_records_platform_last_successful_poll_at(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        timestamp = "2026-09-04T19:00:00+00:00"
+
+        status.write_runtime_status(
+            platform="telegram",
+            platform_state="connected",
+            error_code="stale_error",
+            error_message="stale message",
+        )
+
+        status.write_runtime_status(
+            platform="telegram",
+            last_successful_poll_at=timestamp,
+        )
+
+        payload = status.read_runtime_status()
+        telegram = payload["platforms"]["telegram"]
+        assert telegram["last_successful_poll_at"] == timestamp
+        assert telegram["state"] == "connected"
+        assert telegram["error_code"] == "stale_error"
+        assert telegram["error_message"] == "stale message"
+
+    def test_write_runtime_status_accepts_none_last_successful_poll_at(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            platform="telegram",
+            last_successful_poll_at="2026-09-04T19:00:00+00:00",
+        )
+        status.write_runtime_status(
+            platform="telegram",
+            last_successful_poll_at=None,
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["telegram"]["last_successful_poll_at"] is None
+
+    def test_read_runtime_status_allows_older_platform_record_without_poll_timestamp(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "gateway_state": "running",
+            "pid": os.getpid(),
+            "kind": "hermes-gateway",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "updated_at": "2026-09-04T18:00:00+00:00",
+                }
+            },
+            "updated_at": "2026-09-04T18:00:00+00:00",
+        }))
+
+        payload = status.read_runtime_status()
+        assert payload["platforms"]["telegram"]["state"] == "connected"
+        assert "last_successful_poll_at" not in payload["platforms"]["telegram"]
+        assert status.derive_gateway_busy(
+            gateway_running=True,
+            gateway_state=payload["gateway_state"],
+            active_agents=payload.get("active_agents"),
+        ) is False
 
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

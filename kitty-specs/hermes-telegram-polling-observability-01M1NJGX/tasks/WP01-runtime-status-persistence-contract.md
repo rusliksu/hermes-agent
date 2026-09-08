@@ -6,16 +6,19 @@ requirement_refs:
 - FR-001
 - FR-006
 - FR-007
-planning_base_branch: codex/hermes-telegram-polling-planning-root
-merge_target_branch: codex/hermes-telegram-polling-planning-root
-branch_strategy: Planning artifacts for this mission were generated on codex/hermes-telegram-polling-planning-root. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into codex/hermes-telegram-polling-planning-root unless the human explicitly redirects the landing branch.
+tracker_refs: []
+planning_base_branch: main
+merge_target_branch: main
+branch_strategy: Planning artifacts for this mission were generated on main. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into main unless the human explicitly redirects the landing branch.
 subtasks:
 - T001
 - T002
 - T003
 - T004
 phase: Phase 1 - Foundation
-agent: codex-wp01-gate-review
+assignee: ''
+agent: "codex-wp01-gate-review"
+shell_pid: "116568"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -31,7 +34,6 @@ owned_files:
 role: implementer
 tags: []
 task_type: implement
-tracker_refs: []
 ---
 
 # Work Package Prompt: WP01 - Runtime Status Persistence Contract

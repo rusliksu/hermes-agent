@@ -8,18 +8,19 @@ requirement_refs:
 - FR-006
 - FR-007
 - FR-008
-planning_base_branch: codex/hermes-telegram-polling-planning-root
-merge_target_branch: codex/hermes-telegram-polling-planning-root
-branch_strategy: Planning artifacts for this mission were generated on codex/hermes-telegram-polling-planning-root. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into codex/hermes-telegram-polling-planning-root unless the human explicitly redirects the landing branch.
+tracker_refs: []
+planning_base_branch: main
+merge_target_branch: main
+branch_strategy: Planning artifacts for this mission were generated on main. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into main unless the human explicitly redirects the landing branch.
 subtasks:
 - T009
 - T010
 - T011
 - T012
 phase: Phase 3 - Projection And Documentation
-agent: codex-parent-wp03-review
-shell_pid: 259504
-shell_pid_created_at: '1788714736.08'
+assignee: "codex-runtime-binding-review"
+agent: "codex-parent-wp03-review"
+shell_pid: "194403"
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -39,7 +40,6 @@ owned_files:
 role: implementer
 tags: []
 task_type: implement
-tracker_refs: []
 ---
 
 # Work Package Prompt: WP03 - Status Projections, Docs, And Redaction

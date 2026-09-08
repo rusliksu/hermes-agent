@@ -2293,6 +2293,82 @@ class TestWebServerEndpoints:
             "telegram": {"state": "connected", "updated_at": "2026-04-12T00:00:00+00:00"},
         }
 
+    def test_get_status_projects_telegram_last_successful_poll_at(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        timestamp = "2026-09-04T19:00:00+00:00"
+
+        class _Platform:
+            def __init__(self, value):
+                self.value = value
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return [_Platform("telegram")]
+
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "updated_at": "2026-09-04T19:00:05+00:00",
+                "platforms": {
+                    "telegram": {
+                        "state": "connected",
+                        "updated_at": "2026-09-04T19:00:05+00:00",
+                        "last_successful_poll_at": timestamp,
+                    },
+                },
+            },
+        )
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert (
+            resp.json()["gateway_platforms"]["telegram"]["last_successful_poll_at"]
+            == timestamp
+        )
+
+    def test_get_status_accepts_telegram_platform_without_poll_timestamp(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        class _Platform:
+            def __init__(self, value):
+                self.value = value
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return [_Platform("telegram")]
+
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "updated_at": "2026-09-04T19:00:05+00:00",
+                "platforms": {
+                    "telegram": {
+                        "state": "connected",
+                        "updated_at": "2026-09-04T19:00:05+00:00",
+                    },
+                },
+            },
+        )
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert "last_successful_poll_at" not in resp.json()["gateway_platforms"]["telegram"]
+
     def test_get_status_hides_stale_platforms_when_gateway_not_running(self, monkeypatch):
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server

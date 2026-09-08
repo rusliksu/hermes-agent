@@ -811,6 +811,54 @@ class TestHealthDetailedEndpoint:
                 assert "updated_at" in data
 
     @pytest.mark.asyncio
+    async def test_health_detailed_projects_telegram_last_successful_poll_at(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        timestamp = "2026-09-04T19:00:00+00:00"
+        with patch("gateway.status.read_runtime_status", return_value={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "updated_at": "2026-09-04T19:00:05+00:00",
+                    "last_successful_poll_at": timestamp,
+                }
+            },
+            "active_agents": 0,
+            "exit_reason": None,
+            "updated_at": "2026-09-04T19:00:05+00:00",
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["platforms"]["telegram"]["last_successful_poll_at"] == timestamp
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_accepts_telegram_without_poll_timestamp(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "updated_at": "2026-09-04T19:00:05+00:00",
+                }
+            },
+            "active_agents": 0,
+            "exit_reason": None,
+            "updated_at": "2026-09-04T19:00:05+00:00",
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert "last_successful_poll_at" not in data["platforms"]["telegram"]
+
+    @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):
         """When gateway_state.json is missing, fields are None."""
         app = _create_app(adapter)

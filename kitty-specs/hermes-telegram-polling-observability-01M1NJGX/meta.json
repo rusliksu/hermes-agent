@@ -25,7 +25,6 @@
   "purpose_context": "Create a planning mission for Hermes Telegram polling observability on the verified origin/main baseline d9fb7fb49051815158791b2e7b50789fa51398fa. Bootstrap only: record lifecycle identity and Beads coordination; do not implement, test, deploy, or change runtime behavior in this package.",
   "purpose_tldr": "Persist the last successful Telegram polling timestamp for observability without changing polling behavior.",
   "slug": "hermes-telegram-polling-observability-01M1NJGX",
-  "status_phase": "1",
-  "target_branch": "codex/hermes-telegram-polling-planning-root",
+  "target_branch": "main",
   "topology": "coord"
 }

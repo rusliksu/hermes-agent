@@ -8,6 +8,8 @@ rather than silently leaving polling dead.
 
 import ast
 import asyncio
+import importlib
+import importlib.util
 from pathlib import Path
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +20,16 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
+    existing = sys.modules.get("telegram")
+    if existing is not None and isinstance(getattr(existing, "__file__", None), str):
+        return
+    if "telegram" in sys.modules:
+        for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
+            module = sys.modules.get(name)
+            if module is not None and not isinstance(getattr(module, "__file__", None), str):
+                sys.modules.pop(name, None)
+    if importlib.util.find_spec("telegram") is not None:
+        importlib.import_module("telegram")
         return
 
     telegram_mod = MagicMock()
@@ -37,6 +48,20 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _capture_runtime_status_writes(monkeypatch):
+    def _capture(self, context, **kwargs):
+        self.__dict__.setdefault("_runtime_status_writes", []).append(
+            (context, kwargs)
+        )
+
+    monkeypatch.setattr(
+        TelegramAdapter,
+        "_write_runtime_status_safe",
+        _capture,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -165,11 +190,14 @@ async def test_reconnect_chained_retry_updates_polling_error_task():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_success_waits_for_progress_to_reset_error_count():
+async def test_reconnect_success_waits_for_progress_to_reset_error_count(monkeypatch):
     """
     start_polling() return alone cannot reset the network-error count.
     """
     adapter = _make_adapter()
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:04:00+00:00"
+    )
     adapter._polling_network_error_count = 3
 
     mock_updater = MagicMock()
@@ -187,10 +215,17 @@ async def test_reconnect_success_waits_for_progress_to_reset_error_count():
 
     assert adapter._polling_network_error_count == 4
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
     await _complete_current_polling_generation(adapter)
     assert adapter._polling_network_error_count == 0
     assert adapter._send_path_degraded is False
+    assert adapter._runtime_status_writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:04:00+00:00"},
+        )
+    ]
 
     # Clean up the heartbeat-probe task scheduled after a successful reconnect.
     pending = [t for t in adapter._background_tasks if not t.done()]
