@@ -9,18 +9,16 @@ requirement_refs:
 - FR-003
 - FR-004
 - FR-005
-tracker_refs: []
-planning_base_branch: main
-merge_target_branch: main
-branch_strategy: Planning artifacts for this mission were generated on main. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into main unless the human explicitly redirects the landing branch.
+planning_base_branch: codex/hermes-telegram-polling-planning-root
+merge_target_branch: codex/hermes-telegram-polling-planning-root
+branch_strategy: Planning artifacts for this mission were generated on codex/hermes-telegram-polling-planning-root. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into codex/hermes-telegram-polling-planning-root unless the human explicitly redirects the landing branch.
 subtasks:
 - T005
 - T006
 - T007
 - T008
 phase: Phase 2 - Adapter Behavior
-assignee: ''
-agent: codex
+agent: codex-parent-wp02-review
 history:
 - at: '2026-09-04T19:49:03Z'
   actor: system
@@ -38,6 +36,7 @@ owned_files:
 role: implementer
 tags: []
 task_type: implement
+tracker_refs: []
 ---
 
 # Work Package Prompt: WP02 - Telegram Polling Progress Recording
@@ -146,3 +145,7 @@ pytest tests/gateway/test_telegram_network_reconnect.py
 ## Activity Log
 
 - 2026-09-04T19:49:03Z - system - Prompt created.
+- 2026-09-06T14:38:00Z – codex – WP02 recovery ready: transferred approved WP01 prerequisite, original WP02 implementation, and reviewed non-list/test-isolation fixes; focused gate targets passed with no new failures.
+- 2026-09-06T14:50:56Z – codex – Rerun pre-review gate after WP02 test isolation and baseline placement repair
+- 2026-09-06T14:51:27Z – codex – Pre-review gate rerun after test isolation and baseline placement repair
+- 2026-09-06T15:07:03Z – user – Moved to approved

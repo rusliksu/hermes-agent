@@ -2,9 +2,9 @@
   "event_count": 43,
   "last_event_id": "01M20JQB7R5S12XS0E65BXD0KJ",
   "materialized_at": "2026-09-08T13:18:38.328654+00:00",
-  "mission_number": "1",
+  "mission_number": "",
   "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
-  "mission_type": "software-dev",
+  "mission_type": "",
   "summary": {
     "approved": 0,
     "blocked": 0,
@@ -19,69 +19,37 @@
   "work_packages": {
     "WP01": {
       "actor": "merge",
-      "agent": "codex-wp01-gate-review",
       "force_count": 1,
       "lane": "done",
       "last_event_id": "01M20JQ3W0XM8QBQ1P9Z6PV43G",
       "last_transition_at": "2026-09-08T13:18:30.784369+00:00",
       "review_result": null,
-      "role": "reviewer",
-      "shell_pid": 116568,
-      "subtasks": {
-        "T001": "planned",
-        "T002": "planned",
-        "T003": "planned",
-        "T004": "planned"
-      }
+      "shell_pid": 116568
     },
     "WP02": {
       "actor": "merge",
-      "agent": "codex-parent-wp02-review",
+      "agent": "codex",
       "force_count": 1,
       "lane": "done",
       "last_event_id": "01M20JQ7JYMK47EBQMXENBTQXE",
       "last_transition_at": "2026-09-08T13:18:34.590235+00:00",
-      "review_result": null,
-      "role": "reviewer",
-      "subtasks": {
-        "T005": "planned",
-        "T006": "planned",
-        "T007": "planned",
-        "T008": "planned"
-      }
+      "review_result": null
     },
     "WP03": {
       "actor": "merge",
-      "agent": "codex-parent-wp03-review",
-      "agent_profile": "__resolved_profile_absent__",
-      "agent_profile_version": "__resolved_profile_version_absent__",
-      "assignee": "codex-runtime-binding-review",
+      "agent": "codex-parent-wp03-repair",
       "force_count": 5,
       "lane": "done",
       "last_event_id": "01M20JQB7R5S12XS0E65BXD0KJ",
       "last_transition_at": "2026-09-08T13:18:38.328654+00:00",
-      "model": "__resolved_model_absent__",
-      "notes": [
-        "Rework failed environment gate: previous run used uv on PATH; rerun uses pinned test Python with uv absent so pytest resolver selects original test Python.",
-        "verified-parent-review"
-      ],
-      "provider": "__resolved_provider_absent__",
-      "review": null,
       "review_result": {
         "feedback_path": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/kitty-specs/hermes-telegram-polling-observability-01M1NJGX/tasks/WP03-status-projections-docs-and-redaction/review-cycle-3.md",
         "reference": "review-cycle://hermes-telegram-polling-observability-01M1NJGX/WP03-status-projections-docs-and-redaction/review-cycle-3.md",
         "reviewer": "codex-parent-wp03-review",
         "verdict": "approved"
       },
-      "role": "reviewer",
-      "shell_pid": 259504,
-      "shell_pid_created_at": "1788714736.08",
-      "subtasks": {
-        "T009": "done",
-        "T010": "done",
-        "T011": "done",
-        "T012": "done"
-      }
+      "shell_pid": 235870,
+      "shell_pid_created_at": "1788712945.94"
     }
   }
 }

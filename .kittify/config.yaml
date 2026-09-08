@@ -3,6 +3,8 @@ project:
   slug: hermes-agent
   node_id: f1da69b66ab4
   build_id: d1032300-c4bb-5715-944f-89fa915fbe1b
+  path_conventions:
+    workspace: gateway/
 vcs:
   type: git
 agents:
@@ -11,6 +13,6 @@ agents:
   auto_commit: true
   lint_on_edit: false
 review:
-  test_command: "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.worktrees/hermes-tg-polling-obs-WP03/.test-venv/bin/python -m pytest tests/gateway/test_status.py --junitxml={output_file} -q"
+  test_command: "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.worktrees/hermes-tg-polling-obs-WP03/.test-venv/bin/python -m pytest tests/gateway/test_status.py tests/gateway/test_api_server.py tests/gateway/test_telegram_error_redaction.py tests/hermes_cli/test_web_server.py::TestWebServerEndpoints tests/gateway/test_telegram_polling_progress.py tests/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_network_reconnect.py tests/gateway/test_telegram_mock_bootstrap.py --junitxml={output_file} -q"
   test_output_format: junit_xml
-  pre_review_test_command: "tests/gateway/test_status.py"
+  pre_review_test_command: "tests/gateway/test_status.py tests/gateway/test_api_server.py tests/gateway/test_telegram_error_redaction.py tests/hermes_cli/test_web_server.py::TestWebServerEndpoints tests/gateway/test_telegram_polling_progress.py tests/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_network_reconnect.py tests/gateway/test_telegram_mock_bootstrap.py"
