@@ -1,0 +1,310 @@
+{
+  "archive": {
+    "format": "tar",
+    "path": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.spec-kitty/evidence/primary-mission-archive-20260905T093406Z/hermes-telegram-polling-observability-01M1NJGX.tar",
+    "verification": {
+      "archive_sha256": "2be14e325f3a82cdb0267d734b179dac80d343d6b48819b4622b771ba16b3c33",
+      "archive_size": 81920,
+      "mismatches": [],
+      "missing_dirs": [],
+      "ok": true,
+      "unexpected": [],
+      "verified_dirs": 6,
+      "verified_files": 19
+    }
+  },
+  "bead": "hermes-tg-polling-obs-gy5",
+  "canonical_lane_c_used": false,
+  "comparison": {
+    "coord_only": [
+      {
+        "path": "acceptance-matrix.json",
+        "sha256": "9ced522ae5e15e8b65ebe57092de3b253e484b1c16463056e53889a4207b8029",
+        "size": 2658
+      },
+      {
+        "path": "analysis-report.md",
+        "sha256": "ba3a4cdebb7468ce8ded95ca90380a3291acfc32be95eb1aa282cc59b22e7215",
+        "size": 3698
+      },
+      {
+        "path": "status.json",
+        "sha256": "55488a7cbfc1e3d00d1fd58830864530cdebca135bec0236f110ae19a7f52a39",
+        "size": 1142
+      }
+    ],
+    "different": [
+      {
+        "coord_sha256": "1b709457ead2e907097420070d816bb9456c62281c082aaa0fd6342780ac01dc",
+        "coord_size": 4463,
+        "path": "status.events.jsonl",
+        "root_sha256": "a181452dae7bffd6990ddd8c7d129a4bfd289bd5994959f2b4960c3006f00581",
+        "root_size": 4715
+      },
+      {
+        "coord_sha256": "5efd7ed5b878341fd8903e3678bb2ae02523261e3b7196970c7b2223c472bd93",
+        "coord_size": 7370,
+        "path": "tasks.md",
+        "root_sha256": "439765731b591ca3a38a035b70c09b51599d1c6e31c1bef7472fa94adca89f1c",
+        "root_size": 7370
+      }
+    ],
+    "identical": [
+      {
+        "path": "checklists/requirements.md",
+        "sha256": "c43f4a4ba51740b3f463f74e124fbbafcc1772867bf7fc2f3f55c3b99e386f5a",
+        "size": 1432
+      },
+      {
+        "path": "contracts/status-projection.md",
+        "sha256": "b3965cf779c591a3bd0145ee1b67db84e5ceb9b8254f62a5b196df0036ab65db",
+        "size": 1188
+      },
+      {
+        "path": "data-model.md",
+        "sha256": "30e51d2d9d936e6dc739bab9946e0735b30dbe8ac236634e8064756d15210dac",
+        "size": 2670
+      },
+      {
+        "path": "lanes.json",
+        "sha256": "e6ccf3d5738761405bbb8cd56f6a1ca94d52b936b804fb6d1d0765e634d431bf",
+        "size": 1745
+      },
+      {
+        "path": "meta.json",
+        "sha256": "affc6620dff77da9f10bfd4fdc349fd0ff3c289a97d8d3912318f00a6a5253ca",
+        "size": 957
+      },
+      {
+        "path": "mission-events.jsonl",
+        "sha256": "cb3fbd935714e588692e8dc474f74de0aab4592112bb209a17114c5f0b3818d3",
+        "size": 1009
+      },
+      {
+        "path": "plan.md",
+        "sha256": "36d9f24dbe593b7c37c66f4bed430e1918258fd2bb15751502cd9910d22cd559",
+        "size": 7285
+      },
+      {
+        "path": "quickstart.md",
+        "sha256": "a6f03ac27738119e22db047e2eecacaeadf1b06fa5d051712ba3ca46a65ed905",
+        "size": 1501
+      },
+      {
+        "path": "research.md",
+        "sha256": "7b7a8da0dee160780bb651f0eba2420fefb1fd6cae9bb6147b53aba22707a070",
+        "size": 4515
+      },
+      {
+        "path": "research/evidence-log.csv",
+        "sha256": "e899d0df3dfab081d54cbd8f4262e240301ac1f01df26befeebd633d2e0b7d8a",
+        "size": 1522
+      },
+      {
+        "path": "research/source-register.csv",
+        "sha256": "8bb4b77532fdc7a4e2462bdab7b98d7d47160046500f3c443417746c52806411",
+        "size": 664
+      },
+      {
+        "path": "spec.md",
+        "sha256": "1003451ccbd84e70aff4ef2876aed33dec269737b1e18c964bd2960934f5b2e3",
+        "size": 7475
+      },
+      {
+        "path": "tasks/.gitkeep",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 0
+      },
+      {
+        "path": "tasks/README.md",
+        "sha256": "846dd9ddee4b2a635772e0258d041a1082506423611cbdafb2ca33eae6a96fe5",
+        "size": 1408
+      },
+      {
+        "path": "tasks/WP01-runtime-status-persistence-contract.md",
+        "sha256": "488f9352d1826cdfc8a0f658592e07fea843fc92d089254d4607890fe4dc2100",
+        "size": 5751
+      },
+      {
+        "path": "tasks/WP02-telegram-polling-progress-recording.md",
+        "sha256": "2ce97015b7195211f00e0498d338f91098a86110969d8452779cc6fa6bbb915c",
+        "size": 6226
+      },
+      {
+        "path": "tasks/WP03-status-projections-docs-and-redaction.md",
+        "sha256": "f53f2d387cb7d9da37d7d67c4df86dd13818ef545ba0eb270337d6a3b7e85a18",
+        "size": 6626
+      }
+    ],
+    "root_only": []
+  },
+  "coord_counts": {
+    "dirs": 5,
+    "files": 22,
+    "rejected_paths": 0,
+    "symlinks": 0,
+    "total_safe_file_bytes": 71305
+  },
+  "coord_head": "fff2f787b735e3eee721e9aa35b9bf72bcc161d8",
+  "coord_inventory_hash": "b94fb1fd85fd55015f5086b44627809dc772b2e2af1e2b17aa03b003bc8d98e5",
+  "coord_rel": ".worktrees/hermes-telegram-polling-observability-01M1NJGX-coord/kitty-specs/hermes-telegram-polling-observability-01M1NJGX",
+  "coord_resolved": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.worktrees/hermes-telegram-polling-observability-01M1NJGX-coord/kitty-specs/hermes-telegram-polling-observability-01M1NJGX",
+  "created_utc": "20260905T093406Z",
+  "main_head": "d9fb7fb49051815158791b2e7b50789fa51398fa",
+  "mission": "hermes-telegram-polling-observability-01M1NJGX",
+  "root": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning",
+  "safety": {
+    "archive_includes_rejected_paths": false,
+    "coord_root_is_symlink": false,
+    "coord_within_root": true,
+    "followed_symlinks": false,
+    "no_git_writes_requested_or_performed": true,
+    "source_preserved_in_place": true,
+    "source_root_is_symlink": false,
+    "source_within_root": true
+  },
+  "source_after_cas_sha256": "402b8371844770dbbeba74226750f8ced711ae1c58b4360c4da8f622e210c2ae",
+  "source_before_cas_sha256": "402b8371844770dbbeba74226750f8ced711ae1c58b4360c4da8f622e210c2ae",
+  "source_inventory": {
+    "cas_sha256": "402b8371844770dbbeba74226750f8ced711ae1c58b4360c4da8f622e210c2ae",
+    "dirs": [
+      {
+        "path": ".",
+        "sha256": "4307d2f75ecb41ea1ffd7f1d1b0edc4e518f2caca566c0327679ddde50ed1efc",
+        "size": 4096
+      },
+      {
+        "path": "checklists",
+        "sha256": "10475a36201d1bef8dc20991b5182605aa667c15c7f2b3478961b170ffd9ceed",
+        "size": 4096
+      },
+      {
+        "path": "contracts",
+        "sha256": "e6202194e8f6f0700b877c3834a272628608ce44502252779cfc6944cc345f08",
+        "size": 4096
+      },
+      {
+        "path": "research",
+        "sha256": "a7d5d745fc45f257b43b839fef7f9495224c7699eeadac50ee8a1238b9a90fc8",
+        "size": 4096
+      },
+      {
+        "path": "tasks",
+        "sha256": "7b609cc811765e773b7e23214d392625feda51d77a68f8f45abb2b9268e7a76e",
+        "size": 4096
+      },
+      {
+        "path": "tasks/WP03-status-projections-docs-and-redaction",
+        "sha256": "e2077f8b0b40823d895719415efe49ccebf9267845065c20973c0f0df0f4cd87",
+        "size": 4096
+      }
+    ],
+    "files": [
+      {
+        "path": "checklists/requirements.md",
+        "sha256": "c43f4a4ba51740b3f463f74e124fbbafcc1772867bf7fc2f3f55c3b99e386f5a",
+        "size": 1432
+      },
+      {
+        "path": "contracts/status-projection.md",
+        "sha256": "b3965cf779c591a3bd0145ee1b67db84e5ceb9b8254f62a5b196df0036ab65db",
+        "size": 1188
+      },
+      {
+        "path": "data-model.md",
+        "sha256": "30e51d2d9d936e6dc739bab9946e0735b30dbe8ac236634e8064756d15210dac",
+        "size": 2670
+      },
+      {
+        "path": "lanes.json",
+        "sha256": "e6ccf3d5738761405bbb8cd56f6a1ca94d52b936b804fb6d1d0765e634d431bf",
+        "size": 1745
+      },
+      {
+        "path": "meta.json",
+        "sha256": "affc6620dff77da9f10bfd4fdc349fd0ff3c289a97d8d3912318f00a6a5253ca",
+        "size": 957
+      },
+      {
+        "path": "mission-events.jsonl",
+        "sha256": "cb3fbd935714e588692e8dc474f74de0aab4592112bb209a17114c5f0b3818d3",
+        "size": 1009
+      },
+      {
+        "path": "plan.md",
+        "sha256": "36d9f24dbe593b7c37c66f4bed430e1918258fd2bb15751502cd9910d22cd559",
+        "size": 7285
+      },
+      {
+        "path": "quickstart.md",
+        "sha256": "a6f03ac27738119e22db047e2eecacaeadf1b06fa5d051712ba3ca46a65ed905",
+        "size": 1501
+      },
+      {
+        "path": "research.md",
+        "sha256": "7b7a8da0dee160780bb651f0eba2420fefb1fd6cae9bb6147b53aba22707a070",
+        "size": 4515
+      },
+      {
+        "path": "research/evidence-log.csv",
+        "sha256": "e899d0df3dfab081d54cbd8f4262e240301ac1f01df26befeebd633d2e0b7d8a",
+        "size": 1522
+      },
+      {
+        "path": "research/source-register.csv",
+        "sha256": "8bb4b77532fdc7a4e2462bdab7b98d7d47160046500f3c443417746c52806411",
+        "size": 664
+      },
+      {
+        "path": "spec.md",
+        "sha256": "1003451ccbd84e70aff4ef2876aed33dec269737b1e18c964bd2960934f5b2e3",
+        "size": 7475
+      },
+      {
+        "path": "status.events.jsonl",
+        "sha256": "a181452dae7bffd6990ddd8c7d129a4bfd289bd5994959f2b4960c3006f00581",
+        "size": 4715
+      },
+      {
+        "path": "tasks.md",
+        "sha256": "439765731b591ca3a38a035b70c09b51599d1c6e31c1bef7472fa94adca89f1c",
+        "size": 7370
+      },
+      {
+        "path": "tasks/.gitkeep",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 0
+      },
+      {
+        "path": "tasks/README.md",
+        "sha256": "846dd9ddee4b2a635772e0258d041a1082506423611cbdafb2ca33eae6a96fe5",
+        "size": 1408
+      },
+      {
+        "path": "tasks/WP01-runtime-status-persistence-contract.md",
+        "sha256": "488f9352d1826cdfc8a0f658592e07fea843fc92d089254d4607890fe4dc2100",
+        "size": 5751
+      },
+      {
+        "path": "tasks/WP02-telegram-polling-progress-recording.md",
+        "sha256": "2ce97015b7195211f00e0498d338f91098a86110969d8452779cc6fa6bbb915c",
+        "size": 6226
+      },
+      {
+        "path": "tasks/WP03-status-projections-docs-and-redaction.md",
+        "sha256": "f53f2d387cb7d9da37d7d67c4df86dd13818ef545ba0eb270337d6a3b7e85a18",
+        "size": 6626
+      }
+    ],
+    "rejected": [],
+    "symlinks": []
+  },
+  "source_rel": "kitty-specs/hermes-telegram-polling-observability-01M1NJGX",
+  "source_resolved": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/kitty-specs/hermes-telegram-polling-observability-01M1NJGX",
+  "source_unchanged": true,
+  "suggested_next_recoverable_move_scope": {
+    "proposal_only": true,
+    "safe_if_accepted": false,
+    "scope": "After separate authorization, move only the primary mirror directory kitty-specs/hermes-telegram-polling-observability-01M1NJGX as a whole, preserving coord and all dirty worktree files; do not remove source in this archive-prep package."
+  }
+}

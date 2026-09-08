@@ -1,0 +1,58 @@
+{
+  "blocked_reason": null,
+  "completed_steps": [
+    "discovery",
+    "specify",
+    "plan"
+  ],
+  "decisions": {
+    "raci:discovery": {
+      "accountable": {
+        "actor_id": null,
+        "actor_type": "human"
+      },
+      "consulted": [],
+      "inferred_rule": "prompt_default",
+      "informed": [],
+      "override_reason": null,
+      "responsible": {
+        "actor_id": null,
+        "actor_type": "llm"
+      },
+      "source": "inferred",
+      "step_id": "discovery"
+    },
+    "raci:specify": {
+      "accountable": {
+        "actor_id": null,
+        "actor_type": "human"
+      },
+      "consulted": [],
+      "inferred_rule": "prompt_default",
+      "informed": [],
+      "override_reason": null,
+      "responsible": {
+        "actor_id": null,
+        "actor_type": "llm"
+      },
+      "source": "inferred",
+      "step_id": "specify"
+    }
+  },
+  "inputs": {
+    "mission_slug": "hermes-telegram-polling-observability-01M1NJGX"
+  },
+  "issued_step_id": "tasks",
+  "mission_id": null,
+  "mission_key": "software-dev",
+  "mission_slug": null,
+  "pending_decisions": {},
+  "policy_snapshot": {
+    "default_route": "same_llm_context",
+    "extras": {},
+    "strictness": "medium"
+  },
+  "run_id": "003725ca2eb84e9faba31ea78b483549",
+  "template_hash": "0b8f1d7165b055dafcbd72af5a2bb02bc2027e35fc5499e7ed4735e8153c9132",
+  "template_path": "/home/openclaw/.local/share/uv/tools/spec-kitty-cli/lib/python3.12/site-packages/specify_cli/missions/software-dev/mission-runtime.yaml"
+}

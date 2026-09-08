@@ -1,0 +1,95 @@
+{
+  "status": "peer_ipc_smoke_passed_web_tests_passed",
+  "verified_at_utc": "2026-09-07T15:04:57Z",
+  "profile_file": "ipc-empty-allowlist.toml",
+  "profile_sha256": "4e2f9f3efc4e87f0bc65dcd9eb280fef260ac86c179bab164245d55246718ff0",
+  "actual_command": [
+    "/home/openclaw/.local/bin/codex",
+    "sandbox",
+    "--permission-profile",
+    "hermes-ipc-test",
+    "--include-managed-config",
+    "--cd",
+    "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.spec-kitty/tools/acceptance-evaluation-37fbfa78a",
+    "--",
+    "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.worktrees/hermes-tg-polling-obs-WP03/.test-venv/bin/python",
+    "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.spec-kitty/tools/acceptance-evaluation-37fbfa78a/peer-ipc-payload.py"
+  ],
+  "private_config_unchanged": true,
+  "controls_and_tests": {
+    "stage": "completed",
+    "web_tests_started": true,
+    "probes": {
+      "ipc": {
+        "socketpair_sent": 1,
+        "socketpair_received": "x",
+        "loop_started": true,
+        "threadsafe_callback_fired": true,
+        "loop_stopped": true
+      },
+      "implementation": {
+        "errno": 30
+      },
+      "root_mission": {
+        "errno": 30
+      },
+      "coord_mission": {
+        "errno": 30
+      },
+      "separate_network_namespace": true,
+      "direct_egress": {
+        "errno": 101
+      },
+      "proxy_egress": {
+        "status": 403,
+        "body": "{\"status\":\"blocked\",\"host\":\"example.invalid\",\"reason\":\"not_allowed_local\",\"decision\":\"deny\",\"source\":\"baseline_policy\",\"protocol\":\"http\",\"port\":80,\"message\":\"Sandbox policy blocks local/private network addresses.\"}"
+      }
+    },
+    "proxy": {
+      "scheme": "http",
+      "host": "127.0.0.1",
+      "port": 45209
+    },
+    "tests": {
+      "exit_code": 0,
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "source_and_refs_preserved": true
+  },
+  "independent_verification": {
+    "mission_preservation": {
+      "refs": true,
+      "tracked_status": true,
+      "mission_regular_files_sha256": true
+    },
+    "twelve_source_hashes_unchanged": true,
+    "ephemeral_proxy_port": 45209,
+    "ephemeral_proxy_still_listening": false,
+    "gateway": "MainPID=1818400\nActiveState=active",
+    "gateway_check_exit_code": 0
+  },
+  "probe_scope_note": "The proxied synthetic example.invalid request received an explicit baseline-policy local/private denial. No HTTP request to a real public website was issued; external proxy default-deny is supported by the loaded empty-allowlist configuration and documented semantics. Direct TEST-NET connection was denied in a separate network namespace.",
+  "compatibility_adjustments": [
+    "Use codex sandbox (not codex sandbox linux) on installed0.153.3.",
+    "The CLI rejected '*' in denied domains; use the documented active-proxy empty-allowlist default deny instead.",
+    "--strict-config is unsupported by codex sandbox; use the explicit named profile, include managed config, local TOML checks, and real enforcement probes.",
+    "Grant read-only access to the exact installed Codex runtime executable, which is outside :minimal."
+  ],
+  "boundaries": {
+    "global_config_changed": false,
+    "credentials_copied": false,
+    "application_code_changed": false,
+    "canonical_matrix_changed": false,
+    "acceptance_executed": false,
+    "merge_or_deploy": false
+  },
+  "candidate_matrix": {
+    "criteria_passed": 8,
+    "criteria_total": 8,
+    "canonical_application_pending": true
+  },
+  "next_step": "Save curated evidence and the historical untracked COORD report through the canonical task workflow, then run acceptance; do not infer acceptance from this smoke or automatically merge/deploy."
+}

@@ -1,0 +1,89 @@
+{
+  "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
+  "mission_number": "",
+  "mission_type": "software-dev",
+  "overall_verdict": "pass",
+  "criteria": [
+    {
+      "criterion_id": "FR-001",
+      "description": "Verify FR-001 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-001; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/status.xml#tests.gateway.test_status.TestGatewayRuntimeStatus::test_write_runtime_status_records_platform_last_successful_poll_at; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_current_polling_generation_success_records_progress",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:10.428662+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-002",
+      "description": "Verify FR-002 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-002; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_current_polling_generation_success_records_progress; .spec-kitty/evidence/acceptance-20260907/ptb.xml#tests.test_telegram_polling_progress_ptb::test_real_base_request_valid_success_envelope_records_progress",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:17.156900+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-003",
+      "description": "Verify FR-003 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-003; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_current_polling_generation_non_empty_success_records_only_timestamp; .spec-kitty/evidence/acceptance-20260907/redaction.xml#tests.gateway.test_telegram_error_redaction::test_polling_progress_status_write_contains_only_timestamp",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:23.340636+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-004",
+      "description": "Verify FR-004 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-004; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_unsuccessful_polling_request_does_not_record_progress[RuntimeError]; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_unsuccessful_polling_request_does_not_record_progress[CancelledError]; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_http_error_response_does_not_record_polling_progress; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_malformed_success_result_does_not_record_polling_progress; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_general_request_success_cannot_record_polling_progress; .spec-kitty/evidence/acceptance-20260907/reconnect.xml#tests.gateway.test_telegram_network_reconnect::test_reconnect_success_waits_for_progress_to_reset_error_count; .spec-kitty/evidence/acceptance-20260907/ptb.xml#tests.test_telegram_polling_progress_ptb::test_real_base_request_unsuccessful_200_envelope_cannot_record_progress[{\"ok\":false,\"result\":[]}-False]; .spec-kitty/evidence/acceptance-20260907/ptb.xml#tests.test_telegram_polling_progress_ptb::test_real_base_request_unsuccessful_200_envelope_cannot_record_progress[{\"ok\":true}-True]",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:29.704606+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-005",
+      "description": "Verify FR-005 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-005; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_late_previous_generation_completion_cannot_heal_current_generation; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_old_polling_child_keeps_generation_when_request_entry_is_delayed; .spec-kitty/evidence/acceptance-20260907/polling.xml#tests.gateway.test_telegram_polling_progress::test_disconnect_fences_verifier_and_late_progress_completion; .spec-kitty/evidence/acceptance-20260907/ptb.xml#tests.test_telegram_polling_progress_ptb::test_real_ptb_stop_cleanup_cannot_heal_recovery_generation",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:36.265737+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-006",
+      "description": "Verify FR-006 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-006; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/junit.xml: both /api/status projection and absent-field cases passed; .spec-kitty/evidence/acceptance-20260907/head-integrated-affected.xml: /health/detailed projection and absence passed in the historical 570-case suite.",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:42.689331+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-007",
+      "description": "Verify FR-007 is satisfied",
+      "proof_type": "automated_test",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-007; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; .spec-kitty/evidence/acceptance-20260907/status.xml#tests.gateway.test_status.TestGatewayRuntimeStatus::test_read_runtime_status_allows_older_platform_record_without_poll_timestamp; .spec-kitty/evidence/acceptance-20260907/status.xml#tests.gateway.test_status.TestGatewayRuntimeStatus::test_write_runtime_status_accepts_none_last_successful_poll_at; .spec-kitty/evidence/acceptance-20260907/status.xml#tests.gateway.test_status.TestGatewayRuntimeStatus::test_write_runtime_status_preserves_poll_timestamp_on_restart",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:49.780204+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    },
+    {
+      "criterion_id": "FR-008",
+      "description": "Verify FR-008 is satisfied",
+      "proof_type": "code_review",
+      "evidence": ".spec-kitty/evidence/acceptance-20260907/acceptance-matrix.candidate.json#FR-008; evaluated code 18420e95a3036fb926eefd3891e92997e0567b05; website/docs/user-guide/messaging/telegram.md:258-283 at lane-c 18420e95a3036fb926eefd3891e92997e0567b05; parent manually checked current-generation getUpdates meaning, empty result, contrast with updated_at, failure/stale exclusions, absence, restart and timestamp-only privacy.",
+      "pass_fail": "pass",
+      "verified_by": "codex-parent-acceptance-evidence",
+      "verified_at": "2026-09-07T17:33:56.175057+00:00",
+      "notes": "TODO: replace with a real acceptance criterion"
+    }
+  ],
+  "negative_invariants": []
+}

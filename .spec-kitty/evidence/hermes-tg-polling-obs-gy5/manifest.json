@@ -1,0 +1,75 @@
+{
+  "mission": "hermes-telegram-polling-observability-01M1NJGX",
+  "bead": "hermes-tg-polling-obs-gy5",
+  "workspace": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.worktrees/hermes-tg-polling-obs-WP03",
+  "branch": "kitty/hermes-tg-polling-obs-WP03",
+  "timestamp_utc": "2026-09-05T08:56:26Z",
+  "code_commit_before_remediation": "d2649a43419d5b1b8cbcb99604f286b03a51fffd",
+  "code_tree_hash_after_test_change": "95bb7df32b08ed05ab79329c220a6413158936de",
+  "commands": [
+    {
+      "name": "direct_restart_preservation",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_status.py::TestGatewayRuntimeStatus::test_write_runtime_status_preserves_poll_timestamp_on_restart --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/status_restart_preservation.xml",
+      "exit_code": 0,
+      "result": "1 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/status_restart_preservation.xml"
+    },
+    {
+      "name": "test_status",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_status.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/test_status.xml",
+      "exit_code": 0,
+      "result": "98 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/test_status.xml"
+    },
+    {
+      "name": "mutation_drop_platforms",
+      "command": ".test-venv/bin/python .spec-kitty/evidence/hermes-tg-polling-obs-gy5/mutation_drop_platforms.py",
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "result": "1 failed as expected: KeyError: 'telegram'",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/mutation_drop_platforms.xml"
+    },
+    {
+      "name": "telegram_polling_progress",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_telegram_polling_progress.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_polling_progress.xml",
+      "exit_code": 0,
+      "result": "24 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_polling_progress.xml"
+    },
+    {
+      "name": "telegram_polling_progress_ptb",
+      "command": ".test-venv/bin/python -m pytest tests/test_telegram_polling_progress_ptb.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_polling_progress_ptb.xml",
+      "exit_code": 0,
+      "result": "8 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_polling_progress_ptb.xml"
+    },
+    {
+      "name": "telegram_network_reconnect",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_telegram_network_reconnect.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_network_reconnect.xml",
+      "exit_code": 0,
+      "result": "42 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_network_reconnect.xml"
+    },
+    {
+      "name": "api_server",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_api_server.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/api_server.xml",
+      "exit_code": 0,
+      "result": "204 passed, 125 warnings",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/api_server.xml"
+    },
+    {
+      "name": "telegram_error_redaction",
+      "command": ".test-venv/bin/python -m pytest tests/gateway/test_telegram_error_redaction.py --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_error_redaction.xml",
+      "exit_code": 0,
+      "result": "8 passed",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/telegram_error_redaction.xml"
+    },
+    {
+      "name": "web_status_projection",
+      "command": ".test-venv/bin/python -m pytest tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_status_projects_telegram_last_successful_poll_at tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_status_accepts_telegram_platform_without_poll_timestamp --junitxml=.spec-kitty/evidence/hermes-tg-polling-obs-gy5/web_status_projection.xml",
+      "exit_code": 0,
+      "result": "2 passed, 1 warning",
+      "junit": ".spec-kitty/evidence/hermes-tg-polling-obs-gy5/web_status_projection.xml"
+    }
+  ]
+}

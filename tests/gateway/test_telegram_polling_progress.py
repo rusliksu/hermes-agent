@@ -44,6 +44,20 @@ def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
 
 
+@pytest.fixture(autouse=True)
+def _capture_runtime_status_writes(monkeypatch):
+    def _capture(self, context, **kwargs):
+        self.__dict__.setdefault("_runtime_status_writes", []).append(
+            (context, kwargs)
+        )
+
+    monkeypatch.setattr(
+        TelegramAdapter,
+        "_write_runtime_status_safe",
+        _capture,
+    )
+
+
 def _mock_polling_app(*, get_me=None):
     app = MagicMock()
     app.updater = MagicMock()
@@ -208,8 +222,11 @@ async def test_webhook_disconnect_polling_reconnect_resets_mode_and_waits_for_pr
 
 
 @pytest.mark.asyncio
-async def test_current_polling_generation_success_records_progress():
+async def test_current_polling_generation_success_records_progress(monkeypatch):
     adapter = _make_adapter()
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:00:00+00:00"
+    )
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 3
     request = _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
@@ -225,6 +242,44 @@ async def test_current_polling_generation_success_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._send_path_degraded is False
     assert generation > 0
+    assert adapter._runtime_status_writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:00:00+00:00"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_current_polling_generation_non_empty_success_records_only_timestamp(
+    monkeypatch,
+):
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:01:00+00:00"
+    )
+    generation, progress = adapter._begin_polling_generation()
+    request = _ControlledRequest(
+        result=(
+            200,
+            b'{"ok":true,"result":[{"update_id":12345,"message":{"chat":{"id":67890}}}]}',
+        )
+    )
+
+    result = await _request_for_generation(
+        generation,
+        adapter._instrument_polling_request(request),
+        "https://api.telegram.org/getUpdates",
+    )
+
+    assert result[0] == 200
+    assert progress.is_set()
+    assert adapter._runtime_status_writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:01:00+00:00"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -245,6 +300,7 @@ async def test_unsuccessful_polling_request_does_not_record_progress(error_type)
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 3
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
@@ -264,6 +320,27 @@ async def test_http_error_response_does_not_record_polling_progress():
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 3
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_success_result_does_not_record_polling_progress():
+    adapter = _make_adapter()
+    generation, progress = adapter._begin_polling_generation()
+    adapter._polling_network_error_count = 3
+    request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":{"update_id":12345}}'))
+    )
+
+    result = await _request_for_generation(
+        generation, request, "https://api.telegram.org/getUpdates"
+    )
+
+    assert result == (200, b'{"ok":true,"result":{"update_id":12345}}')
+    assert not progress.is_set()
+    assert adapter._polling_network_error_count == 3
+    assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
@@ -315,6 +392,7 @@ async def test_general_request_success_cannot_record_polling_progress(monkeypatc
     assert await adapter.connect() is False
     assert builder.general_request is _ControlledRequest.instances[0]
     assert builder.polling_request is _ControlledRequest.instances[1]
+    adapter._runtime_status_writes.clear()
 
     builder.general_request.result = (200, b'{"ok":true}')
     result = await builder.general_request.do_request("https://api.telegram.org/sendMessage")
@@ -322,6 +400,7 @@ async def test_general_request_success_cannot_record_polling_progress(monkeypatc
     assert result == (200, b'{"ok":true}')
     assert not progress.is_set()
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
@@ -351,6 +430,7 @@ async def test_late_previous_generation_completion_cannot_heal_current_generatio
     assert not progress_2.is_set()
     assert adapter._polling_network_error_count == 4
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio

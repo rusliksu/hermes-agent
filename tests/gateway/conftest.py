@@ -32,6 +32,8 @@ incident.
 """
 
 import ast
+import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -51,13 +53,40 @@ def make_async_session_db(sync_mock=None):
 def _ensure_telegram_mock() -> None:
     """Install a comprehensive telegram mock in sys.modules.
 
-    Idempotent — skips when the real library is already imported.
+    Idempotent — skips when the real library is available.
     Uses ``sys.modules[name] = mod`` (overwrite) instead of
     ``setdefault`` so it wins even if a partial/broken import
     already cached a module with ``ChatType = None``.
     """
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return  # Real library is installed — nothing to mock
+    if "telegram" in sys.modules and isinstance(
+        getattr(sys.modules["telegram"], "__file__", None), str
+    ):
+        return  # Real library is already imported — nothing to mock
+
+    if "telegram" in sys.modules:
+        for name in (
+            "telegram",
+            "telegram.ext",
+            "telegram.constants",
+            "telegram.request",
+            "telegram.error",
+        ):
+            module = sys.modules.get(name)
+            if module is not None and not isinstance(
+                getattr(module, "__file__", None), str
+            ):
+                sys.modules.pop(name, None)
+
+    if importlib.util.find_spec("telegram") is not None:
+        for name in (
+            "telegram",
+            "telegram.ext",
+            "telegram.constants",
+            "telegram.request",
+            "telegram.error",
+        ):
+            importlib.import_module(name)
+        return
 
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
@@ -464,4 +493,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

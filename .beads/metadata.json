@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "hermes_tg_polling_obs",
+  "project_id": "c58bb979-a844-45d3-b1a8-ff85b333231b"
+}

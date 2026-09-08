@@ -12,6 +12,20 @@ from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+@pytest.fixture(autouse=True)
+def _capture_runtime_status_writes(monkeypatch):
+    def _capture(self, context, **kwargs):
+        self.__dict__.setdefault("_runtime_status_writes", []).append(
+            (context, kwargs)
+        )
+
+    monkeypatch.setattr(
+        TelegramAdapter,
+        "_write_runtime_status_safe",
+        _capture,
+    )
+
+
 class _GeneralRequest(BaseRequest):
     @property
     def read_timeout(self):
@@ -146,6 +160,7 @@ async def test_real_base_request_invalid_200_body_cannot_record_progress():
     assert adapter._polling_network_error_count == 4
     assert adapter._polling_conflict_count == 3
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
@@ -169,11 +184,15 @@ async def test_real_base_request_bom_rejected_by_ptb_cannot_record_progress():
     assert adapter._polling_network_error_count == 4
     assert adapter._polling_conflict_count == 3
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
-async def test_real_base_request_ptb_replacement_decode_records_progress():
+async def test_real_base_request_ptb_replacement_decode_records_progress(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:02:00+00:00"
+    )
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
@@ -192,6 +211,12 @@ async def test_real_base_request_ptb_replacement_decode_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._polling_conflict_count == 0
     assert adapter._send_path_degraded is False
+    assert adapter._runtime_status_writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:02:00+00:00"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -227,11 +252,15 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
     assert adapter._polling_network_error_count == 4
     assert adapter._polling_conflict_count == 3
     assert adapter._send_path_degraded is True
+    assert getattr(adapter, "_runtime_status_writes", []) == []
 
 
 @pytest.mark.asyncio
-async def test_real_base_request_valid_success_envelope_records_progress():
+async def test_real_base_request_valid_success_envelope_records_progress(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    monkeypatch.setattr(
+        tg_adapter, "_utc_now_iso", lambda: "2026-09-04T19:03:00+00:00"
+    )
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
@@ -252,6 +281,12 @@ async def test_real_base_request_valid_success_envelope_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._polling_conflict_count == 0
     assert adapter._send_path_degraded is False
+    assert adapter._runtime_status_writes == [
+        (
+            "polling_progress",
+            {"last_successful_poll_at": "2026-09-04T19:03:00+00:00"},
+        )
+    ]
 
 
 @pytest.mark.asyncio

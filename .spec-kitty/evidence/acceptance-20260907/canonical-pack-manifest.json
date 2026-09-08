@@ -1,0 +1,99 @@
+{
+  "status": "prepared_not_applied",
+  "mission": "hermes-telegram-polling-observability-01M1NJGX",
+  "beads_id": "hermes-tg-polling-obs-gy5",
+  "evaluation_head": "18420e95a3036fb926eefd3891e92997e0567b05",
+  "fresh_test_cases": 33,
+  "historical_test_cases": 570,
+  "historical_not_a_fresh_rerun": true,
+  "files": [
+    {
+      "source": "acceptance-proof-split/status.xml",
+      "archive_name": "status.xml",
+      "bytes": 898,
+      "sha256": "0bf3cc180dac9af312a8b39dc44767f96677d47348d393c3500911a27dbd776a"
+    },
+    {
+      "source": "acceptance-proof-split/polling.xml",
+      "archive_name": "polling.xml",
+      "bytes": 1802,
+      "sha256": "bd0c3ff05b02326e4f520c64968fc35ea5398dbaf3321e54796f1f564843592d"
+    },
+    {
+      "source": "acceptance-proof-split/ptb.xml",
+      "archive_name": "ptb.xml",
+      "bytes": 1525,
+      "sha256": "efe7e47d853cbeff15954257ac11acf622414744514a0eb20feb4353353c86c1"
+    },
+    {
+      "source": "acceptance-proof-split/redaction.xml",
+      "archive_name": "redaction.xml",
+      "bytes": 1374,
+      "sha256": "542f5c9f32dbce9e8cd8c7d805608b7b1cdbf3228b49a861985ebee8b2d5870f"
+    },
+    {
+      "source": "acceptance-proof-split/reconnect.xml",
+      "archive_name": "reconnect.xml",
+      "bytes": 402,
+      "sha256": "05ed109c7b49935db4858747e757795f6ab425b06421778b0020db400c87deb6"
+    },
+    {
+      "source": "peer-ipc-smoke/junit.xml",
+      "archive_name": "junit.xml",
+      "bytes": 572,
+      "sha256": "236a31a8c0e1d4ad245b3dceb6c45c6be41544c643c998ad1c389b0ec8d7f33d"
+    },
+    {
+      "source": "peer-ipc-outcome.json",
+      "archive_name": "peer-ipc-outcome.json",
+      "bytes": 3811,
+      "sha256": "962f88c7b51e1356763af6ad33a157ff0660f3deb405be146dc13c259d40c1cb"
+    },
+    {
+      "source": "head-integrated-affected.xml",
+      "archive_name": "head-integrated-affected.xml",
+      "bytes": 82045,
+      "sha256": "3c4c65dddebd026d7e7edb07d7142ec7671db84a82d5d7f57e32a3b32ae91219"
+    },
+    {
+      "source": "wp03-parent-review.md",
+      "archive_name": "wp03-parent-review.md",
+      "bytes": 1006,
+      "sha256": "dfa710552ad01c5567b56fef62eabf3fb2a080bcf1a02c6c8cb632fa92ac139b"
+    },
+    {
+      "source": "acceptance-matrix.candidate.json",
+      "archive_name": "acceptance-matrix.candidate.json",
+      "bytes": 10224,
+      "sha256": "77bff760180df6990ba9349079f100fefceedbaf849bfe0e55ec0ad6d4ba437f"
+    },
+    {
+      "source": "recovery-report-20260906.md",
+      "archive_name": "recovery-report-20260906.md",
+      "bytes": 3199,
+      "sha256": "096d00a4a8b6f55d1eca7290764746bf748771aa8ee2e4e386788396147ad629"
+    }
+  ],
+  "proposed_evidence_directory": ".spec-kitty/evidence/acceptance-20260907",
+  "canonical_writer": "agent mission acceptance-verdict",
+  "writer_preserves": [
+    "criterion_id",
+    "description",
+    "notes",
+    "negative_invariants"
+  ],
+  "write_sequence": [
+    "Preflight exact ROOT/COORD/lane heads, task ownership and absence of competing writer; preserve historical report SHA.",
+    "Save only the allowlisted bundle files on COORD and commit exact evidence paths including the historical untracked report.",
+    "Record FR-001..FR-008 individually via pinned CLI with fresh private HOME and permanent evidence paths. Verify routed destination and cumulative prior verdicts after every command.",
+    "Run accept --diagnose under no-network, read-only mission boundary; stop before normal acceptance, merge, push, deploy or cleanup."
+  ],
+  "canonical_matrix_changed": false,
+  "normal_acceptance_executed": false,
+  "notes": [
+    "Canonical descriptions are existing requirement-ID placeholders. Do not hand-edit them through verdict CLI; full requirement meanings remain in approved spec and candidate proof mapping.",
+    "The eight passing candidate rows are evidence, not an acceptance verdict.",
+    "The active empty-allowlist proxy was tested with a synthetic .invalid local/private denial, not a real public-domain request.",
+    "The broad read-only preflight hit its 240-second timeout after actual Git/source observations; no mutation was requested or performed."
+  ]
+}

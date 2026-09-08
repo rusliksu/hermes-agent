@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.598" timestamp="2026-09-05T10:56:21.333372+02:00" hostname="hostkey-codex"><testcase classname="tests.gateway.test_status.TestGatewayRuntimeStatus" name="test_write_runtime_status_preserves_poll_timestamp_on_restart" time="0.008"><failure message="KeyError: 'telegram'">self = &lt;test_status.TestGatewayRuntimeStatus object at 0x72f337991010&gt;
+tmp_path = PosixPath('/tmp/pytest-of-openclaw/pytest-6502/test_write_runtime_status_pres0')
+monkeypatch = &lt;_pytest.monkeypatch.MonkeyPatch object at 0x72f33812c290&gt;
+
+    def test_write_runtime_status_preserves_poll_timestamp_on_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """Restart metadata refresh must not erase prior platform poll progress."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        timestamp = "2026-09-04T19:00:00+00:00"
+    
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "gateway_state": "running",
+            "pid": 99999,
+            "start_time": 1000.0,
+            "kind": "hermes-gateway",
+            "argv": ["/old/path/hermes", "gateway", "run"],
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "last_successful_poll_at": timestamp,
+                    "updated_at": "2026-09-04T19:01:00+00:00",
+                }
+            },
+            "updated_at": "2026-09-04T19:01:00+00:00",
+        }))
+    
+        monkeypatch.setattr(status.sys, "argv", ["/new/path/hermes", "gateway", "run"])
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 2000)
+    
+        status.write_runtime_status(gateway_state="running")
+    
+        payload = status.read_runtime_status()
+&gt;       telegram = payload["platforms"]["telegram"]
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'telegram'
+
+tests/gateway/test_status.py:493: KeyError</failure></testcase></testsuite></testsuites>

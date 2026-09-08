@@ -1,0 +1,53 @@
+{
+  "wp_id": "WP02",
+  "captured_at": "2026-09-06T14:33:32Z",
+  "base_branch": "436c62f99",
+  "base_commit": "436c62f99f3aa0ac2b1b19f7c5990ada09efb0b2",
+  "test_runner": "pytest",
+  "total": 72,
+  "passed": 64,
+  "failed": 8,
+  "skipped": 0,
+  "failures": [
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_invalid_200_body_cannot_record_progress",
+      "error": "TypeError: object MagicMock can't be used in 'await' expression",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_bom_rejected_by_ptb_cannot_record_progress",
+      "error": "RuntimeError: coroutine raised StopIteration",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_ptb_replacement_decode_records_progress",
+      "error": "RuntimeError: coroutine raised StopIteration",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_unsuccessful_200_envelope_cannot_record_progress[{\"ok\":false,\"result\":[]}-False]",
+      "error": "RuntimeError: coroutine raised StopIteration",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_unsuccessful_200_envelope_cannot_record_progress[{\"ok\":true}-True]",
+      "error": "RuntimeError: coroutine raised StopIteration",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_base_request_valid_success_envelope_records_progress",
+      "error": "RuntimeError: coroutine raised StopIteration",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_slotted_request_instrumented_without_read_only_error",
+      "error": "TypeError: object MagicMock can't be used in 'await' expression",
+      "file": "unknown:?"
+    },
+    {
+      "test": "tests.test_telegram_polling_progress_ptb.test_real_ptb_stop_cleanup_cannot_heal_recovery_generation",
+      "error": "TypeError: object MagicMock can't be used in 'await' expression",
+      "file": "unknown:?"
+    }
+  ]
+}

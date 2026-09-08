@@ -27,6 +27,10 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -2528,6 +2532,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count = 0
         self._polling_conflict_count = 0
         self._send_path_degraded = False
+        self._write_runtime_status_safe(
+            "polling_progress",
+            last_successful_poll_at=_utc_now_iso(),
+        )
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -2549,7 +2557,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if (
             isinstance(envelope, dict)
             and envelope.get("ok") is True
-            and "result" in envelope
+            and isinstance(envelope.get("result"), list)
         ):
             self._record_polling_progress(generation)
 

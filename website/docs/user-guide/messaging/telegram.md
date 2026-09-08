@@ -255,6 +255,33 @@ For **cloud deployments** (Fly.io, Railway, Render, etc.), **webhook mode** is m
 | Setup | No extra config | Set `TELEGRAM_WEBHOOK_URL` |
 | Idle cost | Machine must stay running | Machine can sleep between messages |
 
+### Polling progress status
+
+When Telegram runs in long-polling mode, existing gateway status surfaces may
+show `last_successful_poll_at` under the Telegram platform status. This is the
+UTC time when the adapter accepted a successful current-generation
+`getUpdates` response from Telegram.
+
+Empty successful polling responses count as progress. A timestamp therefore
+means the polling request loop reached Telegram and received a valid successful
+response, even if there were no messages waiting.
+
+This value is different from gateway `updated_at`. `updated_at` changes when
+the gateway writes general runtime status; `last_successful_poll_at` changes
+only after accepted `getUpdates` polling progress. Startup, reconnect attempts,
+`getMe`, verifier checks, send-message calls, HTTP errors, Telegram `ok: false`
+responses, parse failures, timeouts, and stale polling generations do not
+advance it.
+
+If the field is absent, Hermes has no successful Telegram polling progress
+recorded in the readable runtime status file. A gateway restart does not create
+a synthetic timestamp; a previous persisted value can remain as historical
+evidence until a later real polling success overwrites it.
+
+The status field contains only this timestamp. It does not include Telegram
+update payloads, update counts, user IDs, chat IDs, bot-token fragments, request
+URLs, query strings, or exception text.
+
 ### Configuration
 
 Add the following to `~/.hermes/.env`:

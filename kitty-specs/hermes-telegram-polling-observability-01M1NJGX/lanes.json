@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
+  "mission_id": "01M1NJGX3JWAYHHRJT4FRMFXDE",
+  "mission_branch": "kitty/mission-hermes-telegram-polling-observability-01M1NJGX",
+  "target_branch": "codex/hermes-telegram-polling-planning-root",
+  "lanes": [
+    {
+      "lane_id": "lane-a",
+      "wp_ids": [
+        "WP01"
+      ],
+      "write_scope": [
+        "gateway/status.py",
+        "tests/gateway/test_status.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "workspace"
+      ],
+      "depends_on_lanes": [],
+      "parallel_group": 0
+    },
+    {
+      "lane_id": "lane-b",
+      "wp_ids": [
+        "WP02"
+      ],
+      "write_scope": [
+        "plugins/platforms/telegram/adapter.py",
+        "tests/gateway/test_telegram_network_reconnect.py",
+        "tests/gateway/test_telegram_polling_progress.py",
+        "tests/test_telegram_polling_progress_ptb.py"
+      ],
+      "predicted_surfaces": [
+        "api"
+      ],
+      "depends_on_lanes": [
+        "lane-a"
+      ],
+      "parallel_group": 1
+    },
+    {
+      "lane_id": "lane-c",
+      "wp_ids": [
+        "WP03"
+      ],
+      "write_scope": [
+        "gateway/platforms/api_server.py",
+        "hermes_cli/web_server.py",
+        "tests/gateway/test_api_server.py",
+        "tests/gateway/test_telegram_error_redaction.py",
+        "tests/hermes_cli/test_web_server.py",
+        "website/docs/user-guide/messaging/telegram.md"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "artifact-rendering",
+        "dashboard",
+        "tracker-integration"
+      ],
+      "depends_on_lanes": [
+        "lane-a",
+        "lane-b"
+      ],
+      "parallel_group": 2
+    }
+  ],
+  "computed_at": "2026-09-07T21:26:43.583036+00:00",
+  "computed_from": "dependency_graph+ownership",
+  "planning_artifact_wps": [],
+  "planning_commit_sha": null
+}
