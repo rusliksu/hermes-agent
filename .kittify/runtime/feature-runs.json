@@ -1,0 +1,10 @@
+{
+  "hermes-telegram-polling-observability-01M1NJGX": {
+    "mission_id": "01M1NJGX3JWAYHHRJT4FRMFXDE",
+    "mission_key": "software-dev",
+    "mission_slug": "hermes-telegram-polling-observability-01M1NJGX",
+    "mission_type": "software-dev",
+    "run_dir": "/home/openclaw/standalone/hermes-telegram-polling-observability-planning/.kittify/runtime/runs/003725ca2eb84e9faba31ea78b483549",
+    "run_id": "003725ca2eb84e9faba31ea78b483549"
+  }
+}

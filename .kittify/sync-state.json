@@ -1,0 +1,15 @@
+{
+  "last_saas_confirmed_hash": null,
+  "pending_local_commits": [
+    {
+      "type": "LocalCommit",
+      "git_hash": "ae5b8dddc6bc498e06a622447f49b19d3f69b4c6",
+      "mission_id": "hermes-telegram-polling-observability-01M1NJGX",
+      "build_id": "d1032300-c4bb-5715-944f-89fa915fbe1b",
+      "changed_files": [
+        "kitty-specs/hermes-telegram-polling-observability-01M1NJGX/acceptance-matrix.json"
+      ],
+      "committed_at": "2026-09-04T19:58:46.608895+00:00"
+    }
+  ]
+}

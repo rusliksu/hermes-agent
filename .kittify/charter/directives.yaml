@@ -1,0 +1,12 @@
+# Auto-generated from charter.md — do not edit directly.
+# Run 'spec-kitty charter sync' to regenerate.
+
+directives:
+- id: DIR-001
+  title: 'Respect risk boundaries: Persist only a privacy-sa'
+  description: 'Respect risk boundaries: Persist only a privacy-safe UTC timestamp for successful current-generation dedicated Telegram getUpdates HTTP/API results. Do not persist payloads, Telegram IDs, bot tokens, URLs, query strings, retry errors, timeout details, or stale-generation observations.'
+  severity: warn
+- id: DIR-002
+  title: 'Keep documentation synchronized with workflow and '
+  description: 'Keep documentation synchronized with workflow and behavior changes: Product-facing documentation duty must be identified when a user-visible status field is introduced or exposed through existing status surfaces.'
+  severity: warn
