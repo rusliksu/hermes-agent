@@ -8,8 +8,6 @@ rather than silently leaving polling dead.
 
 import ast
 import asyncio
-import importlib
-import importlib.util
 from pathlib import Path
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,16 +18,7 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
-    existing = sys.modules.get("telegram")
-    if existing is not None and isinstance(getattr(existing, "__file__", None), str):
-        return
-    if "telegram" in sys.modules:
-        for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-            module = sys.modules.get(name)
-            if module is not None and not isinstance(getattr(module, "__file__", None), str):
-                sys.modules.pop(name, None)
-    if importlib.util.find_spec("telegram") is not None:
-        importlib.import_module("telegram")
+    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
         return
 
     telegram_mod = MagicMock()
