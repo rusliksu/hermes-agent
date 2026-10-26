@@ -3,11 +3,53 @@
 import sqlite3
 import time
 import json
+import multiprocessing as mp
+import queue
+from pathlib import Path
+
 import pytest
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
+
+def _gateway_routing_claim_worker(
+    db_path: str,
+    rounds: int,
+    barrier,
+    result_queue,
+    worker_id: int,
+) -> None:
+    """Spawn-safe contender for the real SQLite routing claim."""
+    contender = SessionDB(db_path=Path(db_path))
+    try:
+        for round_id in range(rounds):
+            candidate = json.dumps(
+                {"round": round_id, "worker": worker_id},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            barrier.wait(timeout=30)
+            started = time.monotonic()
+            claimed, canonical = contender.claim_gateway_routing_entry(
+                f"shared-operation-{round_id}",
+                candidate,
+                scope="atomic-claim-test",
+            )
+            result_queue.put(
+                (
+                    round_id,
+                    worker_id,
+                    claimed,
+                    canonical,
+                    time.monotonic() - started,
+                )
+            )
+            barrier.wait(timeout=30)
+    except BaseException as exc:
+        result_queue.put(("worker_error", worker_id, type(exc).__name__, None, -1.0))
+    finally:
+        contender.close()
 
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
@@ -6151,3 +6193,134 @@ class TestGetMessagesPagination:
         self._seed(db, n=5)
         rows = db.get_messages("s1", offset=3)
         assert [m["content"] for m in rows] == ["msg-3", "msg-4"]
+
+class TestGatewayRoutingAtomicClaim:
+    def test_first_claim_wins_and_conflict_returns_original_exact_binding(self, db):
+        first = '{"binding":"first"}'
+        conflicting = '{"binding":"second"}'
+
+        assert db.claim_gateway_routing_entry(
+            "operation", first, scope="broadcast"
+        ) == (True, first)
+        assert db.claim_gateway_routing_entry(
+            "operation", conflicting, scope="broadcast"
+        ) == (False, first)
+        assert db.load_gateway_routing_entry(
+            "operation", scope="broadcast"
+        ) == first
+        assert db.load_gateway_routing_entries(scope="broadcast") == {
+            "operation": first
+        }
+
+    @pytest.mark.parametrize(
+        ("session_key", "entry_json", "scope"),
+        [
+            ("", "{}", "broadcast"),
+            ("   ", "{}", "broadcast"),
+            (None, "{}", "broadcast"),
+            ("operation", "", "broadcast"),
+            ("operation", "   ", "broadcast"),
+            ("operation", None, "broadcast"),
+            ("operation", "{}", None),
+        ],
+    )
+    def test_invalid_claim_is_fail_closed_without_a_row(
+        self, db, session_key, entry_json, scope
+    ):
+        assert db.claim_gateway_routing_entry(
+            session_key, entry_json, scope=scope
+        ) == (False, None)
+        assert db.load_gateway_routing_entries(scope="broadcast") == {}
+
+    def test_claim_survives_close_reopen_and_independent_connection(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        first = SessionDB(db_path=db_path)
+        second = SessionDB(db_path=db_path)
+        try:
+            assert first.claim_gateway_routing_entry(
+                "operation", "first", scope="broadcast"
+            ) == (True, "first")
+            assert second.claim_gateway_routing_entry(
+                "operation", "second", scope="broadcast"
+            ) == (False, "first")
+        finally:
+            first.close()
+            second.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.load_gateway_routing_entry(
+                "operation", scope="broadcast"
+            ) == "first"
+        finally:
+            reopened.close()
+
+    def test_spawned_processes_have_one_winner_per_round(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        initialized = SessionDB(db_path=db_path)
+        initialized.close()
+
+        ctx = mp.get_context("spawn")
+        barrier = ctx.Barrier(9)
+        result_queue = ctx.Queue()
+        rounds = 20
+        processes = [
+            ctx.Process(
+                target=_gateway_routing_claim_worker,
+                args=(
+                    str(db_path),
+                    rounds,
+                    barrier,
+                    result_queue,
+                    worker_id,
+                ),
+            )
+            for worker_id in range(8)
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+
+            for round_id in range(rounds):
+                barrier.wait(timeout=30)
+                deadline = time.monotonic() + 2.0
+                outcomes = []
+                for _ in processes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AssertionError(
+                            f"atomic claim contenders timed out in round {round_id}"
+                        )
+                    try:
+                        outcomes.append(result_queue.get(timeout=remaining))
+                    except queue.Empty as exc:
+                        raise AssertionError(
+                            f"atomic claim contenders timed out in round {round_id}"
+                        ) from exc
+
+                assert all(outcome[0] == round_id for outcome in outcomes), outcomes
+                assert sum(bool(outcome[2]) for outcome in outcomes) == 1
+                assert len({outcome[3] for outcome in outcomes}) == 1
+                assert all(outcome[4] < 2.0 for outcome in outcomes)
+                barrier.wait(timeout=30)
+        finally:
+            for process in processes:
+                process.join(timeout=5)
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        assert all(process.exitcode == 0 for process in processes)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            rows = reopened.load_gateway_routing_entries(scope="atomic-claim-test")
+        finally:
+            reopened.close()
+        assert len(rows) == rounds
+        assert all(
+            json.loads(raw)["round"] == int(session_key.rsplit("-", 1)[1])
+            for session_key, raw in rows.items()
+        )
+
