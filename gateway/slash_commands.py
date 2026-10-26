@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import hashlib
 import inspect
 import logging
@@ -5407,3 +5408,202 @@ class GatewaySlashCommandsMixin:
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
+
+    @staticmethod
+    def _family_broadcast_command_error(error_code: str) -> str:
+        return json.dumps(
+            {"success": False, "error_code": error_code},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _family_broadcast_command_result(cls, value: Any) -> str:
+        """Serialize only the operation's redacted public contract."""
+        generic = cls._family_broadcast_command_error("operation_failed")
+        if not isinstance(value, dict) or type(value.get("success")) is not bool:
+            return generic
+
+        simple_error_codes = {
+            "invalid_request",
+            "access_denied",
+            "registry_unavailable",
+            "binding_unavailable",
+            "record_invalid",
+            "storage_unavailable",
+            "claim_failed",
+        }
+        if frozenset(value) == frozenset({"success", "error_code"}):
+            error_code = value["error_code"]
+            if (
+                value["success"] is not False
+                or type(error_code) is not str
+                or error_code not in simple_error_codes
+            ):
+                return generic
+            safe_result = {
+                "success": False,
+                "error_code": error_code,
+            }
+            return json.dumps(
+                safe_result,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        delivery_state = value.get("delivery_state")
+        if type(delivery_state) is not str:
+            return generic
+        expected_keys = {
+            "success",
+            "replayed",
+            "delivery_state",
+            "recipient_count",
+            "receipts",
+        }
+        if delivery_state == "failed":
+            expected_keys.add("error_code")
+        if frozenset(value) != frozenset(expected_keys):
+            return generic
+        if (
+            type(value.get("replayed")) is not bool
+            or type(value.get("recipient_count")) is not int
+            or value["recipient_count"] < 1
+            or delivery_state not in {"claimed", "completed", "failed"}
+        ):
+            return generic
+
+        receipts = value.get("receipts")
+        if not isinstance(receipts, list) or len(receipts) != value["recipient_count"]:
+            return generic
+        safe_receipts = []
+        for ordinal, receipt in enumerate(receipts, start=1):
+            if (
+                not isinstance(receipt, dict)
+                or frozenset(receipt) != frozenset({"ordinal", "status"})
+                or type(receipt.get("ordinal")) is not int
+                or receipt["ordinal"] != ordinal
+                or type(receipt.get("status")) is not str
+                or receipt.get("status") not in {
+                    "incomplete",
+                    "delivered",
+                    "failed",
+                }
+            ):
+                return generic
+            safe_receipts.append(
+                {"ordinal": ordinal, "status": receipt["status"]}
+            )
+
+        statuses = [receipt["status"] for receipt in safe_receipts]
+        if delivery_state == "claimed":
+            valid_state = value["success"] is True and all(
+                status == "incomplete" for status in statuses
+            )
+        elif delivery_state == "completed":
+            valid_state = value["success"] is True and all(
+                status == "delivered" for status in statuses
+            )
+        else:
+            error_code = value.get("error_code")
+            valid_state = (
+                value["success"] is False
+                and type(error_code) is str
+                and error_code == "delivery_failed"
+                and "failed" in statuses
+                and all(status in {"delivered", "failed"} for status in statuses)
+            )
+        if not valid_state:
+            return generic
+
+        safe_result = {
+            "success": value["success"],
+            "replayed": value["replayed"],
+            "delivery_state": delivery_state,
+            "recipient_count": value["recipient_count"],
+            "receipts": safe_receipts,
+        }
+        if delivery_state == "failed":
+            safe_result["error_code"] = "delivery_failed"
+        return json.dumps(
+            safe_result,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    async def _handle_family_broadcast_command(self, event: MessageEvent) -> str:
+        """Run the fixed family operation from trusted gateway state only."""
+        raw_args = event.get_command_args() or ""
+        if (
+            event.message_type != MessageType.TEXT
+            or bool(event.media_urls)
+            or bool(event.media_types)
+        ):
+            return self._family_broadcast_command_error("invalid_request")
+        try:
+            tokens = shlex.split(raw_args)
+        except ValueError:
+            return self._family_broadcast_command_error("invalid_request")
+        if len(tokens) != 1:
+            return self._family_broadcast_command_error("invalid_request")
+        operation_key = tokens[0]
+        if (
+            not operation_key
+            or len(operation_key) > 4096
+            or operation_key.startswith(("-", "{", "["))
+            or "=" in operation_key
+        ):
+            return self._family_broadcast_command_error("invalid_request")
+        if ":" in operation_key:
+            selector, _separator, _value = operation_key.partition(":")
+            if selector.strip().lower().replace("-", "_") in {
+                "body",
+                "capability",
+                "chat_id",
+                "content",
+                "file",
+                "media",
+                "message",
+                "owner",
+                "principal",
+                "profile",
+                "recipient",
+                "role",
+                "scope",
+                "session",
+                "target",
+                "text",
+            }:
+                return self._family_broadcast_command_error("invalid_request")
+
+        from gateway.access_registry import AccessRegistry, ResolvedAccessContext
+
+        registry = getattr(self, "access_registry", None)
+        if type(registry) is not AccessRegistry:
+            return self._family_broadcast_command_error("registry_unavailable")
+        caller_context = getattr(event.source, "resolved_access_context", None)
+        if (
+            type(caller_context) is not ResolvedAccessContext
+            or caller_context.role_id != "owner"
+        ):
+            return self._family_broadcast_command_error("access_denied")
+
+        from tools.send_message_tool import family_broadcast_operation
+
+        try:
+            result = await asyncio.to_thread(
+                family_broadcast_operation,
+                {
+                    "operation_key": operation_key,
+                },
+                caller_context=caller_context,
+                access_registry=registry,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Family broadcast operation failed closed: error=%s",
+                type(exc).__name__,
+            )
+            return self._family_broadcast_command_error("operation_failed")
+        return self._family_broadcast_command_result(result)
+

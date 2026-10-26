@@ -120,6 +120,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
+    CommandDef(
+        "family-broadcast",
+        "Deliver the server-owned family broadcast once",
+        "Session",
+        aliases=("family_broadcast",),
+        args_hint="<operation-key>",
+        gateway_only=True,
+    ),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
@@ -1169,7 +1177,18 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - settings: Telegram's inline topic-settings card; Slack can still use
 #     /hermes settings and the typed /model, /reasoning, and /fast commands.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "settings"})
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup",
+    "moa",
+    "debug",
+    "settings",
+    "egress",
+    "init",
+    "version",
+    "diff",
+    "update",
+    "family-broadcast",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -10090,6 +10090,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Setting a new goal text mid-run is rejected with the same
             # "wait or /stop" message as /model so we don't race a second
             # continuation prompt against the current turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "family-broadcast":
+                return await self._handle_family_broadcast_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 _goal_arg = (event.get_command_args() or "").strip().lower()
                 _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
@@ -10646,6 +10649,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "family-broadcast":
+            return await self._handle_family_broadcast_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
