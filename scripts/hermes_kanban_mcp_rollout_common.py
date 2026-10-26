@@ -79,10 +79,13 @@ def canonical_path(raw: str, label: str, *, must_exist: bool) -> Path:
 
 
 def _home_directory() -> Path:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return Path.home().resolve(strict=True)
     try:
         import pwd
 
-        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        return Path(pwd.getpwuid(getuid()).pw_dir).resolve(strict=True)
     except (ImportError, KeyError, OSError):
         return Path.home().resolve(strict=True)
 

@@ -309,11 +309,12 @@ def _stderr_reason(stderr: bytes) -> str:
 def _signal_child(
     child: subprocess.Popen[bytes], process_group: int | None, sig: signal.Signals
 ) -> str | None:
+    killpg = getattr(os, "killpg", None)
     try:
-        if process_group is None:
+        if process_group is None or killpg is None:
             child.send_signal(sig)
         else:
-            os.killpg(process_group, sig)
+            killpg(process_group, sig)
     except ProcessLookupError:
         return None
     except OSError:
@@ -338,7 +339,7 @@ def _stop_child(
         pass
     except OSError:
         failures.append("bwrap_child_reap_failed")
-    failure = _signal_child(child, process_group, signal.SIGKILL)
+    failure = _signal_child(child, process_group, getattr(signal, "SIGKILL", signal.SIGTERM))
     if failure:
         failures.append(failure)
     try:
