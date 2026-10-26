@@ -9429,6 +9429,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @staticmethod
+    def _transport_identity_for_source(source: SessionSource):
+        from gateway.access_registry import TransportIdentity
+
+        return TransportIdentity.from_session_source(
+            source,
+            account=getattr(source, "route_account", None),
+        )
+
+    def _resolve_access_context_for_source(self, source: SessionSource):
+        """Resolve and validate the server-owned six-field access context."""
+        try:
+            from gateway.session_context import reset_session_vars
+
+            reset_session_vars()
+        except Exception:
+            logger.debug("reset_session_vars failed at ingress", exc_info=True)
+
+        registry = getattr(self, "access_registry", None)
+        if registry is None:
+            return None
+
+        from gateway.access_registry import AccessDeniedError, RedactedAuditMetadata
+
+        identity = self._transport_identity_for_source(source)
+        context = registry.resolve(identity)
+        stamped_profile = (getattr(source, "profile", None) or "").strip()
+        if stamped_profile and stamped_profile != context.profile_id:
+            raise AccessDeniedError(
+                "profile_route_mismatch",
+                RedactedAuditMetadata.from_transport("profile_route_mismatch", identity),
+            )
+        return registry.validate_resolved_context_for_identity(context, identity)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9443,6 +9477,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        is_internal = bool(getattr(event, "internal", False))
+        registry = getattr(self, "access_registry", None)
+        if registry is not None and not is_internal:
+            if not bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+                logger.error(
+                    "Access registry configured while multiplex_profiles is disabled; "
+                    "rejecting ingress rather than running in the owner profile"
+                )
+                return None
+            try:
+                context = self._resolve_access_context_for_source(source)
+                source.resolved_access_context = context
+                source.profile = context.profile_id
+            except Exception as exc:
+                from gateway.access_registry import AccessDeniedError
+
+                if isinstance(exc, AccessDeniedError):
+                    logger.warning(
+                        "Access-registry ingress denied: reason=%s audit=%s",
+                        exc.reason,
+                        exc.audit.as_dict(),
+                    )
+                else:
+                    logger.warning(
+                        "Access-registry ingress failed closed: error=%s",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                return None
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
