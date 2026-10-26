@@ -54,7 +54,11 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner.session_store._save = MagicMock()
+    runner.session_store.get_model_override.return_value = None
+    runner.session_store.get_topic_preferences.return_value = {}
     runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._resolve_session_agent_runtime = MagicMock(return_value=("test-model", {"api_key": "test-key"}))
     return runner
 
 

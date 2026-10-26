@@ -153,6 +153,10 @@ async def test_picker_path_offloads_list_picker_providers(_isolated_config, monk
 
     runner = _make_runner()
     runner.adapters = {Platform.TELEGRAM: _FakePickerAdapter()}
+    async def _validator(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(runner, "_build_picker_session_validator", _validator, raising=False)
     # Stub the metadata/anchor helpers the picker branch calls before sending.
     monkeypatch.setattr(runner, "_thread_metadata_for_source", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(runner, "_reply_anchor_for_event", lambda *a, **k: None, raising=False)
@@ -185,6 +189,10 @@ async def test_picker_path_requests_moa_presets(_isolated_config, monkeypatch):
 
     runner = _make_runner()
     runner.adapters = {Platform.TELEGRAM: _FakePickerAdapter()}
+    async def _validator(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(runner, "_build_picker_session_validator", _validator, raising=False)
     monkeypatch.setattr(runner, "_thread_metadata_for_source", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(runner, "_reply_anchor_for_event", lambda *a, **k: None, raising=False)
 
