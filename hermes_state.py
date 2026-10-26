@@ -2074,6 +2074,66 @@ class SessionDB:
 
     # ── Gateway routing index (replaces sessions.json, #9006 follow-up) ────
 
+    def load_gateway_routing_entry(
+        self, session_key: str, *, scope: str = ""
+    ) -> Optional[str]:
+        """Load one exact routing entry without exposing the whole namespace."""
+        if (
+            not isinstance(session_key, str)
+            or not session_key.strip()
+            or not isinstance(scope, str)
+        ):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+        return row["entry_json"] if row is not None else None
+
+    def claim_gateway_routing_entry(
+        self,
+        session_key: str,
+        entry_json: str,
+        *,
+        scope: str = "",
+    ) -> tuple[bool, str | None]:
+        """Atomically insert one routing entry and return the committed value.
+
+        The conditional insert and exact conflict read share the single
+        ``BEGIN IMMEDIATE`` transaction provided by :meth:`_execute_write`.
+        Only the process whose insert changed the table receives ``True``;
+        every contender receives the byte-exact row that SQLite retained.
+        """
+        if (
+            not isinstance(session_key, str)
+            or not session_key.strip()
+            or not isinstance(entry_json, str)
+            or not entry_json.strip()
+            or not isinstance(scope, str)
+        ):
+            return False, None
+
+        def _do(conn):
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO gateway_routing "
+                "(scope, session_key, entry_json, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (scope, session_key, entry_json, time.time()),
+            )
+            claimed = inserted.rowcount == 1
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if row is None:
+                return False, None
+            return claimed, row["entry_json"]
+
+        return self._execute_write(_do)
+
     def save_gateway_routing_entry(
         self, session_key: str, entry_json: str, *, scope: str = ""
     ) -> None:

@@ -6,6 +6,10 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+from typing import Any
+from collections.abc import Mapping
+import math
+import hashlib
 import json
 import logging
 import os
@@ -193,6 +197,728 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
                 _sanitize_error_text(exc),
             )
             await asyncio.sleep(delay)
+
+
+SEND_MESSAGE_SCHEMA = {
+    "name": "send_message",
+    "description": (
+        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "IMPORTANT: When the user asks to send to a specific channel or person "
+        "(not just a bare platform name), call send_message(action='list') FIRST to see "
+        "available targets, then send to the correct one.\n"
+        "If the user just says a platform name like 'send to telegram', send directly "
+        "to the home channel without listing first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send", "list", "react", "unreact"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+            },
+            "target": {
+                "type": "string",
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+            },
+            "message": {
+                "type": "string",
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+            },
+            "emoji": {
+                "type": "string",
+                "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
+            },
+            "message_id": {
+                "type": "string",
+                "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            }
+        },
+        "required": []
+    }
+}
+
+
+FAMILY_BROADCAST_TEXT = """Гурра снова починен ✅
+
+Сейчас по умолчанию он работает на GPT-5.6 Luna через OpenAI Codex. Для сложных задач его можно переключить командой /model на GPT-5.6 Sol.
+
+В личке Гурра умеет работать с документами и файлами, искать информацию, распознавать изображения и голосовые, генерировать картинки, создавать и прикреплять файлы, пользоваться изолированным браузером и терминалом, Wolfram и напоминаниями.
+
+В группах он отвечает, когда его упомянули или ответили на его сообщение.
+
+Если что-то не работает или Гурра ведёт себя странно — напишите мне в Telegram: @Gydro"""
+
+_FAMILY_BROADCAST_SCOPE = "family_broadcast:v1"
+_FAMILY_BROADCAST_SCHEMA_VERSION = 1
+_FAMILY_BROADCAST_MESSAGE_POLICY_VERSION = "gurra-family-broadcast-v1"
+_FAMILY_BROADCAST_MESSAGE_DIGEST = hashlib.sha256(
+    FAMILY_BROADCAST_TEXT.encode("utf-8")
+).hexdigest()
+_FAMILY_BROADCAST_MAX_OPERATION_KEY_LENGTH = 4096
+_FAMILY_BROADCAST_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "operation_digest",
+        "message_policy_version",
+        "message_digest",
+        "owner_fingerprint",
+        "binding_snapshot",
+        "delivery_state",
+        "redacted_result",
+        "created_at",
+        "updated_at",
+    }
+)
+_FAMILY_BROADCAST_BINDING_KEYS = frozenset(
+    {"ordinal", "resolved_context", "binding_digest"}
+)
+_FAMILY_BROADCAST_RESULT_KEYS = frozenset(
+    {"success", "delivery_state", "recipient_count", "receipts"}
+)
+_FAMILY_BROADCAST_RECEIPT_KEYS = frozenset({"ordinal", "status"})
+_FAMILY_BROADCAST_FORBIDDEN_REQUEST_KEYS = frozenset(
+    {
+        "attachment",
+        "attachments",
+        "body",
+        "capabilities",
+        "capability",
+        "chat",
+        "chat_id",
+        "content",
+        "delivery",
+        "delivery_target",
+        "dry_run",
+        "file",
+        "files",
+        "live",
+        "media",
+        "message",
+        "owner",
+        "owner_id",
+        "principal",
+        "principal_id",
+        "profile",
+        "profile_id",
+        "recipient",
+        "recipients",
+        "role",
+        "role_id",
+        "scope",
+        "session",
+        "session_id",
+        "target",
+        "template",
+        "text",
+        "thread_id",
+    }
+)
+
+
+def _family_broadcast_error(error_code: str) -> dict[str, Any]:
+    return {"success": False, "error_code": error_code}
+
+
+def _family_broadcast_normalize_key(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace("-", "_").lstrip("_")
+
+
+def _family_broadcast_has_forbidden_selector(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if (
+                _family_broadcast_normalize_key(key)
+                in _FAMILY_BROADCAST_FORBIDDEN_REQUEST_KEYS
+            ):
+                return True
+            if _family_broadcast_has_forbidden_selector(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_family_broadcast_has_forbidden_selector(item) for item in value)
+    return False
+
+
+def _family_broadcast_operation_key(request: Any) -> str | None:
+    if not isinstance(request, Mapping):
+        return None
+    try:
+        if _family_broadcast_has_forbidden_selector(request):
+            return None
+        if frozenset(request.keys()) != frozenset({"operation_key"}):
+            return None
+        operation_key = request["operation_key"]
+    except Exception:
+        return None
+    if (
+        not isinstance(operation_key, str)
+        or not operation_key.strip()
+        or len(operation_key) > _FAMILY_BROADCAST_MAX_OPERATION_KEY_LENGTH
+    ):
+        return None
+    return operation_key
+
+
+def _family_broadcast_owner_fingerprint(
+    caller_context: Any,
+) -> tuple[str, "ResolvedAccessContext"] | None:
+    from gateway.access_registry import (
+        ResolvedAccessContext,
+        canonical_access_context_fingerprint,
+        deserialize_resolved_access_context,
+        serialize_resolved_access_context,
+    )
+
+    if type(caller_context) is not ResolvedAccessContext:
+        return None
+    if (
+        caller_context.role_id != "owner"
+        or caller_context.delivery_target.peer_kind != "dm"
+    ):
+        return None
+    try:
+        canonical = deserialize_resolved_access_context(
+            serialize_resolved_access_context(caller_context)
+        )
+        if canonical != caller_context:
+            return None
+        return canonical_access_context_fingerprint(canonical), canonical
+    except Exception:
+        return None
+
+
+def _family_broadcast_canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _family_broadcast_is_digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _family_broadcast_stored_result(
+    delivery_state: str,
+    receipt_statuses: list[str],
+) -> dict[str, Any]:
+    success = delivery_state != "failed"
+    result: dict[str, Any] = {
+        "success": success,
+        "delivery_state": delivery_state,
+        "recipient_count": len(receipt_statuses),
+        "receipts": [
+            {"ordinal": ordinal, "status": status}
+            for ordinal, status in enumerate(receipt_statuses, start=1)
+        ],
+    }
+    if delivery_state == "failed":
+        result["error_code"] = "delivery_failed"
+    return result
+
+
+def _family_broadcast_validate_stored_result(
+    value: Any,
+    *,
+    delivery_state: str,
+    recipient_count: int,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected_keys = set(_FAMILY_BROADCAST_RESULT_KEYS)
+    if delivery_state == "failed":
+        expected_keys.add("error_code")
+    if frozenset(value.keys()) != frozenset(expected_keys):
+        return False
+    if type(value.get("success")) is not bool:
+        return False
+    if value.get("delivery_state") != delivery_state:
+        return False
+    if type(value.get("recipient_count")) is not int:
+        return False
+    if value["recipient_count"] != recipient_count:
+        return False
+    receipts = value.get("receipts")
+    if not isinstance(receipts, list) or len(receipts) != recipient_count:
+        return False
+    statuses: list[str] = []
+    for ordinal, receipt in enumerate(receipts, start=1):
+        if (
+            not isinstance(receipt, dict)
+            or frozenset(receipt.keys()) != _FAMILY_BROADCAST_RECEIPT_KEYS
+            or type(receipt.get("ordinal")) is not int
+            or receipt["ordinal"] != ordinal
+            or not isinstance(receipt.get("status"), str)
+        ):
+            return False
+        statuses.append(receipt["status"])
+
+    if delivery_state == "claimed":
+        return value["success"] is True and statuses == ["claimed"] * recipient_count
+    if delivery_state == "completed":
+        return value["success"] is True and statuses == ["delivered"] * recipient_count
+    if delivery_state == "failed":
+        return (
+            value["success"] is False
+            and value.get("error_code") == "delivery_failed"
+            and all(status in {"delivered", "failed"} for status in statuses)
+            and "failed" in statuses
+        )
+    return False
+
+
+def _family_broadcast_validate_record(
+    raw_record: Any,
+    *,
+    operation_digest: str,
+    owner_fingerprint: str,
+    owner_context: "ResolvedAccessContext",
+) -> dict[str, Any] | None:
+    from gateway.access_registry import (
+        canonical_access_context_fingerprint,
+        deserialize_resolved_access_context,
+        serialize_resolved_access_context,
+    )
+
+    if not isinstance(raw_record, str) or not raw_record.strip():
+        return None
+    try:
+        record = json.loads(raw_record)
+        canonical_record = _family_broadcast_canonical_json(record)
+    except Exception:
+        return None
+    if (
+        not isinstance(record, dict)
+        or frozenset(record.keys()) != _FAMILY_BROADCAST_RECORD_KEYS
+        or canonical_record != raw_record
+    ):
+        return None
+    if type(record.get("schema_version")) is not int:
+        return None
+    if record["schema_version"] != _FAMILY_BROADCAST_SCHEMA_VERSION:
+        return None
+    if (
+        not _family_broadcast_is_digest(record.get("operation_digest"))
+        or record["operation_digest"] != operation_digest
+        or record.get("message_policy_version")
+        != _FAMILY_BROADCAST_MESSAGE_POLICY_VERSION
+        or not _family_broadcast_is_digest(record.get("message_digest"))
+        or record["message_digest"] != _FAMILY_BROADCAST_MESSAGE_DIGEST
+        or not _family_broadcast_is_digest(record.get("owner_fingerprint"))
+        or record["owner_fingerprint"] != owner_fingerprint
+    ):
+        return None
+
+    created_at = record.get("created_at")
+    updated_at = record.get("updated_at")
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or isinstance(updated_at, bool)
+        or not isinstance(updated_at, (int, float))
+        or not math.isfinite(created_at)
+        or not math.isfinite(updated_at)
+        or updated_at < created_at
+    ):
+        return None
+
+    snapshot = record.get("binding_snapshot")
+    if not isinstance(snapshot, list) or not snapshot:
+        return None
+    binding_digests: list[str] = []
+    principals: set[str] = set()
+    profiles: set[str] = set()
+    delivery_targets: set[tuple[str, str, str, str, str | None]] = set()
+    for ordinal, entry in enumerate(snapshot, start=1):
+        if (
+            not isinstance(entry, dict)
+            or frozenset(entry.keys()) != _FAMILY_BROADCAST_BINDING_KEYS
+            or type(entry.get("ordinal")) is not int
+            or entry["ordinal"] != ordinal
+            or not _family_broadcast_is_digest(entry.get("binding_digest"))
+        ):
+            return None
+        try:
+            context = deserialize_resolved_access_context(entry["resolved_context"])
+            if (
+                serialize_resolved_access_context(context)
+                != entry["resolved_context"]
+            ):
+                return None
+            digest = canonical_access_context_fingerprint(context)
+        except Exception:
+            return None
+        target = context.delivery_target
+        target_key = (
+            target.platform,
+            target.account,
+            target.peer_kind,
+            target.chat_id,
+            target.thread_id,
+        )
+        if (
+            context.role_id != "family"
+            or target.peer_kind != "dm"
+            or digest != entry["binding_digest"]
+            or context.principal_id == owner_context.principal_id
+            or context.profile_id == owner_context.profile_id
+            or target == owner_context.delivery_target
+            or digest in binding_digests
+            or context.principal_id in principals
+            or context.profile_id in profiles
+            or target_key in delivery_targets
+        ):
+            return None
+        binding_digests.append(digest)
+        principals.add(context.principal_id)
+        profiles.add(context.profile_id)
+        delivery_targets.add(target_key)
+    if binding_digests != sorted(binding_digests):
+        return None
+
+    delivery_state = record.get("delivery_state")
+    if delivery_state not in {"claimed", "completed", "failed"}:
+        return None
+    if not _family_broadcast_validate_stored_result(
+        record.get("redacted_result"),
+        delivery_state=delivery_state,
+        recipient_count=len(snapshot),
+    ):
+        return None
+    return record
+
+
+def _family_broadcast_public_result(
+    record: dict[str, Any],
+    *,
+    replayed: bool,
+) -> dict[str, Any]:
+    state = record["delivery_state"]
+    stored_receipts = record["redacted_result"]["receipts"]
+    if state == "claimed":
+        statuses = ["incomplete"] * len(record["binding_snapshot"])
+    else:
+        statuses = [receipt["status"] for receipt in stored_receipts]
+    result: dict[str, Any] = {
+        "success": state != "failed",
+        "replayed": replayed,
+        "delivery_state": state,
+        "recipient_count": len(record["binding_snapshot"]),
+        "receipts": [
+            {"ordinal": ordinal, "status": status}
+            for ordinal, status in enumerate(statuses, start=1)
+        ],
+    }
+    if state == "failed":
+        result["error_code"] = "delivery_failed"
+    return result
+
+
+def _family_broadcast_binding_snapshot(
+    access_registry: Any,
+    owner_context: "ResolvedAccessContext",
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    from gateway.access_registry import (
+        AccessRegistry,
+        PrincipalBinding,
+        ResolvedAccessContext,
+        RolePolicy,
+        canonical_access_context_fingerprint,
+        serialize_resolved_access_context,
+    )
+
+    if type(access_registry) is not AccessRegistry:
+        return None, "registry_unavailable"
+    if not any(
+        type(policy) is RolePolicy
+        and policy.active
+        and policy.role_id == "owner"
+        for policy in access_registry.roles.values()
+    ):
+        return None, "access_denied"
+    try:
+        access_registry.require_valid()
+    except Exception:
+        return None, "registry_unavailable"
+    try:
+        validated_owner = access_registry.validate_resolved_context(owner_context)
+    except Exception:
+        return None, "access_denied"
+    if validated_owner != owner_context:
+        return None, "access_denied"
+    if not any(
+        type(policy) is RolePolicy
+        and policy.active
+        and policy.role_id == "family"
+        for policy in access_registry.roles.values()
+    ):
+        return None, "binding_unavailable"
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    principals: set[str] = set()
+    profiles: set[str] = set()
+    targets: set[tuple[str, str, str, str, str | None]] = set()
+    for binding in access_registry.principal_bindings:
+        if type(binding) is not PrincipalBinding:
+            return None, "binding_unavailable"
+        if not binding.active or binding.role_id != "family":
+            continue
+        target = binding.delivery_target
+        if (
+            target.peer_kind != "dm"
+            or binding.principal_id == owner_context.principal_id
+            or binding.profile_id == owner_context.profile_id
+            or target == owner_context.delivery_target
+        ):
+            return None, "binding_unavailable"
+        target_key = (
+            target.platform,
+            target.account,
+            target.peer_kind,
+            target.chat_id,
+            target.thread_id,
+        )
+        if (
+            binding.principal_id in principals
+            or binding.profile_id in profiles
+            or target_key in targets
+        ):
+            return None, "binding_unavailable"
+        context = ResolvedAccessContext(
+            principal_id=binding.principal_id,
+            role_id=binding.role_id,
+            profile_id=binding.profile_id,
+            conversation_scope=binding.conversation_scope,
+            capabilities=access_registry.effective_capabilities(
+                binding.role_id,
+                binding.conversation_scope,
+            ),
+            delivery_target=target,
+        )
+        try:
+            validated = access_registry.validate_resolved_context(context)
+            if validated != context:
+                return None, "binding_unavailable"
+            serialized = serialize_resolved_access_context(validated)
+            binding_digest = canonical_access_context_fingerprint(validated)
+        except Exception:
+            return None, "binding_unavailable"
+        candidates.append((binding_digest, serialized))
+        principals.add(binding.principal_id)
+        profiles.add(binding.profile_id)
+        targets.add(target_key)
+
+    if not candidates:
+        return None, "binding_unavailable"
+    candidates.sort(key=lambda item: item[0])
+    if len({digest for digest, _ in candidates}) != len(candidates):
+        return None, "binding_unavailable"
+    snapshot = [
+        {
+            "ordinal": ordinal,
+            "resolved_context": serialized,
+            "binding_digest": binding_digest,
+        }
+        for ordinal, (binding_digest, serialized) in enumerate(candidates, start=1)
+    ]
+    return snapshot, None
+
+
+def _family_broadcast_claimed_record(
+    *,
+    operation_digest: str,
+    owner_fingerprint: str,
+    binding_snapshot: list[dict[str, Any]],
+) -> dict[str, Any]:
+    now = time.time()
+    return {
+        "schema_version": _FAMILY_BROADCAST_SCHEMA_VERSION,
+        "operation_digest": operation_digest,
+        "message_policy_version": _FAMILY_BROADCAST_MESSAGE_POLICY_VERSION,
+        "message_digest": _FAMILY_BROADCAST_MESSAGE_DIGEST,
+        "owner_fingerprint": owner_fingerprint,
+        "binding_snapshot": binding_snapshot,
+        "delivery_state": "claimed",
+        "redacted_result": _family_broadcast_stored_result(
+            "claimed",
+            ["claimed"] * len(binding_snapshot),
+        ),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _family_broadcast_deliver(record: dict[str, Any]) -> list[str]:
+    from gateway.access_registry import deserialize_resolved_access_context
+    from gateway.config import Platform, load_gateway_config
+
+    try:
+        config = load_gateway_config()
+    except Exception:
+        return ["failed"] * len(record["binding_snapshot"])
+
+    statuses: list[str] = []
+    for entry in record["binding_snapshot"]:
+        context = deserialize_resolved_access_context(entry["resolved_context"])
+        target = context.delivery_target
+        try:
+            platform = Platform(target.platform)
+            pconfig = config.platforms.get(platform)
+        except Exception:
+            platform = None
+            pconfig = None
+        if platform is None or pconfig is None or not pconfig.enabled:
+            statuses.append("failed")
+            continue
+        try:
+            from model_tools import _run_async
+
+            provider_result = _run_async(
+                _send_to_platform(
+                    platform,
+                    pconfig,
+                    target.chat_id,
+                    FAMILY_BROADCAST_TEXT,
+                    thread_id=target.thread_id,
+                    media_files=None,
+                    force_document=False,
+                )
+            )
+        except Exception:
+            statuses.append("failed")
+            continue
+        statuses.append(
+            "delivered"
+            if isinstance(provider_result, dict)
+            and provider_result.get("success") is True
+            and not provider_result.get("error")
+            else "failed"
+        )
+    return statuses
+
+
+def family_broadcast_operation(
+    request: Mapping[str, Any],
+    *,
+    caller_context: "ResolvedAccessContext",
+    access_registry: "AccessRegistry | None",
+) -> dict[str, Any]:
+    """Claim and deliver the server-owned family broadcast at most once."""
+    operation_key = _family_broadcast_operation_key(request)
+    if operation_key is None:
+        return _family_broadcast_error("invalid_request")
+    owner = _family_broadcast_owner_fingerprint(caller_context)
+    if owner is None:
+        return _family_broadcast_error("access_denied")
+    owner_fingerprint, canonical_owner = owner
+    operation_digest = hashlib.sha256(operation_key.encode("utf-8")).hexdigest()
+
+    from hermes_state import SessionDB
+
+    try:
+        db = SessionDB()
+    except Exception:
+        return _family_broadcast_error("storage_unavailable")
+    try:
+        try:
+            existing = db.load_gateway_routing_entry(
+                operation_digest,
+                scope=_FAMILY_BROADCAST_SCOPE,
+            )
+        except Exception:
+            return _family_broadcast_error("storage_unavailable")
+        if existing is not None:
+            record = _family_broadcast_validate_record(
+                existing,
+                operation_digest=operation_digest,
+                owner_fingerprint=owner_fingerprint,
+                owner_context=canonical_owner,
+            )
+            if record is None:
+                return _family_broadcast_error("record_invalid")
+            return _family_broadcast_public_result(record, replayed=True)
+
+        binding_snapshot, binding_error = _family_broadcast_binding_snapshot(
+            access_registry,
+            canonical_owner,
+        )
+        if binding_snapshot is None:
+            return _family_broadcast_error(binding_error or "binding_unavailable")
+        candidate = _family_broadcast_claimed_record(
+            operation_digest=operation_digest,
+            owner_fingerprint=owner_fingerprint,
+            binding_snapshot=binding_snapshot,
+        )
+        candidate_json = _family_broadcast_canonical_json(candidate)
+        if _family_broadcast_validate_record(
+            candidate_json,
+            operation_digest=operation_digest,
+            owner_fingerprint=owner_fingerprint,
+            owner_context=canonical_owner,
+        ) is None:
+            return _family_broadcast_error("binding_unavailable")
+
+        try:
+            claimed, canonical_json = db.claim_gateway_routing_entry(
+                operation_digest,
+                candidate_json,
+                scope=_FAMILY_BROADCAST_SCOPE,
+            )
+        except Exception:
+            return _family_broadcast_error("storage_unavailable")
+        if canonical_json is None:
+            return _family_broadcast_error("storage_unavailable")
+        canonical_record = _family_broadcast_validate_record(
+            canonical_json,
+            operation_digest=operation_digest,
+            owner_fingerprint=owner_fingerprint,
+            owner_context=canonical_owner,
+        )
+        if canonical_record is None:
+            return _family_broadcast_error("record_invalid")
+        if not claimed:
+            return _family_broadcast_public_result(canonical_record, replayed=True)
+
+        receipt_statuses = _family_broadcast_deliver(canonical_record)
+        delivery_state = (
+            "completed"
+            if receipt_statuses == ["delivered"] * len(binding_snapshot)
+            else "failed"
+        )
+        terminal_record = dict(canonical_record)
+        terminal_record["delivery_state"] = delivery_state
+        terminal_record["redacted_result"] = _family_broadcast_stored_result(
+            delivery_state,
+            receipt_statuses,
+        )
+        terminal_record["updated_at"] = time.time()
+        terminal_json = _family_broadcast_canonical_json(terminal_record)
+        if _family_broadcast_validate_record(
+            terminal_json,
+            operation_digest=operation_digest,
+            owner_fingerprint=owner_fingerprint,
+            owner_context=canonical_owner,
+        ) is None:
+            return _family_broadcast_error("storage_unavailable")
+        try:
+            db.save_gateway_routing_entry(
+                operation_digest,
+                terminal_json,
+                scope=_FAMILY_BROADCAST_SCOPE,
+            )
+        except Exception:
+            return _family_broadcast_error("storage_unavailable")
+        return _family_broadcast_public_result(terminal_record, replayed=False)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 SEND_MESSAGE_SCHEMA = {
