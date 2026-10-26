@@ -118,6 +118,23 @@ class TestResolutionOrder:
                 mock_get_dir.assert_called_once_with("default")
 
 
+    def test_no_trusted_access_context_uses_normal_profile_resolution(
+        self, mock_runner, discord_source
+    ):
+        """Absent trusted access context must not force trusted-scope behavior."""
+        assert not hasattr(discord_source, "resolved_access_context")
+
+        discord_source.profile = None
+
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+                mock_get_dir.return_value = Path("/hermes/profiles/active")
+
+                result = mock_runner._resolve_profile_home_for_source(discord_source)
+
+        assert result == Path("/hermes/profiles/active")
+        mock_get_dir.assert_called_once_with("active")
+
 class TestMissingProfileWarning:
     """Tests for warning when a profile doesn't exist on disk."""
     
