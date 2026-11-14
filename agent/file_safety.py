@@ -393,6 +393,11 @@ def get_read_block_error(path: str) -> Optional[str]:
     if nt_error:
         return nt_error
     resolved = Path(path).expanduser().resolve()
+    from agent.access_paths import profile_read_block_error
+
+    profile_error = profile_read_block_error(resolved)
+    if profile_error:
+        return profile_error
     hermes_dirs = _hermes_dirs()
     reason = None
     if any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):

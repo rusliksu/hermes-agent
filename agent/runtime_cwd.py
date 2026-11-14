@@ -93,6 +93,19 @@ def _resolve_configured_cwd(
     ``include_session_override``: skip a session cwd known to be a launch artifact
     while still consulting the active profile's TERMINAL_CWD.
     """
+    from agent.access_paths import restricted_profile_home, guard_terminal_cwd, profile_local_cwd
+
+    home = restricted_profile_home()
+    if home is not None:
+        from tools.terminal_scope import terminal_env
+        from tools.terminal_tool_config import _is_container_backend
+
+        override = _SESSION_CWD.get() if include_session_override else _UNSET
+        override = "" if override is _UNSET else str(override).strip()
+        # Context discovery reads the host profile, not a container's virtual cwd.
+        backend = terminal_env("TERMINAL_ENV", "local")
+        base = home if backend == "ssh" or _is_container_backend(backend) else Path(profile_local_cwd())
+        return Path(guard_terminal_cwd(override or str(base), str(base)))
     if include_session_override:
         override = _SESSION_CWD.get()
         override = "" if override is _UNSET else str(override).strip()

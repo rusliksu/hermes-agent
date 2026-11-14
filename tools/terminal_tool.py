@@ -838,6 +838,12 @@ def _get_env_config() -> dict[str, Any]:
 
     cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
 
+    from agent.access_paths import restricted_profile_home, profile_local_cwd
+
+    home = restricted_profile_home()
+    if home is not None and not _is_container_backend(env_type) and env_type != "ssh":
+        cwd = profile_local_cwd()
+
     return {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(_tenv("TERMINAL_MODAL_MODE", "auto")),
@@ -1011,6 +1017,15 @@ def _container_visible_default(default_cwd: str, env_type: str | None, env=None)
     return default_cwd
 
 
+def _guard_profile_cwd(candidate: str, default_cwd: str, env_type: Optional[str]) -> str:
+    """Refuse a cwd outside the bound profile workspace (no-op for registry-free callers)."""
+    from agent.access_paths import guard_terminal_cwd
+
+    return guard_terminal_cwd(
+        candidate, default_cwd, remote=env_type == "ssh" or _is_container_backend(env_type)
+    )
+
+
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -1037,7 +1052,10 @@ def _resolve_command_cwd(
     Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
     """
     if workdir:
-        return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
+        return _guard_profile_cwd(
+            coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type),
+            default_cwd, env_type,
+        )
     recorded = get_session_cwd(session_key)
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(
         recorded, mounted_host=mounted_host
@@ -1057,8 +1075,13 @@ def _resolve_command_cwd(
             "(host/relative path won't work in sandbox). Using %r instead.",
             recorded, env_type, default_cwd,
         )
-        return _container_visible_default(default_cwd, env_type, env)
-    return coerce_ssh_remote_cwd(recorded or _container_visible_default(default_cwd, env_type, env), env_type)
+        return _guard_profile_cwd(
+            _container_visible_default(default_cwd, env_type, env), default_cwd, env_type,
+        )
+    return _guard_profile_cwd(
+        coerce_ssh_remote_cwd(recorded or _container_visible_default(default_cwd, env_type, env), env_type),
+        default_cwd, env_type,
+    )
 
 
 def _error_json(error: str, *, exit_code: int = -1, status: Optional[str] = None, **extra) -> str:
@@ -1422,6 +1445,12 @@ def _pre_exec_block(
     Order matters: gateway lifecycle first (protects the running gateway),
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
+    try:
+        _resolve_command_cwd(
+            workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+        )
+    except ValueError as exc:
+        raise _Rejected(_error_json(str(exc), exit_code=1, status="blocked")) from exc
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
     )

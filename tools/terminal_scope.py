@@ -214,6 +214,9 @@ def _resolve_scope_cwd_placeholder(scope: dict[str, str]) -> None:
     )
     if resolved:
         scope["TERMINAL_CWD"] = resolved
+        # Provenance only: typed callers distinguish a native HOME fallback from
+        # an explicit profile cwd. Registry-free policy values remain unchanged.
+        scope["_cwd_placeholder"] = "1"
 
 
 def prepare_profile_terminal_scope(
