@@ -3110,6 +3110,8 @@ class BasePlatformAdapter(ABC):
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
                             metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively. Default: friendly failure notice."""
+        if kwargs.get("_require_native"):
+            return SendResult(success=False, error="Native document delivery unavailable")
         return await self._send_media_fallback_notice(
             "send_document", "file", file_path, chat_id, caption, reply_to, metadata, file_name=file_name)
 
@@ -4388,6 +4390,11 @@ class BasePlatformAdapter(ABC):
         image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
         paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
         dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
+        if event.artifact_delivery_confirmation is not None:
+            _, clean = self.extract_media(response)
+            _, clean = self.extract_images(clean)
+            return _ExtractedResponse(text_content=_strip_media_directives(clean).strip(), images=[],
+                media_files=[], local_files=[], force_document_attachments=False, pre_extract=response)
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
@@ -4500,6 +4507,16 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
+                if event.artifact_delivery_confirmation is not None:
+                    from gateway.artifact_delivery import deliver_confirmed
+                    self.pause_typing_for_chat(event.source.chat_id)
+                    artifact_result = await deliver_confirmed(
+                        self, event, session_key, _mark_notify_metadata(_thread_metadata),
+                    )
+                    _record_delivery(artifact_result)
+                    if not artifact_result.success:
+                        event._artifact_delivery_failed = True
+                        response = "⚠️ Отправка документа не подтверждена. Повторите запрос явно."
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
@@ -4543,7 +4560,10 @@ class BasePlatformAdapter(ABC):
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                (delivery_succeeded if delivery_attempted else not bool(response))
+                and not getattr(event, "_artifact_delivery_failed", False)
+            )
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4583,6 +4603,8 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             await self._fire_post_delivery_callback(session_key, interrupt_event)
+            from gateway.artifact_delivery import abandon_confirmation
+            await abandon_confirmation(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
