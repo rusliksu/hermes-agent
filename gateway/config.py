@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
+from gateway.access_registry import AccessRegistry
+from gateway.access_config import parse_access_registry
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from gateway.shutdown_watchdog import (
@@ -598,6 +600,7 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
     platforms: dict[Platform, PlatformConfig] = field(default_factory=dict)
+    access_registry: Optional[AccessRegistry] = None
     reset_triggers: list[str] = field(default_factory=lambda: ["/new", "/reset"])
     quick_commands: dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
@@ -785,6 +788,8 @@ class GatewayConfig:
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
+            access_registry=(parse_access_registry(data["access_registry"])
+                             if data.get("access_registry") is not None else None),
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
