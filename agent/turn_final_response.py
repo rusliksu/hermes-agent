@@ -134,6 +134,24 @@ def finish_text_response(
             result=result,
         )
 
+    artifact_turn = getattr(agent, "_artifact_turn", None)
+    if artifact_turn is not None:
+        try:
+            action, nudge = artifact_turn.finish()
+        except Exception:
+            action, nudge = "failed", None
+        if action == "continue":
+            messages.append({"role": "user", "content": nudge, "_artifact_delivery_stop_synthetic": True})
+            agent._session_messages = messages
+            final_response = None
+            return _verdict("continue")
+        if action == "failed":
+            from agent.artifact_turn import ARTIFACT_FAILURE
+            final_response = ARTIFACT_FAILURE
+            _turn_exit_reason = "artifact_delivery_failed"
+            messages.append({"role": "assistant", "content": final_response})
+            return _verdict("break")
+
     # Reasoning-only clean stop on a trusted route (elsewhere reasoning is private and takes the
     # ladder): some parsers (vLLM nemotron_v3 past ~500K prompt tokens) file the whole answer as
     # reasoning when the closing delimiter is missing; ``stop`` means generation is complete, so

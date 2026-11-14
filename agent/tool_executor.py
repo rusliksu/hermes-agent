@@ -1162,6 +1162,9 @@ def _commit_tool_result(
             logging.debug("Tool result metadata callback error: %s", callback_error)
     stamp_data_use(tool_message, sorted(data_use))
     messages.append(tool_message)
+    artifact_turn = getattr(agent, "_artifact_turn", None)
+    if artifact_turn is not None:
+        artifact_turn.observe(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
 

@@ -327,6 +327,12 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
     empty-response storms); the interruption scaffold is replay text carried only in the user
     correction's ``api_content``; an on-screen-empty placeholder is ``display_kind=hidden``."""
+    artifact_turn = getattr(agent, "_artifact_turn", None)
+    if artifact_turn is not None:
+        if artifact_turn.relevant:
+            artifact_turn.abandon(invalidate=True)
+        else:
+            artifact_turn.events.clear()
     visible = agent._strip_think_blocks(getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
 
     checkpoint_parts = [_INTERRUPT_SCAFFOLD_MARKER]
@@ -1833,12 +1839,13 @@ def run_conversation(
     from agent.turn_finalizer import settle_held_final
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
+    from agent.artifact_turn import artifact_turn_scope
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
+    with native_turn_images(user_message), artifact_turn_scope(agent) as artifact_turn:
         try:
             result = _run_conversation_turn(
                 agent,
@@ -1846,7 +1853,7 @@ def run_conversation(
                 system_message=system_message,
                 conversation_history=conversation_history,
                 task_id=task_id,
-                stream_callback=stream_callback,
+                stream_callback=None if artifact_turn is not None else stream_callback,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
@@ -1859,6 +1866,8 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+        if artifact_turn is not None:
+            result = artifact_turn.export(result)
     settle_held_final(agent, result)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):

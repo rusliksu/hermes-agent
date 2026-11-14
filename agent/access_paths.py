@@ -40,6 +40,37 @@ def profile_local_cwd():
     return guard_terminal_cwd(raw or str(home), str(home))
 
 
+def bound_artifact_roots(task_id="default"):
+    """Profile plus declared workspace, without process-cwd or HOME fallback."""
+    home = bound_profile_home()
+    if home is None:
+        raise ValueError("bound artifact home unavailable")
+    from agent.runtime_cwd import scope_terminal_cwd
+    try:
+        configured = profile_local_cwd()
+    except ValueError:
+        from gateway.platforms.base import _docker_env_active, _translate_docker_container_media_path
+        if not _docker_env_active():
+            raise
+        configured = _translate_docker_container_media_path(
+            Path(scope_terminal_cwd()), task_id,
+        )
+        if configured is None or not configured.is_relative_to(home):
+            raise ValueError("bound Docker workspace unavailable")
+    workspace = Path(configured or scope_terminal_cwd() or home).expanduser()
+    workspace = (workspace if workspace.is_absolute() else home / workspace).resolve(strict=True)
+    if not workspace.is_dir():
+        raise ValueError("bound artifact workspace unavailable")
+    roots = [home, workspace]  # Keep position 1 as the base for relative artifact paths.
+    from tools.terminal_tool import get_session_cwd
+    candidate = get_session_cwd(task_id)
+    if isinstance(candidate, str) and candidate:
+        path = Path(candidate).expanduser().resolve()
+        if path.is_dir() and path.is_relative_to(workspace) and path not in roots:
+            roots.append(path)
+    return tuple(roots)
+
+
 def guard_terminal_cwd(candidate, base, *, remote=False):
     """Normalize within the configured workspace; never dereference remote paths on host."""
     home = restricted_profile_home()

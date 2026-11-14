@@ -25,6 +25,17 @@ from tools.binary_extensions import (
 from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
+
+
+def _bound_artifact_output_error(path, task_id):
+    try:
+        from tools.artifact_delivery_tool import validate_bound_artifact_output
+        error = validate_bound_artifact_output(path, task_id)
+    except Exception:
+        from gateway.access_context import get_resolved_access_context
+        context = get_resolved_access_context()
+        error = "validator_unavailable" if context is not None and context.role_id in {"family", "shared_room"} else None
+    return "bound_artifact_output_rejected: " + error if error else None
 import itertools
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
