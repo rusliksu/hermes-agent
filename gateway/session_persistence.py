@@ -375,6 +375,29 @@ class SessionPersistenceMixin:
                     logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
+        self._recover_artifact_deliveries_locked()
+
+    def _recover_artifact_deliveries_locked(self):
+        """Terminalize interrupted uploads in their owning stores; never replay file tools."""
+        from datetime import datetime
+
+        changed = False
+        for key, entry in self._entries.items():
+            db = self._db_for_key(key)
+            recover = getattr(db, "recover_artifact_delivery", None)
+            if not callable(recover):
+                continue
+            try:
+                recovered = recover(entry.session_id)
+            except Exception:
+                recovered = {"state": "uncertain"}
+            if isinstance(recovered, dict) and recovered.get("state") in {"abandoned", "uncertain"}:
+                entry.resume_pending = True
+                entry.resume_reason = "artifact_delivery_" + recovered["state"]
+                entry.last_resume_marked_at = datetime.now()
+                changed = True
+        if changed:
+            self._save()
 
     def _heal_missing_origins(self, entries) -> None:
         for entry in entries:
