@@ -17,19 +17,22 @@ def test_load_marks_interrupted_upload_for_resume(tmp_path):
 
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
-        store = SessionStore(sessions_dir, GatewayConfig())
         now = datetime.now()
         entry = SessionEntry(
             session_key="telegram:42", session_id="root", created_at=now, updated_at=now,
         )
-        store._entries[entry.session_key] = entry
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps({entry.session_key: entry.to_dict()}), encoding="utf-8",
+        )
+
+        store = SessionStore(sessions_dir, GatewayConfig())
         store._db_for_key = lambda key: db
+        store._ensure_loaded_locked()
 
-        store._recover_artifact_deliveries_locked()
-
-        assert entry.resume_pending is True
-        assert entry.resume_reason == "artifact_delivery_abandoned"
-        assert entry.last_resume_marked_at is not None
+        loaded = store._entries[entry.session_key]
+        assert loaded.resume_pending is True
+        assert loaded.resume_reason == "artifact_delivery_abandoned"
+        assert loaded.last_resume_marked_at is not None
         assert json.loads(db.get_session("root")["artifact_delivery_json"])["state"] == "abandoned"
     finally:
         db.close()
