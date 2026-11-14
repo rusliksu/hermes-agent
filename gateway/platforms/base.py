@@ -841,6 +841,13 @@ def _kanban_attachment_roots() -> list[Path]:
 
 def _media_delivery_allowed_roots() -> list[Path]:
     """Return roots from which model-emitted local media may be delivered."""
+    from gateway.media_policy import media_requires_typed_scope
+    if media_requires_typed_scope():
+        from agent.access_paths import bound_artifact_roots
+        try:
+            return list(bound_artifact_roots())
+        except Exception:
+            return []
     from gateway.media_policy import media_delivery_allow_dirs
     operator_roots = (
         root for chunk in media_delivery_allow_dirs().split(os.pathsep)
@@ -996,6 +1003,7 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
 
 def _translate_docker_container_media_path(
     candidate: Path, session_key: str = "", workspace_key: str = "", *, quiet: bool = False, workspace_cwd: str = "",
+    must_exist: bool = True,
 ) -> Optional[Path]:
     """Container-absolute path -> host path via longest-prefix match over ``docker_volumes``, the
     auto-mounted cache dirs (``/root/.hermes/...``), persistent ``/workspace`` and ``/root``.
@@ -1040,7 +1048,7 @@ def _translate_docker_container_media_path(
         _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches", quiet)
         return None
     for host_root, container_root, _score in sorted(matched, key=lambda m: -m[2]):
-        translated = _resolve_path(host_root / candidate.relative_to(container_root), strict=True)
+        translated = _resolve_path(host_root / candidate.relative_to(container_root), strict=must_exist)
         if translated is not None and (
                 translated == host_root or _path_is_within(translated, host_root)):
             return translated
@@ -1070,6 +1078,15 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
+    from gateway.media_policy import media_requires_typed_scope
+    if media_requires_typed_scope():
+        from agent.access_paths import bound_artifact_roots
+        try:
+            roots = bound_artifact_roots(session_key)
+        except Exception:
+            return None
+        if not any(_path_is_within(resolved, root) for root in roots):
+            return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():
         resolved_root = _resolve_path(root, expand=True)

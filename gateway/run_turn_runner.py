@@ -248,6 +248,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     def _setup_stream_consumer(self, platform_key):
         ctx = self._ctx
+        from tools.artifact_delivery_tool import bound_document_context_active
+        if bound_document_context_active():
+            return None, None, None, False
         if ctx.mute_notification_reply:
             return None, None, None, False
         stream_consumer = None
@@ -1438,6 +1441,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
         # about to shrink.
         common = {
+            "artifact_delivery_confirmation": result.get("artifact_delivery_confirmation"),
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             # Usage-window limit (agent/plan_limits.py): the gateway offers the plan's model as a button.

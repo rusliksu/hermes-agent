@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,24 @@ _FLAG_ENVS = (("strict", "HERMES_MEDIA_DELIVERY_STRICT"), ("trust_recent_files",
 _ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS"
 _TRUST_RECENT_SECONDS_ENV = "HERMES_MEDIA_TRUST_RECENT_SECONDS"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_REGISTRY_FREE_MEDIA_SCOPE = ContextVar("HERMES_REGISTRY_FREE_MEDIA_SCOPE", default=False)
+
+
+@contextmanager
+def registry_free_media_scope(enabled):
+    """Native runner verified profile scope, never a fallback for a registry-bound source."""
+    token = _REGISTRY_FREE_MEDIA_SCOPE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _REGISTRY_FREE_MEDIA_SCOPE.reset(token)
+
+
+def media_requires_typed_scope():
+    from agent.secret_scope import is_multiplex_active
+    from gateway.access_context import get_resolved_access_context
+    return get_resolved_access_context() is not None or (
+        is_multiplex_active() and not _REGISTRY_FREE_MEDIA_SCOPE.get())
 
 
 def _routed_gateway_cfg() -> Optional[dict[str, Any]]:

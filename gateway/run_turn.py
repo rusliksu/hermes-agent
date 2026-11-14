@@ -319,6 +319,19 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await self._record_room_silence_decision(
                 session_key, agent_result, _intentional_silence,
                 display_kind=prepared.persist_user_display_kind, reply_expected=event.reply_expected)
+            confirmation = agent_result.get("artifact_delivery_confirmation")
+            if confirmation is not None:
+                from gateway.artifact_delivery import prepare_confirmation
+                delivered = await prepare_confirmation(
+                    self, event, session_key, confirmation,
+                    publish=bool(response and not _intentional_silence
+                                 and not agent_result.get("failed")
+                                 and not agent_result.get("interrupted")),
+                )
+                if not delivered:
+                    return (None if _intentional_silence or not response
+                            else "⚠️ Не удалось подтвердить безопасную отправку документа. Повторите запрос явно.")
+                return response
             return await self._deliver_turn_response_then_limit_offer(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,

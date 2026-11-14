@@ -1043,6 +1043,13 @@ def build_resume_recovery_note(
     nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
     abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
     """
+    if reason in {"artifact_delivery_abandoned", "artifact_delivery_uncertain"}:
+        delivery_state = ("may have been delivered, but no durable receipt was stored"
+                          if reason == "artifact_delivery_uncertain" else "was not sent")
+        return ("[System note: A document delivery was interrupted and " + delivery_state
+                + ". Do not re-execute or auto-resume old tool calls. Tell the user to explicitly retry "
+                "the document request if they still want it delivered, then address only their new message.]"
+                + ("\n\n" + message if message else ""))
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
