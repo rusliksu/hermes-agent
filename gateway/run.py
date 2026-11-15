@@ -3758,6 +3758,11 @@ class GatewayRunner(
         self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
         """Authorize under the live transport's profile, not the routed runtime (which need not copy the
         shared bot token/allowlist); the transport home is stamped on the source for this read only."""
+        from gateway.access_runtime import has_access_registry
+        if has_access_registry(self):
+            identity = self._canonicalize(source)
+            return (identity is not None and identity.access_context is not None
+                    and getattr(source, "profile_route_rejected", False) is not True)
         def _check() -> bool:
             # Keep the one-argument seam used by plugins/tests; pass the keyword only when disabling.
             if allow_adapter_delegation:

@@ -169,7 +169,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # construct SessionSource directly, so this is the shared fail-closed gate. Strict boolean
         # marker: require the literal True so duck-typed test/internal sources with dynamic
         # attributes are not mistaken for a rejection.
-        if getattr(_config, "multiplex_profiles", False):
+        from gateway.access_runtime import has_access_registry
+        if (getattr(_config, "multiplex_profiles", False)
+                or has_access_registry(self)):
             self._canonicalize(source)
         if getattr(source, "profile_route_rejected", False) is True:
             from gateway.parked_route_refusal import drop_rejected_route
@@ -222,6 +224,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if event is None:
             return None
         source = event.source
+
+        if has_access_registry(self):
+            if self._canonicalize(source) is None:
+                return None
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:

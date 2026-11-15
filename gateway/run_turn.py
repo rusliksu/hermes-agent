@@ -467,6 +467,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
+        from gateway.access_tools import toolsets_for_context
+        enabled = toolsets_for_context(enabled, getattr(source, "resolved_access_context", None))
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
         return enabled, disabled
 
@@ -852,7 +854,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
     ) -> dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
+        from gateway.access_runtime import turn_access_scope
+        with turn_access_scope(source, runner=self), self._profile_scope_for_source(source):
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:

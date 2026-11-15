@@ -2375,15 +2375,19 @@ class BasePlatformAdapter(ABC):
             return None
         from gateway.session_identity import canonical_identity, identity_of
         identity = identity_of(source)
-        if identity is not None:
-            return identity
+        from gateway.access_runtime import has_access_registry
         runner = getattr(self, "gateway_runner", None)
+        registered = has_access_registry(runner)
+        if identity is not None and not registered:
+            return identity
         if runner is None or not callable(getattr(runner, "_transport_owner", None)):
             return None
         try:
             return canonical_identity(
                 source, runner=runner, adapter=self, transport_profile=self._owner_transport_profile())
         except Exception:
+            if registered:
+                source.profile_route_rejected = True
             # Duck-typed runners (SimpleNamespace / MagicMock rigs) have no registry to resolve
             # against; the key then falls back to the pre-identity readers instead of failing ingress.
             logger.debug("[%s] identity resolution failed; using legacy key readers", self.name, exc_info=True)
@@ -4762,7 +4766,11 @@ class BasePlatformAdapter(ABC):
         # later ``source.profile``-less fallback can re-route the message through the default bot's routes).
         owner_profile = getattr(self, "_owner_profile", None)
         profile, profile_route_rejected, rejected_profile = owner_profile, False, None
-        if self.gateway_runner is not None:
+        from gateway.access_runtime import has_access_registry
+        registered = has_access_registry(self.gateway_runner)
+        if registered:
+            profile = None
+        if self.gateway_runner is not None and not registered:
             from gateway.profile_routing import ProfileRouteRejected
             try:
                 profile = self.gateway_runner._profile_name_for_source(
@@ -4779,6 +4787,8 @@ class BasePlatformAdapter(ABC):
         # even if profile_routes picks another runtime; the reject flag is consumed before auth.
         source._transport_adapter_ref = weakref.ref(self)
         source.profile_route_rejected, source._rejected_route_profile = profile_route_rejected, rejected_profile
+        if registered:
+            self._canonicalize(source)
         return source
 
     @abstractmethod

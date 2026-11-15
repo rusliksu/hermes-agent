@@ -1543,6 +1543,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             identity = canonical_identity(
                 source, runner=self, transport_profile=transport_profile, primary_home=primary_home)
         except Exception:
+            from gateway.access_runtime import has_access_registry
+            if has_access_registry(self):
+                source.profile_route_rejected = True
             logger.debug("identity resolution failed; legacy readers stay in force", exc_info=True)
             return None
         if transport_profile and not getattr(source, "profile", None):

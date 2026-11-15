@@ -104,6 +104,8 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
+    route_account: Optional[str] = field(default=None, repr=False, compare=False)
+    resolved_access_context: Optional[Any] = field(default=None, repr=False, compare=False)
     # Wire-INVISIBLE: the key of a conversation its chat moved past, still run from the apps
     # (gateway/session_detached.py). It replaces the chat's key, so nothing keyed by route reaches
     # the chat's current conversation, and delivery goes nowhere.

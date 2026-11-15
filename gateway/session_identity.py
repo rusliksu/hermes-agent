@@ -64,6 +64,7 @@ class RoutingIdentity:
     # pre-column source. Delivery may still fall back to the runtime profile's unique adapter for
     # these; an identity whose transport is KNOWN (live or restored) never does.
     transport_inferred: bool = field(default=False, compare=False, hash=False)
+    access_context: Optional[Any] = field(default=None, compare=False, hash=False, repr=False)
 
     @property
     def namespace(self) -> str:
@@ -104,6 +105,7 @@ def clear_identity(source: Any) -> None:
             delattr(source, attr)
     with suppress(AttributeError):
         source.profile = None
+        source.resolved_access_context = None
 
 
 def transport_profile_of(source: Any) -> Optional[str]:
@@ -148,6 +150,20 @@ def canonical_identity(
     must never fall through to ``agent:main``."""
     identity = identity_of(source)
     if identity is not None:
+        from gateway.access_registry import AccessDeniedError
+        from gateway.access_runtime import deny, has_access_registry, profile_home, resolve_context
+        try:
+            if has_access_registry(runner):
+                if identity.access_context is None:
+                    raise IdentityUnresolved("missing_resolved_access_context")
+                if adapter is not None and identity.adapter() is not adapter:
+                    raise IdentityUnresolved("transport_identity_mismatch")
+                resolve_context(source, runner=runner, adapter=identity.adapter(), pinned=identity.access_context)
+                if profile_home(identity.access_context) != identity.runtime_home:
+                    deny("profile_home_mismatch")
+        except (AccessDeniedError, IdentityUnresolved):
+            source.profile_route_rejected = True
+            return None
         return identity
     try:
         return resolve_identity(
@@ -239,11 +255,29 @@ def resolve_identity(
     transport_inferred = adapter is None and _name(transport_profile) is None and _name(owner_profile) is None
     transport_ref = weakref.ref(adapter) if adapter is not None else None
 
+    from gateway.access_registry import AccessDeniedError
+    from gateway.access_runtime import profile_home, resolve_context
+
+    access_context = None
+    registered_home = None
+    try:
+        access_context = resolve_context(source, runner=runner, adapter=adapter)
+        if access_context is not None:
+            if not multiplexed and (access_context.role_id != "owner" or access_context.profile_id != primary_profile):
+                raise IdentityUnresolved("profile_scope_required")
+            registered_home = profile_home(access_context)
+            source.profile = access_context.profile_id
+            source.resolved_access_context = access_context
+    except (AccessDeniedError, IdentityUnresolved) as exc:
+        source.profile_route_rejected = True
+        raise IdentityUnresolved("registry_access_denied") from exc
+
     if not multiplexed:
         home = Path(get_hermes_home())
         identity = RoutingIdentity(
             transport_profile=primary_profile, runtime_profile=primary_profile,
-            authorization_home=home, runtime_home=home, multiplexed=False, transport=transport_ref)
+            authorization_home=home, runtime_home=home, multiplexed=False, transport=transport_ref,
+            access_context=access_context)
         setattr(source, _IDENTITY_ATTR, identity)
         return identity
 
@@ -273,13 +307,14 @@ def resolve_identity(
     runtime_name = _name(source.profile) or primary_profile
     # A routed runtime goes through the runner's resolver (missing-profile fallback + warning);
     # a bot serving its own profile runs where it authorizes.
-    runtime_home = (
-        authorization_home if runtime_name == transport_name
-        else Path(runner._resolve_profile_home_for_source(source)))
+    runtime_home = (registered_home if registered_home is not None else
+                    authorization_home if runtime_name == transport_name
+                    else Path(runner._resolve_profile_home_for_source(source)))
     identity = RoutingIdentity(
         transport_profile=transport_name, runtime_profile=runtime_name,
         authorization_home=authorization_home, runtime_home=runtime_home,
-        multiplexed=True, transport=transport_ref, transport_inferred=transport_inferred)
+        multiplexed=True, transport=transport_ref, transport_inferred=transport_inferred,
+        access_context=access_context)
     setattr(source, _IDENTITY_ATTR, identity)
     return identity
 
