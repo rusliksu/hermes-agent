@@ -665,12 +665,12 @@ class GatewayStartupMixin:
             # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
             if self._is_session_running(entry.session_key):
                 continue
-            source = self._restored_source(entry)
-            adapter = self._delivery_adapter_for(source)
+            adapter = (None if (source := self._restored_source(entry)) is None
+                       else self._delivery_adapter_for(source))
             if adapter is None:
                 logger.debug(
                     "Skipping auto-resume for %s: adapter not ready for %s", entry.session_key,
-                    getattr(source.platform, "value", source.platform),
+                    getattr(getattr(source, "platform", None), "value", None),
                 )
                 continue
             if not self._resume_owner_authorized(entry.session_key, source):

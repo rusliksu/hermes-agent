@@ -444,6 +444,7 @@ from gateway.platforms.base_exec_approval import (
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.media_policy import media_requires_typed_scope
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import SECRET_CACHE_STORES
@@ -843,7 +844,6 @@ def _kanban_attachment_roots() -> list[Path]:
 
 def _media_delivery_allowed_roots() -> list[Path]:
     """Return roots from which model-emitted local media may be delivered."""
-    from gateway.media_policy import media_requires_typed_scope
     if media_requires_typed_scope():
         from gateway.media_policy import typed_artifact_roots
         return typed_artifact_roots()
@@ -1065,7 +1065,6 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
-    from gateway.media_policy import media_requires_typed_scope
     if media_requires_typed_scope():
         from gateway.media_policy import typed_artifact_roots
         if not any(_path_is_within(resolved, root) for root in typed_artifact_roots(session_key)):
@@ -4264,7 +4263,9 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        delivery_adapter = self._final_delivery_adapter(event.source)
+        delivery_adapter, denial = _artifact_delivery.send_delivery_adapter(self, event)
+        if denial is not None:
+            return denial, self
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(

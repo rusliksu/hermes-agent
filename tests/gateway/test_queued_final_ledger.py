@@ -72,6 +72,7 @@ def _telegram_adapter(send_result=None):
 
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={}))
     runner = MagicMock()
+    runner.access_registry = None  # This fixture exercises the native, registry-free lane.
     runner._delivery_adapter_for = MagicMock(return_value=adapter)
     runner._schedule_flood_redelivery = MagicMock(return_value=187.0)
     adapter.gateway_runner = runner

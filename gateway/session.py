@@ -550,6 +550,32 @@ class SessionEntry:
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
     transport_profile: Optional[str] = None
+    # Authority belongs to the routing record, never the transport's source wire payload.
+    resolved_access_context: Optional[Any] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        from gateway.access_registry import deserialize_resolved_access_context, serialize_resolved_access_context
+
+        context = self.resolved_access_context
+        if context is None and self.origin is not None:
+            context = getattr(self.origin, "resolved_access_context", None)
+        if context is not None:
+            self.resolved_access_context = deserialize_resolved_access_context(
+                serialize_resolved_access_context(context))
+
+    def validate_source_authority(self, source):
+        """A pinned routing record and the source's context must agree, or the lane is denied."""
+        from gateway.access_registry import serialize_resolved_access_context
+        from gateway.access_runtime import deny
+
+        current = getattr(source, "resolved_access_context", None)
+        saved = self.resolved_access_context
+        if current is None and saved is None:
+            return
+        if current is None or saved is None or (
+            serialize_resolved_access_context(current) != serialize_resolved_access_context(saved)
+        ):
+            deny("session_authority_mismatch")
     # Exact session-context/channel inputs from the last human turn. Append-only dataclass field so
     # older positional construction of transport_profile keeps its meaning.
     prompt_pin: Optional[dict[str, Any]] = None
@@ -595,6 +621,10 @@ class SessionEntry:
                 result["prompt_pin"] = pin
         if self.transport_profile:
             result["transport_profile"] = self.transport_profile
+        if self.resolved_access_context is not None:
+            from gateway.access_registry import serialize_resolved_access_context
+
+            result["resolved_access_context"] = serialize_resolved_access_context(self.resolved_access_context)
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -629,6 +659,9 @@ class SessionEntry:
         # toggled": only their ON is a real toggle; False follows the launch policy, as it did then.
         plain["yolo"] = data["yolo_toggle"] if "yolo_toggle" in data else (True if data.get("yolo") is True else None)
         transport_profile = data.get("transport_profile")
+        from gateway.access_registry import deserialize_resolved_access_context
+
+        access_payload = data.get("resolved_access_context")
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -640,6 +673,8 @@ class SessionEntry:
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            resolved_access_context=(
+                deserialize_resolved_access_context(access_payload) if access_payload is not None else None),
             **plain,
         )
 
@@ -928,6 +963,11 @@ class SessionStore(
         if detached_route_of(source):
             from gateway.session_detached import detached_entry
             return detached_entry(self, source)
+        if (getattr(self.config, "access_registry", None) is not None
+                and getattr(source, "resolved_access_context", None) is None):
+            from gateway.access_runtime import deny
+
+            deny("missing_resolved_access_context")
         session_key = self._generate_session_key(source)
         inflight_lock = self._lazy("_inflight_lock", threading.Lock)
         self._lazy("_inflight_sessions", dict)
@@ -975,6 +1015,8 @@ class SessionStore(
         with self._lock:
             self._ensure_loaded_locked()
             observed = self._entries.get(session_key)
+            if observed is not None:
+                observed.validate_source_authority(source)
         # Phase 1b (no lock): compression tip + stale check + explicit suspension.
         checks = None
         if not force_new and observed is not None:
@@ -998,6 +1040,7 @@ class SessionStore(
             create_kwargs = self._route_create(
                 decision, session_key, source, now, force_new, observed
             )
+        decision.entry.validate_source_authority(source)
         try:
             if decision.needs_save:
                 if decision.metadata_only_save:
@@ -1078,6 +1121,10 @@ class SessionStore(
         self, decision: _RouteDecision, session_key: str, source: SessionSource, now: datetime
     ) -> None:
         """Adopt a recoverable state.db row, or schedule its reset (no lock held on entry)."""
+        # A transcript row alone cannot prove the routing record's authority. Do not adopt
+        # historical data under freshly inferred rights when the authoritative index is absent.
+        if getattr(source, "resolved_access_context", None) is not None:
+            return
         recovered = self._query_recoverable_session(session_key=session_key, source=source, now=now)
         if recovered is None:
             return
@@ -1220,6 +1267,7 @@ class SessionStore(
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
+            resolved_access_context=old_entry.resolved_access_context,
             transport_profile=old_entry.transport_profile, **fields,
         )
         self._entries[session_key] = new_entry

@@ -366,6 +366,11 @@ class GatewayAuthorizationMixin:
         """
         if source is None:
             return None
+        from gateway.access_runtime import has_access_registry
+        from gateway.session_identity import canonical_identity
+
+        if has_access_registry(self) and canonical_identity(source, runner=self) is None:
+            return None
         from gateway.session_detached import detached_route_of
         if detached_route_of(source):
             # A conversation its chat moved past answers its app viewers only, through the local
@@ -384,6 +389,11 @@ class GatewayAuthorizationMixin:
         # fixture) uses the unique-owner heuristic below.
         from gateway.session_identity import identity_of
         identity = identity_of(source)
+        if (identity is not None and identity.transport is None
+                and identity.access_context is not None):
+            # Registry-authorized restored lane: answer through the persisted transport bot, or
+            # nothing at all when that bot has no live adapter (never the runtime's heuristic).
+            return self._adapters_for_profile(identity.transport_profile).get(getattr(source, "platform", None))
         if self._names_receiving_bot(source, identity):
             return None
         # No identity, or one whose transport was only guessed (hand-built source, pre-column row, a
@@ -468,8 +478,16 @@ class GatewayAuthorizationMixin:
         source = getattr(entry, "origin", None)
         if source is None:
             return None
+        from gateway.access_runtime import has_access_registry
         from gateway.session_identity import restore_identity
-        restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
+
+        # Rebuild from the durable origin, dropping any stale live provenance on the entry.
+        source = SessionSource.from_dict(source.to_dict())
+        source.resolved_access_context = getattr(entry, "resolved_access_context", None)
+        identity = restore_identity(
+            source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
+        if has_access_registry(self) and identity is None:
+            return None
         return source
 
     def _adapter_flag(self, platform, name: str, profile) -> bool:

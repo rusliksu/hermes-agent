@@ -134,3 +134,20 @@ def processing_ok(delivery_succeeded, delivery_attempted, response, event):
     """A failed artifact upload must not let the turn count as delivered."""
     delivered = delivery_succeeded if delivery_attempted else not bool(response)
     return delivered and not getattr(event, "_artifact_delivery_failed", False)
+
+
+def send_delivery_adapter(adapter, event):
+    """(adapter, denial) for a final send; a registry-owned source never falls back to a stale bot."""
+    from gateway.access_registry import AccessDeniedError
+    from gateway.access_runtime import has_access_registry, resolve_context
+    from gateway.platforms.base import SendResult
+
+    runner = getattr(adapter, "gateway_runner", None)
+    if not has_access_registry(runner):
+        return adapter._final_delivery_adapter(event.source), None
+    delivery = runner._delivery_adapter_for(event.source)
+    try:
+        resolve_context(event.source, runner=runner, adapter=delivery)
+    except AccessDeniedError:
+        return None, SendResult(success=False, error="delivery_access_denied", retryable=False)
+    return delivery, None

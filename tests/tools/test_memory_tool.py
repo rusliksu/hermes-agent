@@ -110,6 +110,7 @@ def store(tmp_path, monkeypatch):
     return s
 
 
+@pytest.mark.platforms("posix")
 class TestMemoryFileLockPermissions:
     def test_new_lock_file_is_owner_only_under_permissive_umask(self, tmp_path):
         memory_path = tmp_path / "MEMORY.md"

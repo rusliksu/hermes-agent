@@ -53,6 +53,8 @@ async def restore_heartbeat_watches(runner) -> None:
                     continue
                 try:
                     source = runner._restored_source(entry)
+                    if source is None:
+                        continue
                     by_scope.setdefault(runner._profile_scope_key_for_source(source), []).append((entry, source))
                 except Exception:
                     logger.debug("heartbeat restore for %s failed", entry.session_key, exc_info=True)

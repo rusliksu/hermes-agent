@@ -156,9 +156,12 @@ def canonical_identity(
             # A restored identity has no live transport, so no registry context can be re-resolved;
             # its persisted routing row stays authoritative and fail-closed checks run at delivery.
             if has_access_registry(runner) and identity.access_context is not None:
-                if adapter is not None and identity.adapter() is not adapter:
+                receiving = identity.adapter()
+                if receiving is None and identity.transport is None and not identity.transport_inferred:
+                    receiving = runner._authorization_adapter(source.platform, identity.transport_profile)
+                if adapter is not None and receiving is not adapter:
                     raise IdentityUnresolved("transport_identity_mismatch")
-                resolve_context(source, runner=runner, adapter=identity.adapter(), pinned=identity.access_context)
+                resolve_context(source, runner=runner, adapter=receiving, pinned=identity.access_context)
                 if profile_home(identity.access_context) != identity.runtime_home:
                     deny("profile_home_mismatch")
         except (AccessDeniedError, IdentityUnresolved):
@@ -199,17 +202,34 @@ def restore_identity(
 
     primary_profile = _name(getattr(runner, "_primary_profile_name", None)) or "default"
     runtime_name = _name(getattr(source, "profile", None)) or primary_profile
+    from gateway.access_registry import AccessDeniedError
+    from gateway.access_runtime import has_access_registry, profile_home, resolve_context
+
+    access_context = None
+    registered_home = None
+    if has_access_registry(runner):
+        try:
+            if getattr(source, "resolved_access_context", None) is None:
+                raise IdentityUnresolved("missing_resolved_access_context")
+            receiving = runner._authorization_adapter(source.platform, transport_name)
+            access_context = resolve_context(
+                source, runner=runner, adapter=receiving, pinned=source.resolved_access_context)
+            runtime_name = access_context.profile_id
+            registered_home = profile_home(access_context)
+        except (AccessDeniedError, IdentityUnresolved):
+            source.profile_route_rejected = True
+            return None
     authorization_home = (
         Path(get_process_hermes_home()) if transport_name == primary_profile
         else get_profile_dir(transport_name))
-    runtime_home = (
-        authorization_home if runtime_name == transport_name
-        else Path(runner._resolve_profile_home_for_source(source)))
+    runtime_home = (registered_home if registered_home is not None else
+                    authorization_home if runtime_name == transport_name
+                    else Path(runner._resolve_profile_home_for_source(source)))
     source._authorization_profile_home = authorization_home
     identity = RoutingIdentity(
         transport_profile=transport_name, runtime_profile=runtime_name,
         authorization_home=authorization_home, runtime_home=runtime_home,
-        multiplexed=True, transport=None)
+        multiplexed=True, transport=None, access_context=access_context)
     setattr(source, _IDENTITY_ATTR, identity)
     return identity
 

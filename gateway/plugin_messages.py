@@ -89,7 +89,10 @@ def resolve(runner, *, session_key: str, route, plugin_home, plugin_id: str):
     entry = runner.session_store.lookup_by_session_key(session_key)
     if entry is not None and entry.origin is not None:
         from gateway.session_identity import replace_source
-        source = replace_source(runner._restored_source(entry))
+        restored = runner._restored_source(entry)
+        if restored is None:
+            return None, _err("no_conversation", f"session {session_key!r} is not known to this gateway")
+        source = replace_source(restored)
     elif route is not None and runner._session_key_for_source(route) == session_key:
         source = route
     else:

@@ -142,6 +142,14 @@ def test_interleaved_turns_of_two_profiles_write_to_their_own_stores(homes):
 _REFUSAL_CODE = "memory_caller_profile_unresolved"
 
 
+def _logged_refusal_text(caplog) -> str:
+    """Log records render paths via ``%r`` (backslashes escaped) and may lowercase them."""
+    return "\n".join(
+        r.getMessage().replace("\\\\", "\\")
+        for r in caplog.records if r.name == "agent.memory_caller_scope"
+    ).casefold()
+
+
 def _assert_generic_refusal(result, caplog, *homes):
     """The model/chat sees a generic refusal pointing at a log every host writes (errors.log; gateway.log
     too on a gateway); the log keeps the check's code and the homes."""
@@ -149,8 +157,11 @@ def _assert_generic_refusal(result, caplog, *homes):
     assert "refused" in error and "hermes logs errors" in error, result
     assert _REFUSAL_CODE not in error and not any(str(home) in error for home in homes), result
     logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "agent.memory_caller_scope")
+    # ``%r`` escapes Windows path separators inside the log record; compare an unescaped view so
+    # the assertion is path-style independent.
+    unescaped = logged.replace("\\\\", "\\").casefold()
     assert _REFUSAL_CODE in logged, logged
-    assert all(str(home) in logged for home in homes), logged
+    assert all(str(home).casefold() in unescaped for home in homes), logged
 
 
 @pytest.fixture
@@ -327,7 +338,7 @@ def test_lifecycle_hooks_from_another_profiles_scope_are_refused(homes, caplog):
             hook(alpha)
     assert _InstanceScopedProvider.events == []
     assert _refused_hooks(caplog) == set(_HOOKS)
-    assert all(str(beta_home) in r.getMessage() for r in caplog.records if r.name == "agent.memory_caller_scope")
+    assert str(beta_home).casefold() in _logged_refusal_text(caplog)
 
 
 def test_multiplexed_lifecycle_hooks_without_a_caller_scope_are_refused(homes, multiplexed, monkeypatch, caplog):
@@ -441,8 +452,8 @@ def test_one_provider_instance_is_never_served_to_a_second_profile(homes, multip
     with _Scope(alpha_home):
         assert json.loads(alpha.handle_tool_call(_HOOK_TOOL, {})) == {"ok": True}
     assert [e[1] for e in _InstanceScopedProvider.events] == [str(alpha_home)]
-    logged = "\n".join(r.getMessage() for r in caplog.records if r.name == "agent.memory_caller_scope")
-    assert "memory_provider_instance_shared" in logged and str(beta_home) in logged, logged
+    logged = _logged_refusal_text(caplog)
+    assert "memory_provider_instance_shared" in logged and str(beta_home).casefold() in logged, logged
 
 
 def test_agent_whose_provider_instance_is_refused_is_told_and_runs_without_it(homes, multiplexed, monkeypatch, caplog):

@@ -96,7 +96,7 @@ async def _wait_for_delivery(adapter: TelegramAdapter) -> None:
     assert adapter.send.called, "Telegram delivery did not complete"
 
 
-@pytest.mark.skip(reason="restored-lane delivery needs the 0005 restart-authority port")
+@pytest.mark.skip(reason="process-notification authority lands with the 0010/0017 port")
 @pytest.mark.asyncio
 async def test_parent_topics_exact_override_memory_restore_and_delivery_at_full_boundary(
     monkeypatch,
@@ -244,7 +244,7 @@ async def test_parent_topics_exact_override_memory_restore_and_delivery_at_full_
         import time
         import tools.process_registry as processes
         from gateway.access_runtime import turn_access_scope
-        from gateway.access_context import set_session_vars, clear_session_vars, get_session_env
+        from gateway.session_context import set_session_vars, clear_session_vars, get_session_env
         from tools.terminal_tool_background import _stamp_gateway_routing
         from tools.process_registry import format_process_notification
 
