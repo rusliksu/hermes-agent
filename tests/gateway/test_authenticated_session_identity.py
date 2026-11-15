@@ -60,7 +60,10 @@ def connection(authority, session, monkeypatch):
     from hermes_cli.web_server_chat import _ws_auth_reason
     from gateway.session_controls import AuthorityConnection
     # Exercise the production ticket endpoint and upgrade stamp, not a made-up SessionActor.
-    monkeypatch.setattr(web.app.state, 'auth_required', True, raising=False)
+    if not hasattr(web.app.state, 'auth_required'):
+        monkeypatch.setattr(web.app.state, 'auth_required', True, raising=False)
+    else:
+        web.app.state.auth_required = True
     request = Request({'type': 'http', 'app': web.app, 'state': {'session': session},
                        'headers': [], 'method': 'POST', 'path': '/api/auth/ws-ticket'})
     return request, api_auth_ws_ticket, _ws_auth_reason, AuthorityConnection, WebSocket
@@ -85,7 +88,12 @@ async def test_every_bundled_sign_in_acts_as_the_owner_and_keeps_durable_receipt
 
     async def actor(session):
         request, endpoint, auth, factory, ws_type = connection(authority, session, monkeypatch)
-        monkeypatch.setattr(request.app.state, 'session_authority', authority, raising=False)
+        if not hasattr(request.app.state, 'session_authority'):
+            monkeypatch.setattr(request.app.state, 'session_authority', authority, raising=False)
+        else:
+            # A second actor() call must not register a second undo for the same key
+            # (tearing that down twice raised KeyError in starlette State).
+            request.app.state.session_authority = authority
         ticket = (await endpoint(request))['ticket']
         ws = ws_type({'type': 'websocket', 'path': '/api/ws', 'headers': [],
                       'query_string': ('ticket=' + ticket).encode(), 'client': ('127.0.0.1', 1)},

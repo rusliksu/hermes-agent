@@ -57,3 +57,31 @@ def turn_access_scope(source: Any, *, runner: Any):
     context = identity.access_context if identity is not None else None
     with bind_resolved_access_context(context):
         yield context
+
+
+_SESSION_VERBS_BY_ROLE = {
+    "owner": frozenset({"session:submit", "session:interrupt", "session:cancel",
+                        "session:mutate", "session:respond", "session:operator"}),
+    "member": frozenset({"session:submit", "session:interrupt", "session:cancel", "session:respond"}),
+    "family": frozenset({"session:submit", "session:interrupt", "session:cancel", "session:respond"}),
+    "shared_room": frozenset({"session:submit", "session:respond"}),
+}
+
+
+def session_actor_for_context(context: Any, *, transport_id: str):
+    """Bridge the resolved access context onto the 0.23 session actor contract.
+
+    The authority only checks ``actor.subject/profile_id/capabilities``; tool-level
+    capabilities ride the actor as ``tool:<name>`` so they never grant a session verb.
+    """
+    from gateway.session_contract import SessionActor
+
+    serialize_resolved_access_context(context)
+    verbs = _SESSION_VERBS_BY_ROLE.get(context.role_id, frozenset())
+    tool_caps = frozenset(f"tool:{name}" for name in context.capabilities)
+    return SessionActor(
+        subject=context.principal_id,
+        profile_id=context.profile_id,
+        capabilities=frozenset(set(verbs) | tool_caps),
+        transport_id=transport_id,
+    )
