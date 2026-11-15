@@ -1,6 +1,9 @@
 """Native-adapter handoff for one server-confirmed document; never replay an uncertain upload."""
 import asyncio
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from gateway.access_context import session_scope_from_resolved_access_context
 from gateway.access_context import get_resolved_access_context
@@ -40,6 +43,7 @@ async def prepare_confirmation(runner, event, session_key, confirmation, *, publ
             event._artifact_delivery_transition = transition
             return True
     except Exception:
+        logger.debug("artifact confirmation preparation failed", exc_info=True)
         return False
 
 
@@ -71,13 +75,15 @@ async def deliver_confirmed(adapter, event, session_key, metadata):
             delivered = True
             return result
     except Exception:
+        logger.debug("artifact delivery failed", exc_info=True)
         return SendResult(success=False, error="Artifact delivery failed")
     finally:
         if claimed and not delivered:
             try:
                 await transition("delivery_started", "uncertain")
             except Exception:
-                pass  # The durable delivery_started state is recovered as uncertain after restart.
+                logger.debug("artifact uncertain transition failed", exc_info=True)
+                # The durable delivery_started state is recovered as uncertain after restart.
 
 
 async def abandon_confirmation(event):
@@ -86,8 +92,37 @@ async def abandon_confirmation(event):
         if callable(transition):
             await transition("ready", "abandoned")
     except Exception:
-        pass  # Restart recovery terminalizes an unsent ready transaction if cleanup cannot write.
+        logger.debug("artifact abandon transition failed", exc_info=True)
+        # Restart recovery terminalizes an unsent ready transaction if cleanup cannot write.
     finally:
         event.artifact_delivery_confirmation = None
         if hasattr(event, "_artifact_delivery_transition"):
             delattr(event, "_artifact_delivery_transition")
+
+
+async def deliver_for_event(adapter, event, session_key, metadata, record_delivery):
+    """Native-upload the confirmed document; returns failure text, else None."""
+    adapter.pause_typing_for_chat(event.source.chat_id)
+    result = await deliver_confirmed(adapter, event, session_key, metadata)
+    record_delivery(result)
+    if result.success:
+        return None
+    event._artifact_delivery_failed = True
+    return "⚠️ Отправка документа не подтверждена. Повторите запрос явно."
+
+
+def confirmation_response(adapter, response):
+    """Text-only extraction: the document itself goes through the native upload."""
+    from gateway.platforms.base import _ExtractedResponse, _strip_media_directives
+
+    _, clean = adapter.extract_media(response)
+    _, clean = adapter.extract_images(clean)
+    return _ExtractedResponse(text_content=_strip_media_directives(clean).strip(), images=[],
+                              media_files=[], local_files=[], force_document_attachments=False,
+                              pre_extract=response)
+
+
+def processing_ok(delivery_succeeded, delivery_attempted, response, event):
+    """A failed artifact upload must not let the turn count as delivered."""
+    delivered = delivery_succeeded if delivery_attempted else not bool(response)
+    return delivered and not getattr(event, "_artifact_delivery_failed", False)

@@ -31,7 +31,7 @@ def _bound_artifact_output_error(path, task_id):
     try:
         from tools.artifact_delivery_tool import validate_bound_artifact_output
         error = validate_bound_artifact_output(path, task_id)
-    except Exception:
+    except (ImportError, OSError, RuntimeError, ValueError):
         from gateway.access_context import get_resolved_access_context
         context = get_resolved_access_context()
         error = "validator_unavailable" if context is not None and context.role_id in {"family", "shared_room"} else None

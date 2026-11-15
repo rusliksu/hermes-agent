@@ -390,6 +390,7 @@ class SessionPersistenceMixin:
             try:
                 recovered = recover(entry.session_id)
             except Exception:
+                logger.warning("artifact delivery recovery failed", exc_info=True)
                 recovered = {"state": "uncertain"}
             if isinstance(recovered, dict) and recovered.get("state") in {"abandoned", "uncertain"}:
                 entry.resume_pending = True

@@ -103,6 +103,6 @@ def profile_read_block_error(path):
         resolved = Path(path).resolve()
         if resolved.is_relative_to(root) and not resolved.is_relative_to(home):
             return "Access denied: path belongs to another Hermes profile."
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return "Access denied: bound profile context unavailable."
     return None

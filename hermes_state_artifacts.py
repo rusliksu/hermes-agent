@@ -29,7 +29,7 @@ class SessionArtifactsMixin:
     @classmethod
     def _decode_artifact_delivery(
         cls, raw: Any
-    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+    ) -> tuple[Optional[dict[str, Any]], bool]:
         if raw is None:
             return None, True
         malformed = {"state": "uncertain", "malformed": True}
@@ -64,7 +64,7 @@ class SessionArtifactsMixin:
             transaction_id
         ):
             return malformed, False
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "state": state,
             "transaction_id": transaction_id,
         }
@@ -78,7 +78,7 @@ class SessionArtifactsMixin:
         return result, True
 
     @staticmethod
-    def _encode_artifact_delivery(value: Dict[str, Any]) -> str:
+    def _encode_artifact_delivery(value: dict[str, Any]) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
@@ -191,7 +191,7 @@ class SessionArtifactsMixin:
 
     def recover_artifact_delivery(
         self, lineage_tip_session_id: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Terminalize the newest interrupted transaction in a compression lineage."""
         if not lineage_tip_session_id:
             return None

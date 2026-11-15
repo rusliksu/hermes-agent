@@ -38,7 +38,7 @@ def is_outbound_document_path(raw_path: str) -> bool:
         suffix = Path(raw_path.strip()).suffix.lower()
         if suffix not in MEDIA_DELIVERY_EXTS:
             return False
-    except Exception:
+    except (OSError, ValueError):
         return False
     mime_type, _ = mimetypes.guess_type(raw_path)
     return not (mime_type and mime_type.startswith(_MEDIA_MIME_PREFIXES))

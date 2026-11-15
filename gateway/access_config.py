@@ -41,7 +41,7 @@ def _require_keys(
 ) -> None:
     keys = set(data.keys())
     if missing := required - keys:
-        field = sorted(missing)[0]
+        field = min(missing)
         raise _access_registry_schema_error(f"{path}.{field}", "required field")
     if keys - required - optional:
         raise _access_registry_schema_error(f"{path}.<unknown>", "known field")
@@ -71,7 +71,7 @@ def _require_str_list(value: Any, path: str) -> list[str]:
     return [_require_str(item, f"{path}[]") for item in value]
 
 
-def parse_access_registry(raw: Any) -> "AccessRegistry":
+def parse_access_registry(raw: Any) -> AccessRegistry:
     from gateway.access_registry import (
         AccessRegistry,
         DeliveryTarget,
@@ -136,9 +136,7 @@ def parse_access_registry(raw: Any) -> "AccessRegistry":
             {"user_id", "thread_id"},
         )
         user_id = item.get("user_id")
-        if require_user:
-            user_id = _require_str(user_id, f"{path}.user_id")
-        elif user_id is not None:
+        if require_user or user_id is not None:
             user_id = _require_str(user_id, f"{path}.user_id")
         return TransportIdentity(
             platform=_require_str(item["platform"], f"{path}.platform"),

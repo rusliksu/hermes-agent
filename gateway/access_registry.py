@@ -126,7 +126,7 @@ def command_args_have_authority_selector(raw_args: Any) -> bool:
         return False
     try:
         parsed = json.loads(raw_args)
-    except Exception:
+    except (TypeError, ValueError):
         parsed = None
     if isinstance(parsed, dict) and payload_has_authority_selector(parsed):
         return True
@@ -394,7 +394,7 @@ class TransportIdentity:
     thread_id: Any = None
 
     @classmethod
-    def from_session_source(cls, source: Any, *, account: str) -> "TransportIdentity":
+    def from_session_source(cls, source: Any, *, account: str) -> TransportIdentity:
         platform = getattr(getattr(source, "platform", None), "value", None)
         return cls(
             platform=platform,
@@ -457,7 +457,7 @@ class RedactedAuditMetadata:
     thread_ref: Optional[str] = None
 
     @classmethod
-    def from_transport(cls, event: str, identity: Optional[TransportIdentity]) -> "RedactedAuditMetadata":
+    def from_transport(cls, event: str, identity: Optional[TransportIdentity]) -> RedactedAuditMetadata:
         if identity is None:
             return cls(event=event)
         return cls(
@@ -471,7 +471,7 @@ class RedactedAuditMetadata:
         )
 
     @classmethod
-    def from_delivery_target(cls, event: str, target: Optional["DeliveryTarget"]) -> "RedactedAuditMetadata":
+    def from_delivery_target(cls, event: str, target: Optional[DeliveryTarget]) -> RedactedAuditMetadata:
         if not isinstance(target, DeliveryTarget):
             return cls(event=event)
         return cls(

@@ -106,7 +106,7 @@ def _write_message(path, tool_call_id="write-1"):
 
 @pytest.mark.asyncio
 async def test_bound_document_reaches_a_native_upload_receipt(wired):
-    homes, db, artifact = wired
+    _homes, db, artifact = wired
     agent = SimpleNamespace(
         _session_db=db,
         session_id="fixture",
@@ -146,7 +146,7 @@ async def test_bound_document_reaches_a_native_upload_receipt(wired):
 
 @pytest.mark.asyncio
 async def test_foreign_document_never_reaches_the_upload(wired):
-    homes, db, artifact = wired
+    homes, db, _artifact = wired
     foreign = homes["beta"] / "foreign.csv"
     foreign.write_text("foreign,value\n", encoding="utf-8")
     refused = json.loads(handle_function_call(
@@ -163,7 +163,7 @@ async def test_foreign_document_never_reaches_the_upload(wired):
 
 @pytest.mark.asyncio
 async def test_unpublished_turn_abandons_before_any_upload(wired):
-    homes, db, artifact = wired
+    _homes, db, artifact = wired
     path = artifact.resolve()
     db_token = db.begin_artifact_delivery("fixture")
     assert db.transition_artifact_delivery("fixture", db_token, "pending", "ready")

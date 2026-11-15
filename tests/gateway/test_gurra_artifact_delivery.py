@@ -84,7 +84,7 @@ def _event():
 
 @pytest.mark.asyncio
 async def test_publish_confirms_then_claims_and_stores_the_receipt(wired):
-    db, home, artifact = wired
+    db, _home, artifact = wired
     confirmation = _confirmation(db, artifact)
     event = _event()
     runner = _runner(db)
@@ -100,7 +100,7 @@ async def test_publish_confirms_then_claims_and_stores_the_receipt(wired):
 
 @pytest.mark.asyncio
 async def test_unpublished_confirmation_is_terminal(wired):
-    db, home, artifact = wired
+    db, _home, artifact = wired
     confirmation = _confirmation(db, artifact)
     event = _event()
     assert await prepare_confirmation(_runner(db), event, "telegram:1001", confirmation, publish=False) is False
@@ -109,7 +109,7 @@ async def test_unpublished_confirmation_is_terminal(wired):
 
 @pytest.mark.asyncio
 async def test_missing_native_receipt_leaves_the_transaction_uncertain(wired):
-    db, home, artifact = wired
+    db, _home, artifact = wired
     confirmation = _confirmation(db, artifact)
     event = _event()
     assert await prepare_confirmation(_runner(db), event, "telegram:1001", confirmation, publish=True) is True
@@ -120,7 +120,7 @@ async def test_missing_native_receipt_leaves_the_transaction_uncertain(wired):
 
 @pytest.mark.asyncio
 async def test_abandon_confirmation_terminalizes_a_ready_transaction(wired):
-    db, home, artifact = wired
+    db, _home, artifact = wired
     confirmation = _confirmation(db, artifact)
     event = _event()
     assert await prepare_confirmation(_runner(db), event, "telegram:1001", confirmation, publish=True) is True

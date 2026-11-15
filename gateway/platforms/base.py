@@ -21,6 +21,8 @@ from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import describe_proxy_error, env_proxy_for_redaction, safe_proxy_url_for_log, safe_url_for_log
 from gateway.platforms.base_image_sniff import _looks_like_image
+from gateway import artifact_delivery as _artifact_delivery
+from gateway.platforms.docker_media_paths import warn_unresolved_docker_media
 from gateway.platforms.base_media_flags import pad_inline_flags
 
 from utils import normalize_proxy_url, unlink_files_older_than
@@ -843,11 +845,8 @@ def _media_delivery_allowed_roots() -> list[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     from gateway.media_policy import media_requires_typed_scope
     if media_requires_typed_scope():
-        from agent.access_paths import bound_artifact_roots
-        try:
-            return list(bound_artifact_roots())
-        except Exception:
-            return []
+        from gateway.media_policy import typed_artifact_roots
+        return typed_artifact_roots()
     from gateway.media_policy import media_delivery_allow_dirs
     operator_roots = (
         root for chunk in media_delivery_allow_dirs().split(os.pathsep)
@@ -986,19 +985,7 @@ def _cache_dir_container_mounts() -> list[tuple[Path, Path]]:
         return []
 
 
-def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str, quiet: bool = False) -> None:
-    """Name WHY a container-absolute MEDIA path failed translation (otherwise the only signal is
-    the generic "Skipping unsafe MEDIA directive path" line). Docker-only; host rejections and ``quiet``
-    callers (fs routes, which also see ordinary host paths) stay silent.
 
-    See #93950.
-    """
-    if quiet or not _docker_env_active():
-        return
-    logger.warning("Docker MEDIA path %s did not resolve to a host sandbox file (%s%s); "
-                   "the producing container's sandbox directory may not exist yet or "
-                   "was pruned", _log_safe_path(str(candidate)), reason,
-                   f", session_key={session_key}" if session_key else "")
 
 
 def _translate_docker_container_media_path(
@@ -1037,7 +1024,7 @@ def _translate_docker_container_media_path(
             (root, Path("/root"))
             for root in _docker_persistent_sandbox_roots(session_key, "home", workspace_key))
     if not mounts:
-        _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved", quiet)
+        warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved", quiet)
         return None
     # Longest container-prefix match; equal-length prefixes are tried in insertion order.
     candidate_posix = candidate.as_posix()
@@ -1045,14 +1032,14 @@ def _translate_docker_container_media_path(
                for prefix in (container_root.as_posix().rstrip("/") or "/",)
                if candidate_posix == prefix or candidate_posix.startswith(prefix + "/")]
     if not matched:
-        _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches", quiet)
+        warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches", quiet)
         return None
     for host_root, container_root, _score in sorted(matched, key=lambda m: -m[2]):
         translated = _resolve_path(host_root / candidate.relative_to(container_root), strict=must_exist)
         if translated is not None and (
                 translated == host_root or _path_is_within(translated, host_root)):
             return translated
-    _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox", quiet)
+    warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox", quiet)
     return None
 
 
@@ -1080,12 +1067,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         return None
     from gateway.media_policy import media_requires_typed_scope
     if media_requires_typed_scope():
-        from agent.access_paths import bound_artifact_roots
-        try:
-            roots = bound_artifact_roots(session_key)
-        except Exception:
-            return None
-        if not any(_path_is_within(resolved, root) for root in roots):
+        from gateway.media_policy import typed_artifact_roots
+        if not any(_path_is_within(resolved, root) for root in typed_artifact_roots(session_key)):
             return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():
@@ -2371,27 +2354,8 @@ class BasePlatformAdapter(ABC):
         FIRST. Returns the identity, or ``None`` when it cannot be resolved (a rejected route under
         multiplexing marks ``source.profile_route_rejected``; ``_drop_unresolved`` reads it) or when
         no runner seam exists (hand-built adapters, restored sources: the legacy readers stay)."""
-        if source is None:
-            return None
-        from gateway.session_identity import canonical_identity, identity_of
-        identity = identity_of(source)
-        from gateway.access_runtime import has_access_registry
-        runner = getattr(self, "gateway_runner", None)
-        registered = has_access_registry(runner)
-        if identity is not None and not registered:
-            return identity
-        if runner is None or not callable(getattr(runner, "_transport_owner", None)):
-            return None
-        try:
-            return canonical_identity(
-                source, runner=runner, adapter=self, transport_profile=self._owner_transport_profile())
-        except Exception:
-            if registered:
-                source.profile_route_rejected = True
-            # Duck-typed runners (SimpleNamespace / MagicMock rigs) have no registry to resolve
-            # against; the key then falls back to the pre-identity readers instead of failing ingress.
-            logger.debug("[%s] identity resolution failed; using legacy key readers", self.name, exc_info=True)
-            return None
+        from gateway.platforms.access_identity import canonicalize
+        return canonicalize(self, source)
 
     def _drop_unresolved(self, event: MessageEvent) -> bool:
         """True when *event* must be dropped: its identity could not be resolved because the route
@@ -4395,10 +4359,7 @@ class BasePlatformAdapter(ABC):
         paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
         dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
         if event.artifact_delivery_confirmation is not None:
-            _, clean = self.extract_media(response)
-            _, clean = self.extract_images(clean)
-            return _ExtractedResponse(text_content=_strip_media_directives(clean).strip(), images=[],
-                media_files=[], local_files=[], force_document_attachments=False, pre_extract=response)
+            return _artifact_delivery.confirmation_response(self, response)
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
@@ -4512,15 +4473,10 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
                 if event.artifact_delivery_confirmation is not None:
-                    from gateway.artifact_delivery import deliver_confirmed
-                    self.pause_typing_for_chat(event.source.chat_id)
-                    artifact_result = await deliver_confirmed(
-                        self, event, session_key, _mark_notify_metadata(_thread_metadata),
-                    )
-                    _record_delivery(artifact_result)
-                    if not artifact_result.success:
-                        event._artifact_delivery_failed = True
-                        response = "⚠️ Отправка документа не подтверждена. Повторите запрос явно."
+                    failure_text = await _artifact_delivery.deliver_for_event(
+                        self, event, session_key, _mark_notify_metadata(_thread_metadata), _record_delivery)
+                    if failure_text is not None:
+                        response = failure_text
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
@@ -4564,10 +4520,7 @@ class BasePlatformAdapter(ABC):
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
             await self._release_turn_marker(event)
-            processing_ok = (
-                (delivery_succeeded if delivery_attempted else not bool(response))
-                and not getattr(event, "_artifact_delivery_failed", False)
-            )
+            processing_ok = _artifact_delivery.processing_ok(delivery_succeeded, delivery_attempted, response, event)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4607,8 +4560,7 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             await self._fire_post_delivery_callback(session_key, interrupt_event)
-            from gateway.artifact_delivery import abandon_confirmation
-            await abandon_confirmation(event)
+            await _artifact_delivery.abandon_confirmation(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
@@ -4766,10 +4718,8 @@ class BasePlatformAdapter(ABC):
         # later ``source.profile``-less fallback can re-route the message through the default bot's routes).
         owner_profile = getattr(self, "_owner_profile", None)
         profile, profile_route_rejected, rejected_profile = owner_profile, False, None
-        from gateway.access_runtime import has_access_registry
-        registered = has_access_registry(self.gateway_runner)
-        if registered:
-            profile = None
+        from gateway.platforms.access_identity import prepare_source_access
+        profile, registered = prepare_source_access(self, owner_profile)
         if self.gateway_runner is not None and not registered:
             from gateway.profile_routing import ProfileRouteRejected
             try:

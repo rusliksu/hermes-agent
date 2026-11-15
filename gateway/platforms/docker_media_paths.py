@@ -158,3 +158,18 @@ def _default_docker_workspace_host_roots(
         if root not in roots:
             roots.append(root)
     return roots
+
+
+def warn_unresolved_docker_media(candidate, session_key: str, reason: str, quiet: bool = False) -> None:
+    """Name WHY a container-absolute MEDIA path failed translation (base.py keeps the logger)."""
+    import logging
+
+    from gateway.platforms.base import _docker_env_active, _log_safe_path
+
+    if quiet or not _docker_env_active():
+        return
+    logging.getLogger("gateway.platforms.base").warning(
+        "Docker MEDIA path %s did not resolve to a host sandbox file (%s%s); "
+        "the producing container's sandbox directory may not exist yet or "
+        "was pruned", _log_safe_path(str(candidate)), reason,
+        f", session_key={session_key}" if session_key else "")

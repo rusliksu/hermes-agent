@@ -138,3 +138,15 @@ def apply_media_policy_env(config: Optional[dict[str, Any]] = None) -> None:
             _set_env_default(_ALLOW_DIRS_ENV, _allow_dirs_str(allow_dirs))
     except Exception:
         logger.debug("apply_media_policy_env failed", exc_info=True)
+
+
+def typed_artifact_roots(session_key: Optional[str] = None) -> list:
+    """Roots a documents-capable access context may deliver from; empty when unbound."""
+    from agent.access_paths import bound_artifact_roots
+
+    try:
+        roots = bound_artifact_roots() if session_key is None else bound_artifact_roots(session_key)
+    except (OSError, RuntimeError, ValueError):
+        logger.exception("bound artifact roots unavailable")
+        return []
+    return list(roots)

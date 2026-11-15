@@ -120,7 +120,7 @@ class MessageEvent:
     # so untrusted payload text stays conversational. New fields append after it (positional compat).
     allow_gateway_control: bool = True
     # Server-only tool provenance; never populated from inbound wire metadata.
-    artifact_delivery_confirmation: Optional[Dict[str, str]] = None
+    artifact_delivery_confirmation: Optional[dict[str, str]] = None
     # Was this message addressed to this bot? False lets a bare silence marker stand (the adapter
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
