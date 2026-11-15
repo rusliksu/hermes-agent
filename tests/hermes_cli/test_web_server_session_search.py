@@ -39,7 +39,9 @@ class _FakeSessionDB:
         source=None,
         sources=None,
         exclude_sources=None,
+        activity=None,
     ):
+        assert activity in (None, "all")
         assert query == "20260603"
         assert include_archived is True
         rows = [
@@ -67,7 +69,9 @@ class _FakeSessionDB:
         exclude_sources=None,
         limit=20,
         fields=None,
+        activity=None,
     ):
+        assert activity in (None, "all")
         assert query == "20260603*"
         type(self).requested_fields = fields
         rows = [
@@ -225,11 +229,11 @@ class _DeepLineageSessionDB(_FakeSessionDB):
     MID = "s100"
 
     def search_sessions_by_id(self, query, limit=20, include_archived=True,
-                              source=None, sources=None, exclude_sources=None):
+                              source=None, sources=None, exclude_sources=None, activity=None):
         return []  # pragma: no cover - content-hit path only in this test
 
     def search_messages(self, query, source_filter=None, exclude_sources=None,
-                        limit=20, fields=None):
+                        limit=20, fields=None, activity=None):
         return [{
             "session_id": self.MID,
             "snippet": "content hit inside a deep lineage",

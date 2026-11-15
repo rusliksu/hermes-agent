@@ -227,6 +227,11 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     aliases ``content``."""
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    from tools.memory_access import MemoryAccessDenied, _require_memory_access
+    try:
+        _require_memory_access(store, "memory" if target is None else target)
+    except MemoryAccessDenied as exc:
+        return tool_error(exc.reason, success=False)
     token = FAILURE_CLASS.set("other")
     try:
         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)

@@ -129,6 +129,15 @@ def _csv(value: Optional[str]) -> list[str]:
     return [s.strip() for s in (value or "").split(",") if s.strip()]
 
 
+def _validate_activity(activity: str) -> None:
+    from hermes_state_activity import session_activity_filter_sql
+
+    try:
+        session_activity_filter_sql(activity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _is_active(row: dict, now: float) -> bool:
     return (
         row.get("ended_at") is None
@@ -184,13 +193,14 @@ def get_sessions(
     limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
     archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
     exclude_sources: str | None = None, cwd_prefix: str | None = None, full: bool = False,
-    profile: Optional[str] = None):
+    profile: Optional[str] = None, activity: str = "all"):
     """List sessions.
 
     ``order=recent`` sorts by latest activity across the compression chain, so
     a long-running chat stays on page one after it auto-compresses onto a fresh
     id.  Rows omit ``system_prompt`` / ``model_config`` unless ``full=1``.
     """
+    _validate_activity(activity)
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(
             status_code=400, detail="archived must be one of: exclude, only, include")
@@ -210,6 +220,7 @@ def get_sessions(
                 Path(db.db_path).parent, source=source or None, sources=source_list or None,
                 exclude_sources=_csv(exclude_sources) or None)
             scope = dict(
+                activity=activity,
                 source=source or None, sources=source_list or None,
                 exclude_sources=exclude_list or None, cwd_prefix=(cwd_prefix or None),
                 min_message_count=min_message_count, include_archived=include_archived,
@@ -286,7 +297,7 @@ def _is_compression_edge(child: dict, parent: dict) -> bool:
 @search_router.get("/api/sessions/search")
 async def search_sessions(
     q: str = "", limit: int = 20, profile: Optional[str] = None, source: str | None = None,
-    sources: str | None = None, exclude_sources: str | None = None):
+    sources: str | None = None, exclude_sources: str | None = None, activity: str = "all"):
     """Search sessions by ID (first) plus FTS5 message content.
 
     Results are deduped by compression lineage, not raw ``session_id``:
@@ -294,6 +305,7 @@ async def search_sessions(
     in the FTS index.  Branches also use ``parent_session_id`` but are real
     alternate conversations — they are NOT collapsed into the parent.
     """
+    _validate_activity(activity)
     if not q or not q.strip():
         return {"results": []}
     with http_failure("GET /api/sessions/search failed", 500, detail="Search failed"):
@@ -406,7 +418,7 @@ async def search_sessions(
             # Direct ID matches first (pasted ids never appear in message text).
             for row in db.search_sessions_by_id(
                 q, limit=safe_limit, include_archived=True, source=source_filter,
-                sources=source_list or None, exclude_sources=exclude_list or None):
+                sources=source_list or None, exclude_sources=exclude_list or None, activity=activity):
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
@@ -421,7 +433,7 @@ async def search_sessions(
             # conversations when several hits collapse onto one root.
             matches = db.search_messages(
                 query=prefix_query, source_filter=include_sources,
-                exclude_sources=exclude_list or None, limit=max(safe_limit * 5, 50),
+                exclude_sources=exclude_list or None, limit=max(safe_limit * 5, 50), activity=activity,
                 fields=("session_id", "role", "snippet", "source", "model", "session_started"))
             for m in matches:
                 if len(seen) >= safe_limit:
@@ -536,20 +548,22 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @manage_router.get("/api/sessions/stats")
-async def get_session_stats(profile: Optional[str] = None):
+async def get_session_stats(profile: Optional[str] = None, activity: str = "all"):
     """Session-store statistics (mirrors `hermes sessions stats`)."""
+    _validate_activity(activity)
     def _stats(db):
         out = {
             # exclude_children=True: the dashboard Sessions page pairs these counts with
             # list_sessions_rich rows, which collapse compression chains to one row carrying
             # the tip's id — the raw row count is inflated by the hidden chain links (#54298).
-            "total": db.session_count(include_archived=True, exclude_children=True),
-            "active_store": db.session_count(include_archived=False, exclude_children=True),
-            "archived": db.session_count(archived_only=True, exclude_children=True), "messages": db.message_count(),
+            "total": db.session_count(include_archived=True, exclude_children=True, activity=activity),
+            "active_store": db.session_count(include_archived=False, exclude_children=True, activity=activity),
+            "archived": db.session_count(archived_only=True, exclude_children=True, activity=activity),
+            "messages": db.message_count(),
             "by_source": {}}
         try:
             out["by_source"] = db.session_count_by_source(
-                include_archived=True, exclude_children=True)
+                include_archived=True, exclude_children=True, activity=activity)
         except Exception:
             pass
         return out

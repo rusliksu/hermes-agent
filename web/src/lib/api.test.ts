@@ -55,6 +55,21 @@ function jsonFetchMock(body: unknown = { ok: true }) {
   );
 }
 
+it("keeps the same activity partition on list, search and stats requests", async () => {
+  const fetchMock = jsonFetchMock();
+  vi.stubGlobal("fetch", fetchMock);
+  for (const activity of ["people", "automations", "all"] as const) {
+    await api.getSessions(1, 0, { profile: "fixture", activity });
+    await api.searchSessions("needle", { profile: "fixture", activity });
+    await api.getSessionStats("fixture", activity);
+    for (const [url] of fetchMock.mock.calls.slice(-3)) {
+      const parsed = new URL(String(url), "https://fixture.invalid");
+      expect(parsed.searchParams.get("activity")).toBe(activity);
+      expect(parsed.searchParams.get("profile")).toBe("fixture");
+    }
+  }
+});
+
 describe("fetchJSON", () => {
   it("tries the one-shot reload path for loopback 401s", async () => {
     vi.stubGlobal(

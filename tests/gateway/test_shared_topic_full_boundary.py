@@ -96,7 +96,7 @@ async def _wait_for_delivery(adapter: TelegramAdapter) -> None:
     assert adapter.send.called, "Telegram delivery did not complete"
 
 
-@pytest.mark.skip(reason="shared-room memory scope lands with the 0011 port")
+@pytest.mark.skip(reason="restored-lane delivery needs the 0005 restart-authority port")
 @pytest.mark.asyncio
 async def test_parent_topics_exact_override_memory_restore_and_delivery_at_full_boundary(
     monkeypatch,

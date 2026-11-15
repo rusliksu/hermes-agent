@@ -4,6 +4,7 @@ import {
   type ModelOptionsResult,
 } from "@hermes/shared";
 import { createDashboardSessionMutations } from "./session-mutations";
+import { appendProfileParam, appendQueryParam } from "./api_query";
 
 const mutateSessionHttp = createDashboardSessionMutations(fetchJSON);
 
@@ -400,17 +401,9 @@ function profileQuery(profile?: string): string {
   return profile ? `?profile=${encodeURIComponent(profile)}` : "";
 }
 
-function appendProfileParam(url: string, profile?: string): string {
-  if (!profile || url.includes("profile=")) return url;
-  return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
-}
-
-function appendQueryParam(url: string, key: string, value?: string): string {
-  if (!value) return url;
-  return `${url}${url.includes("?") ? "&" : "?"}${key}=${encodeURIComponent(value)}`;
-}
 
 export interface SessionQueryOptions {
+  activity?: "people" | "automations" | "all";
   profile?: string;
   order?: "created" | "recent";
   source?: string | null;
@@ -434,6 +427,7 @@ function normalizeSessionQueryOptions(
 
 function appendSessionFilters(url: string, options: SessionQueryOptions): string {
   let next = url;
+  next = appendQueryParam(next, "activity", options.activity);
   next = appendQueryParam(next, "source", options.source ?? undefined);
   if (options.sources && options.sources.length > 0) {
     next = appendQueryParam(next, "sources", options.sources.join(","));
@@ -541,8 +535,10 @@ export const api = {
     }),
   renameSession: (id: string, title: string, profile = getManagementProfile()) =>
     mutateSessionHttp<{ ok: boolean; title: string }>(id, "PATCH", { title }, profile),
-  getSessionStats: (profile = getManagementProfile()) =>
-    fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+  getSessionStats: (profile = getManagementProfile(), activity?: SessionQueryOptions["activity"]) =>
+    fetchJSON<SessionStoreStats>(
+      appendProfileParam(appendQueryParam("/api/sessions/stats", "activity", activity), profile),
+    ),
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
   importSessions: (

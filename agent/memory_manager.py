@@ -30,6 +30,7 @@ from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
+from agent.memory_access import MemoryAccessBinding, UNSET, owned_memory_callback
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +197,7 @@ class _StuckCallGate:
                 state.pop(key, None)
 
 
-class MemoryManager:
+class MemoryManager(MemoryAccessBinding):
     """Builtin provider (always first) plus at most one external provider.
 
     Failures in one provider never block the other: every fan-out hook logs and
@@ -209,7 +210,9 @@ class MemoryManager:
     _PREFETCH_GATE = _StuckCallGate()
     _BACKGROUND_GATE = _StuckCallGate()
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 resolved_access_context: Any = UNSET) -> None:
+        self._init_access_binding(resolved_access_context)
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
@@ -241,6 +244,7 @@ class MemoryManager:
         self._agent_context = "primary"
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
+    @owned_memory_callback
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
         """Call ``call(provider)`` per provider, logging+swallowing failures; returns successes in order.
@@ -280,6 +284,7 @@ class MemoryManager:
         self._tool_to_provider = {t: p for t, p in self._tool_to_provider.items() if p is not provider}
         self._has_external = any(p.name != "builtin" for p in self._providers)
 
+    @owned_memory_callback
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
         if provider.name != "builtin" and self._has_external:
@@ -347,6 +352,7 @@ class MemoryManager:
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         return next((p for p in self._providers if p.name == name), None)
 
+    @owned_memory_callback
     def build_system_prompt(self) -> str:
         """Join every provider's non-empty ``system_prompt_block()`` with blank lines."""
         blocks = self._each_provider("system_prompt_block() failed", lambda p: p.system_prompt_block(),
@@ -357,6 +363,7 @@ class MemoryManager:
     # providers get just the user's instruction (None for a bare invocation).
     _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
 
+    @owned_memory_callback
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
         if self._fork_turn_hooks_suppressed():
@@ -370,6 +377,7 @@ class MemoryManager:
         )
         return "\n\n".join(p for p in parts if p and p.strip())
 
+    @owned_memory_callback
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
         call keeps running on its daemon thread; _PREFETCH_GATE decides whether later turns call again."""
@@ -456,6 +464,7 @@ class MemoryManager:
         params = _signature_params(provider.sync_turn)
         return params is None or _has_var_kwargs(params) or keyword in params
 
+    @owned_memory_callback
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[list[dict[str, Any]]] = None,
                  turn_author: Optional[dict[str, Any]] = None) -> None:
@@ -565,6 +574,7 @@ class MemoryManager:
         with self._sync_executor_lock:
             self._background_futures.pop(future, None)
 
+    @owned_memory_callback
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
         """Block until queued sync/prefetch work has drained (False on timeout).
         With a single worker, a sentinel task completing proves every earlier task ran."""
@@ -577,6 +587,7 @@ class MemoryManager:
             return isinstance(e, RuntimeError)  # executor already shut down — nothing pending
         return True
 
+    @owned_memory_callback
     def get_all_tool_schemas(self) -> list[dict[str, Any]]:
         """Collect deduplicated tool schemas from all providers; reserved core tool names are
         skipped because :meth:`add_provider` refuses to route them."""
@@ -606,6 +617,7 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
+    @owned_memory_callback
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         provider = self._tool_to_provider.get(tool_name)
@@ -649,6 +661,7 @@ class MemoryManager:
 
         self._each_provider("on_turn_start failed", _tick)
 
+    @owned_memory_callback
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_session_end"):
             return
@@ -716,6 +729,7 @@ class MemoryManager:
         versions = (self._checkpoint_api_version(p) for p in self._providers)
         return any(v is not None and v >= api_version for v in versions)
 
+    @owned_memory_callback
     def on_pre_compress(self, messages: list[dict[str, Any]], *,
                         evidence_messages: Optional[list[dict[str, Any]]] = None, require_checkpoint: bool = False,
                         checkpoint_api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION) -> str:
@@ -948,6 +962,10 @@ class MemoryManager:
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers, injecting ``hermes_home`` so they resolve profile-scoped paths."""
+        self._capture_resolved_access_context(kwargs)
+        if self._memory_scope is not None:
+            kwargs["memory_scope"] = self._memory_scope
+            kwargs["hermes_home"] = str(self._memory_home)
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())

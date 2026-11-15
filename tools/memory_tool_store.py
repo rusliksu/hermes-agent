@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from utils import atomic_write_text
 from tools.threat_patterns import first_threat_message as _first_threat_message
+from tools.memory_access import _require_memory_access
 
 logger = logging.getLogger("tools.memory_tool")
 
@@ -186,7 +187,30 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True,
+                 memory_dir: Optional[Path] = None, allow_user_profile: bool = True,
+                 access_context: Any = None, require_access_context: bool = False):
+        from gateway.access_context import get_resolved_access_context
+        from gateway.access_registry import (
+            deserialize_resolved_access_context, serialize_resolved_access_context,
+            shared_memory_namespace_for_access_context,
+        )
+        current = access_context if access_context is not None else get_resolved_access_context()
+        self.access_context = (deserialize_resolved_access_context(serialize_resolved_access_context(current))
+                               if current is not None else None)
+        self.require_access_context = require_access_context or current is not None
+        self.memory_dir = Path(memory_dir) if memory_dir is not None else None
+        self.allow_user_profile = allow_user_profile
+        if current is not None:
+            from hermes_constants import get_hermes_home
+
+            if self.memory_dir is None:
+                self.memory_dir = get_hermes_home() / "memories"
+                if current.role_id == "shared_room":
+                    self.memory_dir /= Path("shared") / shared_memory_namespace_for_access_context(current)
+            if current.role_id == "shared_room":
+                self.allow_user_profile = False
+                user_profile_enabled = False
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
@@ -225,6 +249,7 @@ class MemoryStore:
         Threat hits are replaced by a ``[BLOCKED: …]`` placeholder in the SNAPSHOT only;
         live lists keep the raw text so the user can see and remove poisoned entries
         (dropping them silently would hide the attack)."""
+        _require_memory_access(self)
         from tools.threat_patterns import scan_for_threats
 
         def _sanitize(entry, filename):
@@ -238,6 +263,10 @@ class MemoryStore:
                     f"to delete the original.]")
 
         for target in ("memory", "user"):
+            if target == "user" and not self.allow_user_profile:
+                self._set_entries(target, [])
+                self._system_prompt_snapshot[target] = ""
+                continue
             path = self._path_for(target)
             from hermes_constants import mkdir_under_hermes_home
 
@@ -297,12 +326,15 @@ class MemoryStore:
                 with suppress(OSError):
                     _flock(True)
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Path:
+        _require_memory_access(self, target)
         from tools import memory_tool  # get_memory_dir is monkeypatched there
-        return memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
+
+        directory = self.memory_dir if self.memory_dir is not None else memory_tool.get_memory_dir()
+        return directory / ("USER.md" if target == "user" else "MEMORY.md")
 
     def _entries_for(self, target: str) -> list[str]:
+        _require_memory_access(self, target)
         return self.user_entries if target == "user" else self.memory_entries
 
     def _set_entries(self, target: str, entries: list[str]):
@@ -649,6 +681,9 @@ class MemoryStore:
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
         it, preserving the prefix cache); None if empty."""
+        if target == "user" and not self.allow_user_profile:
+            return None
+        _require_memory_access(self, target)
         return self._system_prompt_snapshot.get(target, "") or None
 
     def _success_response(self, target: str, message: str | None = None, **extra) -> dict[str, Any]:

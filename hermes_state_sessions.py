@@ -115,7 +115,7 @@ def _session_filter_where(
     *, exclude_children: bool = False, source: str | None = None, sources: list[str] | None = None,
     session_key: str | None = None, exclude_sources: list[str] | None = None, cwd_prefix: str | None = None,
     min_message_count: int = 0, archived_only: bool = False, include_archived: bool = False,
-    include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
+    activity: str | None = None, include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
     workspace_key: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """Shared ``sessions s`` WHERE builder so counts line up with listed rows. ``exclude_children``
@@ -124,6 +124,12 @@ def _session_filter_where(
     (``sessions.show_subagents``). Clause order is part of the SQL text contract."""
     where: list[str] = []
     params: list[Any] = []
+    from hermes_state_activity import session_activity_filter_sql
+
+    clause, values = session_activity_filter_sql(activity)
+    if clause:
+        where.append(clause)
+        params.extend(values)
     if exclude_children and include_subagents:
         where.append(f"({_LISTABLE_CHILD_SQL} OR {_delegate_from_json('s.model_config')} IS NOT NULL)")
     elif exclude_children:
@@ -1314,7 +1320,7 @@ class SessionSessionsMixin:
         id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False,
         include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False,
         include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
-        workspace_key: str | None = None,
+        workspace_key: str | None = None, activity: str | None = None,
     ) -> list[dict[str, Any]]:
         """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
         by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
@@ -1328,6 +1334,7 @@ class SessionSessionsMixin:
         self.flush_for_read()  # rows carry token/cost totals
         where_clauses, params = _session_filter_where(
             exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
+            activity=activity,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
             local_created_sources=local_created_sources, workspace_key=workspace_key,
@@ -1583,11 +1590,11 @@ class SessionSessionsMixin:
         self, source: str | None = None, sources: list[str] | None = None, cwd_prefix: str | None = None,
         min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False,
         exclude_children: bool = False, exclude_sources: list[str] | None = None, include_subagents: bool = False,
-        local_created_sources: Sequence[str] | None = None,
+        local_created_sources: Sequence[str] | None = None, activity: str | None = None,
     ) -> int:
         """Count sessions with list_sessions_rich's filters so a paired "load more" total matches."""
         where_clauses, params = _session_filter_where(
-            exclude_children=exclude_children, source=source, sources=sources,
+            exclude_children=exclude_children, source=source, sources=sources, activity=activity,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
             local_created_sources=local_created_sources,
@@ -1603,12 +1610,12 @@ class SessionSessionsMixin:
 
     def session_count_by_source(
         self, *, include_archived: bool = False, archived_only: bool = False,
-        exclude_children: bool = False,
+        exclude_children: bool = False, activity: str | None = None,
     ) -> dict[str, int]:
         """``{source: count}`` via one GROUP BY; ``exclude_children`` mirrors listing visibility."""
         where_clauses, params = _session_filter_where(
             exclude_children=exclude_children, archived_only=archived_only,
-            include_archived=include_archived,
+            include_archived=include_archived, activity=activity,
         )
         if exclude_children:
             from hermes_state_local import exclude_superseded_segments

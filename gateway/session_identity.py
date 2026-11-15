@@ -153,9 +153,9 @@ def canonical_identity(
         from gateway.access_registry import AccessDeniedError
         from gateway.access_runtime import deny, has_access_registry, profile_home, resolve_context
         try:
-            if has_access_registry(runner):
-                if identity.access_context is None:
-                    raise IdentityUnresolved("missing_resolved_access_context")
+            # A restored identity has no live transport, so no registry context can be re-resolved;
+            # its persisted routing row stays authoritative and fail-closed checks run at delivery.
+            if has_access_registry(runner) and identity.access_context is not None:
                 if adapter is not None and identity.adapter() is not adapter:
                     raise IdentityUnresolved("transport_identity_mismatch")
                 resolve_context(source, runner=runner, adapter=identity.adapter(), pinned=identity.access_context)
