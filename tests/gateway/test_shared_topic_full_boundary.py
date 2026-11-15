@@ -96,7 +96,6 @@ async def _wait_for_delivery(adapter: TelegramAdapter) -> None:
     assert adapter.send.called, "Telegram delivery did not complete"
 
 
-@pytest.mark.skip(reason="process-notification authority lands with the 0010/0017 port")
 @pytest.mark.asyncio
 async def test_parent_topics_exact_override_memory_restore_and_delivery_at_full_boundary(
     monkeypatch,

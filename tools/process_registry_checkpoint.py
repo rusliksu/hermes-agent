@@ -150,7 +150,10 @@ class ProcessCheckpointMixin:
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
+                from tools.process_event_metadata import process_event_metadata
+
                 self.pending_watchers.append({
+                    **process_event_metadata(session),
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,

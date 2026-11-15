@@ -90,6 +90,13 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
     proc_session.watcher_platform = platform
     for attr, var in _ROUTING_FIELDS:
         setattr(proc_session, attr, get_session_env(var, ""))
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.access_context import get_resolved_access_context
+
+    context = get_resolved_access_context()
+    if context is not None:
+        # Durable authority travels with the process, not the foreground chat.
+        proc_session.resolved_access_context = serialize_resolved_access_context(context)
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
@@ -132,7 +139,10 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     serves, or while it stops, the descriptor waits in ``pending_watchers`` for the
     startup / post-turn drain instead."""
     proc_session.watcher_interval = 5
+    from tools.process_event_metadata import process_event_metadata
+
     watcher = {
+        **process_event_metadata(proc_session),
         "session_id": proc_session.id, "check_interval": 5, "session_key": session_key,
         "platform": proc_session.watcher_platform,
         **{attr.removeprefix("watcher_"): getattr(proc_session, attr)

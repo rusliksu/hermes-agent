@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, List, Optional
@@ -189,3 +190,52 @@ class ProcessTerminationMixin:
             # reparented orphans are outside PID scope (systemd scope stop,
             # issued before this check, covers the cgroup case).
         return [pid for pid in survivors if pid]
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        """Close a Popen stream; test doubles may expose no ``close`` at all."""
+        close = getattr(stream, "close", None)
+        if callable(close):
+            with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
+                close()
+
+    def _release_finished_handles(self, session):
+        """Close a finished session's OS handles (Popen pipes / PTY master).
+
+        Best-effort and idempotent: the session may have no local Popen (env
+        backends, detached recovery), or the handles may already be closed by
+        the reader loop / kill path. Closing a Popen's stream objects does not
+        kill anything — the child has already exited — it only releases the
+        parent's pipe FDs, which is exactly the retained-resource leak.
+        """
+        proc = session.process
+        if proc is not None:
+            # A pipe reader blocked in ``read`` holds the buffer lock; closing its stream from
+            # another thread would wait on that lock while the child is already gone. The reader
+            # closes its own pipes in ``_finish_reader``; only stdin is safe to close here.
+            reader = getattr(session, "_reader_thread", None)
+            reader_busy = (reader is not None and reader.is_alive()
+                           and reader is not threading.current_thread())
+            for stream in ((getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+                           if not reader_busy else ()):
+                self._close_stream(stream)
+            self._close_stream(getattr(proc, "stdin", None))
+        if session._pty is not None:
+            # A live ptyprocess reader sits in a blocking read holding the PTY file
+            # object's buffer lock, and that read only ends once every holder of
+            # the slave side is gone. A descendant that setsid()s past the kill
+            # keeps it open, so close() here would block forever (under _lock on
+            # the prune path). The reader closes the PTY itself via
+            # _finish_reader once its read ends. pywinpty reads don't block, so
+            # Windows closes here as before.
+            from tools.process_registry import _IS_WINDOWS
+
+            reader = session._reader_thread
+            if (not _IS_WINDOWS and reader is not None and reader.is_alive()
+                    and reader is not threading.current_thread()):
+                return
+            # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
+            # closes the master fd exactly once; it raises only if the child
+            # ignores SIGKILL, which we don't want to surface on the finish path.
+            with suppress(Exception):
+                session._pty.close()

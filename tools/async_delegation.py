@@ -105,6 +105,7 @@ _ACTIVE_STATES = ("running", "stalling")
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+_EVENT_SCOPE_KEYS = (*_ROUTING_KEYS, "resolved_access_context")
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -167,9 +168,18 @@ def _capture_routing_origin() -> dict[str, Any]:
     Best-effort: empty values are omitted."""
     try:
         from gateway.session_context import get_session_env
-        return {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+
+        origin = {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
     except Exception:
-        return {}
+        origin = {}
+    from gateway.access_registry import serialize_resolved_access_context
+    from gateway.access_context import get_resolved_access_context
+
+    context = get_resolved_access_context()
+    if context is not None:
+        # Authority is strict and server-owned, never an environment routing hint.
+        origin["resolved_access_context"] = serialize_resolved_access_context(context)
+    return origin
 
 
 def _persist_dispatch(record: dict[str, Any]) -> None:
@@ -183,7 +193,8 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes",
+                    "task_transcripts", *_EVENT_SCOPE_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -333,7 +344,7 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None, "error": error, **diagnostics,
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+                **{k: task[k] for k in _EVENT_SCOPE_KEYS if task.get(k)}}
             result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
                       **({"results": recovered_results} if recovered_results else {})}
             event, result = redact_completion_event(event), redact_child_result(result)
@@ -1152,7 +1163,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in _EVENT_SCOPE_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     try:
         _persist_completion(evt, result)

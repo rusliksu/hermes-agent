@@ -671,6 +671,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
         """
+        from gateway.process_event_access import requires_process_context, validated_process_source
+
+        if requires_process_context(self, evt):
+            return validated_process_source(self, evt)
         from gateway.run import _parse_session_key
         session_key = str(evt.get("session_key") or "").strip()
         derived = {}
@@ -748,6 +752,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
+            from gateway.process_event_access import requires_process_context
+
+            if requires_process_context(self, evt) and self._build_process_event_source(evt) is None:
+                continue
             next_retry_at = evt.get("_watch_next_retry_at")
             if next_retry_at is not None and next_retry_at > time.monotonic():
                 # Backoff between refused injections: hold the event for a later drain tick
@@ -964,7 +972,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = self._resolve_injection_adapter(platform_name, source)
+        from gateway.process_event_access import requires_process_context
+
+        adapter = (self._delivery_adapter_for(source) if requires_process_context(self, evt)
+                   else self._resolve_injection_adapter(platform_name, source))
         if not adapter and platform_name == Platform.API_SERVER.value and getattr(source, "profile", None):
             # A route-only served profile owns no adapter map; the shared listener wakes exactly the
             # session that profile's store owns (proven in ``_self_post_api_server``), fail-closed.
@@ -1259,6 +1270,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
+        from gateway.process_event_access import process_event_scope, requires_process_context
+
+        if requires_process_context(self, evt):
+            return process_event_scope(self, source)
         if source is None or not getattr(source, "profile", None):
             raw_sid = _raw_process_event_session_id(evt)
             if raw_sid and getattr(getattr(self, "config", None), "multiplex_profiles", False):
@@ -1485,6 +1500,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
     async def _enqueue_process_completion_notification(self, synth_text: str, evt: dict) -> Optional[bool]:
         """Fan in policy-admitted process completions with compatible pinned owners."""
+        from gateway.process_event_access import requires_process_context
+
+        if requires_process_context(self, evt) and self._build_process_event_source(evt) is None:
+            return None
         # Filter each event before it can contaminate (or suppress) a foreground batch.
         # The shared queue may be drained outside the owning profile's runtime scope.
         async with self._completion_event_scope(evt):
@@ -1752,15 +1771,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
-        from gateway.run import _non_conversational_metadata
-        source = await asyncio.to_thread(self._build_process_event_source, watcher)
-        adapter = self._resolve_injection_adapter(platform_name, source)
-        if adapter and chat_id:
-            with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
-                send_meta = {"thread_id": thread_id} if thread_id else None
-                await adapter.send(
-                    chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                )
+        from gateway.process_event_access import send_watcher_message
+
+        await send_watcher_message(self, platform_name, chat_id, thread_id, message_text, watcher)
 
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
@@ -1789,6 +1802,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return {
             "type": "completion",
             "session_id": session_id,
+            "resolved_access_context": watcher.get("resolved_access_context"),
             **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
             "owner_task_id": getattr(session, "owner_task_id", "") or "",
             "task_id": getattr(session, "task_id", "") or "",

@@ -888,7 +888,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     @staticmethod
     def _watch_event_base(session: ProcessSession) -> dict:
         """Session identity + watcher routing fields shared by every watch event."""
+        from tools.process_event_metadata import process_event_metadata
+
         return {
+            **process_event_metadata(session),
             "event_id": uuid.uuid4().hex,
             "started_at": session.started_at,
             "parent_session_id": session.parent_session_id,
@@ -1411,6 +1414,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
+        proc = getattr(session, "process", None)
+        if proc is not None:
+            # The reader owns these pipes: close them here, after its last read returned.
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+                self._close_stream(stream)
         self._finish_exited(session, exit_code())
 
     _log_delta_command = staticmethod(log_delta_command)
@@ -1585,7 +1593,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         self._release_finished_handles(session)
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
+            from tools.process_event_metadata import process_event_metadata
+
             notification = {
+                **process_event_metadata(session),
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1610,39 +1621,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
         }
-
-    def _release_finished_handles(self, session: ProcessSession):
-        """Close a finished session's OS handles (Popen pipes / PTY master).
-
-        Best-effort and idempotent: the session may have no local Popen (env
-        backends, detached recovery), or the handles may already be closed by
-        the reader loop / kill path. Closing a Popen's stream objects does not
-        kill anything — the child has already exited — it only releases the
-        parent's pipe FDs, which is exactly the retained-resource leak.
-        """
-        proc = session.process
-        if proc is not None:
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
-                if stream is not None:
-                    with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
-                        stream.close()
-        if session._pty is not None:
-            # A live ptyprocess reader sits in a blocking read holding the PTY file
-            # object's buffer lock, and that read only ends once every holder of
-            # the slave side is gone. A descendant that setsid()s past the kill
-            # keeps it open, so close() here would block forever (under _lock on
-            # the prune path). The reader closes the PTY itself via
-            # _finish_reader once its read ends. pywinpty reads don't block, so
-            # Windows closes here as before.
-            reader = session._reader_thread
-            if (not _IS_WINDOWS and reader is not None and reader.is_alive()
-                    and reader is not threading.current_thread()):
-                return
-            # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
-            # closes the master fd exactly once; it raises only if the child
-            # ignores SIGKILL, which we don't want to surface on the finish path.
-            with suppress(Exception):
-                session._pty.close()
 
     # ----- Query Methods -----
 
