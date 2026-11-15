@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import pytest
 
 from agent.access_paths import bound_profile_home, guard_terminal_cwd, profile_read_block_error
-from gateway.access_context import ResolvedAccessContext, bind_resolved_access_context
+from gateway.access_context import DeliveryTarget, ResolvedAccessContext, bind_resolved_access_context
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
@@ -30,9 +30,12 @@ def scoped(home):
 
 def authority(profile="alpha", role="member"):
     return ResolvedAccessContext(
-        profile_id=profile,
+        principal_id="person:1001",
         role_id=role,
+        profile_id=profile,
+        conversation_scope="telegram:1001",
         capabilities=frozenset({"terminal", "private_memory"}),
+        delivery_target=DeliveryTarget("telegram", "account", "dm", "1001"),
     )
 
 

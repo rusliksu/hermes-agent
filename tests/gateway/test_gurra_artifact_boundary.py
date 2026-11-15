@@ -66,10 +66,12 @@ def wired(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("fixture", source="telegram")
     context = ResolvedAccessContext(
-        profile_id="alpha",
+        principal_id="person:1001",
         role_id="family",
+        profile_id="alpha",
+        conversation_scope="telegram:1001",
         capabilities=frozenset({"terminal", "documents"}),
-        delivery_target=DeliveryTarget("telegram", "1001"),
+        delivery_target=DeliveryTarget("telegram", "account", "dm", "1001"),
     )
     monkeypatch.setenv("TERMINAL_CWD", str(homes["alpha"]))
     token = set_hermes_home_override(str(homes["alpha"]))

@@ -34,10 +34,12 @@ def scoped(home):
 
 def context(profile="alpha"):
     return ResolvedAccessContext(
-        profile_id=profile,
+        principal_id="person:1001",
         role_id="family",
+        profile_id=profile,
+        conversation_scope="telegram:1001",
         capabilities=frozenset({"terminal", "private_memory", "documents"}),
-        delivery_target=DeliveryTarget("telegram", "1001"),
+        delivery_target=DeliveryTarget("telegram", "account", "dm", "1001"),
     )
 
 

@@ -23,10 +23,12 @@ def workspace(tmp_path):
 def bound(home, monkeypatch):
     monkeypatch.setenv("TERMINAL_CWD", str(home))
     context = ResolvedAccessContext(
-        profile_id="alpha",
+        principal_id="person:1001",
         role_id="family",
+        profile_id="alpha",
+        conversation_scope="telegram:1001",
         capabilities=frozenset({"terminal", "documents"}),
-        delivery_target=DeliveryTarget("telegram", "1001"),
+        delivery_target=DeliveryTarget("telegram", "account", "dm", "1001"),
     )
     home_token = set_hermes_home_override(str(home))
     try:
