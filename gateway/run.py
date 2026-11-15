@@ -3409,7 +3409,7 @@ class GatewayRunner(
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional[asyncio.Task] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(self, config: Optional[GatewayConfig] = None, access_registry: Optional[Any] = None):
         global _gateway_runner_ref
         # With multiplex_profiles on, load under the default profile secret scope so bot tokens in its
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
@@ -3417,6 +3417,7 @@ class GatewayRunner(
         # Injected configs keep their mode (including None), except the launching profile's
         # standalone opt-out: --config must not turn that profile into a host multiplexer.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self.access_registry = access_registry if access_registry is not None else self.config.access_registry
         if config is not None:
             from hermes_cli.gateway_multiplex_mode import standalone_launcher_decision, log_multiplex_decision
             decision = standalone_launcher_decision(self.config)
