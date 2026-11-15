@@ -1,6 +1,6 @@
 """Registry authority inside the native gateway routing identity."""
 from typing import Any
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from gateway.access_registry import (AccessDeniedError, RedactedAuditMetadata,
                                     TransportIdentity, serialize_resolved_access_context)
@@ -85,3 +85,26 @@ def session_actor_for_context(context: Any, *, transport_id: str):
         capabilities=frozenset(set(verbs) | tool_caps),
         transport_id=transport_id,
     )
+
+
+def media_delivery_scope_for_source(runner: Any, source: Any):
+    """Context + profile scope for a turn's media paths after the turn scope was reset (#109024).
+
+    Delivery runs on the adapter side, where the turn's contextvars are gone: the source's own
+    resolved context is rebound so path validation sees the same authority as the turn did.
+    """
+    from gateway.access_context import bind_resolved_access_context
+    from gateway.run import _profile_runtime_scope
+
+    context = getattr(source, "resolved_access_context", None)
+    if context is not None:
+        return _bind_context_and_scope(bind_resolved_access_context, context, _profile_runtime_scope(profile_home(context), {}))
+    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return nullcontext()
+    return _profile_runtime_scope(runner._resolve_profile_home_for_source(source), {})
+
+
+@contextmanager
+def _bind_context_and_scope(bind, context, scope):
+    with bind(context), scope:
+        yield

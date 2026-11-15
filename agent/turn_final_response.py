@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Dict, Optional
 
+from agent.artifact_delivery_stop import artifact_stop_action
 from agent.message_metadata import append_message
 from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
@@ -112,6 +113,51 @@ def finish_text_response(
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
     effective_task_id: Any,
 ) -> FinalResponseVerdict:
+    """Artifact stop gate first; a confirmed document must upload before any text goes out."""
+    stop = artifact_stop_action(agent)
+    if stop is None:
+        return _finish_text_response_body(
+            agent, assistant_message=assistant_message, response=response, finish_reason=finish_reason,
+            messages=messages, api_messages=api_messages, conversation_history=conversation_history,
+            api_call_count=api_call_count, user_message=user_message,
+            active_system_prompt=active_system_prompt, final_response=final_response,
+            _turn_exit_reason=_turn_exit_reason,
+            _preflight_compression_blocked=_preflight_compression_blocked,
+            codex_ack_continuations=codex_ack_continuations,
+            truncated_response_parts=truncated_response_parts,
+            length_continue_retries=length_continue_retries,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=_pending_verification_response_previewed,
+            effective_task_id=effective_task_id)
+    action, payload = stop
+    if action == "continue":
+        messages.append({"role": "user", "content": payload, "_artifact_delivery_stop_synthetic": True})
+        agent._session_messages = messages
+        final_response, exit_reason = None, _turn_exit_reason
+    else:
+        messages.append({"role": "assistant", "content": payload})
+        final_response, exit_reason = payload, "artifact_delivery_failed"
+    return FinalResponseVerdict(
+        action=action, active_system_prompt=active_system_prompt, final_response=final_response,
+        _turn_exit_reason=exit_reason, _preflight_compression_blocked=_preflight_compression_blocked,
+        codex_ack_continuations=codex_ack_continuations,
+        truncated_response_parts=truncated_response_parts,
+        length_continue_retries=length_continue_retries,
+        _pending_verification_response=_pending_verification_response,
+        _pending_verification_response_previewed=_pending_verification_response_previewed,
+        api_call_count=api_call_count, result=None)
+
+
+
+def _finish_text_response_body(
+    agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
+    api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
+    active_system_prompt: Any, final_response: Any, _turn_exit_reason: Any,
+    _preflight_compression_blocked: Any, codex_ack_continuations: Any,
+    truncated_response_parts: Any, length_continue_retries: Any,
+    _pending_verification_response: Any, _pending_verification_response_previewed: Any,
+    effective_task_id: Any,
+) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
     iteration-limit summarization; the final message is appended and flushed only after the
@@ -119,7 +165,6 @@ def finish_text_response(
     from agent.conversation_loop import (
         _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
     )
-
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
         return FinalResponseVerdict(
             action=action, active_system_prompt=active_system_prompt, final_response=final_response,
@@ -134,23 +179,6 @@ def finish_text_response(
             result=result,
         )
 
-    artifact_turn = getattr(agent, "_artifact_turn", None)
-    if artifact_turn is not None:
-        try:
-            action, nudge = artifact_turn.finish()
-        except Exception:
-            action, nudge = "failed", None
-        if action == "continue":
-            messages.append({"role": "user", "content": nudge, "_artifact_delivery_stop_synthetic": True})
-            agent._session_messages = messages
-            final_response = None
-            return _verdict("continue")
-        if action == "failed":
-            from agent.artifact_turn import ARTIFACT_FAILURE
-            final_response = ARTIFACT_FAILURE
-            _turn_exit_reason = "artifact_delivery_failed"
-            messages.append({"role": "assistant", "content": final_response})
-            return _verdict("break")
 
     # Reasoning-only clean stop on a trusted route (elsewhere reasoning is private and takes the
     # ladder): some parsers (vLLM nemotron_v3 past ~500K prompt tokens) file the whole answer as

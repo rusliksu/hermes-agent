@@ -169,13 +169,10 @@ def run_tool_round(
     maybe_prepare(agent, messages, origin="tool-batch")
 
     artifact_turn = getattr(agent, "_artifact_turn", None)
-    if artifact_turn is not None:
-        try:
-            artifact_turn.begin_batch(assistant_message.tool_calls)
-        except Exception:
-            from agent.artifact_turn import ARTIFACT_FAILURE
-            failed, final_response, _turn_exit_reason = True, ARTIFACT_FAILURE, "artifact_delivery_begin_failed"
-            return _verdict("break")
+    if artifact_turn is not None and not artifact_turn.begin_batch(assistant_message.tool_calls):
+        from agent.artifact_turn import ARTIFACT_FAILURE
+        failed, final_response, _turn_exit_reason = True, ARTIFACT_FAILURE, "artifact_delivery_begin_failed"
+        return _verdict("break")
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 

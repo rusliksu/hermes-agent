@@ -585,6 +585,28 @@ class AccessRegistry:
             if count:
                 counts[category] = counts.get(category, 0) + count
 
+        aliases = self._validate_roles(add)
+        principal_keys, principal_ids, principal_profiles = self._validate_principals(add)
+        room_keys, room_profiles = self._validate_shared_scopes(add, principal_ids, principal_profiles)
+        for policies in aliases.values():
+            if len(policies) > 1:
+                add("conflicting_role_alias")
+        for category, counted in (
+            ("duplicate_principal_binding", principal_keys),
+            ("duplicate_principal_id", principal_ids),
+            ("duplicate_principal_profile", principal_profiles),
+            ("duplicate_shared_scope_binding", room_keys),
+            ("duplicate_shared_room_profile", room_profiles),
+        ):
+            add(category, sum(count - 1 for count in counted.values() if count > 1))
+        conflicts = tuple(sorted(counts.items()))
+        return RegistryValidationReport(
+            verdict="fail" if conflicts else "pass",
+            conflicts=conflicts,
+        )
+
+    def _validate_roles(self, add) -> dict:
+        aliases: dict[str, set[tuple[frozenset[str], bool]]] = {}
         for key, role in self.roles.items():
             if not _is_nonempty_str(key):
                 add("malformed_role_key")
@@ -593,17 +615,10 @@ class AccessRegistry:
                 continue
             if canonical_role_id(key) != role.role_id:
                 add("mismatched_role_key")
+            aliases.setdefault(canonical_role_id(key), set()).add((role.capabilities, role.active))
+        return aliases
 
-        role_aliases: dict[str, set[tuple[frozenset[str], bool]]] = {}
-        for key, role in self.roles.items():
-            if isinstance(role, RolePolicy):
-                role_aliases.setdefault(canonical_role_id(key), set()).add(
-                    (role.capabilities, role.active)
-                )
-        for policies in role_aliases.values():
-            if len(policies) > 1:
-                add("conflicting_role_alias")
-
+    def _validate_principals(self, add):
         principal_keys: dict[tuple[str, str, str, str], int] = {}
         principal_ids: dict[str, int] = {}
         principal_profiles: dict[str, int] = {}
@@ -616,15 +631,11 @@ class AccessRegistry:
             if not _valid_principal_binding_identity(binding.transport_identity):
                 add("malformed_principal_binding")
             else:
-                principal_keys[_principal_key(binding.transport_identity)] = (
-                    principal_keys.get(_principal_key(binding.transport_identity), 0) + 1
-                )
+                key = _principal_key(binding.transport_identity)
+                principal_keys[key] = principal_keys.get(key, 0) + 1
             self._validate_binding_authority(
-                binding.principal_id,
-                binding.role_id,
-                binding.profile_id,
-                binding.conversation_scope,
-                add,
+                binding.principal_id, binding.role_id, binding.profile_id,
+                binding.conversation_scope, add,
             )
             if not _delivery_matches_identity(binding.delivery_target, binding.transport_identity):
                 add("delivery_target_mismatch")
@@ -632,7 +643,9 @@ class AccessRegistry:
                 principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
             if _is_nonempty_str(binding.profile_id):
                 principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
+        return principal_keys, principal_ids, principal_profiles
 
+    def _validate_shared_scopes(self, add, principal_ids, principal_profiles):
         room_keys: dict[tuple[str, str, str, str, Optional[str]], int] = {}
         room_profiles: dict[str, int] = {}
         for binding in self.shared_scope_bindings:
@@ -644,52 +657,41 @@ class AccessRegistry:
             if not _valid_room_identity(binding.room_identity):
                 add("malformed_shared_scope_binding")
             else:
-                room_keys[_room_key(binding.room_identity)] = (
-                    room_keys.get(_room_key(binding.room_identity), 0) + 1
-                )
+                key = _room_key(binding.room_identity)
+                room_keys[key] = room_keys.get(key, 0) + 1
             if binding.role_id != "shared_room":
                 add("invalid_shared_room_role")
             self._validate_binding_authority(
-                binding.principal_id,
-                binding.role_id,
-                binding.profile_id,
-                binding.conversation_scope,
-                add,
+                binding.principal_id, binding.role_id, binding.profile_id,
+                binding.conversation_scope, add,
             )
             if not _delivery_matches_identity(binding.delivery_target, binding.room_identity):
                 add("delivery_target_mismatch")
-            if not binding.participant_identities:
-                add("missing_shared_room_membership")
-            participant_keys: dict[tuple[str, str, str], int] = {}
-            for participant in binding.participant_identities:
-                if not isinstance(participant, ParticipantIdentity):
-                    add("malformed_shared_room_membership")
-                    continue
-                if not all(_is_nonempty_str(value) for value in participant.key()):
-                    add("malformed_shared_room_membership")
-                    continue
-                participant_keys[participant.key()] = participant_keys.get(participant.key(), 0) + 1
-            add(
-                "duplicate_shared_room_member",
-                sum(count - 1 for count in participant_keys.values() if count > 1),
-            )
+            self._validate_room_members(binding, add)
             if _is_nonempty_str(binding.principal_id):
                 principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
             if _is_nonempty_str(binding.profile_id):
                 principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
                 room_profiles[binding.profile_id] = room_profiles.get(binding.profile_id, 0) + 1
+        return room_keys, room_profiles
 
-        add("duplicate_principal_binding", sum(count - 1 for count in principal_keys.values() if count > 1))
-        add("duplicate_principal_id", sum(count - 1 for count in principal_ids.values() if count > 1))
-        add("duplicate_principal_profile", sum(count - 1 for count in principal_profiles.values() if count > 1))
-        add("duplicate_shared_scope_binding", sum(count - 1 for count in room_keys.values() if count > 1))
-        add("duplicate_shared_room_profile", sum(count - 1 for count in room_profiles.values() if count > 1))
-
-        conflicts = tuple(sorted(counts.items()))
-        return RegistryValidationReport(
-            verdict="fail" if conflicts else "pass",
-            conflicts=conflicts,
+    def _validate_room_members(self, binding, add) -> None:
+        if not binding.participant_identities:
+            add("missing_shared_room_membership")
+        participant_keys: dict[tuple[str, str, str], int] = {}
+        for participant in binding.participant_identities:
+            if not isinstance(participant, ParticipantIdentity):
+                add("malformed_shared_room_membership")
+                continue
+            if not all(_is_nonempty_str(value) for value in participant.key()):
+                add("malformed_shared_room_membership")
+                continue
+            participant_keys[participant.key()] = participant_keys.get(participant.key(), 0) + 1
+        add(
+            "duplicate_shared_room_member",
+            sum(count - 1 for count in participant_keys.values() if count > 1),
         )
+
 
     def validate_rollout_shape(self) -> RegistryValidationReport:
         counts = dict(self.validate().conflicts)

@@ -10,6 +10,10 @@ page) arrives as a ``NetworkError`` chained to the failed parse of that body.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 REFUSED = "refused"  # Telegram answered with a refusal (BadRequest, Forbidden, InvalidToken)
 FLOOD = "flood"  # a flood wait: answered, nothing posted, ``retry_after`` says when
 UNSENT = "unsent"  # connect/pool failure: the request never left
@@ -77,3 +81,15 @@ def is_entity_parse_error(error: Exception, markers: tuple = ("parse", "markdown
     transport/5xx error: PTB's "Parsing the server response ... failed" for an HTML 502/504 page
     may follow a posted message."""
     return any(marker in str(error).lower() for marker in markers) and send_error_kind(error) in (REFUSED, LOCAL)
+
+
+async def document_failure(adapter, error, *, require_native, fallback):
+    """A confirmed artifact upload must fail closed instead of becoming a text receipt."""
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.telegram.adapter import _redact_telegram_error_text
+
+    if require_native:
+        logger.warning("[%s] Native document upload failed: %s",
+                       getattr(adapter, "name", adapter), _redact_telegram_error_text(error))
+        return SendResult(success=False, error="native document upload failed")
+    return await adapter._warn_then("document", error, fallback())

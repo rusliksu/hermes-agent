@@ -1,12 +1,20 @@
 """Native-adapter handoff for one server-confirmed document; never replay an uncertain upload."""
 import asyncio
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from gateway.access_context import session_scope_from_resolved_access_context
-from gateway.access_context import get_resolved_access_context
+
+def _source_context_scope(event):
+    """Bind the source's resolved context when it has one; the seam tests rely on ambient."""
+    context = getattr(event.source, "resolved_access_context", None)
+    return bind_resolved_access_context(context) if context is not None else nullcontext()
+
+from gateway.access_context import (
+    bind_resolved_access_context, get_resolved_access_context, session_scope_from_resolved_access_context,
+)
 
 
 async def prepare_confirmation(runner, event, session_key, confirmation, *, publish):
@@ -21,7 +29,7 @@ async def prepare_confirmation(runner, event, session_key, confirmation, *, publ
         return False
     sid, token = confirmation["transaction_session_id"], confirmation["transaction_id"]
     try:
-        with runner._media_delivery_scope_for_source(event.source):
+        with _source_context_scope(event), runner._media_delivery_scope_for_source(event.source):
             from tools.artifact_delivery_tool import _resolve_artifact, bound_document_context_active
             context = get_resolved_access_context()
             if context is None or not bound_document_context_active():
@@ -57,7 +65,7 @@ async def deliver_confirmed(adapter, event, session_key, metadata):
     claimed = delivered = False
     try:
         current = adapter._final_delivery_adapter(event.source)
-        with current._media_delivery_scope(event.source):
+        with _source_context_scope(event), current._media_delivery_scope(event.source):
             if not bound_document_context_active():
                 return SendResult(success=False, error="Artifact access denied")
             path, error = _resolve_artifact(confirmation["path"], session_key)

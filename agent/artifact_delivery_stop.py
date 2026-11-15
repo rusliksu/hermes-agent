@@ -308,3 +308,24 @@ def bound_artifact_stop_action(
 
 
 __all__ = ["bound_artifact_stop_action", "bound_artifact_tool_batch_relevant"]
+
+
+def artifact_stop_action(agent):
+    """``("continue", nudge)`` / ``("failed", text)`` for the artifact turn, else None.
+
+    A broken ledger fails the turn closed: an unconfirmed upload must never look delivered.
+    """
+    artifact_turn = getattr(agent, "_artifact_turn", None)
+    if artifact_turn is None:
+        return None
+    try:
+        action, nudge = artifact_turn.finish()
+    except (OSError, RuntimeError, ValueError):
+        logger.warning("artifact turn finish failed", exc_info=True)
+        action, nudge = "failed", None
+    if action == "continue":
+        return ("continue", nudge)
+    if action == "failed":
+        from agent.artifact_turn import ARTIFACT_FAILURE
+        return ("failed", ARTIFACT_FAILURE)
+    return None

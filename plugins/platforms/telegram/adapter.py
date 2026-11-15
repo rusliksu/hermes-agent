@@ -5025,13 +5025,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
+        from plugins.platforms.telegram.telegram_send_errors import document_failure
+
         return await self._send_local_file(
             "File", file_path, chat_id, reply_to, metadata, "document",
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
-            lambda e: self._warn_then(
-                "document", e, super(
-                    TelegramAdapter, self,
-                ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
+            lambda e: document_failure(self, e, require_native=kwargs.get("_require_native"),
+                                       fallback=lambda: super(TelegramAdapter, self).send_document(
+                                           chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,

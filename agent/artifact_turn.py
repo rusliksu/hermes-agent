@@ -5,6 +5,8 @@ import logging
 from agent.artifact_delivery_stop import bound_artifact_stop_action, bound_artifact_tool_batch_relevant
 from tools.artifact_delivery_tool import bound_document_context_active
 
+logger = logging.getLogger(__name__)
+
 
 ARTIFACT_FAILURE = "⚠️ Не удалось безопасно подготовить документ к отправке. Повторите запрос явно."
 
@@ -31,7 +33,16 @@ class ArtifactTurn:
                 serialize_resolved_access_context(get_resolved_access_context()) != self.authority):
             raise ValueError("artifact authority changed")
 
-    def begin_batch(self, calls):
+    def begin_batch(self, calls) -> bool:
+        """True when the batch is tracked; False means the ledger cannot vouch for it."""
+        try:
+            self._begin_batch(calls)
+        except (OSError, RuntimeError, ValueError):
+            logger.warning("artifact batch begin failed", exc_info=True)
+            return False
+        return True
+
+    def _begin_batch(self, calls):
         self._check_authority()
         if bound_artifact_tool_batch_relevant(calls) and self.transaction_id is None:
             self.relevant = True

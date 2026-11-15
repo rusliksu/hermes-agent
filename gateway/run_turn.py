@@ -21,6 +21,8 @@ from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
+from gateway.access_runtime import turn_access_scope
+from gateway.access_tools import toolsets_for_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log
@@ -331,6 +333,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 if not delivered:
                     return (None if _intentional_silence or not response
                             else "⚠️ Не удалось подтвердить безопасную отправку документа. Повторите запрос явно.")
+                from gateway.artifact_delivery import deliver_confirmed
+                from gateway.platforms.base import _mark_notify_metadata, _thread_metadata_for_event
+                delivery_adapter = self._delivery_adapter_for(event.source)
+                upload = (await deliver_confirmed(
+                    delivery_adapter, event, session_key, _mark_notify_metadata(_thread_metadata_for_event(event)))
+                    if delivery_adapter is not None else None)
+                if upload is None:
+                    event.artifact_delivery_confirmation = None
+                    return "⚠️ Отправка документа не подтверждена. Повторите запрос явно."
+                event.artifact_delivery_confirmation = None
+                if not upload.success:
+                    return "⚠️ Отправка документа не подтверждена. Повторите запрос явно."
                 return response
             return await self._deliver_turn_response_then_limit_offer(
                 event, source, session_entry, session_key, run_generation,
@@ -394,18 +408,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         return launch_profile_scope_if_multiplexed()
 
     def _media_delivery_scope_for_source(self, source: SessionSource):
-        """Home + terminal-policy scope for validating a turn's MEDIA / local-file paths on the
-        adapter's delivery side, which runs after the routed turn scope was reset.
-
-        Docker path translation (``platforms/base.py::_translate_docker_container_media_path``)
-        infers the producing container from the ACTIVE profile (``get_active_profile_name``) and the
-        scope-aware ``TERMINAL_DOCKER_VOLUMES``; without this a secondary's ``MEDIA:/output/x.png``
-        resolves against the default profile's sandbox and mounts (#109024). No secret hydration:
-        path validation reads no credentials and this runs on the event loop."""
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return nullcontext()
-        from gateway.run import _profile_runtime_scope
-        return _profile_runtime_scope(self._resolve_profile_home_for_source(source), {})
+        """Profile scope for validating a turn's media paths after the turn scope was reset."""
+        from gateway.access_runtime import media_delivery_scope_for_source
+        return media_delivery_scope_for_source(self, source)
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, resolved inside the profile serving ``source``.
@@ -417,33 +422,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
     def _format_session_info(self) -> str:
         """Model / provider / context-length / endpoint block so users can spot bad context detection."""
-        from gateway.run import _resolve_gateway_model_context
-        resolved = _resolve_gateway_model_context()
-        context_length = resolved.context_length
-        ctx_source = {
-            "config": "config",
-            "default": "fallback, not a detected limit — set model.context_length in config to override",
-        }.get(resolved.context_source, "detected")
-        ctx_display = (
-            f"{context_length / 1_000_000:.1f}M" if context_length >= 1_000_000
-            else f"{context_length // 1_000}K" if context_length >= 1_000 else str(context_length)
-        )
-        lines = [
-            t("gateway.session.info_model", model=resolved.model),
-            t("gateway.session.info_provider", provider=resolved.provider or "openrouter"),
-            t("gateway.session.info_context", tokens=ctx_display, source=ctx_source),
-        ]
-        if (resolved.provider or "") == "moa":
-            # The preset name hides who pays: the aggregator runs every tool-loop step (#112359).
-            from hermes_cli.config import load_config
-            from hermes_cli.moa_config import normalize_moa_config
-            agg = normalize_moa_config(load_config().get("moa"))["presets"].get(resolved.model, {}).get("aggregator") or {}
-            if agg:
-                lines.append(t("gateway.session.info_acting_model", provider=agg.get("provider"), model=agg.get("model")))
-        base_url = resolved.base_url
-        if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):
-            lines.append(t("gateway.session.info_endpoint", url=base_url))
-        return "\n".join(lines)
+        from gateway.run_turn_session_info import format_session_info
+        return format_session_info()
 
     def _resolve_enabled_toolsets_for_source(
         self, user_config: dict, source: SessionSource, platform_key: str,
@@ -466,9 +446,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
     def _resolve_turn_toolsets(self, user_config: dict, source: SessionSource, platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
         from agent.skill_utils import parse_config_string_list
-        enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
-        from gateway.access_tools import toolsets_for_context
-        enabled = toolsets_for_context(enabled, getattr(source, "resolved_access_context", None))
+        enabled = toolsets_for_context(
+            self._resolve_enabled_toolsets_for_source(user_config, source, platform_key),
+            getattr(source, "resolved_access_context", None))
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
         return enabled, disabled
 
@@ -854,7 +834,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
     ) -> dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
-        from gateway.access_runtime import turn_access_scope
         with turn_access_scope(source, runner=self), self._profile_scope_for_source(source):
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
