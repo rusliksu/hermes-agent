@@ -53,7 +53,7 @@ def bound_artifact_roots(task_id="default"):
         if not _docker_env_active():
             raise
         configured = _translate_docker_container_media_path(
-            Path(scope_terminal_cwd()), task_id,
+            Path(scope_terminal_cwd()), task_id, must_exist=False,
         )
         if configured is None or not configured.is_relative_to(home):
             raise ValueError("bound Docker workspace unavailable")

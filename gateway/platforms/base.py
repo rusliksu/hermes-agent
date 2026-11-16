@@ -444,7 +444,7 @@ from gateway.platforms.base_exec_approval import (
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from gateway.media_policy import media_requires_typed_scope
+from gateway.media_policy import media_path_in_scope, media_requires_typed_scope, remote_media_may_fetch
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import SECRET_CACHE_STORES
@@ -1065,10 +1065,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
-    if media_requires_typed_scope():
-        from gateway.media_policy import typed_artifact_roots
-        if not any(_path_is_within(resolved, root) for root in typed_artifact_roots(session_key)):
-            return None
+    if media_requires_typed_scope() and not media_path_in_scope(resolved):
+        return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():
         resolved_root = _resolve_path(root, expand=True)
@@ -1106,7 +1104,9 @@ def _validated_delivery_path(raw_path, session_key: str, label: str,
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
     if not safe_path:
         from gateway.media_fetch import fetch_remote_media
-        safe_path = fetch_remote_media(raw)
+        scoped = media_requires_typed_scope()
+        fetched = (fetch_remote_media(raw) if remote_media_may_fetch(raw, scoped, _existing_regular_file) else None)
+        safe_path = validate_media_delivery_path(fetched, session_key=session_key) if scoped and fetched else fetched
     if not safe_path:
         # Say WHY: a path that does not exist on the host is the common case (a model hallucinated or
         # a sandbox path failed to translate) and is not a security rejection.

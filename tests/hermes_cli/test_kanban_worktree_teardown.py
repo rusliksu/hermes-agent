@@ -11,6 +11,8 @@ remote-tracking ref. Any doubt preserves the worktree.
 
 from __future__ import annotations
 
+import os
+
 import subprocess
 from pathlib import Path
 
@@ -121,10 +123,13 @@ def test_cleanup_proceeds_when_cwd_was_deleted(
     """Deferred parent cleanup (#33774) runs after the child's scratch cwd was
     rmtree'd; a dead cwd must not preserve a clean, pushed worktree."""
     wt = _make_worktree(repo, "t_deadcwd113073")
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    monkeypatch.chdir(scratch)
-    scratch.rmdir()
+    # Windows cannot remove a directory that is the process cwd; simulate the same
+    # cwd-lookup failure the cleanup handles, without faking the host platform or
+    # breaking subprocess/git child spawns that pass an explicit cwd.
+    def _gone():
+        raise OSError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: _gone()))
 
     kbw._cleanup_worktree_workspace("t_deadcwd113073", str(wt))
 

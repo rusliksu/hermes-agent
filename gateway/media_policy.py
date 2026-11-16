@@ -150,3 +150,35 @@ def typed_artifact_roots(session_key: Optional[str] = None) -> list:
         logger.exception("bound artifact roots unavailable")
         return []
     return list(roots)
+
+
+def media_path_in_scope(resolved) -> bool:
+    """Typed-scope delivery: bound artifact roots plus the foreign-profile/denylist guard."""
+    from agent.access_paths import bound_artifact_roots, profile_read_block_error
+    from gateway.platforms.base import _path_under_denied_prefix
+
+    try:
+        if profile_read_block_error(resolved) or _path_under_denied_prefix(resolved):
+            return False
+        return any(resolved.is_relative_to(root) for root in bound_artifact_roots())
+    except (OSError, RuntimeError, ValueError):
+        logger.debug("typed media scope check failed", exc_info=True)
+        return False
+
+
+def remote_media_may_fetch(raw, scoped, exists) -> bool:
+    """Whether the remote-sandbox fallback may copy *raw* into an allowed cache."""
+    if not scoped:
+        return True
+    from pathlib import Path
+
+    from agent.access_paths import bound_profile_home, profile_read_block_error
+    from gateway.platforms.base import _path_under_denied_prefix
+
+    try:
+        return (bound_profile_home() is not None and not exists(raw)
+                and not profile_read_block_error(raw)
+                and not _path_under_denied_prefix(Path(raw).expanduser().resolve()))
+    except (OSError, RuntimeError, ValueError):
+        logger.debug("remote media fetch guard failed", exc_info=True)
+        return False

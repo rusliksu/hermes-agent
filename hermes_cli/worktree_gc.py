@@ -74,12 +74,14 @@ def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess
     audit mid-list. :func:`noninteractive_repo_git_env` because ``status`` executes the repo's
     ``core.fsmonitor`` and clean filters (GHSA-7x36-8jrh-v4pw)."""
     from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    from hermes_cli.worktree_ops import autocrlf_git_args
+
     env = noninteractive_repo_git_env(cwd)
     if env is None:
         return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="",
                                            stderr=FILTER_DISCOVERY_FAILED)
     try:
-        return _run(["git", *args], timeout, cwd, env=env)
+        return _run(["git", *autocrlf_git_args(cwd), *args], timeout, cwd, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
                                            stderr=f"timeout after {timeout}s")

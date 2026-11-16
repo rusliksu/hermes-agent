@@ -43,6 +43,24 @@ def _git(args, cwd, timeout: float = 10, **kwargs):
                           errors="replace", timeout=timeout, cwd=cwd, **kwargs)
 
 
+def autocrlf_git_args(repo_path) -> list:
+    """Pin the checkout's eol conversion for hardened git calls.
+
+    noninteractive_repo_git_env drops the user's global config; a repository checked out with
+    core.autocrlf (Git for Windows default) would otherwise read every CRLF file as modified.
+    """
+    try:
+        probe = subprocess.run(["git", "-C", str(repo_path), "config", "--get", "core.autocrlf"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=5, check=False)
+        value = (probe.stdout or "").strip()
+        if probe.returncode == 0 and value in {"true", "input", "false"}:
+            return ["-c", f"core.autocrlf={value}"]
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("core.autocrlf probe failed for %s", repo_path, exc_info=True)
+    return []
+
+
 def _git_out(args, cwd, timeout: float = 10, **kwargs) -> Optional[str]:
     """``_git`` returning stripped stdout, or None on a non-zero exit. Raises like ``_git``."""
     result = _git(args, cwd, timeout=timeout, **kwargs)
