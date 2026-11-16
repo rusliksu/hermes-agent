@@ -153,13 +153,21 @@ def typed_artifact_roots(session_key: Optional[str] = None) -> list:
 
 
 def media_path_in_scope(resolved) -> bool:
-    """Typed-scope delivery: bound artifact roots plus the foreign-profile/denylist guard."""
-    from agent.access_paths import bound_artifact_roots, profile_read_block_error
+    """Typed-scope delivery: bound artifact roots plus the foreign-profile/denylist guard.
+
+    Multiplex-without-registry has no bound access context; the scoped profile home is then the
+    authority the adapter-side scope was entered for (#109024).
+    """
+    from agent.access_paths import bound_artifact_roots, bound_profile_home, profile_read_block_error
     from gateway.platforms.base import _path_under_denied_prefix
 
     try:
         if profile_read_block_error(resolved) or _path_under_denied_prefix(resolved):
             return False
+        if bound_profile_home() is None:
+            from hermes_constants import get_hermes_home
+
+            return resolved.is_relative_to(get_hermes_home())
         return any(resolved.is_relative_to(root) for root in bound_artifact_roots())
     except (OSError, RuntimeError, ValueError):
         logger.debug("typed media scope check failed", exc_info=True)

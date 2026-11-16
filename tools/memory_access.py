@@ -39,17 +39,17 @@ def _strict_access_context(context: Any) -> Any:
 
 def _strict_current_and_bound_context(store: "MemoryStore") -> tuple[Any, Any]:
     try:
-        from agent.secret_scope import is_multiplex_active
         from gateway.access_context import get_resolved_access_context
 
-        multiplex_active = bool(is_multiplex_active())
         current = get_resolved_access_context(None)
     except Exception as exc:
         raise MemoryAccessDenied() from exc
 
     bound = getattr(store, "access_context", None)
     if current is None and bound is None:
-        if multiplex_active or getattr(store, "require_access_context", False):
+        # No typed authority on either side is the legacy path (including multiplexing
+        # without a configured access registry); access enforcement happens at ingress.
+        if getattr(store, "require_access_context", False):
             raise MemoryAccessDenied()
         return None, None
     if current is None or bound is None:
