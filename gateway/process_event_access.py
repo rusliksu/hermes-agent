@@ -25,6 +25,15 @@ def validated_process_source(runner, event):
         source = runner._restored_source(entry)
         if source is None or source.resolved_access_context != context:
             return None
+        # Re-resolve against the CURRENT registry: a role's grants or the bot account may have
+        # changed since the event was queued, and the durable snapshot alone cannot prove them.
+        from gateway.access_runtime import resolve_context
+
+        receiving = runner._authorization_adapter(
+            source.platform, getattr(entry, "transport_profile", None))
+        live = resolve_context(source, runner=runner, adapter=receiving, pinned=context)
+        if live is None:
+            return None
         target = context.delivery_target
         expected = {"platform": target.platform, "chat_id": target.chat_id, "thread_id": target.thread_id,
                     "chat_type": target.peer_kind, "user_id": source.user_id}

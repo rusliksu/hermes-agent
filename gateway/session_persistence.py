@@ -381,6 +381,8 @@ class SessionPersistenceMixin:
         """Terminalize interrupted uploads in their owning stores; never replay file tools."""
         from datetime import datetime
 
+        if getattr(self, "_db_handle_cache", None) is None:
+            return  # hand-built/partial store (tests, migration shells): no DB handles to recover
         changed = False
         for key, entry in self._entries.items():
             db = self._db_for_key(key)
