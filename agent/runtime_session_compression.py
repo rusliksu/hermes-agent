@@ -25,7 +25,8 @@ class RuntimeSessionCompressionMixin:
         apply_row_annotations(messages, result['annotations'])
         return result['count']
 
-    def get_session(self, session_id):
+    def get_session(self, session_id, session_scope=None):
+        # session_scope narrows a shared SessionDB; a worker store already serves one scope.
         if session_id != self.scope['session_id']:
             from agent.runtime_session_store import WorkerPersistenceError
             ids = self._apply('compression.lineage', {'target': self.scope['session_id']})['readable_ids']

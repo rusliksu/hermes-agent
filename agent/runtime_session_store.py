@@ -412,6 +412,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise WorkerPersistenceError('pending_receipt')
             return True
 
+    def begin_artifact_delivery(self, session_id):
+        """Managed workers deliver through the gateway; no local artifact ledger exists here."""
+        raise WorkerPersistenceError('artifact_delivery_unavailable')
+
+    def transition_artifact_delivery(self, session_id, transaction_id, expected_state,
+                                     new_state, *, receipt_id=None):
+        raise WorkerPersistenceError('artifact_delivery_unavailable')
+
     def get_session_title(self, session_id):
         return self.get_session(session_id).get('title')
 
