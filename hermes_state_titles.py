@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, Optional
 
 from agent.message_sanitization import _sanitize_surrogates
+from hermes_state_access import session_scope_sql
 from hermes_state_common import (
     _COMPRESSION_CHILD_SQL, _RECOVERABLE_END_REASONS, _RECOVERABLE_END_REASONS_SQL,
     _non_continuation_child_sql, escape_like as _escape_like,
@@ -241,7 +242,7 @@ class SessionTitlesMixin:
                          [(sid,) for sid in held])
         return held
 
-    def get_session_by_title(self, title: str) -> Optional[dict[str, Any]]:
+    def get_session_by_title(self, title: str, *, session_scope=None) -> Optional[dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None.
 
         A deliberately archived canonical "Bot Chat" (:func:`bot_chat_title_released`, judged on
@@ -249,10 +250,11 @@ class SessionTitlesMixin:
         Bot Mode mints a fresh one (#139779). Recoverable auto-archives stay visible for #92687
         resurrection. Every other title keeps returning its archived row (``-c``, ``/resume``).
         """
+        clause, values = session_scope_sql(session_scope)
         row = self._read_one(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "WHERE s.title = ?", (title,))
+            "WHERE s.title = ?" + (" AND " + clause if clause else ""), (title, *values))
         if not row:
             return None
         session = self._session_row_dict(row)
@@ -263,9 +265,9 @@ class SessionTitlesMixin:
         released = bot_chat_title_released(session["archived"], session.get("auto_archived"), tip.get("end_reason"))
         return None if released else session
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(self, title: str, *, session_scope=None) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest "title #N" continuation."""
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, session_scope=session_scope)
         # Exception to the "#N continuation" preference: the canonical Bot Chat's identity
         # IS its exact title (Bot Mode re-resolves it by name on every open, no id pointer).
         # A "<title> #N" sibling — a Desktop branch or a client-minted numbered row — is NOT
@@ -278,10 +280,12 @@ class SessionTitlesMixin:
         if title == self.CANONICAL_BOT_CHAT_TITLE:
             return exact["id"] if exact is not None else None
         # Escape LIKE wildcards so "%"/"_" in titles cannot false-match.
+        clause, values = session_scope_sql(session_scope)
         numbered = self._read_all(
-            "SELECT id, title, started_at FROM sessions "
-            "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-            (f"{_escape_like(title)} #%",))
+            "SELECT s.id, s.title, s.started_at FROM sessions s "
+            "WHERE s.title LIKE ? ESCAPE '\\'" + (" AND " + clause if clause else "")
+            + " ORDER BY s.started_at DESC",
+            (f"{_escape_like(title)} #%", *values))
         return numbered[0]["id"] if numbered else (exact["id"] if exact else None)
 
     def get_next_title_in_lineage(self, base_title: str) -> str:

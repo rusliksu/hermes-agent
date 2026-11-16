@@ -532,7 +532,19 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
         env = noninteractive_repo_git_env(worktree_path)
         if env is None:
             return True
-        result = _git(["status", "--porcelain", "-z", "--untracked-files=normal"], worktree_path,
+        # The hardened env drops the user's global config, so a repository checked out with
+        # core.autocrlf (Git for Windows default) would read every CRLF file as modified.
+        # Read that one value read-only and pin it for the status/diff comparison.
+        eol: list[str] = []
+        try:
+            probe = _git(["config", "--get", "core.autocrlf"], worktree_path, timeout=timeout,
+                         stdin=subprocess.DEVNULL)
+            value = (probe.stdout or "").strip()
+            if probe.returncode == 0 and value in {"true", "input", "false"}:
+                eol = ["-c", f"core.autocrlf={value}"]
+        except Exception:
+            logger.debug("core.autocrlf probe failed for %s", worktree_path, exc_info=True)
+        result = _git([*eol, "status", "--porcelain", "-z", "--untracked-files=normal"], worktree_path,
                       timeout=timeout, stdin=subprocess.DEVNULL, env=env)
         if result.returncode != 0:
             return True
@@ -540,10 +552,17 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
         if not entries:
             from hermes_cli.worktree_retention import hidden_index_edits
             return bool(hidden_index_edits(worktree_path))
-        if any(not e.startswith("?? ") for e in entries):
-            return True
+        changes = [e[3:].rstrip("/") for e in entries if not e.startswith("?? ")]
+        untracked = [e[3:].rstrip("/") for e in entries if e.startswith("?? ")]
+        if changes:
+            # A stat-only index entry (mtime touched, bytes identical) can survive the
+            # GIT_OPTIONAL_LOCKS=0 status read; only a non-empty diff is real work.
+            diff = _git([*eol, "diff", "--quiet", "--", *changes], worktree_path, timeout=timeout,
+                        stdin=subprocess.DEVNULL, env=env)
+            if diff.returncode != 0:
+                return True
         include_links = _include_symlink_paths(worktree_path, repo_root)
-        return any(e[3:].rstrip("/") not in include_links for e in entries)
+        return any(path not in include_links for path in untracked)
     except Exception:
         return True
 

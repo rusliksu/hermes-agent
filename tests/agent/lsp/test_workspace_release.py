@@ -48,7 +48,10 @@ def mock_pyright(request):
     original = SERVERS[idx]
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
-        return SpawnSpec(command=[sys.executable, MOCK_SERVER], workspace_root=root, cwd=root,
+        # Windows locks a process's cwd: keep the server on a stable dir so the test can delete
+        # the workspace root while the server is alive (the LSP root travels via workspace_root).
+        return SpawnSpec(command=[sys.executable, MOCK_SERVER], workspace_root=root,
+                         cwd=str(Path(MOCK_SERVER).parent),
                          env={"MOCK_LSP_SCRIPT": "errors"}, initialization_options={})
 
     SERVERS[idx] = ServerDef(

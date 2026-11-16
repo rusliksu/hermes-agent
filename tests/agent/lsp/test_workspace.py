@@ -75,12 +75,12 @@ def test_resolve_workspace_for_file_survives_deleted_cwd(tmp_path: Path, monkeyp
     (repo / ".git").mkdir(parents=True)
     file_path = repo / "x.py"
     file_path.write_text("")
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    monkeypatch.chdir(scratch)
-    scratch.rmdir()
-    with pytest.raises(OSError):
-        os.getcwd()
+    # Windows cannot remove a directory that is the process cwd, so simulate the
+    # same environment failure the resolver must tolerate (no host faking involved).
+    def _gone():
+        raise OSError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", _gone)
 
     root, gated = resolve_workspace_for_file(str(file_path))
 

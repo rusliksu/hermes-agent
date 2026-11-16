@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from agent.lsp import manager
 from agent.lsp.manager import LSPService
@@ -87,13 +88,16 @@ def test_delta_baseline_is_capped_by_write_recency(monkeypatch):
 
     service._delta_baseline = _LockedDict()
     cap = manager._DELTA_BASELINE_CAP
-    for i in range(cap):
-        service.snapshot_baseline(f"/repo/f{i}.py")
+    # The product keys baselines by os.path.abspath (drive-qualified on Windows).
+    paths = [os.path.abspath(f"/repo/f{i}.py") for i in range(cap)]
+    for path in paths:
+        service.snapshot_baseline(path)
     server_diags.append({"message": "rewritten"})
-    assert service._apply_delta("/repo/f0.py", [{"message": "rewritten"}], None) == [{"message": "rewritten"}]
+    assert service._apply_delta(paths[0], [{"message": "rewritten"}], None) == [{"message": "rewritten"}]
     server_diags.clear()
-    service.snapshot_baseline("/repo/new.py")
+    new_path = os.path.abspath("/repo/new.py")
+    service.snapshot_baseline(new_path)
     assert len(service._delta_baseline) == cap
-    assert "/repo/f1.py" not in service._delta_baseline
-    assert service._delta_baseline["/repo/f0.py"] == [{"message": "rewritten"}]
-    assert "/repo/new.py" in service._delta_baseline
+    assert paths[1] not in service._delta_baseline
+    assert service._delta_baseline[paths[0]] == [{"message": "rewritten"}]
+    assert new_path in service._delta_baseline

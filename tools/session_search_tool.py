@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from hermes_state_common import _BOUNDARY_END_REASONS
 from hermes_time import safe_strftime
+from tools.session_search_access import ScopedSessionReader, resolved_session_scope
 
 # Hidden from browsing/searching — integrations (HERMES_SESSION_SOURCE=tool), delegate
 # subagent runs, kanban workers are not the user's history.
@@ -215,6 +216,8 @@ def _session_left_live_context(db, session_id: str) -> bool:
 def _get_message_storage_state(db, message_id) -> Optional[dict[str, Any]]:
     """Owning session and visibility flags for *message_id* (None if missing/error)."""
     def _lookup():
+        if isinstance(db, ScopedSessionReader):
+            return db.get_message_storage_state(message_id)
         with db._lock:
             return db._conn.execute(
                 "SELECT session_id, active, compacted FROM messages WHERE id = ?", (message_id,)).fetchone()
@@ -576,7 +579,8 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
 
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail,
-              after=None, before=None, exclude_session_ids=None) -> str:
+              after=None, before=None, exclude_session_ids=None,
+              session_scope=None, profile_home=None) -> str:
     """Mode dispatch (see module docstring); scroll wins when an anchor is set."""
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
@@ -618,6 +622,11 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    try:
+        session_scope, profile_home = resolved_session_scope(profile)
+    except Exception:
+        logging.debug("session_search: authority resolution failed", exc_info=True)
+        return tool_error("session_search denied: bound access context or profile unavailable", success=False)
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
@@ -643,10 +652,16 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
         if db is None:
             return tool_error(format_session_db_unavailable(), success=False)
         owned_dbs.append(db)
+    if session_scope is not None:
+        try:
+            db = ScopedSessionReader(db, session_scope, profile_home)
+        except ValueError as e:
+            return tool_error(str(e), success=False)
     try:
         return _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+                         after=after, before=before, exclude_session_ids=exclude_session_ids,
+                         session_scope=session_scope, profile_home=profile_home)
     finally:
         for owned_db in reversed(owned_dbs):
             _quiet(lambda: release_or_close(owned_db), None, "Failed to close session_search SessionDB")

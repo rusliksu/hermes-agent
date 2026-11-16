@@ -7,6 +7,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -52,6 +53,22 @@ _ACTIVE_CHILDREN_SQL = (
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
+def _autocrlf_args(repo_root: Path) -> list[str]:
+    """Pin the checkout's eol conversion for the hardened env (it drops the user's global config)."""
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", "core.autocrlf"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, check=False)
+        value = (probe.stdout or "").strip()
+        if probe.returncode == 0 and value in {"true", "input", "false"}:
+            return ["-c", f"core.autocrlf={value}"]
+    except (OSError, subprocess.SubprocessError):
+        logging.getLogger(__name__).debug(
+            "core.autocrlf probe failed for %s", repo_root, exc_info=True)
+    return []
+
+
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
     """``git -C repo_root args``; never raises on a non-zero exit.
 
@@ -63,7 +80,7 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
     if env is None:
         return subprocess.CompletedProcess(["git", "-C", str(repo_root), *args], 1, "", FILTER_DISCOVERY_FAILED)
     return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
+        ["git", "-C", str(repo_root), *_autocrlf_args(repo_root), *args],
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         timeout=timeout,

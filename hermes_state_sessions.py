@@ -23,6 +23,7 @@ from hermes_state_common import (
     escape_like as _escape_like, _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
     _source_match_clause, emit_session_deleted, launch_stub_filter_sql,
 )
+from hermes_state_access import scoped_session_cte, session_scope_sql
 from hermes_state_compression import _CHAIN_CAP, _UNSET_CREATED_SQL
 
 # caplog tests pin the "hermes_state" logger name.
@@ -839,15 +840,17 @@ class SessionSessionsMixin:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
-    def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
+    def get_session(self, session_id: str, *, session_scope=None) -> Optional[dict[str, Any]]:
         """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
         self.flush_for_read()
+        clause, values = session_scope_sql(session_scope)
         row = self._read_one(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
             "COALESCE(tp.prompt, s.tool_names) AS _tool_names_resolved "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ?",
-            (session_id,),
+            "LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ?"
+            + (" AND " + clause if clause else ""),
+            (session_id, *values),
         )
         return self._session_row_dict(row) if row else None
 
@@ -1136,6 +1139,7 @@ class SessionSessionsMixin:
         timeout_seconds: float = 3.0,
         candidate_limit: int | None = None,
         lineage_limit: int | None = None,
+        session_scope=None,
     ) -> list[dict[str, Any]]:
         """Latency-bounded recent-conversation browse (``session_search()``): preselect a small candidate set
         from the indexed durable activity timestamp (fallback ``started_at``), resolve only those across
@@ -1165,6 +1169,7 @@ class SessionSessionsMixin:
             candidate_clauses.append(f"s.source NOT IN ({placeholders})")
             candidate_params.extend(exclude_sources)
         candidate_where = " AND ".join(candidate_clauses)
+        scope_cte, session_table, scope_values = scoped_session_cte(session_scope)
 
         # A compression continuation is an implementation edge, unlike /new
         # reset and /branch children which are independent user-visible
@@ -1183,9 +1188,10 @@ class SessionSessionsMixin:
 
         query = f"""
             WITH RECURSIVE
+            {scope_cte}
             recent_candidates(id) AS (
                 SELECT s.id
-                FROM sessions s
+                FROM {session_table} s
                 WHERE {candidate_where}
                 ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,
                          s.started_at DESC, s.id DESC
@@ -1196,17 +1202,17 @@ class SessionSessionsMixin:
                 UNION
                 SELECT a.candidate_id, parent.id
                 FROM ancestors a
-                JOIN sessions child ON child.id = a.cur_id
-                JOIN sessions parent ON {compression_parent_edge}
+                JOIN {session_table} child ON child.id = a.cur_id
+                JOIN {session_table} parent ON {compression_parent_edge}
                 LIMIT ?
             ),
             candidate_roots(root_id) AS (
                 SELECT DISTINCT a.cur_id
                 FROM ancestors a
-                JOIN sessions child ON child.id = a.cur_id
+                JOIN {session_table} child ON child.id = a.cur_id
                 WHERE NOT EXISTS (
                     SELECT 1
-                    FROM sessions parent
+                    FROM {session_table} parent
                     WHERE {compression_parent_edge}
                 )
             ),
@@ -1215,8 +1221,8 @@ class SessionSessionsMixin:
                 UNION
                 SELECT c.root_id, child.id
                 FROM chain c
-                JOIN sessions parent ON parent.id = c.cur_id
-                JOIN sessions child ON {compression_parent_edge}
+                JOIN {session_table} parent ON parent.id = c.cur_id
+                JOIN {session_table} child ON {compression_parent_edge}
                 LIMIT ?
             ),
             chain_rows AS (
@@ -1226,8 +1232,8 @@ class SessionSessionsMixin:
                     {_sql_session_last_active_by_id('c.cur_id')} AS activity,
                     CASE WHEN EXISTS (
                         SELECT 1
-                        FROM sessions parent
-                        JOIN sessions child ON {compression_parent_edge}
+                        FROM {session_table} parent
+                        JOIN {session_table} child ON {compression_parent_edge}
                         WHERE parent.id = c.cur_id
                     ) THEN 0 ELSE 1 END AS is_tip
                 FROM chain c
@@ -1256,8 +1262,8 @@ class SessionSessionsMixin:
                 CASE WHEN s.id != tip.id THEN s.id ELSE NULL END
                     AS _lineage_root_id
             FROM ranked_tips rt
-            JOIN sessions s ON s.id = rt.root_id
-            JOIN sessions tip ON tip.id = rt.cur_id
+            JOIN {session_table} s ON s.id = rt.root_id
+            JOIN {session_table} tip ON tip.id = rt.cur_id
             WHERE rt.rank_in_root = 1
               AND s.archived = 0
               AND s.hidden = 0
@@ -1266,12 +1272,7 @@ class SessionSessionsMixin:
             ORDER BY rt.activity DESC, s.started_at DESC, tip.id DESC
             LIMIT ?
         """
-        params = candidate_params + [
-            candidate_limit,
-            lineage_limit,
-            lineage_limit,
-            limit,
-        ]
+        params = [*scope_values, *candidate_params, candidate_limit, lineage_limit, lineage_limit, limit]
         deadline = time.monotonic() + timeout_seconds
         interrupted_by_deadline = False
 

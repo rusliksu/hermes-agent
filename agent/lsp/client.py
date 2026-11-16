@@ -329,6 +329,10 @@ class LSPClient:
             return ""
         if code < 0:
             return f"server exited on signal {-code}"
+        if sys.platform == "win32" and code >= 0xC0000000:
+            # Windows reports an abnormal termination (abort, heap fault) as an unsigned NTSTATUS.
+            why = "abort" if code == 0xC0000409 else "fatal exception"
+            return f"server exited on signal: {why} (ntstatus 0x{code:08X})"
         return f"server exited with code {code}"
 
     def failure_details(self) -> str:
