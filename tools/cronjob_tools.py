@@ -671,6 +671,9 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
 
 
 def _action_create(a: dict[str, Any]) -> str:
+    from cron.access_context import capture_job_access_context
+
+    access_snapshot = capture_job_access_context()
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
     if not a["schedule"]:
@@ -732,6 +735,7 @@ def _action_create(a: dict[str, Any]) -> str:
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             catch_up=a["catch_up"],
+            **({"resolved_access_context": access_snapshot} if access_snapshot is not None else {}),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:

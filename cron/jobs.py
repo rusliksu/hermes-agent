@@ -425,7 +425,7 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
 # update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "resolved_access_context"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1835,6 +1835,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    resolved_access_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1871,6 +1872,9 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    from cron.access_context import canonical_job_access_context
+
+    access_snapshot = canonical_job_access_context(resolved_access_context)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
@@ -1943,6 +1947,8 @@ def create_job(
         if value is not None:
             job[key] = value
 
+    if access_snapshot is not None:
+        job["resolved_access_context"] = access_snapshot
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
     return job

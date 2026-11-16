@@ -277,14 +277,27 @@ def test_dashboard_run_now_isolates_a_sibling_profile_fire_like_the_ticker(tmp_p
     secret_scope.set_multiplex_active(False)  # the desktop backend never sets the process flag
 
     def _job_for(home, name):
+        from gateway.access_registry import (
+            DeliveryTarget,
+            ResolvedAccessContext,
+            serialize_resolved_access_context,
+        )
+
         (home / "scripts" / f"{name}.sh").write_text(
             "#!/usr/bin/env bash\n"
-            f'echo "${{ROUTED_ONLY_SECRET:-<unset>}}|${{LAUNCH_ONLY_SECRET:-<unset>}}" > "{probe / name}"\n',
+            f'echo "${{ROUTED_ONLY_SECRET:-<unset>}}|${{LAUNCH_ONLY_SECRET:-<unset>}}" > "{(probe / name).as_posix()}"\n',
             encoding="utf-8")
+        snapshot = serialize_resolved_access_context(ResolvedAccessContext(
+            principal_id="fixture-user", role_id="owner",
+            profile_id="default" if home == launch else "ops",
+            conversation_scope="dm", capabilities=frozenset(),
+            delivery_target=DeliveryTarget(platform="telegram", account="fixture",
+                                           peer_kind="dm", chat_id="1001")))
         token = set_hermes_home_override(str(home))
         try:
             return create_job(prompt=None, schedule="every 1h", script=f"{name}.sh",
-                              no_agent=True, deliver="local")["id"]
+                              no_agent=True, deliver="local",
+                              resolved_access_context=snapshot)["id"]
         finally:
             reset_hermes_home_override(token)
 

@@ -5032,7 +5032,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
             lambda e: document_failure(self, e, require_native=kwargs.get("_require_native"),
                                        fallback=lambda: super(TelegramAdapter, self).send_document(
-                                           chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
+                                           chat_id, file_path, caption, file_name, reply_to, metadata=metadata,
+                                           _require_native=kwargs.get("_require_native", False))))
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,

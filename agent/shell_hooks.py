@@ -66,7 +66,9 @@ _skip_logged: set[tuple[str, str, str]] = set()
 
 
 def _home_key() -> str:
-    return str(get_hermes_home().expanduser().resolve())
+    from hermes_constants import hermes_home_key
+
+    return hermes_home_key(get_hermes_home())
 
 
 def _forget_home_registrations(registry: set[tuple], lock: threading.Lock) -> None:

@@ -56,7 +56,7 @@ def slot_env(tmp_path, monkeypatch):
 
     counter = home / "fires.txt"
     (home / "scripts" / "fire.sh").write_text(
-        f"#!/bin/sh\necho fired >> {counter}\necho fired\n", encoding="utf-8")
+        f"#!/bin/sh\necho fired >> '{counter.as_posix()}'\necho fired\n", encoding="utf-8")
     (home / "scripts" / "fire.sh").chmod(0o755)
     job = J.create_job(prompt=None, schedule="every 1h", name="slot", script="fire.sh",
                        no_agent=True, deliver="local")

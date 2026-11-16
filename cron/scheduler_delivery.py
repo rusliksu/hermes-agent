@@ -17,7 +17,7 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
-
+from cron.access_context import job_access_scoped
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -1823,6 +1823,7 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+@job_access_scoped(require_snapshot=False)
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:

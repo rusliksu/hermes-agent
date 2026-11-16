@@ -103,8 +103,19 @@ def test_requested_mcp_server_owned_by_other_profile_blocks_run(tmp_path):
     finally:
         reset_hermes_home_override(token)
     try:
-        (success, _output, _final, error), agent_built = _run(
-            _job(enabled_toolsets=["terminal", "notion"]), tmp_path)
+        from gateway.access_registry import (
+            DeliveryTarget,
+            ResolvedAccessContext,
+            serialize_resolved_access_context,
+        )
+
+        job = _job(enabled_toolsets=["terminal", "notion"])
+        job["resolved_access_context"] = serialize_resolved_access_context(ResolvedAccessContext(
+            principal_id="fixture-user", role_id="owner", profile_id="default",
+            conversation_scope="dm", capabilities=frozenset(),
+            delivery_target=DeliveryTarget(platform="telegram", account="fixture",
+                                            peer_kind="dm", chat_id="1001")))
+        (success, _output, _final, error), agent_built = _run(job, tmp_path)
     finally:
         undo()
         set_multiplex_active(False)

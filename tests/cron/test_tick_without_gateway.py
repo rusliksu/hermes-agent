@@ -159,7 +159,7 @@ def test_headless_receipt_recovery_never_connects_or_spawns(cron_home, monkeypat
 def test_no_agent_jobs_still_fire_without_a_gateway(cron_home, monkeypatch):
     counter = cron_home / "fires.txt"
     script = cron_home / "scripts" / "fire.sh"
-    script.write_text(f"#!/bin/sh\necho fired >> {counter}\necho fired\n", encoding="utf-8")
+    script.write_text(f"#!/bin/sh\necho fired >> '{counter.as_posix()}'\necho fired\n", encoding="utf-8")
     script.chmod(0o755)
     monkeypatch.setattr(
         scheduler_authority, "reconcile_pending",
