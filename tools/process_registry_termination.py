@@ -33,14 +33,15 @@ class ProcessTerminationMixin:
     @classmethod
     def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
         """Terminate a host-visible PID and its descendants.
-        ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
+
+        expected_start (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
-        it — a leaked orphan beats tree-killing someone's browser. POSIX: snapshot descendants,
-        SIGTERM the parent alone so it can perform an orderly shutdown, then clean up snapshot
-        descendants that survive its grace window. Survivors are SIGKILLed after a second
-        ``terminal.daemon_term_grace_seconds`` window. Windows:
-        ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
-        is the fallback."""
+        it - a leaked orphan beats tree-killing someone else's browser.
+
+        The platform strategy is a separate classmethod so both arms stay testable on
+        every host: Windows uses taskkill /T /F (psutil's stale PPID links miss orphans
+        there), POSIX snapshots descendants and lets the parent shut down first.
+        """
         from tools.process_registry import _IS_WINDOWS
 
         if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
@@ -48,27 +49,39 @@ class ProcessTerminationMixin:
                 "Refusing to terminate host pid %d: start-time mismatch — "
                 "PID was recycled onto an unrelated process.", pid)
             return
-
-        def _sigterm_quietly():
-            with suppress(OSError, ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGTERM)
         if _IS_WINDOWS:
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', timeout=10, creationflags=windows_hide_flags(),
-                    stdin=subprocess.DEVNULL, check=False)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                _sigterm_quietly()
-            return
+            cls._terminate_windows(pid)
+        else:
+            cls._terminate_posix(pid)
+
+    @staticmethod
+    def _sigterm_quietly(pid: int) -> None:
+        with suppress(OSError, ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+
+    @classmethod
+    def _terminate_windows(cls, pid: int) -> None:
+        """taskkill /T /F; os.kill is the fallback when taskkill is unavailable."""
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=10, creationflags=windows_hide_flags(),
+                stdin=subprocess.DEVNULL, check=False)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            cls._sigterm_quietly(pid)
+
+    @classmethod
+    def _terminate_posix(cls, pid: int) -> None:
+        """POSIX arm: SIGTERM the parent alone, then clean up surviving snapshot descendants."""
         import psutil
+
         gone = (psutil.NoSuchProcess, psutil.AccessDenied, OSError)
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
             return
         except (OSError, PermissionError):
-            _sigterm_quietly()
+            cls._sigterm_quietly(pid)
             return
         # Snapshot before signalling: once the parent exits, psutil can no longer
         # reliably find children that it failed to reap.
@@ -109,14 +122,14 @@ class ProcessTerminationMixin:
         # included in case it ignored the first signal.
         targets = [parent, *remaining]
         # Escalate to SIGKILL for anything that ignored SIGTERM within the grace window.
-        # ``psutil.wait_procs``' gone/alive partition is deliberately NOT trusted: it
-        # reaps via ``Process.wait()`` and mis-partitions across zombie transitions in a
+        # psutil.wait_procs' gone/alive partition is deliberately NOT trusted: it
+        # reaps via Process.wait() and mis-partitions across zombie transitions in a
         # parent/child tree, leaving survivors un-killed. Re-probing every target is
         # deterministic.
         if grace <= 0:
             return
         _wait_for_exit(targets)
-        # A parent that ignored SIGTERM (the interactive ``bash -lic`` wrapper does) keeps
+        # A parent that ignored SIGTERM (the interactive bash -lic wrapper does) keeps
         # running its script through both grace windows and can spawn children the first
         # snapshot never saw. Re-snapshot while it is still alive: once it is SIGKILLed
         # they reparent to init and nothing can find them again.

@@ -92,16 +92,31 @@ def guard_terminal_cwd(candidate, base, *, remote=False):
 
 
 def profile_read_block_error(path):
+    from agent.secret_scope import is_multiplex_active
     from gateway.access_context import get_resolved_access_context
-    if get_resolved_access_context() is None:
+
+    context = get_resolved_access_context()
+    if context is None and not is_multiplex_active():
         return None  # Native registry-free callers retain their existing read policy.
     try:
-        from gateway.access_context import home_root
+        from hermes_constants import get_default_hermes_root
 
-        home = bound_profile_home()
-        root = home_root().resolve()
-        resolved = Path(path).resolve()
-        if resolved.is_relative_to(root) and not resolved.is_relative_to(home):
+        root = get_default_hermes_root().resolve()
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_relative_to(root):
+            return None
+        if bound_profile_home() is None:
+            return "Access denied: bound profile context unavailable."
+        parts = resolved.relative_to(root).parts
+        if not parts:
+            return None
+        if parts[0] == "profiles":
+            if len(parts) < 2:
+                return "Access denied: Hermes profile namespace is not addressable."
+            target_profile = parts[1]
+        else:
+            target_profile = "default"
+        if target_profile != context.profile_id:
             return "Access denied: path belongs to another Hermes profile."
     except (OSError, RuntimeError, ValueError):
         return "Access denied: bound profile context unavailable."

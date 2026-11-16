@@ -21,6 +21,15 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+
+def _load_pty_process_class():
+    """The platform PTY backend; tests patch this seam instead of faking the host OS."""
+    if _IS_WINDOWS:
+        from winpty import PtyProcess
+    else:
+        from ptyprocess import PtyProcess
+    return PtyProcess
 # systemd transient scopes exist only on Linux; gate every scope-path branch on this
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
@@ -1159,10 +1168,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
         Raises ImportError when no PTY backend is installed and re-raises any spawn
         failure; ``spawn_local`` falls back to pipe mode in both cases."""
-        if _IS_WINDOWS:
-            from winpty import PtyProcess as _PtyProcessCls
-        else:
-            from ptyprocess import PtyProcess as _PtyProcessCls
+        _PtyProcessCls = _load_pty_process_class()
         pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
         pty_env = self._spawn_env(env_vars)
         if session.systemd_unit:

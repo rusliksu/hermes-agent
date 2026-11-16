@@ -18,6 +18,7 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
@@ -180,6 +181,7 @@ class LSPService:
         # (server_id, root) → monotonic deadline after which the pair may be retried (inf = lifetime).
         self._broken: dict[_Key, float] = {}
         self._spawning: dict[_Key, asyncio.Future] = {}
+        self._in_use: dict[LSPClient, int] = {}
         self._last_used: dict[_Key, float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
@@ -535,23 +537,39 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        with self._client_use(client):
+            try:
+                srv = self._server_for(file_path)
+                version = await client.open_file(file_path, language_id=language_id_for(file_path, srv))
+                if not snapshot:
+                    await client.save_file(file_path)
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode,
+                    timeout=budget if budget is not None else self._wait_timeout,
+                )
+            except Exception as e:
+                if snapshot:
+                    logger.debug("snapshot open/wait failed: %s", e)
+                else:
+                    logger.debug("open/wait failed for %s: %s", file_path, e)
+                return None
+            return list(client.diagnostics_for(file_path, fresh_only=True)) if fresh else None
+
+    @contextmanager
+    def _client_use(self, client: LSPClient):
+        """Count overlapping operations; cancellation releases only its own use."""
+        with self._state_lock:
+            self._in_use[client] = self._in_use.get(client, 0) + 1
         try:
-            srv = self._server_for(file_path)
-            version = await client.open_file(file_path, language_id=language_id_for(file_path, srv))
-            if not snapshot:
-                await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode,
-                timeout=budget if budget is not None else self._wait_timeout,
-            )
-        except Exception as e:
-            if snapshot:
-                logger.debug("snapshot open/wait failed: %s", e)
-            else:
-                logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
-        self._touch(client)
-        return list(client.diagnostics_for(file_path, fresh_only=True)) if fresh else None
+            yield client
+        finally:
+            with self._state_lock:
+                remaining = self._in_use[client] - 1
+                if remaining:
+                    self._in_use[client] = remaining
+                else:
+                    self._in_use.pop(client)
+            self._touch(client)
 
     async def _current_diags_async(self, file_path: str) -> _Diags:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -593,7 +611,7 @@ class LSPService:
             trusted = key[1] == "" or self._trusted(root)
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                self._last_used[key] = time.monotonic()
             else:
                 client = None
                 spawning = self._spawning.get(key)
@@ -602,7 +620,8 @@ class LSPService:
                     spawning = self._spawning[key] = asyncio.get_running_loop().create_future()
         if client is not None:
             eventlog.log_active(srv.server_id, root)
-            return await self._attach_root(srv, client, root)
+            with self._client_use(client):
+                return await self._attach_root(srv, client, root)
         if not owner:
             try:
                 # Shielded: cancelling this waiter (its caller timed out) must not cancel the spawn
@@ -614,7 +633,10 @@ class LSPService:
                 raise
             except Exception:
                 return None
-            return await self._attach_root(srv, client, root) if client is not None else None
+            if client is None:
+                return None
+            with self._client_use(client):
+                return await self._attach_root(srv, client, root)
         try:
             client = await self._spawn_client(srv, root, trusted)
             if client is None:
@@ -622,7 +644,7 @@ class LSPService:
             else:
                 with self._state_lock:
                     self._clients[key] = client
-                    self._last_used[key] = time.time()
+                    self._last_used[key] = time.monotonic()
                 eventlog.log_active(srv.server_id, root)
             spawning.set_result(client)
             return client
@@ -668,7 +690,7 @@ class LSPService:
         with self._state_lock:
             for key, c in self._clients.items():
                 if c is client:
-                    self._last_used[key] = time.time()
+                    self._last_used[key] = time.monotonic()
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
@@ -686,9 +708,10 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = time.monotonic() - self._idle_timeout
         with self._state_lock:
-            idle_keys = [key for key in self._clients if self._last_used.get(key, 0) < cutoff]
+            idle_keys = [key for key, client in self._clients.items()
+                         if client not in self._in_use and self._last_used.get(key, 0) < cutoff]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)

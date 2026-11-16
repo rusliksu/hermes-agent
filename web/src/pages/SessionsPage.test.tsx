@@ -123,6 +123,39 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
+  it("uses server activity categories and retains Telegram as an automation source", async () => {
+    let finishPeople: (() => void) | undefined;
+    apiMocks.getSessionStats.mockImplementation((_profile, activity) => {
+      if (activity === "automations") return Promise.resolve({
+        total: 2, active_store: 2, archived: 0, messages: 2, by_source: { telegram: 1, cron: 1 },
+      });
+      return new Promise(resolve => {
+        finishPeople = () => resolve({ total: 2, active_store: 2, archived: 0, messages: 2,
+          by_source: { telegram: 1, cli: 1 } });
+      });
+    });
+    await renderSessionsPage([
+      { id: "cron:telegram:legacy", profile: "default", source: "telegram", model: null,
+        title: "Legacy automation", started_at: 1, ended_at: null, last_active: 1, is_active: false,
+        message_count: 1, tool_call_count: 0, input_tokens: 0, output_tokens: 0, preview: "fixture" },
+    ]);
+    const tab = Array.from(document.querySelectorAll("button")).find(b => b.textContent?.trim() === "Automation");
+    const listCalls = apiMocks.getSessions.mock.calls.length;
+    const statsCalls = apiMocks.getSessionStats.mock.calls.length;
+    await act(async () => click(tab ?? null));
+    await waitFor(() => apiMocks.getSessions.mock.calls.length > listCalls);
+    await waitFor(() => apiMocks.getSessionStats.mock.calls.length > statsCalls);
+    expect(apiMocks.getSessions.mock.calls.at(-1)?.[2]?.activity).toBe("automations");
+    expect(apiMocks.getSessionStats.mock.calls.at(-1)?.[1]).toBe("automations");
+    const menu = Array.from(document.querySelectorAll("button")).find(b => b.textContent?.trim() === "Any automation source");
+    await act(async () => click(menu ?? null));
+    expect(document.querySelector('[aria-label="Session source: Telegram"]')).not.toBeNull();
+    expect(document.querySelector('[aria-label="Session source: Cron"]')).not.toBeNull();
+    expect(finishPeople).toBeDefined();
+    await act(async () => finishPeople?.());
+    expect(document.querySelector('[aria-label="Session source: Cron"]')).not.toBeNull();
+  });
+
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,

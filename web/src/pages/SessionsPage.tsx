@@ -46,13 +46,10 @@ import type {
 import { timeAgo } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
 import {
-  AUTOMATION_SESSION_SOURCES,
   NO_MATCHING_SESSION_SOURCE,
   SOURCE_CONFIG,
   type SessionFilterCategory,
   type SourceSelectionsByCategory,
-  isAutomationSource,
-  sourceBelongsToCategory,
   sourceLabel,
 } from "./SessionsPage_sources";
 import { StructuredReasoning } from "@/components/StructuredReasoning";
@@ -84,6 +81,23 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { apiErrorFromResponse, errorMessage } from "@/lib/api-error";
+
+/** Server-side activity partition; the source list is derived from the matching stats bucket. */
+const SESSION_ACTIVITY = { chats: "people", automation: "automations", all: "all" } as const;
+
+function loadSessionStats(
+  requestRef: { current: number },
+  activity: "people" | "automations" | "all",
+  setStats: (stats: SessionStoreStats) => void,
+) {
+  const requestId = ++requestRef.current;
+  api
+    .getSessionStats(undefined, activity)
+    .then(nextStats => {
+      if (requestId === requestRef.current) setStats(nextStats);
+    })
+    .catch(() => {});
+}
 
 
 /** Render an FTS5 snippet with highlighted matches.
@@ -765,6 +779,7 @@ export default function SessionsPage() {
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
   const sourceMenuRef = useRef<HTMLDivElement | null>(null);
   const sessionsRequestRef = useRef(0);
+  const statsRequestRef = useRef(0);
   // Count of empty (no-message, ended, non-archived) sessions across the
   // entire DB, populated by /api/sessions/empty/count. Used to:
   //   • hide the "Delete empty" button when there's nothing to clean up
@@ -832,46 +847,22 @@ export default function SessionsPage() {
   const sessionQueryOptions = useMemo(() => {
     if (selectedSources !== null) {
       if (selectedSources.length === 0) {
-        return allSourceNames.length > 0
-          ? { excludeSources: allSourceNames }
-          : { source: NO_MATCHING_SESSION_SOURCE };
+        return { activity: SESSION_ACTIVITY[sessionCategory], source: NO_MATCHING_SESSION_SOURCE };
       }
-      if (selectedSources.length === 1) {
-        return { source: selectedSources[0] };
-      }
-      const selected = new Set(selectedSources);
-      const excludedSources = allSourceNames.filter(
-        (source) => !selected.has(source),
-      );
-      return excludedSources.length > 0 ? { excludeSources: excludedSources } : {};
+      return { activity: SESSION_ACTIVITY[sessionCategory], sources: selectedSources };
     }
-    if (sessionCategory === "chats") {
-      return { excludeSources: AUTOMATION_SESSION_SOURCES };
-    }
-    if (sessionCategory === "automation") {
-      const excludedSources = allSourceNames.filter(
-        (source) => !isAutomationSource(source),
-      );
-      return excludedSources.length > 0
-        ? { excludeSources: excludedSources }
-        : { sources: AUTOMATION_SESSION_SOURCES };
-    }
-    return {};
-  }, [selectedSources, sessionCategory, allSourceNames]);
+    return { activity: SESSION_ACTIVITY[sessionCategory] };
+  }, [selectedSources, sessionCategory]);
 
   const categoryDefaultSources = useMemo(() => {
-    return allSourceNames.filter((source) =>
-      sourceBelongsToCategory(source, sessionCategory),
-    );
-  }, [sessionCategory, allSourceNames]);
-
+    return allSourceNames.filter((source) => (stats?.by_source[source] ?? 0) > 0);
+  }, [stats, allSourceNames]);
   const sourceOptions = useMemo(() => {
     const selected = new Set(selectedSources ?? []);
     return allSourceOptions.filter(
-      ([source]) =>
-        sourceBelongsToCategory(source, sessionCategory) || selected.has(source),
+      ([source, count]) => count > 0 || selected.has(source),
     );
-  }, [allSourceOptions, selectedSources, sessionCategory]);
+  }, [allSourceOptions, selectedSources]);
 
   const effectiveSelectedSources = selectedSources ?? categoryDefaultSources;
 
@@ -987,12 +978,7 @@ export default function SessionsPage() {
       });
   }, [sessionQueryOptions]);
 
-  const loadStats = useCallback(() => {
-    api
-      .getSessionStats()
-      .then(setStats)
-      .catch(() => {});
-  }, []);
+  const loadStats = useCallback(() => loadSessionStats(statsRequestRef, SESSION_ACTIVITY[sessionCategory], setStats), [sessionCategory]);
 
   const handleImportSessions = useCallback(
     async (files: FileList | null) => {

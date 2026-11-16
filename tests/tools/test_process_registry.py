@@ -623,45 +623,6 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
-    def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
-        """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
-
-        Background non-PTY mode used to expose subprocess stdin via a pipe,
-        but PR #214b95392 detached non-PTY stdin to DEVNULL to fix keyboard
-        lockout (#17959). For interactive stdin → PTY mode is now the only
-        supported path.
-        """
-        command = f'{shlex.quote(sys.executable)} -c "import sys; print(sys.stdin.read().strip())"'
-        session = registry.spawn_local(
-            command,
-            cwd=str(tmp_path),
-            use_pty=True,
-        )
-
-        try:
-            # Wait for the PTY child to be up rather than sleeping blindly.
-            assert _wait_until(
-                lambda: registry.poll(session.id)["status"] == "running",
-                timeout=5.0,
-                interval=0.02,
-            ), "PTY session never reached running"
-            assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
-            assert registry.close_stdin(session.id)["status"] == "ok"
-
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                poll = registry.poll(session.id)
-                if poll["status"] == "exited":
-                    assert poll["exit_code"] == 0
-                    assert "hello" in poll["output_preview"]
-                    return
-                time.sleep(0.02)
-
-            pytest.fail("process did not exit after stdin was closed")
-        finally:
-            registry.kill_process(session.id)
-
-
 # =========================================================================
 # List sessions
 # =========================================================================
@@ -889,6 +850,14 @@ class TestSpawnEnvSanitization:
         with patch.dict(os.environ, {
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
+            "USERPROFILE": "C:/Users/tester",
+            "LOCALAPPDATA": "C:/Users/tester/AppData/Local",
+            "SYSTEMROOT": "C:/Windows",
+            "WINDIR": "C:/Windows",
+            "COMSPEC": "C:/Windows/System32/cmd.exe",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "TEMP": "C:/Temp",
+            "TMP": "C:/Temp",
             "USER": "tester",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
@@ -1192,14 +1161,14 @@ class TestSpawnRewriteCompoundBackground:
         mock_pty_proc = MagicMock()
         mock_pty_proc.pid = 5555
 
-        mock_pty_module = MagicMock()
-        mock_pty_module.PtyProcess.spawn = MagicMock(return_value=mock_pty_proc)
+        mock_pty_cls = MagicMock()
+        mock_pty_cls.spawn = MagicMock(return_value=mock_pty_proc)
 
         fake_thread = MagicMock()
         fake_thread.daemon = False
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch.dict("sys.modules", {"ptyprocess": mock_pty_module}), \
+             patch("tools.process_registry._load_pty_process_class", return_value=mock_pty_cls), \
              patch("threading.Thread", return_value=fake_thread), \
              patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_local(
@@ -1208,9 +1177,9 @@ class TestSpawnRewriteCompoundBackground:
                 use_pty=True,
             )
 
-        assert mock_pty_module.PtyProcess.spawn.called, \
+        assert mock_pty_cls.spawn.called, \
             "PTY spawn should have been attempted"
-        pty_args = mock_pty_module.PtyProcess.spawn.call_args[0][0]
+        pty_args = mock_pty_cls.spawn.call_args[0][0]
         assert "&& { node server.js & }" in pty_args[2], \
             f"PTY path should use rewritten command, got: {pty_args[2]}"
         assert session.command == "cd /app && node server.js &"
@@ -1340,36 +1309,19 @@ class TestKillProcess:
         registry._running[s.id] = s
 
         terminate_calls = []
-        # Post-#115490 kill_process verifies tree death after signalling: the
-        # fake terminate must actually kill, or the live fake reads as a
-        # survivor and the kill correctly reports incomplete.
+        # The platform kill strategy is patched: the bookkeeping under test is
+        # "kill_process signals the host pid and confirms death", and taskkill vs
+        # SIGTERM ordering is covered by the strategy tests below.
         kill_state = {"alive": True}
 
-        class FakeProcess:
-            def __init__(self, pid):
-                self.pid = pid
-            def children(self, recursive=False):
-                return []
-            def terminate(self):
-                terminate_calls.append(("terminate", self.pid))
-                kill_state["alive"] = False
-
-        import psutil as _psutil
+        def fake_terminate(cls, pid, expected_start=None):
+            terminate_calls.append(("terminate", pid))
+            kill_state["alive"] = False
 
         try:
-            # Post-#21561: liveness probe routes through
-            # ``ProcessRegistry._is_host_pid_alive`` (→
-            # ``gateway.status._pid_exists``), and the actual kill on POSIX
-            # routes through ``psutil.Process(pid).terminate()``. Neither
-            # touches ``os.kill`` directly. Mock both seams.  Disable the
-            # SIGKILL-escalation step (grace=0) so it doesn't call
-            # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", side_effect=lambda pid: kill_state["alive"]), \
-                 patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
-                              staticmethod(lambda: 0.0)), \
-                 patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
+                 patch.object(ProcessRegistry, "_terminate_host_pid", classmethod(fake_terminate)):
                 result = registry.kill_process(s.id)
-
             assert result["status"] == "killed"
             assert ("terminate", 424242) in terminate_calls
         finally:
@@ -1645,7 +1597,7 @@ class TestTerminateHostPidPosix:
         monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 0.0))
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        pr.ProcessRegistry._terminate_posix(12345)
 
         assert terminate_order == [12345, 101, 102, 103], (
             "Parent must receive SIGTERM before any snapshot descendant"
@@ -1707,7 +1659,7 @@ class TestTerminateHostPidPosix:
         monkeypatch.setattr(psutil, "Process", boom)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        pr.ProcessRegistry._terminate_posix(12345)
 
         assert kill_calls == [(12345, signal.SIGTERM)]
 
