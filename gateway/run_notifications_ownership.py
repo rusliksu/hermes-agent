@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import inspect
 import logging
 import sqlite3
 from typing import Any, Optional, Sequence, cast
@@ -107,7 +108,9 @@ class GatewayNotificationOwnershipMixin:
                 return "terminal", session_id, None
             seen.add(session_id)
             try:
-                row = await session_db.get_session(session_id)
+                row = session_db.get_session(session_id)
+                if inspect.isawaitable(row):
+                    row = await row
             except Exception:
                 logger.debug("Completion ownership lookup failed for %s", session_id, exc_info=True)
                 return "retry", session_id, None
@@ -123,7 +126,10 @@ class GatewayNotificationOwnershipMixin:
             # admission rules: climbing past it would reach the parent the run was spawned from.
             if current_session_id and row.get("end_reason") == "compression":
                 try:
-                    if await session_db.get_compression_tip(session_id) == current_session_id:
+                    tip = session_db.get_compression_tip(session_id)
+                    if inspect.isawaitable(tip):
+                        tip = await tip
+                    if tip == current_session_id:
                         return "deliver", session_id, row
                 except Exception:
                     logger.debug("Completion compression lookup failed for %s", session_id, exc_info=True)

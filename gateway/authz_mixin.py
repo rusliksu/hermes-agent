@@ -479,10 +479,12 @@ class GatewayAuthorizationMixin:
         if source is None:
             return None
         from gateway.access_runtime import has_access_registry
-        from gateway.session_identity import restore_identity
+        from gateway.session_identity import replace_source, restore_identity
 
-        # Rebuild from the durable origin, dropping any stale live provenance on the entry.
-        source = SessionSource.from_dict(source.to_dict())
+        # Copy the durable origin (never mutate the entry) and re-pin its authority from the row.
+        if not isinstance(source, SessionSource):
+            return None
+        source = replace_source(source)
         source.resolved_access_context = getattr(entry, "resolved_access_context", None)
         identity = restore_identity(
             source, runner=self, transport_profile=getattr(entry, "transport_profile", None))

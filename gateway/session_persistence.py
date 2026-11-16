@@ -387,8 +387,13 @@ class SessionPersistenceMixin:
             recover = getattr(db, "recover_artifact_delivery", None)
             if not callable(recover):
                 continue
+            # Hand-built routing entries (tests, plugin-injected rows) carry no session id;
+            # recovery is best-effort and must never make the whole store unloadable.
+            session_id = getattr(entry, "session_id", "")
+            if not isinstance(session_id, str) or not session_id:
+                continue
             try:
-                recovered = recover(entry.session_id)
+                recovered = recover(session_id)
             except Exception:
                 logger.warning("artifact delivery recovery failed", exc_info=True)
                 recovered = {"state": "uncertain"}
@@ -398,7 +403,10 @@ class SessionPersistenceMixin:
                 entry.last_resume_marked_at = datetime.now()
                 changed = True
         if changed:
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                logger.warning("gateway.session: artifact recovery save failed", exc_info=True)
 
     def _heal_missing_origins(self, entries) -> None:
         for entry in entries:
