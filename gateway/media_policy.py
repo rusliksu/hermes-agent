@@ -152,22 +152,25 @@ def typed_artifact_roots(session_key: Optional[str] = None) -> list:
     return list(roots)
 
 
-def media_path_in_scope(resolved) -> bool:
+def media_path_in_scope(resolved, *, translated: bool = False) -> bool:
     """Typed-scope delivery: bound artifact roots plus the foreign-profile/denylist guard.
 
-    Multiplex-without-registry has no bound access context; the scoped profile home is then the
-    authority the adapter-side scope was entered for (#109024).
+    `translated` marks a Docker container-absolute MEDIA tag mapped to its host mount by the ACTIVE
+    profile scope. Multiplex-without-registry has no bound access context, so that scope's own home
+    is the authority (#109024); an untyped host path still requires a bound context.
     """
     from agent.access_paths import bound_artifact_roots, bound_profile_home, profile_read_block_error
     from gateway.platforms.base import _path_under_denied_prefix
 
     try:
-        if profile_read_block_error(resolved) or _path_under_denied_prefix(resolved):
+        if _path_under_denied_prefix(resolved):
             return False
-        if bound_profile_home() is None:
+        if translated and bound_profile_home() is None:
             from hermes_constants import get_hermes_home
 
             return resolved.is_relative_to(get_hermes_home())
+        if profile_read_block_error(resolved):
+            return False
         return any(resolved.is_relative_to(root) for root in bound_artifact_roots())
     except (OSError, RuntimeError, ValueError):
         logger.debug("typed media scope check failed", exc_info=True)

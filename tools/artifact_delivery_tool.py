@@ -208,9 +208,8 @@ def _deliver_artifact(args: dict[str, Any], **kwargs: Any) -> str:
 DELIVER_ARTIFACT_SCHEMA = {
     "name": _TOOL_NAME,
     "description": (
-        "Mark one existing non-image document or archive from the current bound "
-        "profile/workspace for delivery to this conversation. Pass only the path. "
-        "The server-bound destination cannot be selected by the model."
+        "Mark an existing non-image document for delivery to this conversation. "
+        "Pass only its path; the server-bound destination cannot be selected by the model."
     ),
     "parameters": {
         "type": "object",

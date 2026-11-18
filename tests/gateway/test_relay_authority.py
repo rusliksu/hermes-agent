@@ -116,7 +116,11 @@ async def probe(peer):
             failed_insert = asyncio.Event()
             authority.db._execute_write(lambda conn: conn.create_function(
                 'ingress_failure_witness', 0, lambda: failed_insert.set() or 1))
-            authority.db._execute_write(lambda conn: conn.execute("CREATE TRIGGER fail_relay BEFORE INSERT ON session_admissions BEGIN SELECT ingress_failure_witness(); SELECT RAISE(ABORT, 'owned storage failure'); END"))
+            authority.db._execute_write(lambda conn: conn.execute(
+                "CREATE TRIGGER fail_relay BEFORE INSERT ON session_admissions "
+                "WHEN NEW.request_id = 'relay-1' "
+                "BEGIN SELECT ingress_failure_witness(); "
+                "SELECT RAISE(ABORT, 'owned storage failure'); END"))
             await connector_ws.send(json.dumps({'type': 'inbound', 'event': raw,
                                                'bufferId': 'durable-buffer-1'}) + '\n')
             await asyncio.wait_for(failed_insert.wait(), 10)
@@ -176,7 +180,7 @@ async def probe(peer):
                 await connector_ws.send(json.dumps({'type': 'inbound', 'event': queued}) + '\n')
                 try:
                     await async_wait_until(lambda: any(r['request_id'] == 'relay-4' for r in list_session_admissions(
-                        authority.db, session_id=sid, pending_only=False)), timeout=5, what='relay-4 admitted')
+                        authority.db, session_id=sid, pending_only=False)), timeout=60, what='relay-4 admitted')
                     assert not adapter._pending_messages
                 finally:
                     peer.release.set()

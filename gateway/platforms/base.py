@@ -1061,11 +1061,12 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         return None
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
+    translated = resolved is not None
     if resolved is None:
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
-    if media_requires_typed_scope() and not media_path_in_scope(resolved):
+    if media_requires_typed_scope() and not media_path_in_scope(resolved, translated=translated):
         return None
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():

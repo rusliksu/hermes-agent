@@ -152,7 +152,7 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            timeout=10,  # a loaded runner may need seconds to start the fake turn
         )
     )
 

@@ -137,7 +137,7 @@ def _event_clause(runner, event, provenance, fresh_roles):
         return 'role_authorized_without_fresh_roles'
     if source.delivered_via_upstream_relay and not (provenance and 'relay' in provenance):
         return 'upstream_relay_without_provenance'
-    if source.profile_route_rejected:
+    if source.profile_route_rejected and getattr(runner.config, 'multiplex_profiles', False):
         return 'profile_route_rejected'
     if getattr(source, '_authorization_profile_home', None) is not None and provenance is None:
         return 'authorization_home_without_provenance'

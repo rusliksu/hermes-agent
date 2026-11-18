@@ -31,7 +31,7 @@ def may_answer_live_turn(runner, event) -> bool:
     return bool(state is not None and state.persistent.update_prompt_pending)
 
 
-async def answers_live_turn(runner, event) -> bool:
+async def answers_live_turn(runner, event, *, allow_preempt: bool = True) -> bool:
     """True when *event* was consumed by the chat's in-flight work (never admitted); a reply to send
     rides ``event._consumer_reply``. False: admit it as usual (an interrupt-mode follow-up too: the
     interrupted turn ends and the FIFO runs it next). A bot peer's message is always admitted, so
@@ -39,7 +39,7 @@ async def answers_live_turn(runner, event) -> bool:
     if event.get_command() or getattr(event, 'internal', False) or getattr(event.source, 'is_bot', False):
         return False
     replay = _replay_key(event)
-    consumed = await _route(runner, event)
+    consumed = await _route(runner, event, allow_preempt=allow_preempt)
     if consumed and replay is not None:
         _consumed[replay] = None
         while len(_consumed) > _CONSUMED_MAX:
@@ -61,7 +61,7 @@ def was_consumed(event) -> bool:
     return replay is not None and replay in _consumed
 
 
-async def _route(runner, event) -> bool:
+async def _route(runner, event, *, allow_preempt: bool = True) -> bool:
     source = event.source
     key = runner._session_key_for_source(source)
     reply = await runner._hm_pending_reply_intercepts(event, source, key)
@@ -70,5 +70,11 @@ async def _route(runner, event) -> bool:
         return True
     if not runner._is_session_running(key):
         return False
-    return bool(await runner._route_plaintext_approval_while_busy(event, key)
-                or await runner._hm_busy_preempt(event, source, key))
+    if await runner._route_plaintext_approval_while_busy(event, key):
+        return True
+    if not allow_preempt:
+        from tools import clarify_gateway
+
+        if clarify_gateway.get_pending_for_session(key, include_choice_prompts=True) is None:
+            return False  # relay ordinary text queues; a pending question still cancels on takeover
+    return bool(await runner._hm_busy_preempt(event, source, key))

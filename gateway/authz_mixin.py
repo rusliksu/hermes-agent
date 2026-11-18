@@ -481,7 +481,14 @@ class GatewayAuthorizationMixin:
         from gateway.access_runtime import has_access_registry
         from gateway.session_identity import restore_identity
 
-        source.resolved_access_context = getattr(entry, "resolved_access_context", None)
+        context = getattr(entry, "resolved_access_context", None)
+        target = getattr(context, "delivery_target", None) if context is not None else None
+        if target is not None and (
+                str(source.chat_id) != str(target.chat_id)
+                or str(source.thread_id or "") != str(target.thread_id or "")
+                or (source.platform.value if source.platform else "") != (target.platform or "")):
+            return None  # a copied/mutated routing record cannot revive an authority it no longer names
+        source.resolved_access_context = context
         identity = restore_identity(
             source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
         if has_access_registry(self) and identity is None:

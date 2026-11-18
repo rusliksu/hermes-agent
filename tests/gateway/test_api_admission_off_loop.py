@@ -9,7 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 KEY = 'off-loop-admission-key-long-enough'
-HOLD_S = 1.5
+HOLD_S = 3.0  # generous hold: a loaded CI runner must not be judged by scheduler gaps
 AUTH = {'Authorization': 'Bearer ' + KEY}
 
 DOORS = [

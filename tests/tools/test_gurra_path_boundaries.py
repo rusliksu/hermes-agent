@@ -9,8 +9,9 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 
 
 @pytest.fixture
-def homes(tmp_path):
+def homes(tmp_path, monkeypatch):
     root = tmp_path / "state"
+    monkeypatch.setenv("HERMES_HOME", str(root))  # the profile namespace this authority scopes to
     made = {}
     for name in ("alpha", "beta"):
         home = root / "profiles" / name

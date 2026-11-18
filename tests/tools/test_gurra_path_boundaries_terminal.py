@@ -4,13 +4,14 @@ from contextlib import contextmanager
 
 import pytest
 
-from gateway.access_context import ResolvedAccessContext, bind_resolved_access_context
+from gateway.access_context import DeliveryTarget, ResolvedAccessContext, bind_resolved_access_context
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
 @pytest.fixture
-def homes(tmp_path):
+def homes(tmp_path, monkeypatch):
     root = tmp_path / "state"
+    monkeypatch.setenv("HERMES_HOME", str(root))
     made = {}
     for name in ("alpha", "beta"):
         home = root / "profiles" / name
@@ -32,9 +33,12 @@ def scoped(home):
 
 def authority(profile="alpha"):
     return ResolvedAccessContext(
-        profile_id=profile,
+        principal_id="person:1001",
         role_id="member",
+        profile_id=profile,
+        conversation_scope="telegram:1001",
         capabilities=frozenset({"terminal", "private_memory"}),
+        delivery_target=DeliveryTarget("telegram", "account", "dm", "1001"),
     )
 
 

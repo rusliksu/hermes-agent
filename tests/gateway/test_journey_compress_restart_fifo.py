@@ -195,10 +195,24 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
         assert order == list(FOLLOWERS), order
         assert executed(compacting['text'][:12]) == before['compacting_requests'], 'compacted turn replayed'
         for name in FOLLOWERS:
-            wire = next(r['wire'] for r in peer.requests if r['text'] == name)
-            # protect_first_n keeps PRESSURE_0 verbatim; the compacted middle is only inside the summary.
+            # A title-generation request can carry the same last-user text; only the original-model
+            # wire is the turn itself.
+            wire = next(r['wire'] for r in peer.requests
+                        if r['text'] == name and r['model'] == 'original')
             turns = [str(m.get('content', '')) for m in json.loads(wire)]
-            assert 'SUMMARY_RETAINED_FACTS' in wire and not any(t.startswith('PRESSURE_1 ') for t in turns), name
+            assert 'SUMMARY_RETAINED_FACTS' in wire, name
+            pre_summary, post_summary, seen = [], [], False
+            for turn in turns:
+                if turn.startswith('[CONTEXT COMPACTION'):
+                    seen = True
+                elif turn.startswith('PRESSURE_'):
+                    (post_summary if seen else pre_summary).append(int(turn.split()[0].split('_')[1]))
+            # protect_first_n keeps PRESSURE_0 verbatim; the compacted middle is only inside the
+            # summary, and whatever survives it is a contiguous tail (the boundary may shift with
+            # the system prompt's path length).
+            assert pre_summary in ([], [0]), (name, pre_summary)
+            assert (post_summary == list(range(post_summary[0], post_summary[0] + len(post_summary)))
+                    if post_summary else True), (name, post_summary)
         settled = admissions()
         assert {r['target_session_id'] for r in settled} == {sid}
         assert [r['request_id'] for r in settled][-3:] == list(FOLLOWERS)

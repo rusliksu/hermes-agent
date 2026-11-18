@@ -65,6 +65,7 @@ _EXEMPT_DIRS = (
     ".cache",
     ".git",
     ".venv",
+    ".venv-all",
     "venv",
     ".worktrees",
 )

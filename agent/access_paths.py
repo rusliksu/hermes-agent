@@ -105,20 +105,6 @@ def profile_read_block_error(path):
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_relative_to(root):
             return None
-        if context is None:
-            # Multiplex without a typed registry context: the active scope's own home is the
-            # authority. Another profile's subtree (and the default root for a secondary) stays
-            # unaddressable.
-            from hermes_constants import get_hermes_home
-
-            current = get_hermes_home().resolve(strict=False)
-            if current == root:
-                parts = resolved.relative_to(root).parts
-                if parts and parts[0] == "profiles":
-                    return "Access denied: path belongs to another Hermes profile."
-                return None
-            return None if resolved.is_relative_to(current) else (
-                "Access denied: path belongs to another Hermes profile.")
         if bound_profile_home() is None:
             return "Access denied: bound profile context unavailable."
         parts = resolved.relative_to(root).parts

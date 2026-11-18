@@ -140,6 +140,7 @@ async def admit_producer(adapter, event):
         # (``session_ingress_live_turn``) takes the prepared path: its replay check and
         # ``pre_gateway_dispatch`` run first, as on a direct adapter's ``_handle_message``.
         live = not webhook and may_answer_live_turn(authority.runner, event)
+        relay = adapter.platform == Platform.RELAY
         if not (webhook or hooks or live):
             return await _admit_native(authority, event)
         from gateway.session_authority import native_write_started
@@ -150,7 +151,7 @@ async def admit_producer(adapter, event):
             # rechecks the ledger: the retry check, the hooks and the commit run once per delivery.
             async with _delivery_turn((authority.profile_id, principal, event.message_id)):
                 committed = payload, _committed(authority, principal, event.message_id)
-                return await _admit_once(authority, event, webhook, hooks, live, committed)
+                return await _admit_once(authority, event, webhook, hooks, live, committed, relay=relay)
         except (Exception, asyncio.CancelledError) as exc:
             # Refused after preparing (a command-shaped rewrite, a drain during the hooks, a conflict),
             # or cancelled (relay disconnect, shutdown) before the admission write began. A cancelled
@@ -162,7 +163,7 @@ async def admit_producer(adapter, event):
             native_write_started.reset(writing)
 
 
-async def _admit_once(authority, event, webhook, hooks, live, committed):
+async def _admit_once(authority, event, webhook, hooks, live, committed, *, relay=False):
     from gateway.run_inbound_consumer import POST_ADMISSION_HOOK
     if webhook:
         prior = await _webhook_retry(authority, event, *committed)
@@ -182,7 +183,7 @@ async def _admit_once(authority, event, webhook, hooks, live, committed):
             # a provider retry or relay re-send resends that, and resolves to this row.
             from gateway.session_ingress_media import ingress_fingerprint
             admitted._ingress_sha256 = ingress_fingerprint(committed[0], event.raw_message)
-    if live and await _answers_live_turn(runner, event, admitted):
+    if live and await _answers_live_turn(runner, event, admitted, allow_preempt=not relay):
         await _release_preparation(authority, committed[0])
         return None
     if POST_ADMISSION_HOOK in hooks:
@@ -195,11 +196,11 @@ async def _admit_once(authority, event, webhook, hooks, live, committed):
     return await _admit_native(authority, admitted)
 
 
-async def _answers_live_turn(runner, event, admitted):
+async def _answers_live_turn(runner, event, admitted, *, allow_preempt=True):
     """The delivery (as ``pre_gateway_dispatch`` left it) was consumed by the chat's running turn or
     pending prompt; its reply rides the delivery as received."""
     from gateway.session_ingress_live_turn import answers_live_turn
-    if not await answers_live_turn(runner, admitted):
+    if not await answers_live_turn(runner, admitted, allow_preempt=allow_preempt):
         return False
     event._consumer_reply = getattr(admitted, '_consumer_reply', None)
     return True
