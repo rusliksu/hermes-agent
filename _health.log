@@ -1,0 +1,22 @@
+
+=== health (failed) ===
+agent/artifact_turn.py:39  F821  ArtifactTurn.begin_batch
+    undefined name
+    fix: import or define it
+agent/turn_final_response.py:132  FUNC_LINES  _finish_text_response_body
+    FUNC_LINES 303 > 302, its value on main (over target 300: it may only go down)
+    fix: extract phases into named helpers or a topical sibling module
+gateway/run.py:1049  F821  _prepare_resume_pending_message
+    undefined name
+    fix: import or define it
+
+code health: 57 files vs eb0f8f0842af: 3 blocking, 0 advisory (21.4s)
+
+Each function and file has its own cap: its value on main if it is already over target,
+otherwise the target. New code meets the target; existing code may only go down. Fix the code
+(the `fix:` line is the repo's remedy); a genuine exception takes a reviewed comment on the line,
+`# health: allow <RULE> -- <why>`. Rules and targets: scripts/code_health/config.py.
+Reproduce locally: python scripts/check --only health (every lint check: python scripts/check;
+on every push: python scripts/check --install-hook pre-push).
+
+scripts/check: 1 checks, FAILED: health

@@ -1,0 +1,17 @@
+{
+  "description": "Mark an existing non-image document for delivery to this conversation. Pass only its path; the server-bound destination cannot be selected by the model.",
+  "name": "deliver_artifact",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "path": {
+        "description": "Absolute path, or bound-workspace-relative path, to the artifact.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "type": "object"
+  }
+}

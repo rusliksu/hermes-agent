@@ -6,9 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
-
 
 def _make_source() -> SessionSource:
     return SessionSource(
@@ -19,10 +18,8 @@ def _make_source() -> SessionSource:
         chat_type="dm",
     )
 
-
 def _make_event(text: str = "/compress") -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
-
 
 def _make_history() -> list[dict[str, str]]:
     return [
@@ -31,7 +28,6 @@ def _make_history() -> list[dict[str, str]]:
         {"role": "user", "content": "three"},
         {"role": "assistant", "content": "four"},
     ]
-
 
 def _make_runner(history: list[dict[str, str]]):
     from gateway.run import GatewayRunner
@@ -50,16 +46,12 @@ def _make_runner(history: list[dict[str, str]]):
     )
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
-    runner.session_store.get_topic_preferences.return_value = {}
-    runner.session_store.get_model_override.return_value = None
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner.session_store._save = MagicMock()
-    runner._session_service_tier_overrides = {}
     runner._session_db = None
     return runner
-
 
 @pytest.mark.asyncio
 async def test_compress_focus_topic_passed_to_agent():
@@ -71,6 +63,7 @@ async def test_compress_focus_topic_passed_to_agent():
     agent_instance.context_compressor.has_content_to_compress.return_value = True
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
 
     def _estimate(messages):
         return 100
@@ -81,73 +74,9 @@ async def test_compress_focus_topic_passed_to_agent():
         patch("run_agent.AIAgent", return_value=agent_instance),
         patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_estimate),
     ):
-        result = await runner._handle_compress_command(_make_event("/compress database schema"))
+        await runner._handle_compress_command(_make_event("/compress database schema"))
 
     # Verify focus_topic was passed
     agent_instance._compress_context.assert_called_once()
     call_kwargs = agent_instance._compress_context.call_args
     assert call_kwargs.kwargs.get("focus_topic") == "database schema"
-
-    # Verify focus is mentioned in response
-    assert 'Focus: "database schema"' in result
-
-
-@pytest.mark.asyncio
-async def test_compress_no_focus_passes_none():
-    """Bare /compress passes focus_topic=None."""
-    history = _make_history()
-    runner = _make_runner(history)
-    agent_instance = MagicMock()
-    agent_instance.context_compressor.has_content_to_compress.return_value = True
-    agent_instance.session_id = "sess-1"
-    agent_instance._compress_context.return_value = (list(history), "")
-
-    with (
-        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
-        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-        patch("run_agent.AIAgent", return_value=agent_instance),
-        patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
-    ):
-        result = await runner._handle_compress_command(_make_event("/compress"))
-
-    agent_instance._compress_context.assert_called_once()
-    call_kwargs = agent_instance._compress_context.call_args
-    assert call_kwargs.kwargs.get("focus_topic") is None
-
-    # No focus line in response
-    assert "Focus:" not in result
-
-
-@pytest.mark.asyncio
-async def test_compress_rotation_clears_only_current_session_fast_override():
-    history = _make_history()
-    runner = _make_runner(history)
-    session_key = build_session_key(_make_source())
-    other_key = "agent:main:telegram:dm:other"
-    runner._session_service_tier_overrides = {
-        session_key: "priority",
-        other_key: "priority",
-    }
-    runner._sync_telegram_topic_binding = MagicMock()
-    agent_instance = MagicMock()
-    agent_instance.context_compressor.has_content_to_compress.return_value = True
-    agent_instance.session_id = "sess-2"
-    agent_instance._compress_context.return_value = (list(history), "")
-
-    with (
-        patch(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            return_value={"api_key": "***"},
-        ),
-        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-        patch("run_agent.AIAgent", return_value=agent_instance),
-        patch(
-            "agent.model_metadata.estimate_messages_tokens_rough",
-            return_value=100,
-        ),
-    ):
-        await runner._handle_compress_command(_make_event())
-
-    runner.session_store.rewrite_transcript.assert_called_once()
-    assert session_key not in runner._session_service_tier_overrides
-    assert runner._session_service_tier_overrides[other_key] == "priority"

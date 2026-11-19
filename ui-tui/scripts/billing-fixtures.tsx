@@ -8,23 +8,23 @@
  * to what `/subscription` and `/topup` draw at runtime.
  *
  * Usage:
- *   npx tsx scripts/billing-fixtures.tsx <fixture-name>
- *   npx tsx scripts/billing-fixtures.tsx --list
+ *   pnpm exec tsx scripts/billing-fixtures.tsx <fixture-name>
+ *   pnpm exec tsx scripts/billing-fixtures.tsx --list
  *
  * Drive a specific screen of a fixture with SCREEN=<screen>, e.g.:
- *   SCREEN=confirm npx tsx scripts/billing-fixtures.tsx sub-free
- *   SCREEN=handoff npx tsx scripts/billing-fixtures.tsx sub-mid
+ *   SCREEN=confirm pnpm exec tsx scripts/billing-fixtures.tsx sub-free
+ *   SCREEN=handoff pnpm exec tsx scripts/billing-fixtures.tsx sub-mid
  *
  * The selection cursor can be moved with ↑/↓ once it's live (the components own
  * their own useInput); Esc/Enter behave as in production. Ctrl-C to exit.
  */
 import { render } from '@hermes/ink'
+import type { BillingStateResponse, SubscriptionStateResponse, SubscriptionTierOption } from '@hermes/shared/gateway-types'
 import React from 'react'
 
 import type { BillingOverlayState, SubscriptionOverlayState, SubscriptionScreen } from '../src/app/interfaces.js'
 import { BillingOverlay } from '../src/components/billingOverlay.js'
 import { SubscriptionOverlay } from '../src/components/subscriptionOverlay.js'
-import type { BillingStateResponse, SubscriptionStateResponse, SubscriptionTierOption } from '../src/gatewayTypes.js'
 import { DEFAULT_THEME } from '../src/theme.js'
 
 const t = DEFAULT_THEME
@@ -42,11 +42,13 @@ const tier = (o: Partial<SubscriptionTierOption> = {}): SubscriptionTierOption =
   ...o
 })
 
+// Mirrors the live portal catalog so fixtures don't drift; the real overlay
+// reads tiers from GET /api/billing/subscription, never from here.
 const TIERS = {
   free: tier({ tier_id: 'free', name: 'Free', tier_order: 0, dollars_per_month_display: '$0', monthly_credits: '0' }),
-  plus: tier({ tier_id: 'plus', name: 'Plus', tier_order: 1, dollars_per_month_display: '$20', monthly_credits: '1,000' }),
-  super: tier({ tier_id: 'super', name: 'Super', tier_order: 2, dollars_per_month_display: '$50', monthly_credits: '3,000' }),
-  ultra: tier({ tier_id: 'ultra', name: 'Ultra', tier_order: 3, dollars_per_month_display: '$99', monthly_credits: '7,000' })
+  plus: tier({ tier_id: 'plus', name: 'Plus', tier_order: 1, dollars_per_month_display: '$20', monthly_credits: '22' }),
+  super: tier({ tier_id: 'super', name: 'Super', tier_order: 2, dollars_per_month_display: '$100', monthly_credits: '110' }),
+  ultra: tier({ tier_id: 'ultra', name: 'Ultra', tier_order: 3, dollars_per_month_display: '$200', monthly_credits: '220' })
 }
 
 const tierList = (currentId?: string): SubscriptionTierOption[] =>
@@ -205,7 +207,7 @@ const FIXTURES: Record<string, Fixture> = {
     node: billEl(billState({ is_admin: false }))
   },
   'topup-disabled': {
-    desc: '/topup overview — terminal billing OFF for org',
+    desc: '/topup overview — remote spending OFF for org',
     node: billEl(billState({ cli_billing_enabled: false }))
   },
   'topup-buy': {
@@ -225,10 +227,12 @@ const arg = process.argv[2]
 if (!arg || arg === '--list' || arg === '-l') {
   const names = Object.keys(FIXTURES)
   process.stdout.write('Billing/Subscription TUI fixtures:\n\n')
+
   for (const name of names) {
     process.stdout.write(`  ${name.padEnd(18)} ${FIXTURES[name]!.desc}\n`)
   }
-  process.stdout.write(`\n  ${names.length} fixtures. Run:  npx tsx scripts/billing-fixtures.tsx <name>\n`)
+
+  process.stdout.write(`\n  ${names.length} fixtures. Run:  pnpm exec tsx scripts/billing-fixtures.tsx <name>\n`)
   process.exit(0)
 }
 
