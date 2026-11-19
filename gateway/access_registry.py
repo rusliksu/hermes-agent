@@ -17,6 +17,7 @@ _LEGACY_ROLE_ALIASES = {
 
 
 def canonical_role_id(role_id: Any) -> Any:
+    """Return the canonical role name while accepting rollout-era aliases."""
     if not isinstance(role_id, str):
         return role_id
     return _LEGACY_ROLE_ALIASES.get(role_id, role_id)
@@ -33,7 +34,9 @@ def _is_nonempty_str(value: Any) -> bool:
 
 
 def _redact(value: Any) -> Optional[str]:
-    return "present" if _is_nonempty_str(value) else None
+    if not _is_nonempty_str(value):
+        return None
+    return "present"
 
 
 _AUDIT_PLATFORMS = frozenset({"signal", "telegram"})
@@ -123,7 +126,7 @@ def command_args_have_authority_selector(raw_args: Any) -> bool:
         return False
     try:
         parsed = json.loads(raw_args)
-    except Exception:
+    except (TypeError, ValueError):
         parsed = None
     if isinstance(parsed, dict) and payload_has_authority_selector(parsed):
         return True
@@ -239,7 +242,7 @@ def _deserialize_capabilities(values: Any) -> frozenset[str]:
 
 
 def serialize_resolved_access_context(context: Any) -> dict[str, Any]:
-    """Serialize a trusted access context for authoritative routing storage."""
+    """Serialize a trusted access context for the authoritative routing store."""
     if not isinstance(context, ResolvedAccessContext):
         raise ValueError("malformed_resolved_access_context")
     return {
@@ -294,6 +297,7 @@ def deserialize_resolved_access_context(data: Any) -> ResolvedAccessContext:
 
 
 def canonical_access_context_fingerprint(context: Any) -> str:
+    """Return an opaque stable fingerprint for a strict six-field context."""
     canonical = json.dumps(
         serialize_resolved_access_context(
             deserialize_resolved_access_context(
@@ -308,6 +312,7 @@ def canonical_access_context_fingerprint(context: Any) -> str:
 
 
 def shared_memory_namespace_for_access_context(context: Any) -> str:
+    """Return the opaque shared-memory namespace for a shared_room context."""
     resolved = deserialize_resolved_access_context(
         serialize_resolved_access_context(context)
     )
@@ -329,6 +334,7 @@ def shared_memory_namespace_for_access_context(context: Any) -> str:
 
 
 def memory_scope_from_resolved_access_context(context: Any) -> str:
+    """Return the opaque memory-provider namespace for a strict six-field context."""
     if isinstance(context, dict):
         resolved = deserialize_resolved_access_context(context)
     else:
@@ -337,11 +343,17 @@ def memory_scope_from_resolved_access_context(context: Any) -> str:
         )
     if resolved.role_id == "shared_room":
         return f"memory/shared/{shared_memory_namespace_for_access_context(resolved)}"
-    canonical = "\0".join((resolved.profile_id, resolved.conversation_scope)).encode("utf-8")
+    canonical = "\0".join(
+        (
+            resolved.profile_id,
+            resolved.conversation_scope,
+        )
+    ).encode("utf-8")
     return f"memory/personal/{hashlib.sha256(canonical).hexdigest()}"
 
 
 def session_scope_from_resolved_access_context(context: Any) -> dict[str, Any]:
+    """Return the neutral SessionDB scope for a strict six-field context."""
     resolved = deserialize_resolved_access_context(
         serialize_resolved_access_context(context)
     )
@@ -382,7 +394,7 @@ class TransportIdentity:
     thread_id: Any = None
 
     @classmethod
-    def from_session_source(cls, source: Any, *, account: str) -> "TransportIdentity":
+    def from_session_source(cls, source: Any, *, account: str) -> TransportIdentity:
         platform = getattr(getattr(source, "platform", None), "value", None)
         return cls(
             platform=platform,
@@ -445,7 +457,7 @@ class RedactedAuditMetadata:
     thread_ref: Optional[str] = None
 
     @classmethod
-    def from_transport(cls, event: str, identity: Optional[TransportIdentity]) -> "RedactedAuditMetadata":
+    def from_transport(cls, event: str, identity: Optional[TransportIdentity]) -> RedactedAuditMetadata:
         if identity is None:
             return cls(event=event)
         return cls(
@@ -459,7 +471,7 @@ class RedactedAuditMetadata:
         )
 
     @classmethod
-    def from_delivery_target(cls, event: str, target: Optional[DeliveryTarget]) -> "RedactedAuditMetadata":
+    def from_delivery_target(cls, event: str, target: Optional[DeliveryTarget]) -> RedactedAuditMetadata:
         if not isinstance(target, DeliveryTarget):
             return cls(event=event)
         return cls(
@@ -493,6 +505,30 @@ class AccessDeniedError(PermissionError):
 
 
 @dataclass(frozen=True)
+class AccessComparisonResult:
+    legacy_outcome: str
+    resolved_outcome: str
+    outcome_agrees: bool
+    profile_agrees: Optional[bool]
+    legacy_profile: str
+    resolved_reason: str
+    comparison_reason: str
+    audit: RedactedAuditMetadata
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "legacy_outcome": self.legacy_outcome,
+            "resolved_outcome": self.resolved_outcome,
+            "outcome_agrees": self.outcome_agrees,
+            "profile_agrees": self.profile_agrees,
+            "legacy_profile": self.legacy_profile,
+            "resolved_reason": self.resolved_reason,
+            "comparison_reason": self.comparison_reason,
+            "audit": self.audit.as_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class RegistryValidationReport:
     verdict: str
     conflicts: tuple[tuple[str, int], ...] = ()
@@ -512,6 +548,8 @@ class RegistryValidationReport:
 
 
 class RegistryValidationError(ValueError):
+    """Raised without transport IDs or human labels when registry validation fails."""
+
     def __init__(self, report: RegistryValidationReport):
         self.report = report
         categories = ",".join(category for category, _ in report.conflicts)
@@ -547,6 +585,28 @@ class AccessRegistry:
             if count:
                 counts[category] = counts.get(category, 0) + count
 
+        aliases = self._validate_roles(add)
+        principal_keys, principal_ids, principal_profiles = self._validate_principals(add)
+        room_keys, room_profiles = self._validate_shared_scopes(add, principal_ids, principal_profiles)
+        for policies in aliases.values():
+            if len(policies) > 1:
+                add("conflicting_role_alias")
+        for category, counted in (
+            ("duplicate_principal_binding", principal_keys),
+            ("duplicate_principal_id", principal_ids),
+            ("duplicate_principal_profile", principal_profiles),
+            ("duplicate_shared_scope_binding", room_keys),
+            ("duplicate_shared_room_profile", room_profiles),
+        ):
+            add(category, sum(count - 1 for count in counted.values() if count > 1))
+        conflicts = tuple(sorted(counts.items()))
+        return RegistryValidationReport(
+            verdict="fail" if conflicts else "pass",
+            conflicts=conflicts,
+        )
+
+    def _validate_roles(self, add) -> dict:
+        aliases: dict[str, set[tuple[frozenset[str], bool]]] = {}
         for key, role in self.roles.items():
             if not _is_nonempty_str(key):
                 add("malformed_role_key")
@@ -555,7 +615,10 @@ class AccessRegistry:
                 continue
             if canonical_role_id(key) != role.role_id:
                 add("mismatched_role_key")
+            aliases.setdefault(canonical_role_id(key), set()).add((role.capabilities, role.active))
+        return aliases
 
+    def _validate_principals(self, add):
         principal_keys: dict[tuple[str, str, str, str], int] = {}
         principal_ids: dict[str, int] = {}
         principal_profiles: dict[str, int] = {}
@@ -571,11 +634,8 @@ class AccessRegistry:
                 key = _principal_key(binding.transport_identity)
                 principal_keys[key] = principal_keys.get(key, 0) + 1
             self._validate_binding_authority(
-                binding.principal_id,
-                binding.role_id,
-                binding.profile_id,
-                binding.conversation_scope,
-                add,
+                binding.principal_id, binding.role_id, binding.profile_id,
+                binding.conversation_scope, add,
             )
             if not _delivery_matches_identity(binding.delivery_target, binding.transport_identity):
                 add("delivery_target_mismatch")
@@ -583,7 +643,9 @@ class AccessRegistry:
                 principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
             if _is_nonempty_str(binding.profile_id):
                 principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
+        return principal_keys, principal_ids, principal_profiles
 
+    def _validate_shared_scopes(self, add, principal_ids, principal_profiles):
         room_keys: dict[tuple[str, str, str, str, Optional[str]], int] = {}
         room_profiles: dict[str, int] = {}
         for binding in self.shared_scope_bindings:
@@ -600,41 +662,67 @@ class AccessRegistry:
             if binding.role_id != "shared_room":
                 add("invalid_shared_room_role")
             self._validate_binding_authority(
-                binding.principal_id,
-                binding.role_id,
-                binding.profile_id,
-                binding.conversation_scope,
-                add,
+                binding.principal_id, binding.role_id, binding.profile_id,
+                binding.conversation_scope, add,
             )
             if not _delivery_matches_identity(binding.delivery_target, binding.room_identity):
                 add("delivery_target_mismatch")
-            if not binding.participant_identities:
-                add("missing_shared_room_membership")
-            participant_keys: dict[tuple[str, str, str], int] = {}
-            for participant in binding.participant_identities:
-                if not isinstance(participant, ParticipantIdentity):
-                    add("malformed_shared_room_membership")
-                    continue
-                if not all(_is_nonempty_str(value) for value in participant.key()):
-                    add("malformed_shared_room_membership")
-                    continue
-                participant_keys[participant.key()] = participant_keys.get(participant.key(), 0) + 1
-            add(
-                "duplicate_shared_room_member",
-                sum(count - 1 for count in participant_keys.values() if count > 1),
-            )
+            self._validate_room_members(binding, add)
             if _is_nonempty_str(binding.principal_id):
                 principal_ids[binding.principal_id] = principal_ids.get(binding.principal_id, 0) + 1
             if _is_nonempty_str(binding.profile_id):
                 principal_profiles[binding.profile_id] = principal_profiles.get(binding.profile_id, 0) + 1
                 room_profiles[binding.profile_id] = room_profiles.get(binding.profile_id, 0) + 1
+        return room_keys, room_profiles
 
-        add("duplicate_principal_binding", sum(count - 1 for count in principal_keys.values() if count > 1))
-        add("duplicate_principal_id", sum(count - 1 for count in principal_ids.values() if count > 1))
-        add("duplicate_principal_profile", sum(count - 1 for count in principal_profiles.values() if count > 1))
-        add("duplicate_shared_scope_binding", sum(count - 1 for count in room_keys.values() if count > 1))
-        add("duplicate_shared_room_profile", sum(count - 1 for count in room_profiles.values() if count > 1))
+    def _validate_room_members(self, binding, add) -> None:
+        if not binding.participant_identities:
+            add("missing_shared_room_membership")
+        participant_keys: dict[tuple[str, str, str], int] = {}
+        for participant in binding.participant_identities:
+            if not isinstance(participant, ParticipantIdentity):
+                add("malformed_shared_room_membership")
+                continue
+            if not all(_is_nonempty_str(value) for value in participant.key()):
+                add("malformed_shared_room_membership")
+                continue
+            participant_keys[participant.key()] = participant_keys.get(participant.key(), 0) + 1
+        add(
+            "duplicate_shared_room_member",
+            sum(count - 1 for count in participant_keys.values() if count > 1),
+        )
 
+
+    def validate_rollout_shape(self) -> RegistryValidationReport:
+        counts = dict(self.validate().conflicts)
+        active_principals = [
+            binding
+            for binding in self.principal_bindings
+            if isinstance(binding, PrincipalBinding) and binding.active
+        ]
+        active_rooms = [
+            binding
+            for binding in self.shared_scope_bindings
+            if isinstance(binding, SharedScopeBinding) and binding.active
+        ]
+        owner_count = sum(canonical_role_id(binding.role_id) == "owner" for binding in active_principals)
+        family_count = sum(canonical_role_id(binding.role_id) == "family" for binding in active_principals)
+        shared_count = sum(binding.role_id == "shared_room" for binding in active_rooms)
+        allowed_private_roles = {"owner", "family"}
+        expected = {
+            "active_principal_binding_count": (len(active_principals), 10),
+            "invalid_private_role_count": (
+                sum(binding.role_id not in allowed_private_roles for binding in active_principals),
+                0,
+            ),
+            "owner_count": (owner_count, 1),
+            "family_count": (family_count, 9),
+            "active_shared_scope_binding_count": (len(active_rooms), 2),
+            "shared_room_count": (shared_count, 2),
+        }
+        for category, (actual, wanted) in expected.items():
+            if actual != wanted:
+                counts[category] = abs(actual - wanted) or 1
         conflicts = tuple(sorted(counts.items()))
         return RegistryValidationReport(
             verdict="fail" if conflicts else "pass",
@@ -643,6 +731,12 @@ class AccessRegistry:
 
     def require_valid(self) -> RegistryValidationReport:
         report = self.validate()
+        if not report.valid:
+            raise RegistryValidationError(report)
+        return report
+
+    def require_valid_rollout_shape(self) -> RegistryValidationReport:
+        report = self.validate_rollout_shape()
         if not report.valid:
             raise RegistryValidationError(report)
         return report
@@ -664,31 +758,43 @@ class AccessRegistry:
             "validate_context",
             getattr(context, "delivery_target", None),
         )
+        if context is None:
+            raise AccessDeniedError("missing_resolved_access_context", audit)
         if not isinstance(context, ResolvedAccessContext):
             raise AccessDeniedError("malformed_resolved_access_context", audit)
-        if not self.validate().valid:
-            raise AccessDeniedError("registry_validation_failed", audit)
-        matches = [candidate for candidate in self._active_resolved_contexts() if candidate == context]
+
+        matches = [
+            candidate
+            for candidate in self._active_resolved_contexts()
+            if candidate == context
+        ]
         if len(matches) > 1:
             raise AccessDeniedError("ambiguous_resolved_access_context", audit)
-        if matches:
-            return matches[0]
-        principal_context = self._validate_derived_principal_context(context, audit)
-        if principal_context is not None:
-            return principal_context
-        shared_context = self._validate_derived_shared_context(context, audit)
-        if shared_context is not None:
+        if not self.validate().valid:
+            raise AccessDeniedError("registry_validation_failed", audit)
+        if not matches:
+            principal_context = self._validate_derived_principal_context(context, audit)
+            if principal_context is not None:
+                return principal_context
+            shared_context = self._validate_derived_shared_context(context, audit)
+            if shared_context is None:
+                raise AccessDeniedError("resolved_access_context_mismatch", audit)
             return shared_context
-        raise AccessDeniedError("resolved_access_context_mismatch", audit)
+        return matches[0]
 
     def validate_resolved_context_for_identity(
         self,
         context: Any,
         identity: TransportIdentity,
     ) -> ResolvedAccessContext:
-        audit = RedactedAuditMetadata.from_transport("validate_context_source", identity)
+        """Validate a resolved context against the original trusted identity."""
+        audit = RedactedAuditMetadata.from_transport(
+            "validate_context_source",
+            identity,
+        )
         if not isinstance(identity, TransportIdentity) or not _valid_ingress_identity(identity):
             raise AccessDeniedError("malformed_identity", audit)
+
         validated = self.validate_resolved_context(context)
         expected = self.resolve(identity)
         if (
@@ -703,17 +809,30 @@ class AccessRegistry:
         if not _is_nonempty_str(profile_id):
             raise AccessDeniedError("missing_profile", audit)
         active_contexts = [
-            context for context in self._active_resolved_contexts() if context.profile_id == profile_id
+            context
+            for context in self._active_resolved_contexts()
+            if context.profile_id == profile_id
         ]
         if len(active_contexts) > 1:
             raise AccessDeniedError("ambiguous_profile_binding", audit)
         if not self.validate().valid:
             raise AccessDeniedError("registry_validation_failed", audit)
         if not active_contexts:
-            raise AccessDeniedError("missing_profile_binding", audit)
+            disabled_match = any(
+                isinstance(binding, (PrincipalBinding, SharedScopeBinding))
+                and not binding.active
+                and binding.profile_id == profile_id
+                for binding in self.principal_bindings + self.shared_scope_bindings
+            )
+            reason = "disabled_profile_binding" if disabled_match else "missing_profile_binding"
+            raise AccessDeniedError(reason, audit)
         return self.validate_resolved_context(active_contexts[0])
 
-    def effective_capabilities(self, role_id: str, conversation_scope: str) -> frozenset[str]:
+    def effective_capabilities(
+        self,
+        role_id: str,
+        conversation_scope: str,
+    ) -> frozenset[str]:
         role = self._role_for_id(role_id)
         if not isinstance(role, RolePolicy) or not role.active:
             return frozenset()
@@ -734,28 +853,32 @@ class AccessRegistry:
             None,
         )
 
-    def _resolve_dm(self, identity: TransportIdentity, audit: RedactedAuditMetadata) -> ResolvedAccessContext:
+    def _resolve_dm(
+        self,
+        identity: TransportIdentity,
+        audit: RedactedAuditMetadata,
+    ) -> ResolvedAccessContext:
         if identity.user_id != identity.chat_id:
             raise AccessDeniedError("dm_identity_mismatch", audit)
+        disabled_matches = [
+            binding
+            for binding in self.principal_bindings
+            if (
+                not binding.active
+                and _valid_principal_binding_identity(binding.transport_identity)
+            )
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
+        ]
         matches = [
             binding
             for binding in self.principal_bindings
             if (
                 binding.active
                 and _valid_principal_binding_identity(binding.transport_identity)
-                and _principal_key(binding.transport_identity) == _principal_key(identity)
             )
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
         ]
-        disabled = [
-            binding
-            for binding in self.principal_bindings
-            if (
-                not binding.active
-                and _valid_principal_binding_identity(binding.transport_identity)
-                and _principal_key(binding.transport_identity) == _principal_key(identity)
-            )
-        ]
-        if not matches and disabled:
+        if not matches and disabled_matches:
             raise AccessDeniedError("disabled_principal_binding", audit)
         binding = _single_match(matches, "principal_binding", audit)
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
@@ -766,7 +889,11 @@ class AccessRegistry:
             else None,
         )
 
-    def _resolve_shared_room(self, identity: TransportIdentity, audit: RedactedAuditMetadata) -> ResolvedAccessContext:
+    def _resolve_shared_room(
+        self,
+        identity: TransportIdentity,
+        audit: RedactedAuditMetadata,
+    ) -> ResolvedAccessContext:
         binding, parent_match = self._select_shared_scope_binding(identity, audit)
         member = ParticipantIdentity(identity.platform, identity.account, identity.user_id)
         if member.key() not in {participant.key() for participant in binding.participant_identities}:
@@ -774,7 +901,9 @@ class AccessRegistry:
         self._require_known_authority(binding.role_id, binding.profile_id, binding.conversation_scope, audit)
         return self._context_from_binding(
             binding,
-            delivery_target=_delivery_target_from_room_identity(identity) if parent_match else None,
+            delivery_target=_delivery_target_from_room_identity(identity)
+            if parent_match
+            else None,
         )
 
     def _select_shared_scope_binding(
@@ -784,7 +913,7 @@ class AccessRegistry:
         *,
         allow_missing: bool = False,
     ) -> Optional[tuple[SharedScopeBinding, bool]]:
-        exact = [
+        active_exact = [
             binding
             for binding in self.shared_scope_bindings
             if (
@@ -793,10 +922,23 @@ class AccessRegistry:
                 and _room_key(binding.room_identity) == _room_key(identity)
             )
         ]
-        if exact:
-            return _single_match(exact, "shared_scope_binding", audit), False
+        if active_exact:
+            return _single_match(active_exact, "shared_scope_binding", audit), False
+
+        disabled_exact = [
+            binding
+            for binding in self.shared_scope_bindings
+            if (
+                not binding.active
+                and _valid_room_identity(binding.room_identity)
+                and _room_key(binding.room_identity) == _room_key(identity)
+            )
+        ]
+        if disabled_exact:
+            raise AccessDeniedError("disabled_shared_scope_binding", audit)
+
         if identity.thread_id is not None:
-            parent = [
+            active_parent = [
                 binding
                 for binding in self.shared_scope_bindings
                 if (
@@ -806,8 +948,22 @@ class AccessRegistry:
                     and _room_parent_key(binding.room_identity) == _room_parent_key(identity)
                 )
             ]
-            if parent:
-                return _single_match(parent, "shared_scope_binding", audit), True
+            if active_parent:
+                return _single_match(active_parent, "shared_scope_binding", audit), True
+
+            disabled_parent = [
+                binding
+                for binding in self.shared_scope_bindings
+                if (
+                    not binding.active
+                    and _valid_room_identity(binding.room_identity)
+                    and binding.room_identity.thread_id is None
+                    and _room_parent_key(binding.room_identity) == _room_parent_key(identity)
+                )
+            ]
+            if disabled_parent:
+                raise AccessDeniedError("disabled_shared_scope_binding", audit)
+
         if allow_missing:
             return None
         raise AccessDeniedError("missing_shared_scope_binding", audit)
@@ -828,13 +984,17 @@ class AccessRegistry:
             chat_id=target.chat_id,
             thread_id=target.thread_id,
         )
+        if not _valid_room_identity(identity):
+            return None
         selected = self._select_shared_scope_binding(identity, audit, allow_missing=True)
         if selected is None:
             return None
         binding, parent_match = selected
         expected = self._context_from_binding(
             binding,
-            delivery_target=_delivery_target_from_room_identity(identity) if parent_match else None,
+            delivery_target=_delivery_target_from_room_identity(identity)
+            if parent_match
+            else None,
         )
         return expected if expected == context else None
 
@@ -844,7 +1004,7 @@ class AccessRegistry:
         audit: RedactedAuditMetadata,
     ) -> Optional[ResolvedAccessContext]:
         target = context.delivery_target
-        if target.peer_kind != "dm" or target.thread_id is None:
+        if not isinstance(target, DeliveryTarget) or target.peer_kind != "dm" or target.thread_id is None:
             return None
         identity = TransportIdentity(
             platform=target.platform,
@@ -854,14 +1014,16 @@ class AccessRegistry:
             chat_id=target.chat_id,
             thread_id=target.thread_id,
         )
+        if not _valid_principal_binding_identity(identity):
+            return None
         matches = [
             binding
             for binding in self.principal_bindings
             if (
                 binding.active
                 and _valid_principal_binding_identity(binding.transport_identity)
-                and _principal_key(binding.transport_identity) == _principal_key(identity)
             )
+            and _principal_key(binding.transport_identity) == _principal_key(identity)
         ]
         if not matches:
             return None
@@ -878,7 +1040,6 @@ class AccessRegistry:
         *,
         delivery_target: Optional[DeliveryTarget] = None,
     ) -> ResolvedAccessContext:
-        target = delivery_target or binding.delivery_target
         return ResolvedAccessContext(
             principal_id=binding.principal_id,
             role_id=binding.role_id,
@@ -888,33 +1049,16 @@ class AccessRegistry:
                 binding.role_id,
                 binding.conversation_scope,
             ),
-            delivery_target=target,
+            delivery_target=delivery_target or binding.delivery_target,
         )
 
     def _active_resolved_contexts(self) -> tuple[ResolvedAccessContext, ...]:
-        contexts: list[ResolvedAccessContext] = []
-        for binding in self.principal_bindings + self.shared_scope_bindings:
-            if isinstance(binding, (PrincipalBinding, SharedScopeBinding)) and binding.active:
-                try:
-                    contexts.append(self._context_from_binding(binding))
-                except AccessDeniedError:
-                    continue
-        return tuple(contexts)
-
-    def _require_known_authority(
-        self,
-        role_id: str,
-        profile_id: str,
-        conversation_scope: str,
-        audit: RedactedAuditMetadata,
-    ) -> None:
-        role = self._role_for_id(role_id)
-        if not isinstance(role, RolePolicy) or not role.active:
-            raise AccessDeniedError("unknown_role", audit)
-        if profile_id not in self.profiles:
-            raise AccessDeniedError("unknown_profile", audit)
-        if conversation_scope not in self.scope_capabilities:
-            raise AccessDeniedError("unknown_conversation_scope", audit)
+        bindings = (
+            binding
+            for binding in self.principal_bindings + self.shared_scope_bindings
+            if isinstance(binding, (PrincipalBinding, SharedScopeBinding)) and binding.active
+        )
+        return tuple(self._context_from_binding(binding) for binding in bindings)
 
     def _validate_binding_authority(
         self,
@@ -926,12 +1070,72 @@ class AccessRegistry:
     ) -> None:
         if not all(_is_nonempty_str(value) for value in (principal_id, role_id, profile_id, conversation_scope)):
             add("malformed_binding_authority")
-        if self._role_for_id(role_id) is None:
+            return
+        canonical = canonical_role_id(role_id)
+        role = self._role_for_id(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != canonical or not role.active:
             add("unknown_role")
         if profile_id not in self.profiles:
             add("unknown_profile")
         if conversation_scope not in self.scope_capabilities:
-            add("unknown_conversation_scope")
+            add("unknown_scope")
+
+    def _require_known_authority(
+        self,
+        role_id: str,
+        profile_id: str,
+        conversation_scope: str,
+        audit: RedactedAuditMetadata,
+    ) -> None:
+        canonical = canonical_role_id(role_id)
+        role = self._role_for_id(role_id)
+        if not isinstance(role, RolePolicy) or role.role_id != canonical or not role.active:
+            raise AccessDeniedError("unknown_role", audit)
+        if profile_id not in self.profiles:
+            raise AccessDeniedError("unknown_profile", audit)
+        if conversation_scope not in self.scope_capabilities:
+            raise AccessDeniedError("unknown_scope", audit)
+
+
+def _single_match(matches: list[Any], kind: str, audit: RedactedAuditMetadata) -> Any:
+    if not matches:
+        raise AccessDeniedError(f"missing_{kind}", audit)
+    if len(matches) > 1:
+        raise AccessDeniedError(f"duplicate_{kind}", audit)
+    return matches[0]
+
+
+def _valid_ingress_identity(identity: TransportIdentity) -> bool:
+    values = (
+        getattr(identity, "platform", None),
+        getattr(identity, "account", None),
+        getattr(identity, "peer_kind", None),
+        getattr(identity, "user_id", None),
+        getattr(identity, "chat_id", None),
+    )
+    return all(_is_nonempty_str(value) for value in values) and (
+        getattr(identity, "thread_id", None) is None
+        or _is_nonempty_str(getattr(identity, "thread_id", None))
+    )
+
+
+def _valid_principal_binding_identity(identity: TransportIdentity) -> bool:
+    return _valid_ingress_identity(identity) and identity.peer_kind == "dm" and identity.user_id == identity.chat_id
+
+
+def _valid_room_identity(identity: TransportIdentity) -> bool:
+    return all(
+        _is_nonempty_str(value)
+        for value in (
+            getattr(identity, "platform", None),
+            getattr(identity, "account", None),
+            getattr(identity, "peer_kind", None),
+            getattr(identity, "chat_id", None),
+        )
+    ) and getattr(identity, "peer_kind", None) != "dm" and (
+        getattr(identity, "thread_id", None) is None
+        or _is_nonempty_str(getattr(identity, "thread_id", None))
+    )
 
 
 def _principal_key(identity: TransportIdentity) -> tuple[str, str, str, str]:
@@ -949,54 +1153,11 @@ def _room_key(identity: TransportIdentity) -> tuple[str, str, str, str, Optional
 
 
 def _room_parent_key(identity: TransportIdentity) -> tuple[str, str, str, str]:
-    return (identity.platform, identity.account, identity.peer_kind, identity.chat_id)
-
-
-def _valid_principal_binding_identity(identity: Any) -> bool:
-    return isinstance(identity, TransportIdentity) and all(
-        _is_nonempty_str(value)
-        for value in (identity.platform, identity.account, identity.peer_kind, identity.user_id, identity.chat_id)
-    )
-
-
-def _valid_room_identity(identity: Any) -> bool:
-    return isinstance(identity, TransportIdentity) and all(
-        _is_nonempty_str(value)
-        for value in (identity.platform, identity.account, identity.peer_kind, identity.chat_id)
-    )
-
-
-def _valid_ingress_identity(identity: Any) -> bool:
-    if not isinstance(identity, TransportIdentity):
-        return False
-    if not all(
-        _is_nonempty_str(value)
-        for value in (identity.platform, identity.account, identity.peer_kind, identity.user_id, identity.chat_id)
-    ):
-        return False
-    if identity.thread_id is not None and not _is_nonempty_str(identity.thread_id):
-        return False
-    return True
-
-
-def _delivery_matches_identity(target: DeliveryTarget, identity: TransportIdentity) -> bool:
     return (
-        isinstance(target, DeliveryTarget)
-        and target.platform == identity.platform
-        and target.account == identity.account
-        and target.peer_kind == identity.peer_kind
-        and target.chat_id == identity.chat_id
-        and target.thread_id == identity.thread_id
-    )
-
-
-def _delivery_target_from_principal_identity(identity: TransportIdentity) -> DeliveryTarget:
-    return DeliveryTarget(
-        platform=identity.platform,
-        account=identity.account,
-        peer_kind=identity.peer_kind,
-        chat_id=identity.chat_id,
-        thread_id=identity.thread_id,
+        identity.platform,
+        identity.account,
+        identity.peer_kind,
+        identity.chat_id,
     )
 
 
@@ -1010,9 +1171,79 @@ def _delivery_target_from_room_identity(identity: TransportIdentity) -> Delivery
     )
 
 
-def _single_match(matches: list[Any], category: str, audit: RedactedAuditMetadata) -> Any:
-    if not matches:
-        raise AccessDeniedError(f"missing_{category}", audit)
-    if len(matches) > 1:
-        raise AccessDeniedError(f"ambiguous_{category}", audit)
-    return matches[0]
+def _delivery_target_from_principal_identity(identity: TransportIdentity) -> DeliveryTarget:
+    return DeliveryTarget(
+        platform=identity.platform,
+        account=identity.account,
+        peer_kind=identity.peer_kind,
+        chat_id=identity.chat_id,
+        thread_id=identity.thread_id,
+    )
+
+
+def _delivery_matches_identity(target: Any, identity: TransportIdentity) -> bool:
+    if not isinstance(target, DeliveryTarget):
+        return False
+    return (
+        target.platform == getattr(identity, "platform", None)
+        and target.account == getattr(identity, "account", None)
+        and target.peer_kind == getattr(identity, "peer_kind", None)
+        and target.chat_id == getattr(identity, "chat_id", None)
+        and target.thread_id == getattr(identity, "thread_id", None)
+    )
+
+
+def compare_legacy_access_resolution(
+    *,
+    legacy_allowed: bool,
+    legacy_profile_id: Optional[str],
+    registry: AccessRegistry,
+    identity: TransportIdentity,
+) -> AccessComparisonResult:
+    """Shadow-compare legacy auth/profile facts with the fail-closed resolver."""
+    audit = RedactedAuditMetadata.from_transport("compare", identity)
+    try:
+        resolved = registry.resolve(identity)
+        resolved_allowed = True
+        resolved_reason = "allowed"
+    except AccessDeniedError as exc:
+        resolved = None
+        resolved_allowed = False
+        resolved_reason = exc.reason
+
+    legacy_outcome = "allow" if legacy_allowed else "deny"
+    resolved_outcome = "allow" if resolved_allowed else "deny"
+    outcome_agrees = legacy_allowed == resolved_allowed
+    legacy_profile = _legacy_profile_category(legacy_allowed, legacy_profile_id)
+    profile_agrees: Optional[bool] = None
+
+    if legacy_allowed and resolved_allowed:
+        if legacy_profile == "explicit":
+            profile_agrees = resolved.profile_id == legacy_profile_id
+            comparison_reason = "profiles_match" if profile_agrees else "profile_mismatch"
+        else:
+            profile_agrees = False
+            comparison_reason = "legacy_implicit_profile"
+    elif outcome_agrees:
+        comparison_reason = "outcomes_match"
+    else:
+        comparison_reason = "outcome_mismatch"
+
+    return AccessComparisonResult(
+        legacy_outcome=legacy_outcome,
+        resolved_outcome=resolved_outcome,
+        outcome_agrees=outcome_agrees,
+        profile_agrees=profile_agrees,
+        legacy_profile=legacy_profile,
+        resolved_reason=resolved_reason,
+        comparison_reason=comparison_reason,
+        audit=audit,
+    )
+
+
+def _legacy_profile_category(legacy_allowed: bool, profile_id: Optional[str]) -> str:
+    if not legacy_allowed:
+        return "not_applicable"
+    if not _is_nonempty_str(profile_id) or str(profile_id).strip() == "default":
+        return "implicit_fallback"
+    return "explicit"

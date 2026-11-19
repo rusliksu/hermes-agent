@@ -8,9 +8,10 @@ model in the Telegram/Discord picker silently reverted on the next launch while
 *typing* the same model persisted — a contradiction the same PR introduced.
 
 After the fix (#49176), the picker callback honors the resolved
-``persist_global`` (defaults to ``True``, still respects ``--session``) and runs
-the same read-modify-write block the text path uses, so a tapped model survives
-across sessions like a typed one.
+``persist_global`` and runs the same read-modify-write block the text path
+uses, so a tapped model behaves exactly like a typed one.  Since the
+session-scope-by-default change, both default to session-only and persist
+only with ``--global`` (or ``model.persist_switch_by_default: true``).
 
 These tests drive the real ``_handle_model_command`` with a fake picker-capable
 adapter that captures the ``on_model_selected`` callback, then invoke that
@@ -18,15 +19,14 @@ callback and assert ``config.yaml`` is (or isn't) updated — exercising the exa
 closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
-import threading
+import asyncio
 import types
-from unittest.mock import AsyncMock
 
-import yaml
+import hermes_yaml as yaml
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -41,82 +41,27 @@ class _FakePickerAdapter:
 
     def __init__(self):
         self.captured_callback = None
-        self.captured_state_validator = None
-        self.captured_kwargs = None
 
     async def send_model_picker(self, *, on_model_selected, **kwargs):
         # Stash the closure the handler built so the test can fire a "tap".
         self.captured_callback = on_model_selected
-        self.captured_state_validator = kwargs.get("is_state_current")
-        self.captured_kwargs = kwargs
         return types.SimpleNamespace(success=True)
 
 
-class _StrictCrossPlatformPickerAdapter:
-    """Mirror the Discord/Matrix picker signature without ``**kwargs``."""
-
-    def __init__(self):
-        self.captured_callback = None
-        self.captured_kwargs = None
-
-    async def send_model_picker(
-        self,
-        chat_id,
-        providers,
-        current_model,
-        current_provider,
-        session_key,
-        on_model_selected,
-        metadata=None,
-    ):
-        self.captured_callback = on_model_selected
-        self.captured_kwargs = {
-            "chat_id": chat_id,
-            "providers": providers,
-            "current_model": current_model,
-            "current_provider": current_provider,
-            "session_key": session_key,
-            "metadata": metadata,
-        }
-        return types.SimpleNamespace(success=True)
-
-
-class _CurrentSessionStore:
-    def __init__(self, session_id):
-        self.session_id = session_id
-        self.model_override = None
-
-    def peek_session_id(self, _session_key):
-        return self.session_id
-
-    def get_topic_preferences(self, _source):
-        return {}
-
-    def update_topic_preferences(self, _source, **preferences):
-        return preferences
-
-    def get_model_override(self, _session_key):
-        return self.model_override
-
-    def set_model_override(self, _session_key, override):
-        self.model_override = override
-
-
-def _make_runner(adapter, platform=Platform.TELEGRAM):
+def _make_runner(adapter):
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {platform: adapter}
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
-    runner.session_store = _CurrentSessionStore("session-a")
     return runner
 
 
-def _make_event(text, platform=Platform.TELEGRAM):
+def _make_event(text):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=platform, chat_id="12345", chat_type="dm"),
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
     )
 
 
@@ -138,9 +83,9 @@ def _fake_switch_result():
 
 
 def _stub_picker_dependencies(monkeypatch):
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", dict)
     monkeypatch.setattr(
-        "hermes_cli.model_switch.list_picker_providers",
+        "hermes_cli.model_switch_providers.list_picker_providers",
         lambda **kw: [{"slug": "openrouter", "name": "OpenRouter", "models": ["gpt-5.5"]}],
     )
     monkeypatch.setattr(
@@ -223,6 +168,7 @@ async def _drive_picker(runner, event):
             "default": "old-model",
             "provider": "custom",
             "base_url": "https://api.custom.example/v1",
+            "context_length": 1_048_576,
             "api_key": "sk-stale",
             "api_mode": "anthropic_messages",
         },
@@ -233,314 +179,28 @@ async def _drive_picker(runner, event):
     ],
     ids=["nested-dict", "flat-string"],
 )
-async def test_picker_tap_global_persists(tmp_path, monkeypatch, seed_model):
-    """Tapping a model in a global picker persists to config.yaml,
-    matching typed ``/model --global``. The written
-    ``model:`` must always end up a nested dict regardless of the seed shape."""
+async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model):
+    """Tapping a model in a ``/model --global`` picker persists to config.yaml,
+    matching the typed ``/model --global`` path. The written ``model:`` must
+    always end up a nested dict regardless of the seed shape."""
     adapter = _FakePickerAdapter()
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, seed_model)
 
-    confirmation = await _drive_picker(
-        _make_runner(adapter), _make_event("/model --global")
-    )
+    confirmation = await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
 
     assert confirmation is not None
-    assert adapter.captured_kwargs["allow_shared_lane_control"] is False
     assert "gpt-5.5" in confirmation
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert isinstance(written["model"], dict), (
-        "model: should be coerced to a dict, got %r" % (written["model"],)
+        "model: should be coerced to a dict, got {!r}".format(written["model"])
     )
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
+    # The resolved aggregator endpoint is persisted (same shape as CLI/TUI --global, #25106).
+    assert written["model"]["base_url"] == "https://openrouter.ai/api/v1"
     assert "api_key" not in written["model"]
-    assert "api_mode" not in written["model"]
-
-
-@pytest.mark.asyncio
-async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
-    """``/model --session`` then a picker tap stays in-memory only — config
-    untouched, but the in-memory session override must still be applied (the
-    switch worked, it just wasn't persisted)."""
-    adapter = _FakePickerAdapter()
-    cfg_path = _setup_isolated_home(
-        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
-    )
-    runner = _make_runner(adapter)
-
-    confirmation = await _drive_picker(runner, _make_event("/model --session"))
-
-    assert confirmation is not None
-    assert "gpt-5.5" in confirmation
-    # The session override IS applied in-memory (proves the path didn't no-op).
-    assert runner._session_model_overrides, "session override should be set"
-    assert any(
-        ov.get("model") == "gpt-5.5"
-        for ov in runner._session_model_overrides.values()
-    )
-    # But config.yaml is untouched — the override is in-memory only.
-    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert written["model"]["default"] == "old-model"
-    assert written["model"]["provider"] == "openai-codex"
-
-
-@pytest.mark.asyncio
-async def test_picker_global_write_failure_leaves_runtime_state_unchanged(
-    tmp_path, monkeypatch
-):
-    adapter = _FakePickerAdapter()
-    cfg_path = _setup_isolated_home(
-        tmp_path,
-        monkeypatch,
-        {"default": "old-model", "provider": "openai-codex"},
-    )
-    runner = _make_runner(adapter)
-    event = _make_event("/model --global")
-    session_key = runner._session_key_for_source(event.source)
-    old_override = {"model": "session-old", "provider": "openai-codex"}
-    runner._session_model_overrides[session_key] = dict(old_override)
-    runner._pending_model_notes = {session_key: "old note"}
-
-    class _CachedAgent:
-        switch_calls = 0
-
-        def switch_model(self, **kwargs):
-            self.switch_calls += 1
-
-    cached_agent = _CachedAgent()
-    runner._agent_cache_lock = threading.Lock()
-    runner._agent_cache = {session_key: [cached_agent, None]}
-    update_session_model = AsyncMock()
-    runner._session_db = types.SimpleNamespace(
-        update_session_model=update_session_model
-    )
-    evicted = []
-    runner._evict_cached_agent = lambda key: evicted.append(key)
-
-    write_attempts = []
-
-    def _fail_write(path, config):
-        write_attempts.append((path, config))
-        raise OSError("read-only filesystem")
-
-    monkeypatch.setattr(
-        "gateway.slash_commands.atomic_config_write", _fail_write
-    )
-
-    reply = await _drive_picker(runner, event)
-
-    assert "read-only filesystem" in reply
-    assert "Saved to config.yaml" not in reply
-    assert len(write_attempts) == 1
-    assert cached_agent.switch_calls == 0
-    assert runner._session_model_overrides[session_key] == old_override
-    assert runner._pending_model_notes[session_key] == "old note"
-    update_session_model.assert_not_awaited()
-    assert evicted == []
-    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    assert written["model"]["default"] == "old-model"
-
-
-@pytest.mark.asyncio
-async def test_picker_global_success_evicts_without_inplace_cached_switch(
-    tmp_path, monkeypatch
-):
-    adapter = _FakePickerAdapter()
-    _setup_isolated_home(
-        tmp_path,
-        monkeypatch,
-        {"default": "old-model", "provider": "openai-codex"},
-    )
-    runner = _make_runner(adapter)
-    event = _make_event("/model --global")
-    session_key = runner._session_key_for_source(event.source)
-
-    class _CachedAgent:
-        switch_calls = 0
-
-        def switch_model(self, **kwargs):
-            self.switch_calls += 1
-            raise AssertionError("global picker must rebuild, not swap in place")
-
-    cached_agent = _CachedAgent()
-    runner._agent_cache_lock = threading.Lock()
-    runner._agent_cache = {session_key: [cached_agent, None]}
-    evicted = []
-    runner._evict_cached_agent = lambda key: evicted.append(key)
-
-    reply = await _drive_picker(runner, event)
-
-    assert "Saved to config.yaml" in reply
-    assert cached_agent.switch_calls == 0
-    assert evicted == [session_key]
-
-
-@pytest.mark.asyncio
-async def test_model_picker_is_bound_to_current_transcript(tmp_path, monkeypatch):
-    adapter = _FakePickerAdapter()
-    _setup_isolated_home(
-        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
-    )
-    runner = _make_runner(adapter)
-    store = _CurrentSessionStore("session-a")
-    runner.session_store = store
-
-    sent = await runner._handle_model_command(_make_event("/model --session"))
-
-    assert sent is None
-    assert adapter.captured_kwargs["allow_shared_lane_control"] is True
-    validator = adapter.captured_state_validator
-    assert validator is not None
-    assert await validator() is True
-    store.session_id = "session-b"
-    assert await validator() is False
-
-
-@pytest.mark.asyncio
-async def test_model_picker_binding_failure_falls_back_without_sending(
-    tmp_path, monkeypatch
-):
-    adapter = _FakePickerAdapter()
-    _setup_isolated_home(
-        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
-    )
-    runner = _make_runner(adapter)
-
-    class _FailingSessionStore(_CurrentSessionStore):
-        def peek_session_id(self, _session_key):
-            raise OSError("session store unavailable")
-
-    runner.session_store = _FailingSessionStore("session-a")
-
-    reply = await runner._handle_model_command(_make_event("/model --session"))
-
-    assert reply is not None
-    assert adapter.captured_callback is None
-
-
-@pytest.mark.asyncio
-async def test_picker_topic_store_failure_does_not_publish_partial_switch(
-    tmp_path, monkeypatch
-):
-    adapter = _FakePickerAdapter()
-    _setup_isolated_home(
-        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
-    )
-    runner = _make_runner(adapter)
-    runner._async_session_store = types.SimpleNamespace(
-        _store=runner.session_store,
-        get_topic_preferences=AsyncMock(return_value={}),
-        peek_session_id=AsyncMock(return_value="session-a"),
-        update_topic_preferences=AsyncMock(
-            side_effect=OSError("topic persist failed")
-        ),
-    )
-    event = _make_event("/model --topic")
-    session_key = runner._session_key_for_source(event.source)
-    runner._pending_model_notes = {session_key: "old note"}
-
-    class _CachedAgent:
-        def __init__(self):
-            self.switch_calls = 0
-
-        def switch_model(self, **_kwargs):
-            self.switch_calls += 1
-
-    cached_agent = _CachedAgent()
-    runner._agent_cache_lock = threading.Lock()
-    runner._agent_cache = {session_key: [cached_agent, None]}
-    update_session_model = AsyncMock()
-    runner._session_db = types.SimpleNamespace(
-        update_session_model=update_session_model
-    )
-    evicted = []
-
-    def _evict(key):
-        evicted.append(key)
-        runner._agent_cache.pop(key, None)
-
-    runner._evict_cached_agent = _evict
-
-    sent = await runner._handle_model_command(event)
-    assert sent is None
-    reply = await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
-
-    assert "topic persist failed" in reply
-    assert runner._session_model_overrides == {}
-    assert runner._pending_model_notes[session_key] == "old note"
-    update_session_model.assert_not_awaited()
-    assert cached_agent.switch_calls == 1
-    assert evicted == [session_key]
-    assert session_key not in runner._agent_cache
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.MATRIX])
-async def test_cross_platform_model_picker_receives_only_supported_kwargs(
-    tmp_path, monkeypatch, platform
-):
-    adapter = _StrictCrossPlatformPickerAdapter()
-    _setup_isolated_home(
-        tmp_path,
-        monkeypatch,
-        {"default": "old-model", "provider": "openai-codex"},
-    )
-    runner = _make_runner(adapter, platform=platform)
-
-    sent = await runner._handle_model_command(
-        _make_event("/model --session", platform=platform)
-    )
-
-    assert sent is None
-    assert adapter.captured_callback is not None
-    assert adapter.captured_kwargs["chat_id"] == "12345"
-
-
-@pytest.mark.asyncio
-async def test_multiplex_picker_keeps_profile_adapter_and_callback_scope(
-    tmp_path, monkeypatch
-):
-    """A named profile must present and execute its picker under one identity."""
-    from agent.secret_scope import get_secret, set_multiplex_active
-
-    default_adapter = _FakePickerAdapter()
-    named_adapter = _FakePickerAdapter()
-    named_home = tmp_path / "profiles" / "named"
-    named_home.mkdir(parents=True)
-    (named_home / ".env").write_text("PROFILE_MODEL_KEY=named-secret\n", encoding="utf-8")
-    runner = _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home)
-    _setup_isolated_home(
-        tmp_path,
-        monkeypatch,
-        {"default": "old-model", "provider": "openai-codex"},
-    )
-    resolved = []
-
-    def _profile_switch(**kwargs):
-        resolved.append(get_secret("PROFILE_MODEL_KEY"))
-        return _fake_switch_result()
-
-    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _profile_switch)
-    event = _named_event("--session")
-
-    set_multiplex_active(True)
-    try:
-        sent = await runner._handle_model_command(event)
-
-        assert sent is None
-        assert default_adapter.captured_callback is None
-        assert named_adapter.captured_callback is not None
-        assert resolved == []
-
-        confirmation = await named_adapter.captured_callback(
-            "named-chat", "gpt-5.5", "openrouter"
-        )
-    finally:
-        set_multiplex_active(False)
-
-    assert "gpt-5.5" in confirmation
-    assert resolved == ["named-secret"]
+    assert written["model"]["api_mode"] == "chat_completions"
+    assert "context_length" not in written["model"]
 
 
 @pytest.mark.asyncio
@@ -595,3 +255,155 @@ async def test_multiplex_picker_global_persists_only_named_profile(
     assert written["marker"] == "named"
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
+
+
+def _make_store_runner(adapter, sessions_dir, monkeypatch):
+    """Bare runner with a real JSONL SessionStore (the durable /model override lives there)."""
+    import hermes_state
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    def _no_sqlite(*_a, **_k):
+        raise RuntimeError("SQLite disabled in test")
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _no_sqlite)
+    runner = _make_runner(adapter)
+    runner.session_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+    return runner
+
+
+async def _typed_global(runner, event_text="/model gpt-5.5 --global"):
+    return await runner._handle_model_command(_make_event(event_text))
+
+
+async def _picker_global(runner, event_text="/model --global"):
+    return await _drive_picker(runner, _make_event(event_text))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drive", [_typed_global, _picker_global], ids=["typed", "picker"])
+async def test_global_switch_clears_redundant_session_override(tmp_path, monkeypatch, drive):
+    """A ``--global`` pick (typed or picker) leaves config.yaml as the ONLY durable authority:
+    the per-session override is dropped from memory and the session store, so a later global
+    change is not shadowed after a gateway restart (#100314: a stale override resumed
+    ``gpt-5.6-sol-900k`` as the base 272K model)."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_store_runner(adapter, tmp_path / "sessions", monkeypatch)
+    source = _make_event("x").source
+    session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+    stale = {"model": "old-model", "provider": "openrouter"}
+    runner.session_store.set_model_override(session_key, stale)
+    runner._session_model_overrides[session_key] = dict(stale)
+
+    confirmation = await drive(runner)
+
+    assert "config.yaml" in confirmation
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "gpt-5.5"
+    assert runner._session_model_override(session_key) is None
+    assert runner.session_store.get_model_override(session_key) is None
+    # Restart: a fresh store + runner rehydrate nothing, so config.yaml decides the model.
+    restarted = _make_store_runner(_FakePickerAdapter(), tmp_path / "sessions", monkeypatch)
+    restarted._rehydrate_session_model_override(session_key)
+    assert restarted._session_model_override(session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_global_switch_keeps_session_override_when_config_write_fails(tmp_path, monkeypatch):
+    """When the config.yaml write fails the switch must stay a truthful session override (memory +
+    store) and the confirmation must not claim a clean global save (#100314)."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_store_runner(adapter, tmp_path / "sessions", monkeypatch)
+    source = _make_event("x").source
+    session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+
+    async def _disk_full(result, config_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", _disk_full)
+
+    confirmation = await _typed_global(runner)
+
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "old-model"
+    assert "Saved to config.yaml" not in confirmation
+    assert "disk full" in confirmation
+    assert runner._session_model_override(session_key)["model"] == "gpt-5.5"
+    assert runner.session_store.get_model_override(session_key)["model"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_model_commands_commit_in_issue_order(tmp_path, monkeypatch):
+    """Two /model commands on one session dispatched concurrently (a second slash command bypasses the
+    busy guard while no agent runs) must commit as if issued serially: a ``--global`` pick followed by
+    a session pick leaves config.yaml on the global model AND the session override on the later pick,
+    instead of the global cleanup wiping it; memory and durable store agree (#100314)."""
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    def _switch(**kw):
+        return ModelSwitchResult(success=True, new_model=kw["raw_input"], target_provider="openrouter",
+                                 provider_changed=False, api_key="sk-test", base_url="https://openrouter.ai/api/v1",
+                                 api_mode="chat_completions", provider_label="OpenRouter",
+                                 is_global=kw.get("is_global", False))
+
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch)
+    runner = _make_store_runner(_FakePickerAdapter(), tmp_path / "sessions", monkeypatch)
+    source = _make_event("x").source
+    session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+
+    await asyncio.gather(runner._handle_model_command(_make_event("/model model-A --global")),
+                         runner._handle_model_command(_make_event("/model model-B")))
+
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["model"]["default"] == "model-A"
+    assert runner._session_model_override(session_key)["model"] == "model-B"
+    assert runner.session_store.get_model_override(session_key)["model"] == "model-B"
+
+
+@pytest.mark.asyncio
+async def test_global_switch_keeps_session_override_under_channel_override(tmp_path, monkeypatch):
+    """Precedence is session /model > channel_overrides > config.yaml. In a chat whose
+    ``channel_overrides`` names a model, a ``--global`` pick must NOT drop the session override:
+    config.yaml alone would lose to the channel model on the next turn while the confirmation
+    claims the switch to gpt-5.5 (#100314 follow-up)."""
+    from gateway.config import ChannelOverride, GatewayConfig, PlatformConfig
+
+    _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_store_runner(_FakePickerAdapter(), tmp_path / "sessions", monkeypatch)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(
+        enabled=True, channel_overrides={"12345": ChannelOverride(model="channel-model")})})
+    source = _make_event("x").source
+    runner.session_store.get_or_create_session(source)
+
+    confirmation = await _typed_global(runner)
+
+    assert "gpt-5.5" in confirmation
+    model, _runtime = runner._resolve_session_agent_runtime(source=source)
+    assert model == "gpt-5.5", f"next turn would run {model!r} while the confirmation says gpt-5.5"
+    assert runner.session_store.get_model_override(runner._session_key_for_source(source))["model"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_global_switch_reports_failed_stale_override_cleanup(tmp_path, monkeypatch):
+    """config.yaml written but the stale session override could not be cleared from the store: the
+    in-memory override stays (memory agrees with the store's copy surviving) and the confirmation
+    warns instead of claiming a clean 'Saved to config.yaml' (#100314 acceptance)."""
+    _setup_isolated_home(tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"})
+    runner = _make_store_runner(_FakePickerAdapter(), tmp_path / "sessions", monkeypatch)
+    source = _make_event("x").source
+    session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+
+    def _locked(key, override):
+        raise OSError("store locked")
+
+    monkeypatch.setattr(runner.session_store, "set_model_override", _locked)
+
+    confirmation = await _typed_global(runner)
+
+    assert "store locked" in confirmation
+    assert "Saved to config.yaml" not in confirmation
+    assert runner._session_model_override(session_key)["model"] == "gpt-5.5"

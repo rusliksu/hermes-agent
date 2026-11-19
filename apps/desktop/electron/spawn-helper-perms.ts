@@ -3,7 +3,7 @@
 // so a non-executable helper fails every terminal spawn with
 // `Error: posix_spawnp failed.`. Packaged builds are covered because
 // stage-native-deps.mjs chmods the staged copy, but the dev flow
-// (`npm run dev` → `electron .`) resolves node-pty straight from
+// (`pnpm run dev` → `electron .`) resolves node-pty straight from
 // `node_modules/`, which nobody chmods. This restores the exec bits at runtime,
 // best-effort, so both dev and any environment that stripped the bit keep
 // working. Idempotent: files that are already executable are left untouched.
@@ -17,6 +17,14 @@ import {
 import { join } from 'node:path'
 
 const EXEC_BITS = 0o111
+
+// Electron exposes module paths inside app.asar even when electron-builder has
+// unpacked the native payload beside it. `stat` can read an archived path, but
+// chmod cannot mutate it (ENOTDIR). Native node-pty helpers belong in the
+// writable app.asar.unpacked tree; leave an already-unpacked path unchanged.
+export function writableNodePtyRoot(nodePtyRoot: string): string {
+  return nodePtyRoot.replace(/app\.asar(?!\.unpacked)/, 'app.asar.unpacked')
+}
 
 export interface SpawnHelperFs {
   existsSync(path: string): boolean
@@ -81,8 +89,9 @@ export function ensureSpawnHelperExecutable(
   fs: SpawnHelperFs = defaultFs
 ): EnsureSpawnHelperResult {
   const result: EnsureSpawnHelperResult = { fixed: [], errors: [] }
+  const writableRoot = writableNodePtyRoot(nodePtyRoot)
 
-  for (const path of spawnHelperCandidates(nodePtyRoot, fs)) {
+  for (const path of spawnHelperCandidates(writableRoot, fs)) {
     if (!fs.existsSync(path)) {
       continue
     }
