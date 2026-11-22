@@ -273,7 +273,7 @@ jobs:
           # Each of these tests drives a container, so the docker daemon sets
           # the limit and not the processor. This pins the runner's worker
           # count to the core count.
-          HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/
+          HERMES_TEST_WORKERS=$(nproc) bash scripts/run_tests.sh tests/docker/
 
       - name: Verify release image identity
         if: needs.mode.outputs.phase == 'test'
