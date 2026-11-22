@@ -44,6 +44,11 @@ on:
         required: false
         type: boolean
         default: false
+      run-tests:
+        description: "Run the Docker integration suite after building the image. Used by the dispatch-only integration workflow."
+        required: false
+        type: boolean
+        default: false
     outputs:
       manifest-digest:
         description: "Immutable digest of the published versioned multi-arch manifest."
@@ -111,7 +116,7 @@ jobs:
 
       - name: Detect affected areas
         id: classify
-        if: steps.resolve.outputs.release != 'true' && github.event_name != 'workflow_dispatch'
+        if: steps.resolve.outputs.release != 'true' && github.event_name != 'workflow_dispatch' && inputs.run-tests != true
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
@@ -124,7 +129,7 @@ jobs:
           # for docker meta, the dependency manifests, PM and tests/docker
           # (or the run-e2e label). Every push to main builds the image.
           # classify_changes.py owns the formula.
-          DOCKER: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.classify.outputs.docker }}
+          DOCKER: ${{ (github.event_name == 'workflow_dispatch' || inputs.run-tests == true) && 'true' || steps.classify.outputs.docker }}
         run: |
           set -euo pipefail
           if [ "$DOCKER" = "true" ]; then
@@ -147,7 +152,7 @@ jobs:
     needs: [mode]
     if: >-
       !cancelled() && needs.mode.result == 'success' &&
-      ((needs.mode.outputs.release != 'true' && needs.mode.outputs.build == 'true' && (github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch')) || needs.mode.outputs.phase == 'test')
+      ((needs.mode.outputs.release != 'true' && needs.mode.outputs.build == 'true' && (github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch' || inputs.run-tests == true)) || needs.mode.outputs.phase == 'test')
     strategy:
       fail-fast: false
       matrix:
@@ -246,10 +251,11 @@ jobs:
       # Park the stamp while PM provisions the runner, then restore it so
       # tests/docker can compare the image's provenance with the checkout.
       - name: Park the image install stamp while provisioning the runner toolchain
+        if: (inputs.run-tests == true || needs.mode.outputs.phase == 'test') && inputs.skip-tests != true
         run: mv install-stamp.json "$RUNNER_TEMP/install-stamp.json"
 
       - name: Set up locked Python and test dependencies
-        if: inputs.skip-tests != true
+        if: (inputs.run-tests == true || needs.mode.outputs.phase == 'test') && inputs.skip-tests != true
         uses: ./.github/actions/setup-pm
         with:
           extras: '[]'
@@ -257,10 +263,11 @@ jobs:
           prune-python-cache: true
 
       - name: Restore the image install stamp for the docker tests
+        if: (inputs.run-tests == true || needs.mode.outputs.phase == 'test') && inputs.skip-tests != true
         run: mv "$RUNNER_TEMP/install-stamp.json" install-stamp.json
 
       - name: Run docker integration tests
-        if: inputs.skip-tests != true
+        if: (inputs.run-tests == true || needs.mode.outputs.phase == 'test') && inputs.skip-tests != true
         env:
           # Skip rebuild; use the image already loaded by the build step.
           HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
