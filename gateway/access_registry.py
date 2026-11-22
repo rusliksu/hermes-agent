@@ -709,19 +709,27 @@ class AccessRegistry:
         family_count = sum(canonical_role_id(binding.role_id) == "family" for binding in active_principals)
         shared_count = sum(binding.role_id == "shared_room" for binding in active_rooms)
         allowed_private_roles = {"owner", "family"}
+        # Rollout supports the legacy 9-family cohort and the full 12-profile cohort.
+        # Each cohort has one owner; family+owner is the private-binding total.
+        family_cohorts = (9, 12)
+        principal_cohorts = tuple(size + 1 for size in family_cohorts)
         expected = {
-            "active_principal_binding_count": (len(active_principals), 10),
+            "active_principal_binding_count": (len(active_principals), principal_cohorts),
             "invalid_private_role_count": (
                 sum(binding.role_id not in allowed_private_roles for binding in active_principals),
                 0,
             ),
             "owner_count": (owner_count, 1),
-            "family_count": (family_count, 9),
+            "family_count": (family_count, family_cohorts),
             "active_shared_scope_binding_count": (len(active_rooms), 2),
             "shared_room_count": (shared_count, 2),
         }
         for category, (actual, wanted) in expected.items():
-            if actual != wanted:
+            if isinstance(wanted, tuple):
+                distance = min(abs(actual - size) for size in wanted)
+                if distance:
+                    counts[category] = distance
+            elif actual != wanted:
                 counts[category] = abs(actual - wanted) or 1
         conflicts = tuple(sorted(counts.items()))
         return RegistryValidationReport(

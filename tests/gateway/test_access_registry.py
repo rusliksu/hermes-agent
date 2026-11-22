@@ -907,6 +907,36 @@ def test_rollout_shape_accepts_one_owner_nine_family_and_two_rooms():
     assert roles.count("family") == 9
 
 
+def test_rollout_shape_accepts_full_twelve_family_cohort():
+    extras = tuple(
+        PrincipalBinding(
+            principal_id=f"principal-family-{index}",
+            role_id="family",
+            profile_id=f"family-profile-{index}",
+            transport_identity=_dm_identity(f"opaque-family-{index}"),
+            conversation_scope="private",
+            delivery_target=_target(_dm_identity(f"opaque-family-{index}")),
+        )
+        for index in range(9, 12)
+    )
+    profiles = frozenset(
+        ["owner-profile"]
+        + [f"family-profile-{index}" for index in range(12)]
+        + [f"room-profile-{index}" for index in range(2)]
+    )
+    registry = _registry(
+        principal_bindings=_principal_bindings() + extras,
+        profiles=profiles,
+    )
+
+    report = registry.require_valid_rollout_shape()
+
+    assert report.valid
+    roles = [binding.role_id for binding in registry.principal_bindings]
+    assert roles.count("owner") == 1
+    assert roles.count("family") == 12
+
+
 def test_rollout_shape_rejects_extra_active_private_principal_binding():
     extra = PrincipalBinding(
         principal_id="principal-extra",
