@@ -320,7 +320,7 @@ RUN /opt/hermes/.venv/bin/python -I scripts/generate_icons.py --source /opt/herm
 FROM runtime_base AS frontend_build
 # pnpm installs the workspaces; nothing in the runtime image runs it, so only
 # the build stages (this one and webapp_build) stage it.
-RUN python3 -c 'from pathlib import Path; from pm import ensure, installed_package; ensure("pnpm", explicit=True); Path("/usr/local/bin/pnpm").symlink_to(installed_package("pnpm").binary)' && \
+RUN python3 -c 'from pathlib import Path; from pm import ensure, installed_package; ensure("pnpm", explicit=True); link = Path("/usr/local/bin/pnpm"); link.unlink(missing_ok=True); link.symlink_to(installed_package("pnpm").binary)' && \
     pnpm --version
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY web/package.json web/
@@ -348,7 +348,7 @@ RUN node scripts/build/tui.mjs --source /opt/hermes --out /opt/products/tui && \
 # which installs Desktop's dependencies in a private workspace. A stage of its
 # own so Desktop changes leave the TUI and dashboard layers cached.
 FROM runtime_base AS webapp_build
-RUN python3 -c 'from pathlib import Path; from pm import ensure, installed_package; ensure("pnpm", explicit=True); Path("/usr/local/bin/pnpm").symlink_to(installed_package("pnpm").binary)' && \
+RUN python3 -c 'from pathlib import Path; from pm import ensure, installed_package; ensure("pnpm", explicit=True); link = Path("/usr/local/bin/pnpm"); link.unlink(missing_ok=True); link.symlink_to(installed_package("pnpm").binary)' && \
     pnpm --version
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/desktop/package.json apps/desktop/
