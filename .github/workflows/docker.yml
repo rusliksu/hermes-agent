@@ -17,6 +17,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
   workflow_call:
     inputs:
       commit:
@@ -110,7 +111,7 @@ jobs:
 
       - name: Detect affected areas
         id: classify
-        if: steps.resolve.outputs.release != 'true'
+        if: steps.resolve.outputs.release != 'true' && github.event_name != 'workflow_dispatch'
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
@@ -123,7 +124,7 @@ jobs:
           # for docker meta, the dependency manifests, PM and tests/docker
           # (or the run-e2e label). Every push to main builds the image.
           # classify_changes.py owns the formula.
-          DOCKER: ${{ steps.classify.outputs.docker }}
+          DOCKER: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.classify.outputs.docker }}
         run: |
           set -euo pipefail
           if [ "$DOCKER" = "true" ]; then
@@ -146,7 +147,7 @@ jobs:
     needs: [mode]
     if: >-
       !cancelled() && needs.mode.result == 'success' &&
-      ((needs.mode.outputs.release != 'true' && github.repository == 'NousResearch/hermes-agent' && needs.mode.outputs.build == 'true') || needs.mode.outputs.phase == 'test')
+      ((needs.mode.outputs.release != 'true' && needs.mode.outputs.build == 'true' && (github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch')) || needs.mode.outputs.phase == 'test')
     strategy:
       fail-fast: false
       matrix:
