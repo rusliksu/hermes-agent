@@ -15,3 +15,4 @@ jobs:
     uses: ./.github/workflows/docker.yml
     with:
       run-tests: true
+      archs: '["amd64"]'
