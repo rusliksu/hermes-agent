@@ -142,12 +142,10 @@ events made with the default `GITHUB_TOKEN`. `workflow_dispatch` and
 
 ### Runners
 
-`blacksmith-*` labels are Blacksmith runners (`4vcpu` for small jobs,
-`32vcpu` for test suites and builds, `-arm` for native arm64). `macos-15`,
-`windows-latest-32-core` and `windows-latest-32-arm-core` are GitHub-hosted.
+Runners are GitHub-hosted: `ubuntu-latest` for Linux, `ubuntu-24.04-arm` for
+native arm64, `macos-15`/`macos-latest` for macOS, and the Windows labels below.
 No workflow runs on Intel macOS. Some publish jobs run on `ubuntu-latest` on purpose:
-`docker buildx imagetools` cannot commit manifest lists to Docker Hub from
-Blacksmith.
+`docker buildx imagetools` cannot commit manifest lists to Docker Hub from CI.
 
 ---
 
