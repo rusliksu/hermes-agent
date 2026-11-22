@@ -23,7 +23,8 @@ def _start_console(image: str, name: str, *, tty: bool, env: tuple[str, ...]) ->
         args.extend(["-e", value])
     probe = (
         "if [ -t 0 ] && [ -t 1 ]; then tty=yes; else tty=no; fi; "
-        f'printf "{_FOREGROUND} tty=%s\\n" "$tty"; exec sleep infinity'
+        f'printf "{_FOREGROUND} tty=%s\\n" "$tty" > /tmp/console-probe; '
+        "exec sleep infinity"
     )
     subprocess.run(
         [*args, image, "sh", "-c", probe],
@@ -32,7 +33,11 @@ def _start_console(image: str, name: str, *, tty: bool, env: tuple[str, ...]) ->
         text=True,
         timeout=60,
     )
-    output = wait_for_docker_logs(name, _FOREGROUND)
+    # Read the probe through docker exec: docker logs for a TTY container is not a
+    # portable readiness signal (GitHub-hosted runners can delay/omit it), while the
+    # file is written as soon as the image entrypoint runs the command.
+    ready, output = poll_container(name, "cat /tmp/console-probe", deadline_s=90.0)
+    assert ready, f"console probe did not run: {output}"
     assert f"{_FOREGROUND} tty={'yes' if tty else 'no'}" in output
 
 
