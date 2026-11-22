@@ -84,7 +84,7 @@ jobs:
   # never weakened.
   mode:
     name: Resolve release phase and affected areas
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       phase: ${{ steps.resolve.outputs.phase }}
@@ -159,12 +159,12 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           # arm64 builds on the native arm64 larger runner. A build of
           # linux/arm64 on an x64 host uses emulation.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubuntu-latest
             platform: linux/arm64
 
     runs-on: ${{ matrix.runner }}
@@ -271,9 +271,9 @@ jobs:
           NOUS_API_KEY: ""
         run: |
           # Each of these tests drives a container, so the docker daemon sets
-          # the limit and not the processor. This pins the runner's worker
-          # count to the core count.
-          HERMES_TEST_WORKERS=$(nproc) bash scripts/run_tests.sh tests/docker/
+          # the limit and not the processor. Two workers avoid starving s6 on
+          # the 4-core GitHub-hosted runner.
+          HERMES_TEST_WORKERS=2 bash scripts/run_tests.sh tests/docker/
 
       - name: Verify release image identity
         if: needs.mode.outputs.phase == 'test'
@@ -350,11 +350,11 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           # Native arm64 for the same reason as the build matrix above.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubuntu-latest
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -542,7 +542,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}
@@ -768,7 +768,7 @@ jobs:
     name: Docker phase requirements met
     if: always() && inputs.release-phase != ''
     needs: [mode, build, release-publish, release-publish-manifest]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Validate phase job results
