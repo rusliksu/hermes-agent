@@ -1,0 +1,17 @@
+name: Docker Integration Tests
+
+# Dispatch-only and intentionally not a required PR check: the Docker
+# integration suite is slow and currently environment-sensitive, so it must
+# never block merges to main.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Docker integration suite
+    uses: ./.github/workflows/docker.yml
+    with:
+      run-tests: true
