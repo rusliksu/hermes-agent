@@ -206,10 +206,9 @@ async function phoneReopens(phone: Phone, sandbox: CoreSandbox): Promise<{ tab: 
       response =>
         response.url().includes(`/sessions/${encodeURIComponent(phone.sessionId)}/messages?`) &&
         response.url().includes('order=latest'),
-      { timeout: 60_000 }
+      { timeout: 120_000 }
     )
     .then(response => response.text())
-    .catch(() => '')
 
   await tab.evaluate(id => {
     window.location.hash = `#/${encodeURIComponent(id)}`

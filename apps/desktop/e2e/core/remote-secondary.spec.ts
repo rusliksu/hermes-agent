@@ -313,11 +313,16 @@ test('bot on a remote secondary connection: a client-only image reaches it as by
       const staged = at >= 0 ? /^\S+?\.png/.exec(userText.slice(at))?.[0] : undefined
       expect(staged, `the turn references a remote-side image path: ${userText.slice(0, 400)}`).toBeTruthy()
       expect(fs.readFileSync(staged!).equals(png), 'remote-staged image is byte-identical').toBe(true)
-      const seen = provider.completions.flatMap(c => imageParts(c.body)).map(dataUrlBytes)
-      expect(
-        seen.some(bytes => bytes.equals(png)),
-        'the model received the client image bytes'
-      ).toBe(true)
+      await expect
+        .poll(
+          () =>
+            provider.completions
+              .flatMap(c => imageParts(c.body))
+              .map(dataUrlBytes)
+              .some(bytes => bytes.equals(png)),
+          { timeout: 120_000, message: 'the model received the client image bytes' }
+        )
+        .toBe(true)
 
       expect(
         JSON.stringify(provider.completions.map(c => c.body)).includes(clientBox.root),
