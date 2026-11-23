@@ -12,6 +12,13 @@ name: E2E Desktop core
 # it was wired in.
 
 on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       commit:
