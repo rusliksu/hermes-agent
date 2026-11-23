@@ -10,6 +10,7 @@ post-turn follow-ups (queued prompt, goal continuation, notifications).
 from __future__ import annotations
 
 import dataclasses
+import sys
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -216,6 +217,7 @@ def _route_turn_images(agent, prompt: Any, images: list[str]) -> Any:
     """Run message for a turn with attached images: "native" content parts, or "text" path
     references the agent analyzes in-loop (never blocking submit on vision calls).
     Decision table: agent/image_routing.py."""
+    from .session_history import _active_image_routing_identity, _build_image_ref_message
     try:
         from agent.image_routing import build_native_content_parts, decide_image_input_mode
         from hermes_cli.config import load_config as _tui_load_config
