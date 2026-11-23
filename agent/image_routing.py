@@ -498,15 +498,35 @@ def _accepted_mimes() -> frozenset:
     return _UNIVERSALLY_SUPPORTED_MIMES
 
 
+def _is_session_image(path: Path) -> bool:
+    """True for a server-staged upload under this turn's profile ``images/`` dir.
+
+    ``profile_read_block_error`` fails closed when a multiplexing process has no
+    resolved access context. Remote attachment turns run with the profile home
+    bound but no request context, so their own staged upload would otherwise be
+    skipped as another profile's file.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return path.resolve().is_relative_to((get_hermes_home() / "images").resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _file_to_data_url(path: Path) -> Optional[str]:
     """Encode a local image as a base64 data URL at native size (the agent retry
     loop shrinks on rejection, so lenient providers pay no silent quality tax);
     MIMEs outside the accepted set are transcoded to PNG. None when unreadable,
-    blocked by the read guard, or untranscodable — the caller reports ``skipped``."""
-    try:
-        from agent.file_safety import raise_if_read_blocked
+    blocked by the read guard, or untranscodable — the caller reports ``skipped``.
 
-        raise_if_read_blocked(str(path))
+    Session uploads are exempt from the profile-namespace guard: their path is
+    server-produced under the turn's own home, not a caller-supplied read."""
+    try:
+        if not _is_session_image(path):
+            from agent.file_safety import raise_if_read_blocked
+
+            raise_if_read_blocked(str(path))
     except ValueError as exc:
         logger.warning("image_routing: blocked local image attachment %s -- %s", path, exc)
         return None

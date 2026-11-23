@@ -19,10 +19,20 @@ on:
         required: false
         type: string
         default: ''
+      test_grep:
+        description: Optional Playwright -g filter for a single-test rerun.
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       commit:
         description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
+        default: ''
+      test_grep:
+        description: Optional Playwright -g filter for a single-test rerun.
+        required: false
         type: string
         default: ''
 
@@ -96,9 +106,11 @@ jobs:
         working-directory: apps/desktop
         run: |
           xvfb-run -a --server-args="-screen 0 1280x1024x24" \
-            pnpm exec playwright test -c e2e/core/playwright.config.ts
+            pnpm exec playwright test -c e2e/core/playwright.config.ts \
+            ${PLAYWRIGHT_GREP:+--grep "$PLAYWRIGHT_GREP"}
         env:
           CI: 'true'
+          PLAYWRIGHT_GREP: ${{ inputs.test_grep }}
           HERMES_E2E_PYTHON: ${{ steps.pm.outputs.python-path }}
           # The pack step above ran: a missing release/linux-unpacked is a failure, not a skip.
           HERMES_E2E_REQUIRE_PACKAGED: '1'
